@@ -1,69 +1,158 @@
-import { applyComposerBorderColor } from "./composer.ts";
-import { footerFromContext } from "./footer.ts";
-import { createDiamondTools, type ToolFactoryMap } from "./tools.ts";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { ToolsOptions, ModelRegistry, ExtensionAPI, CustomEditor, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { applyComposerBorderColor, frameEditorLines } from "./composer.ts";
+import { footerLinesFromContext, type FooterContext } from "./footer.ts";
+import { formatCodexQuota, parseCodexQuota, startCodexUsagePolling, type QuotaWindow } from "./subscription.ts";
+import {
+	applyGrokTerminalChrome,
+	resetGrokTerminalChrome,
+	tuiWrite,
+	suspendTerminalChrome,
+} from "./terminal-chrome.ts";
+import { defaultFeatures, type Features } from "./features.ts";
+import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName } from "./tools.ts";
 
 export type SessionUi = {
-	theme?: { fg?: (token: string, text: string) => string };
-	setFooter?: (factory: unknown) => void;
+	theme?: { fg?(token: string, text: string): string };
+	setFooter?(factory: unknown): void;
 	setStatus?: (id: string, text: string | undefined) => void;
-	setEditorComponent?: (factory: unknown) => void;
+	setEditorComponent?(factory: unknown): void;
 };
 
-export type SessionContext = {
+export type SessionContext = FooterContext & {
 	cwd: string;
+	modelRegistry?: Pick<ModelRegistry, "getApiKeyForProvider">;
 	hasUI?: boolean;
 	mode?: string;
-	model?: { name?: string; id?: string } | null;
+	model?: { name?: string; id?: string; provider?: string } | null;
 	getContextUsage?: () => { percent: number | null } | undefined;
+	isProjectTrusted?: () => boolean;
 	ui: SessionUi;
 };
 
 export type ExtensionApiLike = {
-	on: (event: string, handler: (event: unknown, ctx: SessionContext) => unknown) => unknown;
-	registerTool: (tool: unknown) => unknown;
+	on: ExtensionAPI["on"];
+	registerTool: ExtensionAPI["registerTool"];
+	getThinkingLevel?: () => string;
 };
 
-export type CustomEditorCtor = new (tui: unknown, theme: unknown, keybindings: unknown, options?: unknown) => {
-	focused?: boolean;
-	borderColor?: (text: string) => string;
-	render: (width: number) => string[];
-};
+export type CustomEditorCtor = typeof CustomEditor;
 
 export type GrokStyleDeps = {
 	CustomEditor: CustomEditorCtor;
 	tools: ToolFactoryMap;
+	getToolOptions?: (ctx: SessionContext) => ToolsOptions;
+	wrapTool?: (tool: OriginalTool) => OriginalTool;
+	features?: Partial<Features>;
 };
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
+	const features = { ...defaultFeatures, ...deps.features };
+	let suspendChrome: ReturnType<typeof suspendTerminalChrome> | undefined;
+	let restoreTerminal: (() => void) | undefined;
+	let quota: QuotaWindow[] = [];
+	let quotaError: string | undefined;
+	let quotaPolling: ReturnType<typeof startCodexUsagePolling> | undefined;
+	function refreshQuotaSource(ctx: SessionContext) {
+		quotaPolling?.dispose(); quotaPolling = undefined;
+		quotaError = undefined;
+		if (!features.footer || ctx.model?.provider !== "openai-codex" || !ctx.modelRegistry || (ctx.mode && ctx.mode !== "tui")) return;
+		const registry = ctx.modelRegistry;
+		quotaPolling = startCodexUsagePolling(() => registry.getApiKeyForProvider("openai-codex"), (windows, error) => {
+			if (windows) quota = windows;
+			quotaError = error;
+			requestRender?.();
+		});
+	}
+	let requestRender: (() => void) | undefined;
+	pi.on("after_provider_response", (event, ctx) => {
+		if (ctx.model?.provider !== "openai-codex") return;
+		const headers = (event as { headers?: Record<string, string> }).headers;
+		if (!headers) return;
+		const updated = parseCodexQuota(headers);
+		if (updated.length) {
+			quota = [...quota.filter((window) => !updated.some((next) => next.label === window.label)), ...updated];
+			quotaError = undefined;
+			requestRender?.();
+		}
+	});
+	pi.on("model_select", (_event, ctx) => {
+		quota = [];
+		refreshQuotaSource(ctx);
+		requestRender?.();
+	});
+
 	pi.on("session_start", (_event, ctx) => {
-		const tools = createDiamondTools(ctx.cwd, deps.tools);
+		quota = [];
+		const options = deps.getToolOptions?.(ctx);
+		const tools = features.toolStyling ? createDiamondTools(ctx.cwd, deps.tools, options) :
+			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](ctx.cwd, options?.[name]));
 		for (const tool of tools) {
-			pi.registerTool(tool);
+			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
+			pi.registerTool({ ...registered, label: registered.label ?? registered.name });
 		}
 
 		if (!ctx.hasUI && ctx.mode && ctx.mode !== "tui") {
 			return;
 		}
 
-		if (typeof ctx.ui.setFooter === "function") {
-			ctx.ui.setFooter((tui: { requestRender?: () => void }, theme: SessionUi["theme"], footerData?: { onBranchChange?: (cb: () => void) => () => void }) => {
+		if (features.footer && typeof ctx.ui.setFooter === "function") {
+			ctx.ui.setFooter((tui: { requestRender?: () => void }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
+				requestRender = () => tui.requestRender?.();
+				const write = tuiWrite(tui);
+				if (features.terminalColors && write && !restoreTerminal) {
+					applyGrokTerminalChrome(write);
+					suspendChrome ??= suspendTerminalChrome(write);
+					restoreTerminal = () => resetGrokTerminalChrome(write);
+				}
 				const dispose = footerData?.onBranchChange?.(() => tui.requestRender?.());
 				return {
 					dispose,
 					invalidate() {},
-					render(_width: number) {
-						const line = footerFromContext(ctx);
-						return [theme?.fg ? theme.fg("dim", line) : line];
+					render(width: number) {
+						const formattedQuota = formatCodexQuota(quota);
+						const subscription = ctx.model?.provider === "openai-codex"
+							? quotaError && formattedQuota === "Codex weekly ? left" ? `Codex weekly ${quotaError}` : formattedQuota
+							: undefined;
+						return footerLinesFromContext(ctx, width, pi.getThinkingLevel?.(), subscription, footerData?.getGitBranch?.()).map((line) =>
+							truncateToWidth(theme?.fg ? theme.fg("muted", line) : line, Math.max(0, width)),
+						);
 					},
 				};
 			});
 		}
 
-		if (typeof ctx.ui.setEditorComponent === "function") {
+		if ((features.composer || features.terminalColors) && typeof ctx.ui.setEditorComponent === "function") {
 			const Editor = deps.CustomEditor;
 			class GrokComposer extends Editor {
+				private suspendHandler: (() => void) | undefined;
+
+				override handleInput(data: string) {
+					const handler = this.actionHandlers?.get("app.suspend");
+					if (handler && handler !== this.suspendHandler && suspendChrome) {
+						const chrome = suspendChrome;
+						this.suspendHandler = () => chrome.run(handler);
+						this.actionHandlers!.set("app.suspend", this.suspendHandler);
+					}
+					super.handleInput?.(data);
+				}
+
+				private bottomBorder = "";
+				private framed = false;
+
+				override renderBottomBorder(width: number, hiddenLineCount: number): string {
+					this.bottomBorder = super.renderBottomBorder?.(width, hiddenLineCount) ?? this.borderColor!("─".repeat(width));
+					return this.bottomBorder;
+				}
+
+				override handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+					return super.handleMouse?.(this.framed ? { ...event, x: Math.max(0, event.x - 4), width: event.width - 5 } : event);
+				}
+
 				override render(width: number): string[] {
-					const paint = (token: string, text: string) =>
+					if (!features.composer) { this.framed = false; return super.render(width); }
+					const paint = (token: ThemeColor, text: string) =>
 						ctx.ui.theme?.fg ? ctx.ui.theme.fg(token, text) : text;
 					applyComposerBorderColor(
 						(fn) => {
@@ -72,12 +161,34 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 						Boolean(this.focused),
 						paint,
 					);
-					return super.render(width);
+					this.framed = width >= 8;
+					this.bottomBorder = "";
+					const lines = super.render(this.framed ? width - 5 : width);
+					if (!this.framed) return lines;
+					const bottomIndex = this.bottomBorder ? lines.lastIndexOf(this.bottomBorder) : lines.length - 1;
+					return frameEditorLines(lines, bottomIndex, width, paint, Boolean(this.focused));
 				}
 			}
-			ctx.ui.setEditorComponent(
-				(tui: unknown, theme: unknown, keybindings: unknown) => new GrokComposer(tui, theme, keybindings),
-			);
+			ctx.ui.setEditorComponent((...[tui, theme, keybindings]: ConstructorParameters<typeof CustomEditor>) => {
+				const write = tuiWrite(tui);
+				if (features.terminalColors && write && !restoreTerminal) {
+					applyGrokTerminalChrome(write);
+					suspendChrome ??= suspendTerminalChrome(write);
+					restoreTerminal = () => resetGrokTerminalChrome(write);
+				}
+				return new GrokComposer(tui, theme, keybindings);
+			});
 		}
+		refreshQuotaSource(ctx);
+	});
+
+	pi.on("session_shutdown", () => {
+		quotaPolling?.dispose(); quotaPolling = undefined;
+		quotaError = undefined;
+		quota = [];
+		requestRender = undefined;
+		suspendChrome?.dispose(); suspendChrome = undefined;
+		restoreTerminal?.();
+		restoreTerminal = undefined;
 	});
 }

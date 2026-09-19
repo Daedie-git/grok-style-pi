@@ -105,6 +105,13 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 		},
 	);
 
+	const agent = await import("@earendil-works/pi-coding-agent");
+	for (const [name, factory] of [["read", agent.createReadToolDefinition], ["edit", agent.createEditToolDefinition], ["write", agent.createWriteToolDefinition]] as const) {
+		const native = factory(process.cwd());
+		const tool = registered.find((item) => item.name === name)!;
+		assert.equal(tool.promptSnippet, native.promptSnippet);
+		assert.deepEqual(tool.promptGuidelines, native.promptGuidelines);
+	}
 	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length);
 	for (const name of BUILTIN_TOOL_NAMES) {
 		const tool = registered.find((item) => item.name === name);

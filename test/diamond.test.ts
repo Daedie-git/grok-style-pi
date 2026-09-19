@@ -12,8 +12,8 @@ test("formatToolCall is a one-line Grok-style summary", () => {
 	assert.equal(call.split("\n").length, 1);
 });
 
-test("formatToolCall uses command for bash and pattern for grep", () => {
-	assert.equal(formatToolCall("bash", { command: "ls -la" }), "◆ Ran ls -la");
+test("formatToolCall summarizes bash and uses the pattern for grep", () => {
+	assert.equal(formatToolCall("bash", { command: "ls -la" }), "◆ List files");
 	assert.equal(formatToolCall("grep", { pattern: "TODO", glob: "*.ts" }), "◆ Searched TODO *.ts");
 	assert.equal(formatToolCall("ls"), "◆ Listed");
 });
@@ -38,4 +38,11 @@ test("partial results stay collapsed with no extra line", () => {
 	const partial = formatToolResult({ content: [{ type: "text", text: "streaming" }] }, { expanded: false, isPartial: true });
 	assert.equal(partial.collapsed, true);
 	assert.equal(partial.text, "");
+});
+
+test("shell summaries prefer descriptions without exposing command syntax or controls", () => {
+	assert.equal(formatToolCall("bash", { command: "npm test -- --runInBand", description: "Check the footer tests" }), "◆ Check the footer tests");
+	assert.equal(formatToolCall("powershell", { command: "Get-ChildItem", description: "Inspect\nfiles\x1b]52;c;VEVTVA==\x07" }), "◆ Inspect files");
+	assert.equal(formatToolCall("bash", { command: "npm test" }), "◆ Run tests");
+	assert.equal(formatToolCall("bash", { command: "custom-script --private-argument" }), "◆ Run shell command");
 });

@@ -1,3 +1,5 @@
+import { stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+
 export const DIAMOND = "◆";
 
 export const TOOL_SUMMARY_VERBS: Record<string, string> = {
@@ -23,10 +25,16 @@ export type ToolResult = {
 export type ToolResultOptions = {
 	expanded: boolean;
 	isPartial?: boolean;
-	isError?: boolean;
 };
 
+export type ToolRenderContext = { isError?: boolean };
+
 const PRIMARY_ARG_KEYS = ["command", "path", "pattern"] as const;
+
+/** Sanitize untrusted content before adding our own theme escape sequences. */
+export function sanitizeToolText(text: string): string {
+	return stripTerminalSequences(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
 
 export function compactArgs(args: ToolArgs, maxLength = 60): string {
 	if (!args || typeof args !== "object") return "";
@@ -41,7 +49,7 @@ export function compactArgs(args: ToolArgs, maxLength = 60): string {
 	if (typeof args.glob === "string" && args.glob.trim()) {
 		primary = primary ? `${primary} ${args.glob.trim()}` : args.glob.trim();
 	}
-	const collapsed = primary.replace(/\s+/g, " ");
+	const collapsed = sanitizeToolText(primary).replace(/\s+/g, " ");
 	if (collapsed.length <= maxLength) return collapsed;
 	return `${collapsed.slice(0, Math.max(0, maxLength - 1))}…`;
 }
@@ -50,7 +58,23 @@ export function toolVerb(name: string): string {
 	return TOOL_SUMMARY_VERBS[name] ?? name;
 }
 
+export function commandSummary(args: ToolArgs): string {
+	const description = typeof args?.description === "string" ? sanitizeToolText(args.description).replace(/\s+/g, " ").trim() : "";
+	if (description) return description.slice(0, 160);
+	const command = typeof args?.command === "string" ? args.command.trim() : "";
+	// Conservative fallbacks for older calls without a model-provided summary.
+	if (/[;&|\n]/.test(command)) return "Run shell commands";
+	if (/^(?:npm|pnpm|yarn|bun) (?:run )?test\b|^pytest\b|^cargo test\b|^go test\b/.test(command)) return "Run tests";
+	if (/^(?:npm|pnpm|yarn|bun) (?:run )?build\b|^cargo build\b|^make\b/.test(command)) return "Build project";
+	if (/^git status\b/.test(command)) return "Check working tree";
+	if (/^git diff\b/.test(command)) return "Review changes";
+	if (/^(?:rg|grep|Select-String)\b/.test(command)) return "Search files";
+	if (/^(?:ls|find|Get-ChildItem)\b/.test(command)) return "List files";
+	return "Run shell command";
+}
+
 export function formatToolCall(name: string, args?: ToolArgs): string {
+	if (["bash", "powershell"].includes(name)) return `${DIAMOND} ${commandSummary(args)}`;
 	const inner = compactArgs(args);
 	const verb = toolVerb(name);
 	return inner ? `${DIAMOND} ${verb} ${inner}` : `${DIAMOND} ${verb}`;
@@ -67,18 +91,31 @@ export function extractResultText(result: ToolResult | undefined): string {
 export function formatToolResult(
 	result: ToolResult | undefined,
 	options: ToolResultOptions,
+	context: ToolRenderContext = {},
 ): { text: string; collapsed: boolean } {
 	if (options.isPartial || !options.expanded) {
 		return { text: "", collapsed: true };
 	}
 	const full = extractResultText(result);
-	return { text: full || (options.isError ? "error" : ""), collapsed: false };
+	const details = result?.details as { diff?: unknown; patch?: unknown } | undefined;
+	const diff = typeof details?.diff === "string" ? details.diff :
+		typeof details?.patch === "string" ? details.patch : "";
+	return { text: sanitizeToolText([full, diff].filter(Boolean).join("\n\n")) || (context.isError ? "error" : ""), collapsed: false };
 }
 
-export function textComponent(text: string): { render: (width: number) => string[]; invalidate: () => void } {
+export function textComponent(text: string, singleLine = false): { render: (width: number) => string[]; invalidate: () => void } {
+	const normalized = text.replace(/\t/g, "   ");
+	let cachedWidth: number | undefined;
+	let cachedLines: string[] = [];
 	return {
-		render(_width: number) {
-			return text.length > 0 ? text.split("\n") : [];
+		render(width: number) {
+			if (!text || width <= 0) return [];
+			if (width === cachedWidth) return cachedLines;
+			cachedWidth = width;
+			cachedLines = singleLine
+				? [truncateToWidth(normalized, width)]
+				: wrapTextWithAnsi(normalized, width).map((line) => truncateToWidth(line, width, ""));
+			return cachedLines;
 		},
 		invalidate() {},
 	};

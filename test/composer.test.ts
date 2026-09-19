@@ -20,8 +20,8 @@ test("renderComposerFrame draws a box that differs when focused", () => {
 	const focused = renderComposerFrame(["hello"], { focused: true, width: 12, paint });
 
 	assert.ok(idle.length >= 3);
-	assert.ok(idle[0]?.includes("┌"));
-	assert.ok(idle[idle.length - 1]?.includes("└"));
+	assert.ok(idle[0]?.includes("╭"));
+	assert.ok(idle[idle.length - 1]?.includes("╰"));
 	assert.ok(idle.some((line) => line.includes("│") && line.includes("hello")));
 	assert.ok(idle.every((line) => line.includes(`[${IDLE_BORDER_TOKEN}]`)));
 	assert.ok(focused.every((line) => line.includes(`[${FOCUS_BORDER_TOKEN}]`)));

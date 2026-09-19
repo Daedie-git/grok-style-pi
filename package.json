@@ -1,10 +1,12 @@
 {
   "name": "grok-style-pi",
   "version": "1.0.0",
-  "description": "Grok Build-inspired TUI chrome for Pi: GrokNight theme, cwd │ model │ N% ctx footer, focused composer frame, and diamond tool rows.",
+  "description": "Grok Build-inspired TUI chrome for Pi: GrokNight theme, cwd \u2502 model \u2502 N% ctx footer, focused composer frame, and diamond tool rows.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Daedie-git/grok-style-pi.git"
@@ -17,17 +19,28 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/*.test.ts"
+    "test": "npm run typecheck && node --test test/*.test.ts",
+    "typecheck:subagents": "tsc -p tsconfig.subagents.json",
+    "test:subagents": "node --test test/subagent-contract.test.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json"
   },
   "pi": {
-    "extensions": ["./extensions/index.ts"],
-    "themes": ["./themes"]
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "themes": [
+      "./themes"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.85.1"
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@tintinweb/pi-subagents": "0.19.0",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
   }
 }

@@ -1,5 +1,16 @@
 export const DIAMOND = "◆";
 
+export const TOOL_SUMMARY_VERBS: Record<string, string> = {
+	read: "Read",
+	bash: "Ran",
+	powershell: "Ran",
+	edit: "Edited",
+	write: "Wrote",
+	grep: "Searched",
+	find: "Found",
+	ls: "Listed",
+};
+
 export type ToolArgs = Record<string, unknown> | undefined | null;
 
 export type ToolContentBlock = { type?: string; text?: string };
@@ -35,9 +46,14 @@ export function compactArgs(args: ToolArgs, maxLength = 60): string {
 	return `${collapsed.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
+export function toolVerb(name: string): string {
+	return TOOL_SUMMARY_VERBS[name] ?? name;
+}
+
 export function formatToolCall(name: string, args?: ToolArgs): string {
 	const inner = compactArgs(args);
-	return inner ? `${DIAMOND} ${name}(${inner})` : `${DIAMOND} ${name}`;
+	const verb = toolVerb(name);
+	return inner ? `${DIAMOND} ${verb} ${inner}` : `${DIAMOND} ${verb}`;
 }
 
 export function extractResultText(result: ToolResult | undefined): string {
@@ -52,24 +68,26 @@ export function formatToolResult(
 	result: ToolResult | undefined,
 	options: ToolResultOptions,
 ): { text: string; collapsed: boolean } {
-	if (options.isPartial) {
-		return { text: "  running…", collapsed: true };
+	if (options.isPartial || !options.expanded) {
+		return { text: "", collapsed: true };
 	}
 	const full = extractResultText(result);
-	if (!options.expanded) {
-		const lines = full.length > 0 ? full.split("\n") : [options.isError ? "error" : "done"];
-		const first = lines[0] ?? "";
-		const preview = first.length > 72 ? `${first.slice(0, 71)}…` : first;
-		const more = lines.length > 1 ? `  (${lines.length} lines)` : "";
-		return { text: `  ${preview}${more}`, collapsed: true };
-	}
 	return { text: full || (options.isError ? "error" : ""), collapsed: false };
 }
 
 export function textComponent(text: string): { render: (width: number) => string[]; invalidate: () => void } {
 	return {
 		render(_width: number) {
-			return text.length > 0 ? text.split("\n") : [""];
+			return text.length > 0 ? text.split("\n") : [];
+		},
+		invalidate() {},
+	};
+}
+
+export function emptyComponent(): { render: (width: number) => string[]; invalidate: () => void } {
+	return {
+		render() {
+			return [];
 		},
 		invalidate() {},
 	};

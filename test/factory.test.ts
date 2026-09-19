@@ -48,7 +48,8 @@ test("wrapWithDiamondRenderer forwards execute to the original tool", async () =
 
 	const call = wrapped.renderCall({ path: "src/a.ts" }, { fg: (_t, text) => text });
 	assert.ok(call.render(80)[0]?.startsWith("◆"));
-	assert.ok(call.render(80)[0]?.includes("read"));
+	assert.ok(call.render(80)[0]?.includes("Read"));
+	assert.equal(call.render(80).length, 1);
 
 	const full = Array.from({ length: 12 }, (_, i) => `body-line-${i}-UNIQUE`).join("\n");
 	const collapsed = wrapped.renderResult(
@@ -61,10 +62,11 @@ test("wrapWithDiamondRenderer forwards execute to the original tool", async () =
 		{ expanded: true },
 		{ fg: (_t, text) => text },
 	);
+	assert.equal(collapsed.render(80).length, 0);
 	assert.ok(collapsed.render(80).join("\n").length < expanded.render(80).join("\n").length);
 	assert.ok(!collapsed.render(80).join("\n").includes("body-line-11-UNIQUE"));
 	assert.ok(expanded.render(80).join("\n").includes("body-line-11-UNIQUE"));
-	assert.equal(formatToolCall("read", { path: "src/a.ts" }), "◆ read(src/a.ts)");
+	assert.equal(formatToolCall("read", { path: "src/a.ts" }), "◆ Read src/a.ts");
 });
 
 test("createGrokStyleExtension registers diamond built-ins, footer, and composer", async () => {

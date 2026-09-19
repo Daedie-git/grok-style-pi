@@ -29,4 +29,7 @@ test("GrokNight defines every required Pi color token and resolves vars", () => 
 	assert.equal(resolved.accent, theme.vars?.magenta);
 	assert.equal(resolved.borderMuted, theme.vars?.promptBorder);
 	assert.equal(resolved.borderAccent, theme.vars?.promptBorderActive);
+	assert.equal(resolved.text, "#f3f3f3");
+	assert.equal(resolved.userMessageBg, "#242424");
+	assert.equal(resolved.userMessageText, "#e1e1e1");
 });

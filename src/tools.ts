@@ -1,4 +1,12 @@
-import { formatToolCall, formatToolResult, textComponent, type ToolArgs, type ToolResult, type ToolResultOptions } from "./diamond.ts";
+import {
+	emptyComponent,
+	formatToolCall,
+	formatToolResult,
+	textComponent,
+	type ToolArgs,
+	type ToolResult,
+	type ToolResultOptions,
+} from "./diamond.ts";
 
 export const BUILTIN_TOOL_NAMES = [
 	"read",
@@ -68,6 +76,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 		},
 		renderResult(result, options, theme) {
 			const { text } = formatToolResult(result, options);
+			if (!text) return emptyComponent();
 			const token = options.isError ? "error" : "dim";
 			return textComponent(paint(theme, token, text));
 		},

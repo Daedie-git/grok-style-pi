@@ -11,7 +11,7 @@ import {
 	suspendTerminalChrome,
 } from "./terminal-chrome.ts";
 import { defaultFeatures, type Features } from "./features.ts";
-import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName } from "./tools.ts";
+import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName, type ViewImage } from "./tools.ts";
 
 export type SessionUi = {
 	theme?: { fg?(token: string, text: string): string };
@@ -44,11 +44,23 @@ export type GrokStyleDeps = {
 	tools: ToolFactoryMap;
 	getToolOptions?: (ctx: SessionContext) => ToolsOptions;
 	wrapTool?: (tool: OriginalTool) => OriginalTool;
+	viewImage?: ViewImage;
 	features?: Partial<Features>;
 };
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
 	const features = { ...defaultFeatures, ...deps.features };
+	function registerTools(cwd: string, options?: ToolsOptions) {
+		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, deps.viewImage) :
+			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](cwd, options?.[name]));
+		for (const tool of tools) {
+			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
+			pi.registerTool({ ...registered, label: registered.label ?? registered.name });
+		}
+	}
+	// Pi rebuilds transcript rows before session_start on reload. Register the
+	// renderers during extension load, then refresh execution options at startup.
+	registerTools(process.cwd());
 	let suspendChrome: ReturnType<typeof suspendTerminalChrome> | undefined;
 	let restoreTerminal: (() => void) | undefined;
 	let quota: QuotaWindow[] = [];
@@ -85,13 +97,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 
 	pi.on("session_start", (_event, ctx) => {
 		quota = [];
-		const options = deps.getToolOptions?.(ctx);
-		const tools = features.toolStyling ? createDiamondTools(ctx.cwd, deps.tools, options) :
-			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](ctx.cwd, options?.[name]));
-		for (const tool of tools) {
-			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
-			pi.registerTool({ ...registered, label: registered.label ?? registered.name });
-		}
+		registerTools(ctx.cwd, deps.getToolOptions?.(ctx));
 
 		if (!ctx.hasUI && ctx.mode && ctx.mode !== "tui") {
 			return;

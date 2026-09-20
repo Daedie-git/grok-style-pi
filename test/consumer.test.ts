@@ -26,7 +26,8 @@ test("consumer loads the shipped factory and wires public APIs", async () => {
 				handlers[event] = handler;
 			},
 			registerTool(tool) {
-				registered.push(tool as Record<string, unknown>);
+				const index = registered.findIndex((entry) => entry.name === tool.name);
+				if (index >= 0) registered[index] = tool as Record<string, unknown>; else registered.push(tool as Record<string, unknown>);
 			},
 		},
 		{
@@ -84,11 +85,18 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 			if (event === "session_start") start = handler;
 		},
 		registerTool(tool: Record<string, unknown>) {
-			registered.push(tool);
+			const index = registered.findIndex((entry) => entry.name === tool.name); if (index >= 0) registered[index] = tool; else registered.push(tool);
 		},
 	} as any);
 
 	assert.ok(start, "session_start handler should be registered");
+	// Pi rebuilds history before session_start during /reload. Capture the
+	// definition at that point, as the transcript component does.
+	const restoredBash = registered.find((tool) => tool.name === "bash")!;
+	assert.ok(restoredBash, "shell rendering must already be registered during extension load");
+	const paint = { fg: (_token: string, text: string) => text };
+	assert.deepEqual((restoredBash.renderCall as Function)({ command: "curl -fsSL https://example.test/docs", timeout: 20 }, paint, {}).render(100), ["◆ Fetch remote content"]);
+	assert.deepEqual((restoredBash.renderResult as Function)({ content: [{ type: "text", text: "raw response" }] }, { expanded: false }, paint, {}).render(100), []);
 	await start!(
 		{},
 		{
@@ -110,7 +118,7 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 		const native = factory(process.cwd());
 		const tool = registered.find((item) => item.name === name)!;
 		assert.equal(tool.promptSnippet, native.promptSnippet);
-		assert.deepEqual(tool.promptGuidelines, native.promptGuidelines);
+		assert.deepEqual((tool.promptGuidelines as string[]).slice(0, native.promptGuidelines?.length), native.promptGuidelines);
 	}
 	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length);
 	for (const name of BUILTIN_TOOL_NAMES) {

@@ -174,7 +174,7 @@ test("viewer follows live output, pauses on scroll, and strips terminal control 
 	const viewer = new ActivityViewer(entry, theme, () => 20, () => {}, () => {}, () => {});
 	assert.match(viewer.render(40).join("\n"), /line 49/);
 	viewer.handleInput("\x1b[H");
-	assert.match(viewer.render(40).join("\n"), /line 0\s*│/);
+	assert.match(viewer.render(40).join("\n"), /line 0\s*[┃│]/);
 	assert.doesNotMatch(viewer.render(40).join("\n"), /line 49/);
 	viewer.handleInput("\x1b[F");
 	const rendered = viewer.render(40);
@@ -430,4 +430,52 @@ test("resumes without session cancellation do not offer Stop", (t) => {
 	assert.doesNotMatch(viewer.render(100).join("\n"), /\[Stop/);
 	viewer.handleInput("x");
 	assert.equal(stopped, false);
+});
+
+test("agent and task viewer scrollbars track position, jump on click, and follow new output", () => {
+	for (const kind of ["agent", "command"] as const) {
+		const entry: Activity = { id: "scroll", kind, title: "Live output", status: "running", startedAt: 0,
+			output: Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n") };
+		const viewer = new ActivityViewer(entry, theme, () => 20, () => {}, () => {}, () => {});
+		let lines = viewer.render(40);
+		assert.equal(lines[10][38], "┃", "following output places thumb at bottom");
+		viewer.handleMouse(click(38, 3));
+		lines = viewer.render(40);
+		assert.equal(lines[3][38], "┃");
+		assert.match(lines[3], /line 0/);
+		entry.output += "\nnew output";
+		assert.match(viewer.render(40)[3], /line 0/, "scrolling away pauses follow");
+		viewer.handleMouse(click(38, 10));
+		assert.match(viewer.render(40).join("\n"), /new output/);
+		entry.output += "\nlatest output";
+		assert.match(viewer.render(40).join("\n"), /latest output/, "bottom click resumes follow");
+		for (const width of [4, 5, 6, 20, 80]) assert.ok(viewer.render(width).every(line => visibleWidth(line) === width));
+		entry.output = "short output";
+		assert.doesNotMatch(viewer.render(40).join("\n"), /┃/, "no scrollbar when output fits");
+	}
+});
+
+test("viewer scrollbar handles real fullscreen press/drag/release dispatch in an overlay", async () => {
+	const { TuiAltScreen } = await import("@earendil-works/pi-tui");
+	const terminal = { columns: 80, rows: 24, write() {} } as any;
+	const tui = new TuiAltScreen(terminal, false) as any;
+	tui.requestRender = () => {};
+	const entry: Activity = { id: "drag", kind: "agent", title: "Output", status: "running", startedAt: 0,
+		output: Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n") };
+	const viewer = new ActivityViewer(entry, theme, () => 20, () => {}, () => {}, () => {});
+	const height = viewer.render(40).length;
+	// Same positioned overlay layout used by Pi's dispatchMouseToOverlay.
+	tui.renderedOverlayLayouts = [{ entry: { component: viewer }, col: 10, row: 4, width: 40, height }];
+	const send = (button: number, x: number, y: number, release = false) => tui.handleMouseEvent({ button, x, y, release });
+	send(0, 48, 7); // Press at top of scrollbar, in screen coordinates.
+	assert.match(viewer.render(40)[3], /line 0/);
+	send(32, 55, 10); // Drag outside overlay horizontally; capture retains the gesture.
+	assert.doesNotMatch(viewer.render(40)[3], /line 0\s/);
+	send(0, 55, 14, true);
+	assert.match(viewer.render(40).join("\n"), /line 99/);
+	entry.output += "\nlatest";
+	assert.match(viewer.render(40).join("\n"), /latest/);
+	send(0, 49, 7); // Adjacent border is part of the generous scrollbar hit target.
+	send(0, 49, 7, true);
+	assert.match(viewer.render(40)[3], /line 0/);
 });

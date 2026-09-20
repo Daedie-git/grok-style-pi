@@ -2,6 +2,7 @@ import { loadFeatures, installFeatureSettings } from "../src/features.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { loadToolOptions } from "../src/tool-settings.ts";
 import { installActivityPanel } from "../src/activity.ts";
+import { installImageViewer } from "../src/image-viewer.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export { createGrokStyleExtension } from "../src/extension.ts";
@@ -15,9 +16,11 @@ export default async function grokStylePi(pi: ExtensionAPI): Promise<void> {
 	const features = loadFeatures();
 	installFeatureSettings(pi);
 	const activity = features.activity ? installActivityPanel(pi) : undefined;
+	const imageViewer = features.toolStyling ? installImageViewer(pi, agent.convertToPng) : undefined;
 	createGrokStyleExtension(pi, {
 		features,
 		wrapTool: activity?.wrapTool,
+		viewImage: imageViewer?.view,
 		CustomEditor: agent.CustomEditor,
 		getToolOptions: loadToolOptions,
 		tools: {

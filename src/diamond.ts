@@ -1,4 +1,5 @@
 import { stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { WriteSummary } from "./write-summary.ts";
 
 export const DIAMOND = "◆";
 
@@ -11,11 +12,15 @@ export const TOOL_SUMMARY_VERBS: Record<string, string> = {
 	grep: "Searched",
 	find: "Found",
 	ls: "Listed",
+	get_subagent_result: "Read agent result",
+	jev_advisory_assess: "Jev advisory assessment",
 };
 
 export type ToolArgs = Record<string, unknown> | undefined | null;
 
-export type ToolContentBlock = { type?: string; text?: string };
+export type ImagePreview = { data: string; mimeType: string };
+
+export type ToolContentBlock = { type?: string; text?: string; data?: string; mimeType?: string };
 
 export type ToolResult = {
 	content?: ToolContentBlock[];
@@ -27,9 +32,15 @@ export type ToolResultOptions = {
 	isPartial?: boolean;
 };
 
-export type ToolRenderContext = { isError?: boolean };
+export type ToolRenderContext = {
+	isError?: boolean;
+	args?: ToolArgs;
+	expanded?: boolean;
+	state?: { grokEdit?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokImages?: ImagePreview[]; grokExitCode?: string };
+	invalidate?: () => void;
+};
 
-const PRIMARY_ARG_KEYS = ["command", "path", "pattern"] as const;
+const PRIMARY_ARG_KEYS = ["command", "path", "pattern", "agent_id"] as const;
 
 /** Sanitize untrusted content before adding our own theme escape sequences. */
 export function sanitizeToolText(text: string): string {
@@ -70,14 +81,34 @@ export function commandSummary(args: ToolArgs): string {
 	if (/^git diff\b/.test(command)) return "Review changes";
 	if (/^(?:rg|grep|Select-String)\b/.test(command)) return "Search files";
 	if (/^(?:ls|find|Get-ChildItem)\b/.test(command)) return "List files";
+	if (/^(?:curl|wget)\b/.test(command)) return "Fetch remote content";
 	return "Run shell command";
 }
 
+export function agentSummary(args: ToolArgs): string {
+	const clean = (value: unknown) => typeof value === "string" ? sanitizeToolText(value).replace(/\s+/g, " ").trim().slice(0, 160) : "";
+	const type = clean(args?.subagent_type) || "Agent";
+	const description = clean(args?.description);
+	return description ? `${type}: ${description}` : type;
+}
+
 export function formatToolCall(name: string, args?: ToolArgs): string {
+	if (name === "Agent") return `${DIAMOND} ${agentSummary(args)}`;
 	if (["bash", "powershell"].includes(name)) return `${DIAMOND} ${commandSummary(args)}`;
 	const inner = compactArgs(args);
 	const verb = toolVerb(name);
 	return inner ? `${DIAMOND} ${verb} ${inner}` : `${DIAMOND} ${verb}`;
+}
+
+export function extractImages(result: ToolResult | undefined): ImagePreview[] {
+	if (!result?.content) return [];
+	const images: ImagePreview[] = [];
+	for (const block of result.content) {
+		if (block?.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string" && block.data && block.mimeType) {
+			images.push({ data: block.data, mimeType: block.mimeType });
+		}
+	}
+	return images;
 }
 
 export function extractResultText(result: ToolResult | undefined): string {
@@ -86,6 +117,12 @@ export function extractResultText(result: ToolResult | undefined): string {
 		.filter((block) => block && typeof block.text === "string")
 		.map((block) => block.text as string)
 		.join("\n");
+}
+
+export function extractResultDiff(result: ToolResult | undefined): string {
+	const details = result?.details as { diff?: unknown; patch?: unknown } | undefined;
+	return typeof details?.diff === "string" ? details.diff :
+		typeof details?.patch === "string" ? details.patch : "";
 }
 
 export function formatToolResult(
@@ -97,9 +134,7 @@ export function formatToolResult(
 		return { text: "", collapsed: true };
 	}
 	const full = extractResultText(result);
-	const details = result?.details as { diff?: unknown; patch?: unknown } | undefined;
-	const diff = typeof details?.diff === "string" ? details.diff :
-		typeof details?.patch === "string" ? details.patch : "";
+	const diff = extractResultDiff(result);
 	return { text: sanitizeToolText([full, diff].filter(Boolean).join("\n\n")) || (context.isError ? "error" : ""), collapsed: false };
 }
 

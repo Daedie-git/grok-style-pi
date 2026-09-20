@@ -1,7 +1,11 @@
-/** GrokNight canvas — same values as Grok Build, not the host terminal theme. */
-export const GROK_FG = "#f3f3f3";
-export const GROK_BG = "#141414";
-export const GROK_CURSOR = "#bb9af7";
+import { grokNightPath, loadThemeJson, resolveThemeColors } from "./theme.ts";
+
+// Pi's plain assistant prose inherits the terminal foreground. Keep it aligned
+// with Grok Build md_text / text_secondary, not its brighter text_primary.
+const colors = resolveThemeColors(loadThemeJson(grokNightPath()));
+export const GROK_FG = String(colors.mdCodeBlock);
+export const GROK_BG = String(colors.toolPendingBg);
+export const GROK_CURSOR = String(colors.mdCodeBlock);
 
 export function grokTerminalOscApply(): string {
 	return `\x1b]10;${GROK_FG}\x07\x1b]11;${GROK_BG}\x07\x1b]12;${GROK_CURSOR}\x07`;

@@ -1,16 +1,23 @@
 import {
 	emptyComponent,
 	commandSummary,
+	agentSummary,
 	compactArgs,
 	toolVerb,
 	formatToolResult,
+	extractImages,
+	extractResultText,
+	extractResultDiff,
+	sanitizeToolText,
 	textComponent,
 	type ToolArgs,
 	type ToolResult,
 	type ToolResultOptions,
 	type ToolRenderContext,
 } from "./diamond.ts";
-import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
+import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
 	"read",
@@ -26,8 +33,36 @@ export const BUILTIN_TOOL_NAMES = [
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
 
 export type ThemeLike = {
-	fg?: (token: string, text: string) => string;
+	fg?: (token: ThemeColor, text: string) => string;
+	inverse?: (text: string) => string;
 };
+
+function editDisplay(context: ToolRenderContext | undefined, expanded: boolean) {
+	const state = context?.state;
+	if (!state) return { open: true, expanded };
+	state.grokEdit ??= { open: true, expanded };
+	if (state.grokEdit.expanded !== expanded) {
+		state.grokEdit.expanded = expanded;
+		state.grokEdit.open = expanded;
+	}
+	return state.grokEdit;
+}
+
+/** Invert the changed portion of a replacement, preserving its red/green line color. */
+function emphasizeReplacement(oldLine: string, newLine: string, theme: ThemeLike): [string, string] {
+	if (!theme.inverse) return [oldLine, newLine];
+	const parse = (line: string) => /^([+-]\s*\d* )(.*)$/.exec(line);
+	const old = parse(oldLine), next = parse(newLine);
+	if (!old || !next) return [oldLine, newLine];
+	const a = Array.from(old[2]), b = Array.from(next[2]);
+	let start = 0, end = 0;
+	while (start < Math.min(a.length, b.length) && a[start] === b[start]) start++;
+	while (end < Math.min(a.length, b.length) - start && a[a.length - end - 1] === b[b.length - end - 1]) end++;
+	const mark = (prefix: string, chars: string[]) => prefix + chars.slice(0, start).join("") +
+		(start < chars.length - end ? theme.inverse!(chars.slice(start, chars.length - end).join("")) : "") +
+		(end ? chars.slice(-end).join("") : "");
+	return [mark(old[1], a), mark(next[1], b)];
+}
 
 export type OriginalTool = Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "name" | "description" | "parameters" | "execute"> &
 	Partial<Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "label" | "promptSnippet" | "promptGuidelines" | "prepareArguments" | "constrainedSampling" | "executionMode">>;
@@ -47,17 +82,39 @@ export type ToolFactory<N extends BuiltinToolName = BuiltinToolName> = (cwd: str
 
 export type ToolFactoryMap = { [N in BuiltinToolName]: ToolFactory<N> };
 
-function paint(theme: ThemeLike | undefined, token: string, text: string): string {
+export type ViewImage = (images: import("./diamond.ts").ImagePreview[], title: string) => void;
+
+function paint(theme: ThemeLike | undefined, token: ThemeColor, text: string): string {
 	return theme?.fg ? theme.fg(token, text) : text;
 }
 
-export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
+function callComponent(
+	label: string | (() => string),
+	theme: ThemeLike,
+	context: ToolRenderContext | undefined,
+	viewImage: ViewImage | undefined,
+	title: string,
+	onRowClick?: (event: TuiMouseEvent) => { handled: true } | undefined,
+) {
+	return {
+		invalidate() {},
+		handleMouse(event: TuiMouseEvent) {
+			if (event.type !== "click" || event.button !== "left") return undefined;
+			return onRowClick?.(event);
+		},
+		render(width: number) { return width > 0 ? [truncateToWidth(typeof label === "function" ? label() : label, width)] : []; },
+	};
+}
+
+export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: ViewImage): DiamondTool {
 	const execute = original.execute.bind(original);
 	const shell = ["bash", "powershell"].includes(original.name);
+	const edit = original.name === "edit";
+	const write = original.name === "write";
 	const schema = original.parameters as Record<string, any>;
-	const parameters = shell && schema?.type === "object" ? {
+	const parameters = (shell || write) && schema?.type === "object" ? {
 		...original.parameters, properties: { ...schema.properties, description: {
-			type: "string", maxLength: 160, description: "Short human-readable summary of the command's purpose, e.g. Run unit tests. Do not repeat shell syntax.",
+			type: "string", maxLength: 160, description: write ? "Short human-readable description of this file's purpose, e.g. Fury control protocol helpers." : "Short human-readable summary of the command's purpose, e.g. Run unit tests. Do not repeat shell syntax.",
 		} },
 	} : original.parameters;
 	return {
@@ -66,7 +123,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 		description: original.description,
 		parameters,
 		promptSnippet: original.promptSnippet,
-		promptGuidelines: shell ? [...original.promptGuidelines ?? [], "Include a concise description of the command’s purpose for the activity display."] : original.promptGuidelines,
+		promptGuidelines: shell || write ? [...original.promptGuidelines ?? [], write ? "Include a concise description of the file’s purpose for the write summary." : "Include a concise description of the command’s purpose for the activity display."] : original.promptGuidelines,
 		prepareArguments: original.prepareArguments,
 		constrainedSampling: original.constrainedSampling,
 		executionMode: original.executionMode,
@@ -74,20 +131,96 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 		execute: (...args: Parameters<typeof original.execute>) => execute(...args),
 		renderCall(args, theme, context) {
 			const failed = context?.isError;
-			const title = `◆ ${failed ? "Failed: " : ""}${shell ? commandSummary(args) : toolVerb(original.name)}`;
-			const target = shell ? "" : compactArgs(args, Infinity);
-			return textComponent(
-				paint(theme, failed ? "error" : "toolTitle", title) +
-				(target ? " " + paint(theme, failed ? "error" : "text", target) : ""), true,
-			);
+			const viewTitle = compactArgs(args, Infinity) || (shell ? commandSummary(args) : toolVerb(original.name));
+			if (write) {
+				const path = compactArgs(args, Infinity);
+				const purpose = typeof args?.description === "string" ? sanitizeToolText(args.description).replace(/\s+/g, " ").trim().slice(0, 160) : "";
+				const lines = typeof args?.content === "string" ? countLines(args.content) : undefined;
+				return callComponent(() => {
+					const summary = context?.state?.grokWrite;
+					const verb = failed ? "Failed to write" : summary?.kind === "created" ? "Created" : summary?.kind === "replaced" ? "Replaced" : summary ? "Wrote" : "Write";
+					const count = summary?.lines ?? lines;
+					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) +
+						paint(theme, "muted", `${count === undefined ? "" : ` · ${count} ${count === 1 ? "line" : "lines"}`}${purpose ? ` · ${purpose}` : ""}`);
+				}, theme, context, viewImage, viewTitle, (event) => {
+					if (context?.state?.grokWrite?.kind !== "created" || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
+					const display = editDisplay(context, context.expanded ?? false);
+					display.open = !display.open;
+					context.invalidate();
+					return { handled: true };
+				});
+			}
+			const title = `◆ ${failed ? "Failed: " : ""}${shell ? commandSummary(args) : original.name === "Agent" ? agentSummary(args) : toolVerb(original.name)}`;
+			const target = shell || original.name === "Agent" ? "" : compactArgs(args, Infinity);
+			const label = paint(theme, failed ? "error" : "toolTitle", title) +
+				(target ? " " + paint(theme, failed ? "error" : "text", target) : "");
+			const display = edit && context?.state && context.invalidate ? editDisplay(context, context.expanded ?? false) : undefined;
+			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), theme, context, viewImage, viewTitle, display ? (event) => {
+				if (event.type !== "click" || event.button !== "left") return undefined;
+				display.open = !display.open;
+				context?.invalidate?.();
+				return { handled: true };
+			} : undefined);
 		},
 		renderResult(result, options, theme, context) {
-			const { text } = formatToolResult(result, options, context);
-			if (!text) return emptyComponent();
-			const token = context?.isError ? "error" : "dim";
-			const body = textComponent(paint(theme, token, text));
+			if (shell && context?.state) {
+				const exitCode = context.isError && !options.isPartial ? /(?:^|\n)Command exited with code (-?\d+)\s*$/.exec(sanitizeToolText(extractResultText(result)))?.[1] : undefined;
+				if (exitCode !== undefined) context.state.grokExitCode = exitCode;
+				else delete context.state.grokExitCode;
+			}
+			const images = extractImages(result);
+			if (context?.state) {
+				if (images.length) context.state.grokImages = images;
+				else delete context.state.grokImages;
+			}
+			let summary = write && !context?.isError && !options.isPartial ? writeSummary(result.details) : undefined;
+			if (!summary && write && !context?.isError && !options.isPartial && typeof context?.args?.content === "string") {
+				const content = context.args.content;
+				summary = { kind: "unknown", lines: countLines(content), preview: content.slice(0, 16_000),
+					note: "Previous contents were not recorded; showing written contents" + (content.length > 16_000 ? " (truncated)." : ".") };
+			}
+			if (summary && context?.state) context.state.grokWrite = summary;
+			const defaultOpen = edit || summary?.kind === "created";
+			const open = defaultOpen ? editDisplay(context, options.expanded).open : options.expanded;
+			if (options.isPartial || !open) return emptyComponent();
+			const diff = sanitizeToolText(extractResultDiff(result));
+			let { text } = formatToolResult({ ...result, details: undefined }, { ...options, expanded: true });
+			if (shell && typeof context?.args?.command === "string") {
+				// Pi inserts this placeholder when a command emits no stdout/stderr.
+				if (/^\(no output\)(?:\n\nCommand exited with code -?\d+)?\s*$/.test(text)) text = text.replace(/^\(no output\)\s*/, "");
+				text = [`$ ${sanitizeToolText(context.args.command)}`, text].filter(Boolean).join("\n\n");
+			}
+			if (summary) text = sanitizeToolText([summary.note, summary.preview].filter(Boolean).join("\n\n"));
+			const token = context?.isError ? "error" : "toolOutput";
+			const diffLines = diff.split("\n");
+			for (let i = 0; i + 1 < diffLines.length; i++) {
+				if (/^-\s*\d+ /.test(diffLines[i]) && /^\+\s*\d+ /.test(diffLines[i + 1])) {
+					[diffLines[i], diffLines[i + 1]] = emphasizeReplacement(diffLines[i], diffLines[i + 1], theme);
+					i++;
+				}
+			}
+			const coloredDiff = diff ? diffLines.map((line) => {
+				const diffToken = line.startsWith("+++") || line.startsWith("---") ? "toolDiffContext" :
+					line.startsWith("+") ? "toolDiffAdded" : line.startsWith("-") ? "toolDiffRemoved" : "toolDiffContext";
+				return paint(theme, diffToken, line);
+			}).join("\n") : "";
+			const createdContents = summary?.kind === "created" ? [
+				summary.note ? paint(theme, "muted", sanitizeToolText(summary.note)) : "",
+				summary.preview ? sanitizeToolText(summary.preview).replace(/\n$/, "").split("\n")
+					.map((line, index) => paint(theme, "toolDiffAdded", `+${index + 1} ${line}`)).join("\n") : "",
+			].filter(Boolean).join("\n\n") : undefined;
+			const rendered = createdContents ?? [text ? paint(theme, token, text) : "", coloredDiff].filter(Boolean).join("\n\n");
+			if (!rendered && !context?.isError) return emptyComponent();
+			const body = textComponent(rendered || paint(theme, "error", "error"));
 			return {
 				invalidate() { body.invalidate(); },
+				handleMouse(event: TuiMouseEvent) {
+					if (!defaultOpen || !context?.state || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
+					const display = editDisplay(context, options.expanded);
+					display.open = !display.open;
+					context.invalidate();
+					return { handled: true };
+				},
 				render(width: number) {
 					const indent = width > 2 ? "  " : "";
 					return body.render(width - indent.length).map((line) => indent + line);
@@ -97,6 +230,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 	};
 }
 
-export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}): DiamondTool[] {
-	return BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => wrapWithDiamondRenderer(factories[name](cwd, options[name])));
+export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}, viewImage?: ViewImage): DiamondTool[] {
+	return BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => wrapWithDiamondRenderer(
+		name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name]), viewImage,
+	));
 }

@@ -128,7 +128,7 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 			handlers[event] = handler;
 		},
 		registerTool(tool: Record<string, unknown>) {
-			registered.push(tool);
+			const index = registered.findIndex((entry) => entry.name === tool.name); if (index >= 0) registered[index] = tool; else registered.push(tool);
 		},
 	};
 

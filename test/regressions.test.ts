@@ -9,6 +9,7 @@ import { textComponent } from "../src/diamond.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { loadToolOptions } from "../src/tool-settings.ts";
 import { wrapWithDiamondRenderer, type DiamondTool } from "../src/tools.ts";
+import { grokNightPath, loadThemeJson, resolveThemeColors } from "../src/theme.ts";
 
 const theme = { fg: (token: string, text: string) => `\x1b[${token === "error" ? 31 : 90}m${text}\x1b[0m` };
 
@@ -50,11 +51,71 @@ test("expanded real edits retain their diff", async (t) => {
 	await writeFile(join(cwd, "sample.txt"), "before\n");
 	const tool = wrapWithDiamondRenderer(agent.createEditTool(cwd));
 	const result = await tool.execute("edit-probe", { path: "sample.txt", edits: [{ oldText: "before", newText: "after" }] });
-	const expanded = tool.renderResult(result, { expanded: true }, theme).render(80).map(stripAnsi).join("\n");
+	const colors = resolveThemeColors(loadThemeJson(grokNightPath()));
+	const actualTheme = new agent.Theme(colors as any, colors as any, "truecolor");
+	const defaultLines = tool.renderResult(result, { expanded: false }, actualTheme).render(80);
+	const rendered = defaultLines.join("\n");
+	assert.ok(rendered.includes(actualTheme.getFgAnsi("toolDiffAdded")), "actual edits must contain green ANSI styling");
+	assert.ok(rendered.includes(actualTheme.getFgAnsi("toolDiffRemoved")), "actual edits must contain red ANSI styling");
+	// Pi's emphasis helper follows terminal color support (unlike RGB fg).
+	if (actualTheme.inverse("x") !== "x") assert.match(rendered, /\x1b\[7m/);
+	const expanded = defaultLines.map(stripAnsi).join("\n");
 	assert.match(expanded, /Successfully replaced/);
 	assert.match(expanded, /-.*before/);
 	assert.match(expanded, /\+.*after/);
-	assert.deepEqual(tool.renderResult(result, { expanded: false }, theme).render(80), []);
+	assert.deepEqual(tool.renderResult(result, { expanded: true }, actualTheme).render(80), defaultLines);
+});
+
+test("expanded diffs color changes without coloring ordinary output as a diff", () => {
+	const tool = wrapWithDiamondRenderer(agent.createEditToolDefinition(process.cwd()));
+	const colors: Record<string, number> = { toolOutput: 90, toolDiffContext: 90, toolDiffAdded: 32, toolDiffRemoved: 31 };
+	const diffTheme = { fg: (token: string, text: string) => `\x1b[${colors[token]}m${text}\x1b[0m` };
+	for (const key of ["diff", "patch"]) {
+		const result = {
+			content: [{ type: "text", text: "+ordinary output" }],
+			details: { [key]: "--- a/file\n+++ b/file\n context\n-1 old\n+1 new\x1b]52;c;payload\x07" },
+		};
+		const component = tool.renderResult(result, { expanded: true }, diffTheme);
+		const lines = component.render(80);
+		assert.ok(lines.some((line) => line.includes("\x1b[90m+ordinary output")));
+		assert.ok(lines.some((line) => line.includes("\x1b[90m+++ b/file")));
+		assert.ok(lines.some((line) => line.includes("\x1b[31m-1 old")));
+		assert.ok(lines.some((line) => line.includes("\x1b[32m+1 new")));
+		assert.doesNotMatch(lines.join("\n"), /payload|\x1b\]/);
+		assert.ok(component.render(8).every((line) => visibleWidth(line) <= 8));
+		assert.deepEqual(tool.renderResult(result, { expanded: false }, diffTheme).render(80), lines);
+	}
+});
+
+test("edits start open, collapse by clicking their diamond, and follow global expansion changes", () => {
+	const tool = wrapWithDiamondRenderer(agent.createEditToolDefinition(process.cwd()));
+	const result = { content: [], details: { diff: "- 1 old\n+ 1 new" } };
+	let invalidated = 0;
+	const context = { state: {}, expanded: false, invalidate: () => { invalidated++; } };
+	const body = () => tool.renderResult(result, { expanded: context.expanded }, theme, context).render(80);
+	const click = () => (tool.renderCall({ path: "file" }, theme, context) as any).handleMouse({ type: "click", button: "left" });
+	assert.ok(body().length > 0);
+	assert.deepEqual(click(), { handled: true });
+	assert.deepEqual(body(), []);
+	click();
+	assert.ok(body().length > 0);
+	assert.equal(invalidated, 2);
+	context.expanded = true;
+	assert.ok(body().length > 0);
+	context.expanded = false;
+	assert.deepEqual(body(), []);
+	assert.deepEqual(tool.renderResult(result, { expanded: true, isPartial: true }, theme, context).render(80), []);
+});
+
+test("replacement emphasis isolates changed text and keeps terminal controls sanitized", () => {
+	const tool = wrapWithDiamondRenderer(agent.createEditToolDefinition(process.cwd()));
+	const emphasized: string[] = [];
+	const paint = { ...theme, inverse(text: string) { emphasized.push(text); return `\x1b[7m${text}\x1b[27m`; } };
+	const result = { content: [], details: { diff: "- 42 return old_value;\n+ 42 return new_value;\x1b]52;c;attack\x07" } };
+	const output = tool.renderResult(result, { expanded: false }, paint).render(80).join("\n");
+	assert.deepEqual(emphasized, ["old", "new"]);
+	assert.doesNotMatch(output, /attack|\x1b\]/);
+	assert.match(output, /\x1b\[7mnew\x1b\[27m/);
 });
 
 test("registered tools honor global and trusted project shell/image settings", async (t) => {
@@ -79,7 +140,7 @@ test("registered tools honor global and trusted project shell/image settings", a
 		let bashOptions: unknown;
 		createGrokStyleExtension({
 			on(event, handler) { if (event === "session_start") start = handler; },
-			registerTool(tool) { registered.push(tool as DiamondTool); },
+			registerTool(tool) { const index = registered.findIndex((entry) => entry.name === tool.name); if (index >= 0) registered[index] = tool as DiamondTool; else registered.push(tool as DiamondTool); },
 		}, {
 			CustomEditor: class { render() { return []; } },
 			getToolOptions: (ctx) => loadToolOptions(ctx, agentDir),
@@ -146,7 +207,7 @@ test("disabled styling retains native command details and edit diffs", () => {
 		write: agent.createWriteToolDefinition, grep: agent.createGrepToolDefinition,
 		find: agent.createFindToolDefinition, ls: agent.createLsToolDefinition,
 	};
-	createGrokStyleExtension({ on(name, handler) { if (name === "session_start") start = handler; }, registerTool(tool) { registered.push(tool); } }, {
+	createGrokStyleExtension({ on(name, handler) { if (name === "session_start") start = handler; }, registerTool(tool) { const index = registered.findIndex((entry) => entry.name === tool.name); if (index >= 0) registered[index] = tool; else registered.push(tool); } }, {
 		features: { toolStyling: false, footer: false, composer: false, terminalColors: false },
 		CustomEditor: class { render() { return []; } }, tools: nativeFactories,
 	});
@@ -161,4 +222,27 @@ test("disabled styling retains native command details and edit diffs", () => {
 	assert.match(stripAnsi(result), /old/);
 	assert.match(stripAnsi(result), /new/);
 	assert.deepEqual(edit.promptGuidelines, nativeFactories.edit(process.cwd()).promptGuidelines);
+});
+
+test("failed shell diamonds summarize exit status and expand the exact command", async () => {
+	const tool = wrapWithDiamondRenderer(agent.createBashToolDefinition(process.cwd()));
+	const args = { command: "exit 1", description: "Capture consecutive play-mode GUI frames" };
+	let failure = "";
+	try { await tool.execute("fail", args); } catch (error) { failure = (error as Error).message; }
+	assert.match(failure, /Command exited with code 1/);
+	const context = { args, isError: true, state: {} };
+	const header = tool.renderCall(args, theme, context);
+	const result = { content: [{ type: "text", text: failure }] };
+	assert.deepEqual(tool.renderResult(result, { expanded: false }, theme, context).render(100), []);
+	assert.equal(stripAnsi(header.render(100)[0]), "◆ Failed: Capture consecutive play-mode GUI frames · exit 1");
+	const expanded = stripAnsi(tool.renderResult(result, { expanded: true }, theme, context).render(100).join("\n"));
+	assert.match(expanded, /\$ exit 1/);
+	assert.match(expanded, /Command exited with code 1/);
+	assert.doesNotMatch(expanded, /\(no output\)/);
+	const output = { content: [{ type: "text", text: "real stderr\n\nCommand exited with code 2" }] };
+	const multiline = { ...context, args: { command: "printf 'real stderr' >&2\nexit 2\x1b]52;c;attack\x07" } };
+	const details = stripAnsi(tool.renderResult(output, { expanded: true }, theme, multiline).render(100).join("\n"));
+	assert.match(details, /\$ printf 'real stderr' >&2\n  exit 2/);
+	assert.match(details, /real stderr\n\s*\n  Command exited with code 2/);
+	assert.doesNotMatch(details, /attack|\x1b/);
 });

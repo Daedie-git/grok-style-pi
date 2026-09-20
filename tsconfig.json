@@ -8,5 +8,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "extensions/**/*.ts"]
+  "include": ["src/**/*.ts", "extensions/**/*.ts", "integrations/**/*.ts"]
 }

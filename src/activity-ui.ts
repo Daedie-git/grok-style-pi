@@ -48,7 +48,7 @@ export class ActivityPanel {
 				const buttons = [
 					{ label: "[View]", token: "accent", action: () => this.view(entry) },
 					...(isActive(entry) && entry.stop ? [{ label: "[Stop]", token: "error", action: () => this.action(entry) }] : []),
-					{ label: "[Close]", token: "dim", action: () => this.dismiss(entry) },
+					{ label: "[Close]", token: "accent", action: () => this.dismiss(entry) },
 				];
 				// Keep Close reachable when the terminal is too narrow for all controls.
 				while (buttons.length > 1 && buttons.map((button) => button.label).join(" ").length > width) buttons.shift();
@@ -95,6 +95,8 @@ export class ActivityViewer {
 	private maxOffset = 0;
 	private pageSize = 10;
 	private hits: Hit[] = [];
+	private scrollbar?: { x: number; top: number; height: number };
+	private draggingScrollbar = false;
 	private entry: Activity;
 	private theme: Theme;
 	private rows: () => number;
@@ -108,6 +110,7 @@ export class ActivityViewer {
 	invalidate() {}
 	render(width: number): string[] {
 		this.hits = [];
+		this.scrollbar = undefined;
 		if (width <= 0) return [];
 		if (width < 4) {
 			this.hits.push({ y: 0, x: 0, end: width, action: this.close });
@@ -116,12 +119,14 @@ export class ActivityViewer {
 		const inner = width - 2;
 		const inset = inner >= 4 ? 1 : 0;
 		const contentWidth = inner - inset * 2;
+		const outputWidth = Math.max(1, contentWidth - (inset ? 0 : 1));
 		const maxHeight = Math.max(3, Math.floor(this.rows() * 0.7));
 		this.pageSize = Math.max(1, maxHeight - 6);
 		const border = (text: string) => this.theme.fg("borderAccent", text);
-		const frame = (text: string) => {
-			const clipped = truncateToWidth(text, contentWidth, "");
-			return border("│") + " ".repeat(inset) + clipped + " ".repeat(contentWidth - visibleWidth(clipped) + inset) + border("│");
+		const frame = (text: string, scrollbar = "") => {
+			const available = scrollbar && !inset ? outputWidth : contentWidth;
+			const clipped = truncateToWidth(text, available, "");
+			return border("│") + " ".repeat(inset) + clipped + " ".repeat(contentWidth - visibleWidth(clipped) + inset - (scrollbar ? 1 : 0)) + scrollbar + border("│");
 		};
 		const closeLabel = contentWidth >= 7 ? "[Close]" : contentWidth >= 3 ? "[x]" : "×";
 		const titleWidth = Math.max(0, contentWidth - closeLabel.length - 1);
@@ -134,22 +139,35 @@ export class ActivityViewer {
 		];
 		const text = this.entry.transcript?.() || this.entry.output || "Waiting for output…";
 		const clipped = text.length > this.maxCharacters ? `[Earlier activity omitted]\n${text.slice(-this.maxCharacters)}` : text;
-		if (clipped !== this.wrappedText || contentWidth !== this.wrappedWidth) {
-			this.wrappedLines = wrapTextWithAnsi(plainText(clipped).replace(/\t/g, "   "), contentWidth).map((line) => truncateToWidth(line, contentWidth, ""));
+		if (clipped !== this.wrappedText || outputWidth !== this.wrappedWidth) {
+			this.wrappedLines = wrapTextWithAnsi(plainText(clipped).replace(/\t/g, "   "), outputWidth).map((line) => truncateToWidth(line, outputWidth, ""));
 			this.wrappedText = clipped;
-			this.wrappedWidth = contentWidth;
+			this.wrappedWidth = outputWidth;
 		}
 		const content = this.wrappedLines;
 		this.maxOffset = Math.max(0, content.length - this.pageSize);
 		const start = Math.min(this.offset, this.maxOffset);
 		if (maxHeight >= 7) {
-			lines.push(border("├" + "─".repeat(inner) + "┤"), ...content.slice(start, start + this.pageSize).map(frame));
+			lines.push(border("├" + "─".repeat(inner) + "┤"));
+			if (this.maxOffset) this.scrollbar = { x: width - 2, top: lines.length, height: this.pageSize };
+			const thumbSize = Math.max(1, Math.round(this.pageSize * this.pageSize / content.length));
+			const thumbStart = this.maxOffset ? Math.round(start / this.maxOffset * (this.pageSize - thumbSize)) : 0;
+			for (const [row, line] of content.slice(start, start + this.pageSize).entries()) {
+				const scrollbar = this.maxOffset ? this.theme.fg(row >= thumbStart && row < thumbStart + thumbSize ? "accent" : "muted",
+					row >= thumbStart && row < thumbStart + thumbSize ? "┃" : "│") : "";
+
+				lines.push(frame(this.theme.fg("toolOutput", line), scrollbar));
+			}
 			lines.push(border("├" + "─".repeat(inner) + "┤"));
 			const y = lines.length;
-			const stopWidth = isActive(this.entry) && this.entry.stop ? 11 : 0;
+			const stopLabel = isActive(this.entry) && this.entry.stop ? "[Stop: x]  " : "";
+			const stopWidth = stopLabel.length;
 			if (stopWidth && contentWidth >= 9) this.hits.push({ y, x: 1 + inset, end: 1 + inset + 9, action: this.stop });
 			if (contentWidth >= stopWidth + 12) this.hits.push({ y, x: 1 + inset + stopWidth, end: 1 + inset + stopWidth + 12, action: this.close });
-			lines.push(frame(this.theme.fg("muted", `${stopWidth ? "[Stop: x]  " : ""}[Close: Esc]  ↑↓ scroll · End follow`)));
+			lines.push(frame(
+				(stopLabel ? this.theme.fg("error", stopLabel) : "") +
+				this.theme.fg("accent", "[Close: Esc]") + this.theme.fg("muted", "  ↑↓ scroll · End follow"),
+			));
 		}
 		lines.push(border("╰" + "─".repeat(inner) + "╯"));
 		return this.theme.bg ? lines.map((line) => this.theme.bg!("toolPendingBg", line)) : lines;
@@ -166,7 +184,26 @@ export class ActivityViewer {
 		this.redraw();
 	}
 	private scroll(delta: number) { this.offset = Math.max(0, Math.min(this.offset, this.maxOffset) + delta); }
+	private scrollToTrack(y: number) {
+		const bar = this.scrollbar;
+		if (!bar) return;
+		const row = Math.max(0, Math.min(bar.height - 1, y - bar.top));
+		this.offset = row === bar.height - 1 ? Infinity : Math.round(row / Math.max(1, bar.height - 1) * this.maxOffset);
+		this.redraw();
+	}
 	handleMouse(event: TuiMouseEvent) {
+		if (this.draggingScrollbar && (event.type === "drag" || event.type === "release")) {
+			this.scrollToTrack(event.y);
+			if (event.type === "release") this.draggingScrollbar = false;
+			return { handled: true };
+		}
+		const bar = this.scrollbar;
+		if (bar && event.button === "left" && (event.type === "press" || event.type === "click") &&
+			event.x >= bar.x && event.x <= bar.x + 1 && event.y >= bar.top && event.y < bar.top + bar.height) {
+			this.scrollToTrack(event.y);
+			this.draggingScrollbar = event.type === "press";
+			return { handled: true, capture: event.type === "press" };
+		}
 		if (event.type === "wheel") {
 			this.scroll((event.wheelDelta ?? 0) * 3);
 			this.redraw();

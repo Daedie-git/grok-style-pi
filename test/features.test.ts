@@ -59,7 +59,7 @@ function setup(features: any) {
 	const tools: any[] = [];
 	let footer: any, editor: any;
 	const writes: string[] = [];
-	createGrokStyleExtension({ on(name, handler) { handlers.set(name, handler); }, registerTool(tool) { tools.push(tool); } }, {
+	createGrokStyleExtension({ on(name, handler) { handlers.set(name, handler); }, registerTool(tool) { const index = tools.findIndex((entry) => entry.name === tool.name); if (index >= 0) tools[index] = tool; else tools.push(tool); } }, {
 		features, CustomEditor: Editor,
 		tools: Object.fromEntries(BUILTIN_TOOL_NAMES.map((name) => [name, () => ({ name, description: name, parameters: {}, execute() {}, renderCall: "native" })])) as any,
 	});

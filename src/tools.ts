@@ -5,7 +5,6 @@ import {
 	compactArgs,
 	toolVerb,
 	formatToolResult,
-	extractImages,
 	extractResultText,
 	extractResultDiff,
 	sanitizeToolText,
@@ -16,7 +15,7 @@ import {
 	type ToolRenderContext,
 } from "./diamond.ts";
 import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
@@ -82,18 +81,12 @@ export type ToolFactory<N extends BuiltinToolName = BuiltinToolName> = (cwd: str
 
 export type ToolFactoryMap = { [N in BuiltinToolName]: ToolFactory<N> };
 
-export type ViewImage = (images: import("./diamond.ts").ImagePreview[], title: string) => void;
-
 function paint(theme: ThemeLike | undefined, token: ThemeColor, text: string): string {
 	return theme?.fg ? theme.fg(token, text) : text;
 }
 
 function callComponent(
 	label: string | (() => string),
-	theme: ThemeLike,
-	context: ToolRenderContext | undefined,
-	viewImage: ViewImage | undefined,
-	title: string,
 	onRowClick?: (event: TuiMouseEvent) => { handled: true } | undefined,
 ) {
 	return {
@@ -106,7 +99,7 @@ function callComponent(
 	};
 }
 
-export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: ViewImage): DiamondTool {
+export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 	const execute = original.execute.bind(original);
 	const shell = ["bash", "powershell"].includes(original.name);
 	const edit = original.name === "edit";
@@ -131,7 +124,6 @@ export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: View
 		execute: (...args: Parameters<typeof original.execute>) => execute(...args),
 		renderCall(args, theme, context) {
 			const failed = context?.isError;
-			const viewTitle = compactArgs(args, Infinity) || (shell ? commandSummary(args) : toolVerb(original.name));
 			if (write) {
 				const path = compactArgs(args, Infinity);
 				const purpose = typeof args?.description === "string" ? sanitizeToolText(args.description).replace(/\s+/g, " ").trim().slice(0, 160) : "";
@@ -142,7 +134,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: View
 					const count = summary?.lines ?? lines;
 					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) +
 						paint(theme, "muted", `${count === undefined ? "" : ` · ${count} ${count === 1 ? "line" : "lines"}`}${purpose ? ` · ${purpose}` : ""}`);
-				}, theme, context, viewImage, viewTitle, (event) => {
+				}, (event) => {
 					if (context?.state?.grokWrite?.kind !== "created" || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
 					const display = editDisplay(context, context.expanded ?? false);
 					display.open = !display.open;
@@ -155,7 +147,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: View
 			const label = paint(theme, failed ? "error" : "toolTitle", title) +
 				(target ? " " + paint(theme, failed ? "error" : "text", target) : "");
 			const display = edit && context?.state && context.invalidate ? editDisplay(context, context.expanded ?? false) : undefined;
-			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), theme, context, viewImage, viewTitle, display ? (event) => {
+			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), display ? (event) => {
 				if (event.type !== "click" || event.button !== "left") return undefined;
 				display.open = !display.open;
 				context?.invalidate?.();
@@ -167,11 +159,6 @@ export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: View
 				const exitCode = context.isError && !options.isPartial ? /(?:^|\n)Command exited with code (-?\d+)\s*$/.exec(sanitizeToolText(extractResultText(result)))?.[1] : undefined;
 				if (exitCode !== undefined) context.state.grokExitCode = exitCode;
 				else delete context.state.grokExitCode;
-			}
-			const images = extractImages(result);
-			if (context?.state) {
-				if (images.length) context.state.grokImages = images;
-				else delete context.state.grokImages;
 			}
 			let summary = write && !context?.isError && !options.isPartial ? writeSummary(result.details) : undefined;
 			if (!summary && write && !context?.isError && !options.isPartial && typeof context?.args?.content === "string") {
@@ -230,8 +217,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool, viewImage?: View
 	};
 }
 
-export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}, viewImage?: ViewImage): DiamondTool[] {
+export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}): DiamondTool[] {
 	return BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => wrapWithDiamondRenderer(
-		name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name]), viewImage,
+		name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name]),
 	));
 }

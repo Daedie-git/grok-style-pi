@@ -18,8 +18,6 @@ export const TOOL_SUMMARY_VERBS: Record<string, string> = {
 
 export type ToolArgs = Record<string, unknown> | undefined | null;
 
-export type ImagePreview = { data: string; mimeType: string };
-
 export type ToolContentBlock = { type?: string; text?: string; data?: string; mimeType?: string };
 
 export type ToolResult = {
@@ -36,7 +34,7 @@ export type ToolRenderContext = {
 	isError?: boolean;
 	args?: ToolArgs;
 	expanded?: boolean;
-	state?: { grokEdit?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokImages?: ImagePreview[]; grokExitCode?: string };
+	state?: { grokEdit?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokExitCode?: string };
 	invalidate?: () => void;
 };
 
@@ -98,17 +96,6 @@ export function formatToolCall(name: string, args?: ToolArgs): string {
 	const inner = compactArgs(args);
 	const verb = toolVerb(name);
 	return inner ? `${DIAMOND} ${verb} ${inner}` : `${DIAMOND} ${verb}`;
-}
-
-export function extractImages(result: ToolResult | undefined): ImagePreview[] {
-	if (!result?.content) return [];
-	const images: ImagePreview[] = [];
-	for (const block of result.content) {
-		if (block?.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string" && block.data && block.mimeType) {
-			images.push({ data: block.data, mimeType: block.mimeType });
-		}
-	}
-	return images;
 }
 
 export function extractResultText(result: ToolResult | undefined): string {

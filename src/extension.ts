@@ -11,7 +11,7 @@ import {
 	suspendTerminalChrome,
 } from "./terminal-chrome.ts";
 import { defaultFeatures, type Features } from "./features.ts";
-import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName, type ViewImage } from "./tools.ts";
+import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName } from "./tools.ts";
 
 export type SessionUi = {
 	theme?: { fg?(token: string, text: string): string };
@@ -44,14 +44,13 @@ export type GrokStyleDeps = {
 	tools: ToolFactoryMap;
 	getToolOptions?: (ctx: SessionContext) => ToolsOptions;
 	wrapTool?: (tool: OriginalTool) => OriginalTool;
-	viewImage?: ViewImage;
 	features?: Partial<Features>;
 };
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
 	const features = { ...defaultFeatures, ...deps.features };
 	function registerTools(cwd: string, options?: ToolsOptions) {
-		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, deps.viewImage) :
+		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options) :
 			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](cwd, options?.[name]));
 		for (const tool of tools) {
 			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;

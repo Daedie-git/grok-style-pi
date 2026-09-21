@@ -9,6 +9,8 @@ export type Activity = {
 	endedAt?: number;
 	output: string;
 	detail?: string;
+	/** Effective model and thinking level for a subagent run, when known. */
+	model?: string;
 	transcript?: () => string;
 	stop?: () => void | Promise<void>;
 };
@@ -68,6 +70,9 @@ export class ActivityPanel {
 					if (x + button.label.length <= width) this.hits.push({ y, x, end: x + button.label.length, action: button.action });
 					x += button.label.length + 1;
 				}
+				if (entry.kind === "agent" && entry.model) {
+					lines.push(truncateToWidth(this.theme.fg("muted", `  ${oneLine(entry.model)}`), width));
+				}
 			}
 			if (group.length > 3) {
 				this.hits.push({ y: lines.length, x: 0, end: width, action: this.all });
@@ -121,7 +126,9 @@ export class ActivityViewer {
 		const contentWidth = inner - inset * 2;
 		const outputWidth = Math.max(1, contentWidth - (inset ? 0 : 1));
 		const maxHeight = Math.max(3, Math.floor(this.rows() * 0.7));
-		this.pageSize = Math.max(1, maxHeight - 6);
+		const runtime = this.entry.model ? oneLine(this.entry.model) : "";
+		const showRuntime = Boolean(runtime) && maxHeight >= 8;
+		this.pageSize = Math.max(1, maxHeight - 6 - (showRuntime ? 1 : 0));
 		const border = (text: string) => this.theme.fg("borderAccent", text);
 		const frame = (text: string, scrollbar = "") => {
 			const available = scrollbar && !inset ? outputWidth : contentWidth;
@@ -137,6 +144,7 @@ export class ActivityViewer {
 			border("╭" + "─".repeat(inner) + "╮"),
 			frame(this.theme.fg("accent", title) + " ".repeat(contentWidth - visibleWidth(title) - visibleWidth(closeLabel)) + this.theme.fg("accent", closeLabel)),
 		];
+		if (showRuntime) lines.push(frame(this.theme.fg("muted", runtime)));
 		const text = this.entry.transcript?.() || this.entry.output || "Waiting for output…";
 		const clipped = text.length > this.maxCharacters ? `[Earlier activity omitted]\n${text.slice(-this.maxCharacters)}` : text;
 		if (clipped !== this.wrappedText || outputWidth !== this.wrappedWidth) {

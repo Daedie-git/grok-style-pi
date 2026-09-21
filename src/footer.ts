@@ -8,6 +8,7 @@ export type FooterInput = {
 	percent: number | null | undefined;
 	thinkingLevel?: string;
 	branch?: string | null;
+	provider?: string | null;
 	subscription?: string;
 	grokPercent?: number | null;
 	grokWeekly?: string;
@@ -40,13 +41,21 @@ export function formatPercent(percent: number | null | undefined): string {
 	return String(Math.round(Number(percent)));
 }
 
-export function footerStats(input: { percent?: number | null; subscription?: string; grokPercent?: number | null; grokWeekly?: string }): string {
-	return [
-		`Codex Context ${formatPercent(input.percent)}% used`,
-		...(input.subscription ? [input.subscription] : []),
-		`Grok Context ${formatPercent(input.grokPercent)}% used`,
-		input.grokWeekly ?? "Grok Weekly ?% left",
-	].join(" │ ");
+export type UsageSource = "codex" | "grok" | "session";
+
+/** Context and allowance belong to the selected model, not every signed-in provider. */
+export function usageSource(provider?: string | null): UsageSource {
+	if (provider === "openai-codex") return "codex";
+	if (provider === "xai") return "grok";
+	return "session";
+}
+
+export function footerStats(input: { provider?: string | null; percent?: number | null; subscription?: string; grokPercent?: number | null; grokWeekly?: string }): string {
+	const source = usageSource(input.provider);
+	const context = `Context ${formatPercent(source === "grok" ? input.grokPercent : input.percent)}% used`;
+	if (source === "grok") return [context, input.grokWeekly ?? "Weekly ?% left"].join(" │ ");
+	if (source === "codex") return [context, ...(input.subscription ? [input.subscription] : [])].join(" │ ");
+	return context;
 }
 
 export function formatFooterLine(input: FooterInput): string {
@@ -67,6 +76,7 @@ export function footerFromContext(ctx: FooterContext, grok?: GrokFooterInput): s
 		percent: ctx.getContextUsage?.()?.percent ?? null,
 		thinkingLevel: ctx.thinkingLevel,
 		branch: ctx.branch,
+		provider: ctx.model?.provider,
 		grokPercent: grok?.contextPercent,
 		grokWeekly: grok?.weekly,
 	});
@@ -76,6 +86,7 @@ export function footerLinesFromContext(ctx: FooterContext, width: number, thinki
 	if (width <= 0) return [""];
 	const identity = `${cwdDisplayPath(ctx.cwd)}${branch ? ` (${branch})` : ""} │ ${modelDisplayName(ctx.model)} ${thinkingLevel ?? "?"}`;
 	const stats = footerStats({
+		provider: ctx.model?.provider,
 		percent: ctx.getContextUsage?.()?.percent,
 		subscription,
 		grokPercent: grok?.contextPercent,

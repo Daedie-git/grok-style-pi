@@ -24,9 +24,9 @@ export function parseGrokCredits(value: unknown): GrokCredits | undefined {
 
 export function formatGrokWeekly(credits: GrokCredits | undefined, now = Date.now()): string {
 	const weekly = !credits?.periodType || credits.periodType.includes("WEEKLY");
-	if (!credits || !weekly || (credits.periodEnd !== undefined && credits.periodEnd <= now)) return "Grok Weekly ?% left";
+	if (!credits || !weekly || (credits.periodEnd !== undefined && credits.periodEnd <= now)) return "Weekly ?% left";
 	const remaining = Math.round(Math.max(0, Math.min(100, 100 - credits.usedPercent)));
-	return `Grok Weekly ${remaining}% left`;
+	return `Weekly ${remaining}% left`;
 }
 
 export async function fetchGrokCredits(token: string, signal: AbortSignal, request: typeof fetch = fetch): Promise<GrokCredits> {
@@ -118,7 +118,7 @@ export function startGrokFooterPolling(
 	const controller = new AbortController();
 	let pending = false;
 	let contextPercent: number | null = null;
-	let weekly = "Grok Weekly ?% left";
+	let weekly = "Weekly ?% left";
 	function publish() { update({ contextPercent, weekly }); }
 	function refreshContext() {
 		const next = readGrokContextPercent(cwd(), grokHome);
@@ -135,7 +135,7 @@ export function startGrokFooterPolling(
 			const credits = await fetchGrokCredits(token, controller.signal, request);
 			if (!controller.signal.aborted) weekly = formatGrokWeekly(credits);
 		} catch (error) {
-			if (!controller.signal.aborted) weekly = `Grok Weekly ${error instanceof Error && error.message === "login required" ? "login required" : "unavailable"}`;
+			if (!controller.signal.aborted) weekly = `Weekly ${error instanceof Error && error.message === "login required" ? "login required" : "unavailable"}`;
 		} finally {
 			pending = false;
 			if (!controller.signal.aborted) publish();

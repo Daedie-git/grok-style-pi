@@ -1,4 +1,4 @@
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { getCapabilities, truncateToWidth } from "@earendil-works/pi-tui";
 import type { ToolsOptions, ModelRegistry, ExtensionAPI, CustomEditor, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { applyComposerBorderColor, frameEditorLines } from "./composer.ts";
@@ -12,6 +12,8 @@ import {
 	suspendTerminalChrome,
 } from "./terminal-chrome.ts";
 import { defaultFeatures, type Features } from "./features.ts";
+import { COMMUNICATION, installCommunication } from "./communication.ts";
+import { linkifyCodeReferences } from "./code-links.ts";
 import { createOpenHistory, absPath, type OpenTarget } from "./open-in-cursor.ts";
 import { createCursorWorkspaceOpener, type CursorOpenContext, type CursorWorkspaceDeps } from "./cursor-workspace.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName } from "./tools.ts";
@@ -39,6 +41,7 @@ export type ExtensionApiLike = {
 	registerTool: ExtensionAPI["registerTool"];
 	registerCommand?: ExtensionAPI["registerCommand"];
 	registerShortcut?: ExtensionAPI["registerShortcut"];
+	registerMarkdownTransformer?: ExtensionAPI["registerMarkdownTransformer"];
 	getThinkingLevel?: () => string;
 };
 
@@ -52,6 +55,7 @@ export type GrokStyleDeps = {
 	features?: Partial<Features>;
 	openCursor?: (target: OpenTarget) => Promise<void>;
 	refreshCompileCommands?: CursorWorkspaceDeps["refresh"];
+	hyperlinks?: () => boolean;
 };
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
@@ -61,6 +65,25 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	let openContext: CursorOpenContext | undefined;
 	let notifyOpenError: ((message: string, kind: "error") => void) | undefined;
 	let sessionGeneration = 0;
+	let linkCwd = process.cwd();
+	const linksEnabled = deps.hyperlinks ?? (() => {
+		try { return getCapabilities().hyperlinks; } catch { return false; }
+	});
+	pi.registerMarkdownTransformer?.((markdown, context) => {
+		if (!features.communication || context.messageType === "assistant-thinking" || !linksEnabled()) return markdown;
+		return linkifyCodeReferences(markdown, linkCwd);
+	});
+	pi.on("before_agent_start", (event) => {
+		if (!features.communication) return;
+		const options = event.systemPromptOptions as { sections?: Record<string, string> };
+		if (options.sections) {
+			installCommunication(options.sections, true);
+			return;
+		}
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n<communication>\n${COMMUNICATION}\n</communication>`,
+		};
+	});
 	function registerTools(cwd: string, options?: ToolsOptions) {
 		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, {
 			onModifierOpen(target) {
@@ -141,13 +164,13 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	let quotaError: string | undefined;
 	let quotaPolling: ReturnType<typeof startCodexUsagePolling> | undefined;
 	let grokContext: number | null = null;
-	let grokWeekly = "Grok Weekly ?% left";
+	let grokWeekly = "Weekly ?% left";
 	let grokPolling: ReturnType<typeof startGrokFooterPolling> | undefined;
 	function refreshGrokSource(ctx: SessionContext) {
 		grokPolling?.dispose(); grokPolling = undefined;
 		grokContext = null;
-		grokWeekly = "Grok Weekly ?% left";
-		if (!features.footer || (ctx.mode && ctx.mode !== "tui")) return;
+		grokWeekly = "Weekly ?% left";
+		if (!features.footer || ctx.model?.provider !== "xai" || (ctx.mode && ctx.mode !== "tui")) return;
 		grokPolling = startGrokFooterPolling(
 			() => ctx.cwd,
 			() => ctx.modelRegistry ? ctx.modelRegistry.getApiKeyForProvider("xai") : Promise.resolve(undefined),
@@ -180,10 +203,12 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	pi.on("model_select", (_event, ctx) => {
 		quota = [];
 		refreshQuotaSource(ctx);
+		refreshGrokSource(ctx);
 		requestRender?.();
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		linkCwd = ctx.cwd;
 		cursor.reset();
 		openContext = ctx;
 		clear();
@@ -212,7 +237,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 					render(width: number) {
 						const formattedQuota = formatCodexQuota(quota);
 						const subscription = ctx.model?.provider === "openai-codex"
-							? quotaError && formattedQuota === "Codex weekly ? left" ? `Codex weekly ${quotaError}` : formattedQuota
+							? quotaError && formattedQuota === "Weekly ?% left" ? `Weekly ${quotaError}` : formattedQuota
 							: undefined;
 						return footerLinesFromContext(ctx, width, pi.getThinkingLevel?.(), subscription, footerData?.getGitBranch?.(), {
 							contextPercent: grokContext,
@@ -296,7 +321,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 		quota = [];
 		grokPolling?.dispose(); grokPolling = undefined;
 		grokContext = null;
-		grokWeekly = "Grok Weekly ?% left";
+		grokWeekly = "Weekly ?% left";
 		requestRender = undefined;
 		suspendChrome?.dispose(); suspendChrome = undefined;
 		restoreTerminal?.();

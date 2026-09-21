@@ -35,6 +35,7 @@ test("GrokNight defines every required Pi color token and resolves vars", () => 
 	assert.equal(resolved.text, "#e1e1e1");
 	assert.equal(resolved.userMessageBg, "#242424");
 	assert.equal(resolved.userMessageText, "#e1e1e1");
+	assert.equal(resolved.customMessageBg, "#1c1c1c");
 });
 
 test("terminal defaults match explicit GrokNight colors", () => {

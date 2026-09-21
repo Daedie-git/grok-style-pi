@@ -14,20 +14,28 @@ test("writes distinguish new files from replacements and render contents or colo
 	const cwd = await mkdtemp(join(tmpdir(), "grok-write-"));
 	t.after(() => rm(cwd, { recursive: true, force: true }));
 	const tool = wrapWithDiamondRenderer(withWriteSummary(createWriteToolDefinition, cwd));
-	for (const [content, verb] of [["old\nline\n", "Created"], ["new\nline\n", "Replaced"]]) {
+	for (const [content, verb] of [["old\nline\n", "Creating"], ["new\nline\n", "Replaced"]]) {
 		const args = { path: "helpers.ts", content, description: "Fury control helpers\x1b]52;c;attack\x07" };
 		const context = { args, state: {} };
 		const header = tool.renderCall(args, theme, context);
 		const result = await tool.execute("write", args, undefined, undefined, { cwd } as any);
 		assert.equal(await readFile(join(cwd, args.path), "utf8"), content);
 		const initial = tool.renderResult(result, { expanded: false }, theme, context).render(100);
-		if (verb === "Created") assert.match(initial.join("\n"), /\x1b\[32m\+1 old/);
+		if (verb === "Creating") {
+			assert.match(initial.join("\n"), /\x1b\[32m\+1 /);
+			assert.match(stripTerminalSequences(initial.join("\n")), /\+1 old/);
+		}
 		else assert.deepEqual(initial, []);
-		assert.equal(stripTerminalSequences(header.render(100)[0]), `◆ ${verb} helpers.ts · 2 lines · Fury control helpers`);
+		const headerText = stripTerminalSequences(header.render(100)[0]);
+		if (verb === "Creating") assert.equal(headerText, "◆ Creating helpers.ts");
+		else assert.equal(headerText, `◆ ${verb} helpers.ts · 2 lines · Fury control helpers`);
 		assert.ok(visibleWidth(header.render(20)[0]) <= 20);
 		const output = tool.renderResult(result, { expanded: true }, theme, context).render(100).join("\n");
 		assert.doesNotMatch(output, /Successfully wrote|attack|\x1b\]/);
-		if (verb === "Created") assert.match(stripTerminalSequences(output), /\+1 old\n  \+2 line/);
+		if (verb === "Creating") {
+			assert.match(output, /\x1b\[48;2;6;56;6m/);
+			assert.match(stripTerminalSequences(output), /\+1 old\s+\n\s+\+2 line/);
+		}
 		else {
 			assert.match(output, /\x1b\[31m-/);
 			assert.match(output, /\x1b\[32m\+/);
@@ -81,7 +89,7 @@ test("legacy writes expand recorded contents without guessing their previous sta
 	const result = { content: [{ type: "text", text: "Successfully wrote to old.ts" }] };
 	const output = tool.renderResult(result, { expanded: true }, theme, context).render(100).join("\n");
 	assert.match(output, /Previous contents were not recorded/);
-	assert.match(output, /export const value = 1;/);
+	assert.match(stripTerminalSequences(output), /export const value = 1;/);
 	assert.doesNotMatch(output, /Successfully wrote/);
 });
 
@@ -91,10 +99,14 @@ test("created file diamonds start open, toggle locally and follow global expansi
 	const context = { args: { path: "new.ts", content: "hello\n" }, state: {}, expanded: false, invalidate: () => invalidations++ };
 	const result = { content: [{ type: "text", text: "Successfully wrote" }], details: { grokWrite: { kind: "created", lines: 1, preview: "hello\n" } } };
 	const render = () => tool.renderResult(result, { expanded: context.expanded }, theme, context).render(80);
-	assert.match(render().join("\n"), /\x1b\[32m\+1 hello/);
+	assert.match(render().join("\n"), /\x1b\[32m\+1 /);
+	assert.match(render().join("\n"), /\x1b\[48;2;6;56;6m/);
+	assert.match(stripTerminalSequences(render().join("\n")), /\+1 hello/);
+	assert.equal(stripTerminalSequences(tool.renderCall(context.args, theme, context).render(80)[0]), "◆ Creating new.ts");
 	const header = tool.renderCall(context.args, theme, context) as any;
 	header.handleMouse({ type: "click", button: "left" });
 	assert.deepEqual(render(), []);
+	assert.equal(stripTerminalSequences(header.render(80)[0]), "◆ Creating new.ts +1/-0");
 	header.handleMouse({ type: "click", button: "left" });
 	assert.ok(render().length);
 	assert.equal(invalidations, 2);

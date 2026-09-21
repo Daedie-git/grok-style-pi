@@ -1,7 +1,7 @@
 {
   "name": "grok-style-pi",
   "version": "1.0.0",
-  "description": "Grok Build-inspired TUI chrome for Pi: GrokNight theme, cwd \u2502 model \u2502 N% ctx footer, focused composer frame, and diamond tool rows.",
+  "description": "Grok Build-inspired TUI chrome for Pi: GrokNight theme, cwd │ model │ N% ctx footer, focused composer frame, and diamond tool rows.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -21,6 +21,7 @@
   ],
   "scripts": {
     "test": "npm run typecheck && node --test test/*.test.ts",
+    "test:bat": "GROK_BAT_INTEGRATION=1 node --test test/highlight-bat.test.ts",
     "typecheck:subagents": "tsc -p tsconfig.subagents.json",
     "test:subagents": "node --test test/subagent-contract.test.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json"
@@ -43,5 +44,8 @@
     "@tintinweb/pi-subagents": "0.19.0",
     "@types/node": "22.20.4",
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "mdast-util-from-markdown": "^2.0.3"
   }
 }

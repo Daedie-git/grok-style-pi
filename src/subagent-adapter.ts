@@ -1,12 +1,35 @@
 import { randomUUID } from "node:crypto";
 import type { AgentSession, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { compactArgs, extractResultText } from "./diamond.ts";
-import type { Activity } from "./activity-ui.ts";
+import { plainText, type Activity } from "./activity-ui.ts";
 
+export type AgentInvocation = {
+	modelName?: string; modelId?: string; thinking?: string;
+	requestedThinking?: string; requestedModel?: string;
+};
 export type AgentRecord = {
 	status: string; startedAt?: number; completedAt?: number; result?: string; error?: string;
-	session?: Pick<AgentSession, "state" | "subscribe"> & Partial<Pick<AgentSession, "abort">>;
+	session?: Pick<AgentSession, "state" | "subscribe"> & Partial<Pick<AgentSession, "abort" | "model" | "thinkingLevel">>;
+	invocation?: AgentInvocation;
 };
+
+const labelText = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+/** Effective model and thinking level. The live session wins; the spawn invocation is the fallback. */
+export function subagentRuntimeLabel(record: Pick<AgentRecord, "session" | "invocation">): string | undefined {
+	const invocation = record.invocation;
+	const sessionModel = record.session?.model;
+	const name = labelText(sessionModel?.name) ?? labelText(sessionModel?.id) ?? labelText(invocation?.modelName) ?? labelText(invocation?.modelId);
+	const modelId = labelText(sessionModel?.id) ?? labelText(invocation?.modelId);
+	const requestedModel = labelText(invocation?.requestedModel);
+	const model = name && requestedModel && requestedModel !== name && requestedModel !== modelId ? `${name} (asked ${requestedModel})` : name;
+	const thinking = labelText(record.session?.thinkingLevel) ?? labelText(invocation?.thinking);
+	const requestedThinking = labelText(invocation?.requestedThinking);
+	const level = thinking && requestedThinking && requestedThinking !== thinking ? `${thinking} (asked ${requestedThinking})` : thinking;
+	const label = [model, level].filter(Boolean).join(" · ");
+	const clean = label ? plainText(label).replace(/\s+/g, " ").trim() : "";
+	return clean || undefined;
+}
 export type RunStatus = "queued" | "running" | "stopping" | "completed" | "error" | "stopped";
 export type RunIdentity = Readonly<{ agentId: string; sequence: number; startedAt?: number }>;
 type Bus = ExtensionAPI["events"];
@@ -107,12 +130,14 @@ export class SubagentAdapter {
 		run.lastUser = lastUser ? new WeakRef(lastUser) : undefined;
 		const result = (record.result ?? event?.result ?? (!newRun ? run.result : undefined))?.slice(-64000);
 		const error = (record.error ?? event?.error ?? (!newRun ? run.error : undefined))?.slice(-64000);
+		const runtime = subagentRuntimeLabel(record);
 		const previous = run.status;
 		const effective = run.cancelled && !active(status) ? "stopped" : run.status === "stopping" && active(status) ? "stopping" : status;
-		const changed = newRun || previous !== effective || run.completedAt !== record.completedAt || run.result !== result || run.error !== error;
+		const changed = newRun || previous !== effective || run.completedAt !== record.completedAt || run.result !== result || run.error !== error || run.activity.model !== runtime;
 		if (!changed && !active(effective)) return false;
 		run.status = effective; run.completedAt = record.completedAt; run.result = result; run.error = error;
 		run.activity.status = effective;
+		run.activity.model = runtime;
 		run.activity.startedAt = record.startedAt ?? run.activity.startedAt;
 		run.activity.endedAt = record.completedAt;
 		if (record.session && run.session !== record.session) { run.unsubscribe?.(); run.unsubscribe = undefined; run.session = record.session; }

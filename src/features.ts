@@ -4,14 +4,15 @@ import { randomUUID } from "node:crypto";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const featureLabels = {
-	footer: "Footer (model, Codex context, and Grok context and weekly usage)",
+	footer: "Footer (model, and context and usage for the active model)",
 	composer: "Composer frame",
 	toolStyling: "Tool summaries and diamond styling",
 	activity: "Active subagents and tasks panel",
 	terminalColors: "Terminal background, text and cursor colors",
+	communication: "Communication style and clickable file references",
 } as const;
 export type Features = Record<keyof typeof featureLabels, boolean>;
-export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true };
+export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true };
 export const featureSettingsPath = () => join(getAgentDir(), "grok-style.json");
 
 export function loadFeatures(path = featureSettingsPath()): Features {

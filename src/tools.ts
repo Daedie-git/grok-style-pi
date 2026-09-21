@@ -15,8 +15,10 @@ import {
 	type ToolRenderContext,
 } from "./diamond.ts";
 import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openInCursor, type OpenTarget } from "./open-in-cursor.ts";
+import { highlightLines, languageForPath } from "./highlight.ts";
+import { buildDiffRows, createdRows, paintRows, type RenderRow } from "./diff-render.ts";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
@@ -34,6 +36,8 @@ export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
 
 export type ThemeLike = {
 	fg?: (token: ThemeColor, text: string) => string;
+	/** GrokNight code-block panel: `#1c1c1c`, mapped to customMessageBg. */
+	bg?: (token: "customMessageBg", text: string) => string;
 	inverse?: (text: string) => string;
 };
 
@@ -46,22 +50,6 @@ function editDisplay(context: ToolRenderContext | undefined, expanded: boolean) 
 		state.grokEdit.open = expanded;
 	}
 	return state.grokEdit;
-}
-
-/** Invert the changed portion of a replacement, preserving its red/green line color. */
-function emphasizeReplacement(oldLine: string, newLine: string, theme: ThemeLike): [string, string] {
-	if (!theme.inverse) return [oldLine, newLine];
-	const parse = (line: string) => /^([+-]\s*\d* )(.*)$/.exec(line);
-	const old = parse(oldLine), next = parse(newLine);
-	if (!old || !next) return [oldLine, newLine];
-	const a = Array.from(old[2]), b = Array.from(next[2]);
-	let start = 0, end = 0;
-	while (start < Math.min(a.length, b.length) && a[start] === b[start]) start++;
-	while (end < Math.min(a.length, b.length) - start && a[a.length - end - 1] === b[b.length - end - 1]) end++;
-	const mark = (prefix: string, chars: string[]) => prefix + chars.slice(0, start).join("") +
-		(start < chars.length - end ? theme.inverse!(chars.slice(start, chars.length - end).join("")) : "") +
-		(end ? chars.slice(-end).join("") : "");
-	return [mark(old[1], a), mark(next[1], b)];
 }
 
 export type OriginalTool = Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "name" | "description" | "parameters" | "execute"> &
@@ -127,6 +115,21 @@ function changedLine(details: unknown): number {
 	return typeof line === "number" && line > 0 ? line : 1;
 }
 
+function pathArg(args: ToolArgs): string | undefined {
+	return typeof args?.path === "string" ? args.path : undefined;
+}
+
+function paintHighlighted(text: string, theme: ThemeLike | undefined, token: ThemeColor, lang: string | undefined, filePath?: string): string {
+	const lines = highlightLines(text, lang, filePath);
+	return lines ? lines.join("\n") : paint(theme, token, text);
+}
+
+function splitReadNotice(text: string): { code: string; notice: string } {
+	const match = /\n\n\[(?:Showing lines |\d+ more lines in file\.|Line \d+ is )[\s\S]*\]\s*$/.exec(text);
+	if (!match || match.index === undefined) return { code: text, notice: "" };
+	return { code: text.slice(0, match.index), notice: text.slice(match.index + 2) };
+}
+
 export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondHooks): DiamondTool {
 	const onModifierOpen = hooks?.onModifierOpen ?? defaultModifierOpen;
 	const execute = original.execute.bind(original);
@@ -159,11 +162,16 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				const purpose = typeof args?.description === "string" ? sanitizeToolText(args.description).replace(/\s+/g, " ").trim().slice(0, 160) : "";
 				const lines = typeof args?.content === "string" ? countLines(args.content) : undefined;
 				return callComponent(() => {
-					const summary = context?.state?.grokWrite;
-					const verb = failed ? "Failed to write" : summary?.kind === "created" ? "Created" : summary?.kind === "replaced" ? "Replaced" : summary ? "Wrote" : "Write";
+						const summary = context?.state?.grokWrite;
+					const created = summary?.kind === "created";
+					const verb = failed ? "Failed to write" : created ? "Creating" : summary?.kind === "replaced" ? "Replaced" : summary ? "Wrote" : "Write";
 					const count = summary?.lines ?? lines;
-					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) +
-						paint(theme, "muted", `${count === undefined ? "" : ` · ${count} ${count === 1 ? "line" : "lines"}`}${purpose ? ` · ${purpose}` : ""}`);
+					const open = context?.state?.grokEdit?.open ?? true;
+					const stat = created && !open && count !== undefined
+						? paint(theme, "toolDiffAdded", ` +${count}`) + paint(theme, "muted", "/") + paint(theme, "toolDiffRemoved", "-0")
+						: "";
+					const detail = created ? stat : paint(theme, "muted", `${count === undefined ? "" : ` · ${count} ${count === 1 ? "line" : "lines"}`}${purpose ? ` · ${purpose}` : ""}`);
+					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) + detail;
 				}, (event) => {
 					const opened = ctrlOpen(event, args, 1, context?.cwd, onModifierOpen);
 					if (opened) return opened;
@@ -212,33 +220,46 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			if (options.isPartial || !open) return emptyComponent();
 			const diff = sanitizeToolText(extractResultDiff(result));
 			let { text } = formatToolResult({ ...result, details: undefined }, { ...options, expanded: true });
+			const token = context?.isError ? "error" : "toolOutput";
+			const lang = languageForPath(pathArg(context?.args));
+			let paintedText: string | undefined;
 			if (shell && typeof context?.args?.command === "string") {
 				// Pi inserts this placeholder when a command emits no stdout/stderr.
 				if (/^\(no output\)(?:\n\nCommand exited with code -?\d+)?\s*$/.test(text)) text = text.replace(/^\(no output\)\s*/, "");
-				text = [`$ ${sanitizeToolText(context.args.command)}`, text].filter(Boolean).join("\n\n");
+				const command = sanitizeToolText(context.args.command);
+				const commandLang = original.name === "powershell" ? "powershell" : "bash";
+				const highlighted = context?.isError ? undefined : highlightLines(command, commandLang, undefined);
+				const commandText = highlighted
+					? highlighted.map((line, index) => (index === 0 ? paint(theme, token, "$ ") : "") + line).join("\n")
+					: undefined;
+				if (commandText) paintedText = [commandText, text ? paint(theme, token, text) : ""].filter(Boolean).join("\n\n");
+				else text = [`$ ${command}`, text].filter(Boolean).join("\n\n");
+			} else if (original.name === "read" && !context?.isError && text) {
+				const { code, notice } = splitReadNotice(text);
+				const highlighted = highlightLines(code, lang, pathArg(context?.args));
+				if (highlighted) paintedText = [highlighted.join("\n"), notice ? paint(theme, "muted", notice) : ""].filter(Boolean).join("\n\n");
 			}
-			if (summary) text = sanitizeToolText([summary.note, summary.preview].filter(Boolean).join("\n\n"));
-			const token = context?.isError ? "error" : "toolOutput";
-			const diffLines = diff.split("\n");
-			for (let i = 0; i + 1 < diffLines.length; i++) {
-				if (/^-\s*\d+ /.test(diffLines[i]) && /^\+\s*\d+ /.test(diffLines[i + 1])) {
-					[diffLines[i], diffLines[i + 1]] = emphasizeReplacement(diffLines[i], diffLines[i + 1], theme);
-					i++;
-				}
+			if (summary) {
+				const note = summary.note ? paint(theme, "muted", sanitizeToolText(summary.note)) : "";
+				if (summary.kind === "created") {
+					paintedText = note;
+				} else if (summary.preview && !diff) {
+					paintedText = [note, paintHighlighted(sanitizeToolText(summary.preview), theme, token, lang, pathArg(context?.args))].filter(Boolean).join("\n\n");
+				} else text = sanitizeToolText([summary.note, summary.preview].filter(Boolean).join("\n\n"));
 			}
-			const coloredDiff = diff ? diffLines.map((line) => {
-				const diffToken = line.startsWith("+++") || line.startsWith("---") ? "toolDiffContext" :
-					line.startsWith("+") ? "toolDiffAdded" : line.startsWith("-") ? "toolDiffRemoved" : "toolDiffContext";
-				return paint(theme, diffToken, line);
-			}).join("\n") : "";
-			const createdContents = summary?.kind === "created" ? [
-				summary.note ? paint(theme, "muted", sanitizeToolText(summary.note)) : "",
-				summary.preview ? sanitizeToolText(summary.preview).replace(/\n$/, "").split("\n")
-					.map((line, index) => paint(theme, "toolDiffAdded", `+${index + 1} ${line}`)).join("\n") : "",
-			].filter(Boolean).join("\n\n") : undefined;
-			const rendered = createdContents ?? [text ? paint(theme, token, text) : "", coloredDiff].filter(Boolean).join("\n\n");
-			if (!rendered && !context?.isError) return emptyComponent();
-			const body = textComponent(rendered || paint(theme, "error", "error"));
+			const paintDiff = {
+				paint: (token: "toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext", value: string) => paint(theme, token, value),
+				inverse: theme.inverse,
+			};
+			const highlight = (value: string) => highlightLines(value, lang, pathArg(context?.args));
+			const rows: RenderRow[] = [
+				...(summary?.kind === "created" ? createdRows(sanitizeToolText(summary.preview), paintDiff, highlight) : []),
+				...(diff ? buildDiffRows(diff, paintDiff, highlight) : []),
+			];
+			const prose = paintedText ?? (text ? paint(theme, token, text) : "");
+			const proseSource = prose || (rows.length === 0 && context?.isError ? paint(theme, "error", "error") : "");
+			if (!proseSource && rows.length === 0) return emptyComponent();
+			const body = textComponent(proseSource);
 			return {
 				invalidate() { body.invalidate(); },
 				handleMouse(event: TuiMouseEvent) {
@@ -252,7 +273,12 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				},
 				render(width: number) {
 					const indent = width > 2 ? "  " : "";
-					return body.render(width - indent.length).map((line) => indent + line);
+					const prose = proseSource ? body.render(Math.max(0, width - indent.length)).map((line) => indent + line) : [];
+					const painted = paintRows(rows, width, indent);
+					const lines = prose.length && painted.length ? [...prose, "", ...painted] : [...prose, ...painted];
+					// GrokNight bg_dark is #1c1c1c, lighter than the #141414 transcript, for expanded read panels.
+					if (original.name !== "read" || context?.isError || !theme?.bg) return lines;
+					return lines.map((line) => theme.bg!("customMessageBg", line + " ".repeat(Math.max(0, width - visibleWidth(line)))));
 				},
 			};
 		},

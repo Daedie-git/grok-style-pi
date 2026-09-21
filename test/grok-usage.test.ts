@@ -13,12 +13,12 @@ const credits = {
 };
 
 test("Grok weekly remaining comes from the credits config and ignores other periods", () => {
-	assert.equal(formatGrokWeekly(parseGrokCredits(credits), 0), "Grok Weekly 63% left");
-	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 0, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" } } })), "Grok Weekly 100% left");
-	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 105, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" } } })), "Grok Weekly 0% left");
-	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 10, currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY" } } })), "Grok Weekly ?% left");
-	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 10, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2000-01-01T00:00:00Z" } } })), "Grok Weekly ?% left");
-	assert.equal(formatGrokWeekly(undefined), "Grok Weekly ?% left");
+	assert.equal(formatGrokWeekly(parseGrokCredits(credits), 0), "Weekly 63% left");
+	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 0, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" } } })), "Weekly 100% left");
+	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 105, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" } } })), "Weekly 0% left");
+	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 10, currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY" } } })), "Weekly ?% left");
+	assert.equal(formatGrokWeekly(parseGrokCredits({ config: { creditUsagePercent: 10, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2000-01-01T00:00:00Z" } } })), "Weekly ?% left");
+	assert.equal(formatGrokWeekly(undefined), "Weekly ?% left");
 	assert.equal(parseGrokCredits({ config: { creditUsagePercent: "37" } }), undefined);
 });
 
@@ -67,10 +67,10 @@ test("credits polling sends the xAI login and keeps the last context when a read
 		return Response.json(credits);
 	}) as typeof fetch, home);
 	t.after(() => { polling.dispose(); rmSync(home, { recursive: true, force: true }); });
-	for (let i = 0; i < 5 && seen.at(-1) !== "6 Grok Weekly 63% left"; i++) await flush();
+	for (let i = 0; i < 5 && seen.at(-1) !== "6 Weekly 63% left"; i++) await flush();
 	assert.equal(calls, 1);
-	assert.equal(seen.at(-1), "6 Grok Weekly 63% left");
+	assert.equal(seen.at(-1), "6 Weekly 63% left");
 	writeFileSync(join(home, "active_sessions.json"), "{");
 	polling.refreshContext();
-	assert.equal(seen.at(-1), "6 Grok Weekly 63% left");
+	assert.equal(seen.at(-1), "6 Weekly 63% left");
 });

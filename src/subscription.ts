@@ -27,9 +27,9 @@ export function parseCodexQuota(headers: Record<string, string>): QuotaWindow[] 
 
 export function formatCodexQuota(windows: QuotaWindow[], now = Date.now()): string {
 	const weekly = windows.find((window) => window.label === "7d");
-	if (!weekly || (weekly.resetsAt !== undefined && weekly.resetsAt * 1000 <= now)) return "Codex weekly ? left";
+	if (!weekly || (weekly.resetsAt !== undefined && weekly.resetsAt * 1000 <= now)) return "Weekly ?% left";
 	const remaining = Math.round(Math.max(0, Math.min(100, 100 - weekly.usedPercent)));
-	return `Codex weekly ${remaining}% left`;
+	return `Weekly ${remaining}% left`;
 }
 
 const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;

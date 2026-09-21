@@ -79,8 +79,12 @@ test("expanded diffs color changes without coloring ordinary output as a diff", 
 		const lines = component.render(80);
 		assert.ok(lines.some((line) => line.includes("\x1b[90m+ordinary output")));
 		assert.ok(lines.some((line) => line.includes("\x1b[90m+++ b/file")));
-		assert.ok(lines.some((line) => line.includes("\x1b[31m-1 old")));
-		assert.ok(lines.some((line) => line.includes("\x1b[32m+1 new")));
+		assert.ok(lines.some((line) => line.includes("\x1b[31m-1 ")));
+		assert.ok(lines.some((line) => line.includes("\x1b[32m+1 ")));
+		assert.ok(lines.some((line) => line.includes("\x1b[48;2;66;14;20m")));
+		assert.ok(lines.some((line) => line.includes("\x1b[48;2;6;56;6m")));
+		assert.match(stripAnsi(lines.join("\n")), /-1 old/);
+		assert.match(stripAnsi(lines.join("\n")), /\+1 new/);
 		assert.doesNotMatch(lines.join("\n"), /payload|\x1b\]/);
 		assert.ok(component.render(8).every((line) => visibleWidth(line) <= 8));
 		assert.deepEqual(tool.renderResult(result, { expanded: false }, diffTheme).render(80), lines);

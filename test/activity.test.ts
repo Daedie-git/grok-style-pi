@@ -3,6 +3,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { ActivityPanel, ActivityViewer, type Activity } from "../src/activity-ui.ts";
 import { installActivityPanel } from "../src/activity.ts";
+import { subagentRuntimeLabel } from "../src/subagent-adapter.ts";
 import { wrapWithDiamondRenderer } from "../src/tools.ts";
 
 const theme = { fg: (_token: string, text: string) => text };
@@ -269,6 +270,53 @@ test("diagnostic merging retains the size limit and distinct failures", async ()
 	const output = mergeActivityOutput("x".repeat(64000), "independent failure");
 	assert.equal(output.length, 64000);
 	assert.ok(output.endsWith("independent failure"));
+});
+
+test("subagent runtime label prefers the live session and notes an overridden request", () => {
+	assert.equal(subagentRuntimeLabel({
+		session: { model: { name: "Grok 4.6", id: "xai/grok-4.6", provider: "xai", api: "openai-completions" }, thinkingLevel: "high" } as any,
+		invocation: { modelName: "other", thinking: "xhigh", requestedThinking: "xhigh", requestedModel: "opus" },
+	}), "Grok 4.6 (asked opus) · high (asked xhigh)");
+	assert.equal(subagentRuntimeLabel({
+		invocation: { modelName: "haiku 4.5", modelId: "anthropic/claude-haiku-4.5", thinking: "medium" },
+	}), "haiku 4.5 · medium");
+	assert.equal(subagentRuntimeLabel({ invocation: { modelName: "grok\x1b[31m", thinking: "low" } }), "grok · low");
+	assert.equal(subagentRuntimeLabel({}), undefined);
+});
+
+test("active subagent rows, viewer, and activity list show model and thinking level", async (t) => {
+	const record: any = {
+		status: "running", startedAt: 1,
+		invocation: { modelName: "stale", thinking: "xhigh", requestedThinking: "xhigh" },
+		session: {
+			model: { name: "Grok 4.6", id: "xai/grok-4.6" }, thinkingLevel: "high",
+			state: { messages: [] }, subscribe() { return () => {}; },
+		},
+	};
+	const h = harness((id) => id === "agent-1" ? record : undefined);
+	t.after(() => h.emit("session_shutdown"));
+	h.events.emit("subagents:started", { id: "agent-1", type: "Explore", description: "inspect build" });
+	const rows = h.panel().render(100);
+	assert.match(rows[1], /Explore: inspect build/);
+	assert.match(rows[1], /\[View\]/);
+	assert.match(rows[2], /Grok 4.6 · high \(asked xhigh\)/);
+	assert.doesNotMatch(rows[2], /\[View\]/);
+	assert.ok(rows.every((line) => visibleWidth(line) <= 100));
+	let labels: string[] = [];
+	h.ctx.ui.select = async (_title: string, options: string[]) => { labels = options; return options[0]; };
+	const selecting = h.commands.get("activity").handler();
+	await flush();
+	const viewer = h.viewer()!.render(80);
+	assert.match(viewer[1], /\[Close\]/);
+	assert.match(viewer[2], /Grok 4.6 · high \(asked xhigh\)/);
+	assert.match(labels[0], /Grok 4.6 · high \(asked xhigh\) · running/);
+	h.viewer()!.handleInput("\x1b");
+	await selecting;
+	record.session.thinkingLevel = "low";
+	record.invocation.requestedThinking = undefined;
+	h.events.emit("subagents:started", { id: "agent-1", type: "Explore", description: "inspect build" });
+	assert.match(h.panel().render(100)[2], /Grok 4.6 · low/);
+	assert.doesNotMatch(h.panel().render(100).join("\n"), /asked/);
 });
 
 test("panel separates active subagents and tasks and removes empty sections", () => {

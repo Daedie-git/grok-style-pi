@@ -15,16 +15,16 @@ const headers = {
 
 test("Codex footer shows weekly quota remaining and respects reset expiry", () => {
 	const quota = parseCodexQuota(headers);
-	assert.equal(formatCodexQuota(quota, 0), "Codex weekly 88% left");
-	assert.equal(formatCodexQuota(quota, 2000000000001), "Codex weekly 88% left");
-	assert.equal(formatCodexQuota(quota, 2000600000001), "Codex weekly ? left");
-	assert.equal(formatCodexQuota([{ label: "7d", usedPercent: 0 }]), "Codex weekly 100% left");
-	assert.equal(formatCodexQuota([{ label: "7d", usedPercent: 105 }]), "Codex weekly 0% left");
-	assert.equal(formatCodexQuota([]), "Codex weekly ? left");
+	assert.equal(formatCodexQuota(quota, 0), "Weekly 88% left");
+	assert.equal(formatCodexQuota(quota, 2000000000001), "Weekly 88% left");
+	assert.equal(formatCodexQuota(quota, 2000600000001), "Weekly ?% left");
+	assert.equal(formatCodexQuota([{ label: "7d", usedPercent: 0 }]), "Weekly 100% left");
+	assert.equal(formatCodexQuota([{ label: "7d", usedPercent: 105 }]), "Weekly 0% left");
+	assert.equal(formatCodexQuota([]), "Weekly ?% left");
 	assert.deepEqual(parseCodexQuota({ "x-codex-primary-used-percent": "NaN" }), []);
 	assert.deepEqual(parseCodexQuota({ "x-codex-primary-used-percent": "" }), []);
 	assert.deepEqual(parseCodexQuota({ "x-codex-primary-used-percent": "0", "x-codex-primary-window-minutes": "0" }), []);
-	assert.equal(formatCodexQuota(parseCodexQuota({ "x-codex-secondary-used-percent": "0", "x-codex-secondary-window-minutes": "1440" })), "Codex weekly ? left");
+	assert.equal(formatCodexQuota(parseCodexQuota({ "x-codex-secondary-used-percent": "0", "x-codex-secondary-window-minutes": "1440" })), "Weekly ?% left");
 });
 
 test("footer refreshes from Codex response headers and clears quota on model changes", () => {
@@ -41,24 +41,24 @@ test("footer refreshes from Codex response headers and clears quota on model cha
 		tools: Object.fromEntries(BUILTIN_TOOL_NAMES.map((name) => [name, () => ({ name, description: name, parameters: {}, execute() {} })])) as any,
 	});
 	handlers.session_start({}, ctx);
-	assert.match(footer!.render(160)[0], /Codex Context/);
-	assert.match(footer!.render(160)[0], /Grok Context/);
-	assert.match(footer!.render(160)[0], /Grok Weekly/);
-	assert.match(footer!.render(160)[0], /Codex weekly \? left/);
+	assert.match(footer!.render(160)[0], /Context \?% used/);
+	assert.match(footer!.render(160)[0], /Weekly \?% left/);
+	assert.doesNotMatch(footer!.render(160)[0], /Grok|Codex Context|Codex weekly/);
 	const redrawsAfterStart = redraws;
 	handlers.after_provider_response({ headers }, ctx);
 	assert.equal(redraws, redrawsAfterStart + 1);
 	assert.equal(footer!.render(160).length, 1);
-	assert.match(footer!.render(160)[0], /Codex weekly 88% left/);
+	assert.match(footer!.render(160)[0], /Weekly 88% left/);
 	handlers.after_provider_response({ headers: {} }, ctx);
-	assert.match(footer!.render(160)[0], /Codex weekly 88% left/);
+	assert.match(footer!.render(160)[0], /Weekly 88% left/);
 	ctx.model.provider = "anthropic";
 	handlers.model_select({}, ctx);
 	handlers.after_provider_response({ headers }, ctx);
-	assert.doesNotMatch(footer!.render(160)[0], /Codex weekly/);
-	assert.match(footer!.render(160)[0], /Grok Weekly/);
+	assert.doesNotMatch(footer!.render(160)[0], /Weekly/);
+	assert.match(footer!.render(160)[0], /Context \?% used/);
 	ctx.model.provider = "openai-codex";
-	assert.match(footer!.render(160)[0], /Codex weekly \? left/);
+	assert.match(footer!.render(160)[0], /Weekly \?% left/);
+	assert.doesNotMatch(footer!.render(160)[0], /Grok/);
 });
 
 const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.signature`;
@@ -74,7 +74,7 @@ test("usage endpoint supports a weekly primary window and sends only scoped auth
 		assert.equal(options?.redirect, "error");
 		return Response.json(usage);
 	}) as typeof fetch);
-	assert.equal(formatCodexQuota(windows, 0), "Codex weekly 46% left");
+	assert.equal(formatCodexQuota(windows, 0), "Weekly 46% left");
 	assert.deepEqual(parseCodexUsage({ rate_limit: { primary_window: { used_percent: "54", limit_window_seconds: 604800 } } }), []);
 	await assert.rejects(fetchCodexUsage("not-oauth", new AbortController().signal, async () => { throw new Error("should not fetch"); }), /login required/);
 });
@@ -121,10 +121,10 @@ test("footer fetches weekly usage without response headers and stops on model sw
 	handlers.session_start({}, ctx);
 	await flush();
 	assert.equal(calls, 1);
-	assert.match(footer!.render(160)[0], /Codex weekly 46% left/);
+	assert.match(footer!.render(160)[0], /Weekly 46% left/);
 	ctx.model.provider = "anthropic";
 	handlers.model_select({}, ctx);
 	await flush();
 	assert.equal(calls, 1);
-	assert.doesNotMatch(footer!.render(160)[0], /Codex weekly/);
+	assert.doesNotMatch(footer!.render(160)[0], /Weekly/);
 });

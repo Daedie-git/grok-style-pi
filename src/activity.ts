@@ -83,7 +83,11 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 		const current = list();
 		if (!current.length) { ctx.ui.notify("No command or subagent activity yet.", "info"); return; }
 		const version = generation;
-		const labels = current.map((entry, i) => `${i + 1}. ${plainText(entry.title).replace(/\s+/g, " ")} · ${plainText(entry.status).replace(/\s+/g, " ")}`);
+		const labels = current.map((entry, i) => {
+			const title = plainText(entry.title).replace(/\s+/g, " ");
+			const runtime = entry.model ? ` · ${plainText(entry.model).replace(/\s+/g, " ")}` : "";
+			return `${i + 1}. ${title}${runtime} · ${plainText(entry.status).replace(/\s+/g, " ")}`;
+		});
 		const selected = await ctx.ui.select("Activity", labels);
 		if (version !== generation) return;
 		const index = selected === undefined ? -1 : labels.indexOf(selected);

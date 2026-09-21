@@ -14,6 +14,7 @@ export const TOOL_SUMMARY_VERBS: Record<string, string> = {
 	ls: "Listed",
 	get_subagent_result: "Read agent result",
 	jev_advisory_assess: "Jev advisory assessment",
+	jev_discover: "Jev discovery",
 };
 
 export type ToolArgs = Record<string, unknown> | undefined | null;
@@ -34,7 +35,8 @@ export type ToolRenderContext = {
 	isError?: boolean;
 	args?: ToolArgs;
 	expanded?: boolean;
-	state?: { grokEdit?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokExitCode?: string };
+	cwd?: string;
+	state?: { grokEdit?: { open: boolean; expanded: boolean; line?: number }; grokWrite?: WriteSummary; grokExitCode?: string };
 	invalidate?: () => void;
 };
 

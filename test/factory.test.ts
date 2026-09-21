@@ -167,14 +167,14 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 
 	assert.ok(footerFactory);
 	const footer = footerFactory!({ requestRender() {} }, ctx.ui.theme, { onBranchChange: () => () => {} });
-	const footerLine = footer.render(80).join("");
+	const footerLine = footer.render(160).join("");
 	assert.ok(footerLine.includes("demo-project"));
 	assert.ok(footerLine.includes("Grok 4.6"));
 	assert.ok(footerLine.includes("%"));
 	assert.ok(footerLine.includes("│"));
 	assert.ok(footerLine.includes("Grok 4.6 high"));
 	thinkingLevel = "low";
-	assert.ok(footer.render(80).join("").includes("Grok 4.6 low"));
+	assert.ok(footer.render(160).join("").includes("Grok 4.6 low"));
 	assert.ok(footer.render(12).every((line: string) => visibleWidth(line) <= 12));
 	assert.deepEqual(footer.render(0), [""]);
 

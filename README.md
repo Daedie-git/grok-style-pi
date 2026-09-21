@@ -1,6 +1,6 @@
 # grok-style-pi
 
-Grok Build-inspired chrome for [Pi](https://pi.dev): a GrokNight color theme, a `cwd │ model │ Context N% used` footer, a rounded composer with a `❯` prompt, and diamond (`◆`) tool rows.
+Grok Build-inspired chrome for [Pi](https://pi.dev): a GrokNight color theme, a `cwd │ model │ Codex Context N% used │ Grok Context N% used │ Grok Weekly N% left` footer, a rounded composer with a `❯` prompt, and diamond (`◆`) tool rows.
 
 This package uses only documented Pi extension APIs (`setFooter`, `setEditorComponent` wrapping `CustomEditor`, and same-name `registerTool` overrides with `renderShell: "self"`). It does not patch Pi internals.
 
@@ -45,12 +45,18 @@ Install either the local clone or the GitHub package, not both. When working fro
 | Surface | Behavior |
 |---|---|
 | Theme | Neutral near-black gray + blue highlights `#7aa2f7` / `#7dcfff` (GrokNight) |
-| Footer | One row: full working path (`~` for home) with the active Git branch, model, thinking level, context usage, and ChatGPT/Codex subscription usage |
+| Footer | One row: full working path (`~` for home) with the active Git branch, model, thinking level, Codex context usage, Grok context usage, and Codex and Grok subscription usage |
 | Composer | Rounded frame and `❯` prompt; muted idle border, brighter focused border |
 | Tools | Dim diamond summaries for shell commands (using their description when supplied), with readable file-tool labels; edit diffs open by default with green additions, red removals, and changed-text emphasis; other output expands on demand. Images use Pi’s normal inline display |
 | Activity | Live Bash/PowerShell commands and top-level subagents above the composer, with clickable View, Stop, and Close controls |
 
-Built-in tools (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`) use Pi’s full `create*ToolDefinition` factories, preserving built-in prompt guidance and execution. Disabling tool styling restores their native renderers. Styled tool text is sanitized before theme colors are applied. Click an edit diamond to collapse or reopen its diff. Ctrl+O still controls global expansion; expanding and then collapsing all tools also closes edit diffs.
+Built-in tools (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`) use Pi’s full `create*ToolDefinition` factories, preserving built-in prompt guidance and execution. Disabling tool styling restores their native renderers. Styled tool text is sanitized before theme colors are applied. Click an edit diamond to collapse or reopen its diff. Ctrl+click an edit, write, or read row to open that file in Cursor's classic IDE at the change line, reusing a window already opened on the git workspace. `/open` and `ctrl+alt+o` jump to the last edit. Ctrl+O still controls global expansion; expanding and then collapsing all tools also closes edit diffs.
+
+Cursor opening prefers an already-mounted Linux AppImage CLI, avoiding another AppImage mount, and falls back to the normal launcher if that mount disappears. `/open pick` lists this session's successful edits and writes; opening a read row does not replace the last-edited target. Launch failures are reported without exiting Pi.
+
+The first Cursor open per workspace in each Pi session also refreshes `compile_commands.json` when an existing CMake or Meson build can be identified. This applies to Ctrl-click, `/open`, and the shortcut. The existing database (including a symlink or root-level copy) guides build-directory selection; otherwise a bounded search looks for configured builds. CMake reuses its cache and enables compilation-database export for supported Ninja/Makefile generators; Meson reconfigures its existing build. No new preset is guessed and no full build is invoked. Configuration commands have a 60-second timeout. Root-level database copies are updated and symlinks are preserved.
+
+The first open waits for regeneration, with a progress notification; concurrent clicks share that refresh, and later opens skip it. Automatic configuration only runs for the trusted session workspace—not unrelated repositories reached by clicking an external file. Non-native projects are skipped. Ambiguous, unsupported, or failed refreshes warn and still open Cursor. Switching sessions or `/reload` resets the once-per-workspace check and cancels pending refreshes.
 
 Write rows report `Created` or `Replaced`, the line count, and the model-provided file purpose when available. New files open by default with numbered `+` lines in the added-line diff color; click the diamond to collapse or reopen them. Replacements expand on demand to show their colored diff. The previous contents are captured inside Pi's per-file write queue. Previews are bounded: new contents show up to 16,000 characters; diffs require both versions to fit within 64 KB and 1,000 lines each. Larger or unreadable originals fall back to a labeled content preview. Older session entries and custom remote write operations use `Wrote` when creation/replacement cannot be established; previous contents are never inferred from the current file. Original tool-result text sent to the model is preserved.
 
@@ -61,6 +67,8 @@ The grayscale values follow Grok Build's GrokNight implementation: Markdown body
 Our blue accent overrides remain a customization: Grok Build's source also uses teal/purple headings and mixed syntax colors. Pi exposes a single heading color, while Grok Build styles heading levels separately. Run `/reload` after editing the palette. With terminal colors disabled, plain assistant prose and editor input inherit your terminal's colors. Pi controls Markdown list markers (dashes), selection rendering, and transcript spacing; this extension does not replace those renderers.
 
 For `openai-codex`, the footer shows weekly quota remaining (for example, `Codex weekly 46% left`). It refreshes in the background at startup and once per minute using the existing Pi ChatGPT login and Codex's usage endpoint. Response headers also update the display when available. This works with WebSocket transport and makes no model requests. Refresh stops when the footer is disabled, the model changes away from Codex, or the session closes. Unavailable or expired data is not shown as a known percentage; authentication failures display `login required`. The usage endpoint is an internal Codex service and may change.
+
+The same row also shows the Grok session for this working directory (`Grok Context N% used`, from that session's saved context-window percent) and Grok allowance remaining (`Grok Weekly N% left`). Weekly allowance refreshes at startup and once per minute with the existing Pi xAI login and Grok's credits endpoint. Context is re-read locally every few seconds. A missing Grok session or a non-weekly allowance shows `?`. Authentication failures display `login required`. The credits endpoint is an internal Grok service and may change.
 
 ## Feature settings
 
@@ -97,8 +105,8 @@ The default `npm test` first runs strict type checks for every production source
 
 ### Jev intervention diamonds
 
-Optional `integrations/warden.ts` and `integrations/jev-discovery.ts` entrypoints show Warden steering/status messages and Discovery's injected guidance/source evidence as collapsed diamonds. Click the header or use Ctrl+O to read the full message. The Discovery wrapper also styles `jev_advisory_assess`. Intervention contents, tool execution, and turn delivery are preserved; checks that produce no message do not create a row.
+Optional `integrations/warden.ts` and `integrations/jev-discovery.ts` entrypoints show Warden steering/status messages and Discovery's injected guidance/source evidence as collapsed diamonds. Click the header or use Ctrl+O to read the full message; clicking expanded output collapses its diamond. The Discovery wrapper also styles `jev_discover` and `jev_advisory_assess`. Intervention contents, tool execution, and turn delivery are preserved; checks that produce no message do not create a row.
 
-Replace the direct extension entrypoints rather than loading both. Keep `npm:pi-warden` installed with `"extensions": []` in its package settings, and add this package's `integrations/warden.ts` to Pi's `extensions` list. Replace the Discovery extension path with `integrations/jev-discovery.ts`; it defaults to the sibling `pi-jev-discovery-pilot/extension.ts` checkout, or accepts an absolute path through `GROK_JEV_DISCOVERY_EXTENSION`. These wrappers follow the `toolStyling` feature setting.
+Replace the direct extension entrypoints rather than loading both. Keep `npm:pi-warden` installed with `"extensions": []` in its package settings, and add this package's `integrations/warden.ts` to Pi's `extensions` list. Replace the Discovery extension path with `integrations/jev-discovery.ts`; it defaults to the sibling `pi-jev-discovery-delegated/delegated-extension.mjs` checkout, or accepts an absolute path through `GROK_JEV_DISCOVERY_EXTENSION`. These wrappers follow the `toolStyling` feature setting.
 
 Run `/reload` after configuration changes. New intervention messages are saved as visible; previously saved hidden messages are not rewritten or replayed.

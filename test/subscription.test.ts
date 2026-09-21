@@ -41,19 +41,24 @@ test("footer refreshes from Codex response headers and clears quota on model cha
 		tools: Object.fromEntries(BUILTIN_TOOL_NAMES.map((name) => [name, () => ({ name, description: name, parameters: {}, execute() {} })])) as any,
 	});
 	handlers.session_start({}, ctx);
-	assert.match(footer!.render(120)[0], /Codex weekly \? left/);
+	assert.match(footer!.render(160)[0], /Codex Context/);
+	assert.match(footer!.render(160)[0], /Grok Context/);
+	assert.match(footer!.render(160)[0], /Grok Weekly/);
+	assert.match(footer!.render(160)[0], /Codex weekly \? left/);
+	const redrawsAfterStart = redraws;
 	handlers.after_provider_response({ headers }, ctx);
-	assert.equal(redraws, 1);
-	assert.equal(footer!.render(120).length, 1);
-	assert.match(footer!.render(120)[0], /Codex weekly 88% left/);
+	assert.equal(redraws, redrawsAfterStart + 1);
+	assert.equal(footer!.render(160).length, 1);
+	assert.match(footer!.render(160)[0], /Codex weekly 88% left/);
 	handlers.after_provider_response({ headers: {} }, ctx);
-	assert.match(footer!.render(120)[0], /Codex weekly 88% left/);
+	assert.match(footer!.render(160)[0], /Codex weekly 88% left/);
 	ctx.model.provider = "anthropic";
 	handlers.model_select({}, ctx);
 	handlers.after_provider_response({ headers }, ctx);
-	assert.doesNotMatch(footer!.render(120)[0], /Codex weekly/);
+	assert.doesNotMatch(footer!.render(160)[0], /Codex weekly/);
+	assert.match(footer!.render(160)[0], /Grok Weekly/);
 	ctx.model.provider = "openai-codex";
-	assert.match(footer!.render(120)[0], /Codex weekly \? left/);
+	assert.match(footer!.render(160)[0], /Codex weekly \? left/);
 });
 
 const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.signature`;
@@ -116,10 +121,10 @@ test("footer fetches weekly usage without response headers and stops on model sw
 	handlers.session_start({}, ctx);
 	await flush();
 	assert.equal(calls, 1);
-	assert.match(footer!.render(120)[0], /Codex weekly 46% left/);
+	assert.match(footer!.render(160)[0], /Codex weekly 46% left/);
 	ctx.model.provider = "anthropic";
 	handlers.model_select({}, ctx);
 	await flush();
 	assert.equal(calls, 1);
-	assert.doesNotMatch(footer!.render(120)[0], /Codex weekly/);
+	assert.doesNotMatch(footer!.render(160)[0], /Codex weekly/);
 });

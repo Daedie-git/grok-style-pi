@@ -16,6 +16,7 @@ import {
 } from "./diamond.ts";
 import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { openInCursor, type OpenTarget } from "./open-in-cursor.ts";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
@@ -77,6 +78,10 @@ export type DiamondTool = OriginalTool & {
 	) => ReturnType<typeof textComponent>;
 };
 
+export type DiamondHooks = {
+	onModifierOpen?: (target: OpenTarget) => void;
+};
+
 export type ToolFactory<N extends BuiltinToolName = BuiltinToolName> = (cwd: string, options?: ToolsOptions[N]) => OriginalTool;
 
 export type ToolFactoryMap = { [N in BuiltinToolName]: ToolFactory<N> };
@@ -99,11 +104,36 @@ function callComponent(
 	};
 }
 
-export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
+function defaultModifierOpen(target: OpenTarget): void {
+	// Standalone renderers have no notification UI. Never leak a launcher rejection.
+	void openInCursor(target).catch(() => {});
+}
+
+function ctrlOpen(
+	event: TuiMouseEvent,
+	args: ToolArgs,
+	line: number,
+	cwd: string | undefined,
+	onModifierOpen: (target: OpenTarget) => void,
+): { handled: true } | undefined {
+	if (event.type !== "click" || event.button !== "left" || !event.ctrl) return undefined;
+	const path = typeof args?.path === "string" ? args.path : undefined;
+	if (path) onModifierOpen({ path, line: Math.max(1, line), cwd: cwd ?? process.cwd() });
+	return { handled: true };
+}
+
+function changedLine(details: unknown): number {
+	const line = (details as { firstChangedLine?: unknown } | undefined)?.firstChangedLine;
+	return typeof line === "number" && line > 0 ? line : 1;
+}
+
+export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondHooks): DiamondTool {
+	const onModifierOpen = hooks?.onModifierOpen ?? defaultModifierOpen;
 	const execute = original.execute.bind(original);
 	const shell = ["bash", "powershell"].includes(original.name);
 	const edit = original.name === "edit";
 	const write = original.name === "write";
+	const fileRow = original.name === "read" || edit || write;
 	const schema = original.parameters as Record<string, any>;
 	const parameters = (shell || write) && schema?.type === "object" ? {
 		...original.parameters, properties: { ...schema.properties, description: {
@@ -135,6 +165,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) +
 						paint(theme, "muted", `${count === undefined ? "" : ` · ${count} ${count === 1 ? "line" : "lines"}`}${purpose ? ` · ${purpose}` : ""}`);
 				}, (event) => {
+					const opened = ctrlOpen(event, args, 1, context?.cwd, onModifierOpen);
+					if (opened) return opened;
 					if (context?.state?.grokWrite?.kind !== "created" || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
 					const display = editDisplay(context, context.expanded ?? false);
 					display.open = !display.open;
@@ -147,12 +179,18 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 			const label = paint(theme, failed ? "error" : "toolTitle", title) +
 				(target ? " " + paint(theme, failed ? "error" : "text", target) : "");
 			const display = edit && context?.state && context.invalidate ? editDisplay(context, context.expanded ?? false) : undefined;
-			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), display ? (event) => {
-				if (event.type !== "click" || event.button !== "left") return undefined;
+			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), (event) => {
+				if (fileRow) {
+					// Pi calls renderCall before renderResult populates the shared change line.
+					const line = original.name === "read" && typeof args?.offset === "number" ? args.offset : context?.state?.grokEdit?.line ?? 1;
+					const opened = ctrlOpen(event, args, line, context?.cwd, onModifierOpen);
+					if (opened) return opened;
+				}
+				if (!display || event.type !== "click" || event.button !== "left") return undefined;
 				display.open = !display.open;
 				context?.invalidate?.();
 				return { handled: true };
-			} : undefined);
+			});
 		},
 		renderResult(result, options, theme, context) {
 			if (shell && context?.state) {
@@ -167,6 +205,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 					note: "Previous contents were not recorded; showing written contents" + (content.length > 16_000 ? " (truncated)." : ".") };
 			}
 			if (summary && context?.state) context.state.grokWrite = summary;
+			const line = edit ? changedLine(result.details) : original.name === "read" && typeof context?.args?.offset === "number" ? context.args.offset : 1;
+			if (edit && context?.state) editDisplay(context, options.expanded).line = line;
 			const defaultOpen = edit || summary?.kind === "created";
 			const open = defaultOpen ? editDisplay(context, options.expanded).open : options.expanded;
 			if (options.isPartial || !open) return emptyComponent();
@@ -202,6 +242,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 			return {
 				invalidate() { body.invalidate(); },
 				handleMouse(event: TuiMouseEvent) {
+					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
+					if (opened) return opened;
 					if (!defaultOpen || !context?.state || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
 					const display = editDisplay(context, options.expanded);
 					display.open = !display.open;
@@ -217,8 +259,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool): DiamondTool {
 	};
 }
 
-export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}): DiamondTool[] {
+export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}, hooks?: DiamondHooks): DiamondTool[] {
 	return BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => wrapWithDiamondRenderer(
-		name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name]),
+		name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name]), hooks,
 	));
 }

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const featureLabels = {
-	footer: "Footer (model, context and Codex usage)",
+	footer: "Footer (model, Codex context, and Grok context and weekly usage)",
 	composer: "Composer frame",
 	toolStyling: "Tool summaries and diamond styling",
 	activity: "Active subagents and tasks panel",

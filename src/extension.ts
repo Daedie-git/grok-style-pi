@@ -3,6 +3,7 @@ import type { ToolsOptions, ModelRegistry, ExtensionAPI, CustomEditor, ThemeColo
 import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { applyComposerBorderColor, frameEditorLines } from "./composer.ts";
 import { footerLinesFromContext, type FooterContext } from "./footer.ts";
+import { startGrokFooterPolling } from "./grok-usage.ts";
 import { formatCodexQuota, parseCodexQuota, startCodexUsagePolling, type QuotaWindow } from "./subscription.ts";
 import {
 	applyGrokTerminalChrome,
@@ -11,6 +12,8 @@ import {
 	suspendTerminalChrome,
 } from "./terminal-chrome.ts";
 import { defaultFeatures, type Features } from "./features.ts";
+import { createOpenHistory, absPath, type OpenTarget } from "./open-in-cursor.ts";
+import { createCursorWorkspaceOpener, type CursorOpenContext, type CursorWorkspaceDeps } from "./cursor-workspace.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName } from "./tools.ts";
 
 export type SessionUi = {
@@ -34,6 +37,8 @@ export type SessionContext = FooterContext & {
 export type ExtensionApiLike = {
 	on: ExtensionAPI["on"];
 	registerTool: ExtensionAPI["registerTool"];
+	registerCommand?: ExtensionAPI["registerCommand"];
+	registerShortcut?: ExtensionAPI["registerShortcut"];
 	getThinkingLevel?: () => string;
 };
 
@@ -45,12 +50,30 @@ export type GrokStyleDeps = {
 	getToolOptions?: (ctx: SessionContext) => ToolsOptions;
 	wrapTool?: (tool: OriginalTool) => OriginalTool;
 	features?: Partial<Features>;
+	openCursor?: (target: OpenTarget) => Promise<void>;
+	refreshCompileCommands?: CursorWorkspaceDeps["refresh"];
 };
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
 	const features = { ...defaultFeatures, ...deps.features };
+	const { rememberOpen, lastOpen, recentOpens, clear } = createOpenHistory();
+	const cursor = createCursorWorkspaceOpener({ open: deps.openCursor, refresh: deps.refreshCompileCommands });
+	let openContext: CursorOpenContext | undefined;
+	let notifyOpenError: ((message: string, kind: "error") => void) | undefined;
+	let sessionGeneration = 0;
 	function registerTools(cwd: string, options?: ToolsOptions) {
-		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options) :
+		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, {
+			onModifierOpen(target) {
+				const notify = notifyOpenError;
+				const generation = sessionGeneration;
+				void (async () => {
+					try { await cursor.open(target, openContext); }
+					catch (error) {
+						if (generation === sessionGeneration) notify?.(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				})();
+			},
+		}) :
 			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](cwd, options?.[name]));
 		for (const tool of tools) {
 			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
@@ -60,11 +83,77 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	// Pi rebuilds transcript rows before session_start on reload. Register the
 	// renderers during extension load, then refresh execution options at startup.
 	registerTools(process.cwd());
+	pi.on("tool_result", (event, ctx) => {
+		if (event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return;
+		const path = typeof event.input.path === "string" ? event.input.path : undefined;
+		if (!path) return;
+		const details = event.details as { firstChangedLine?: unknown } | undefined;
+		const line = event.toolName === "edit" && typeof details?.firstChangedLine === "number" ? details.firstChangedLine : 1;
+		rememberOpen({ path: absPath(path, ctx.cwd), line, cwd: ctx.cwd });
+	});
+	async function openLast(ctx: CursorOpenContext) {
+		const target = lastOpen();
+		if (!target) {
+			ctx.ui.notify?.("No edited files in this session yet", "warning");
+			return;
+		}
+		try {
+			if (!await cursor.open(target, ctx)) return;
+			ctx.ui.notify?.(`Cursor ${target.path}:${target.line}`, "info");
+		} catch (error) {
+			ctx.ui.notify?.(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	}
+	pi.registerShortcut?.("ctrl+alt+o", {
+		description: "Open last edited file in Cursor at the change line",
+		handler: async (ctx) => { await openLast(ctx); },
+	});
+	pi.registerCommand?.("open", {
+		description: "Open last edited file in Cursor (usage: /open [pick])",
+		handler: async (args, ctx) => {
+			if (args.trim() === "pick") {
+				const generation = sessionGeneration;
+				const recents = recentOpens();
+				if (recents.length === 0) {
+					ctx.ui.notify("No edited files in this session yet", "warning");
+					return;
+				}
+				const labels = recents.map((target) => `${target.path}:${target.line}`);
+				const selected = await ctx.ui.select("Open in Cursor", labels);
+				if (!selected || generation !== sessionGeneration) return;
+				const target = recents[labels.indexOf(selected)];
+				if (target) {
+					try {
+						if (!await cursor.open(target, ctx)) return;
+						ctx.ui.notify(`Cursor ${target.path}:${target.line}`, "info");
+					} catch (error) {
+						ctx.ui.notify(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				}
+				return;
+			}
+			await openLast(ctx);
+		},
+	});
 	let suspendChrome: ReturnType<typeof suspendTerminalChrome> | undefined;
 	let restoreTerminal: (() => void) | undefined;
 	let quota: QuotaWindow[] = [];
 	let quotaError: string | undefined;
 	let quotaPolling: ReturnType<typeof startCodexUsagePolling> | undefined;
+	let grokContext: number | null = null;
+	let grokWeekly = "Grok Weekly ?% left";
+	let grokPolling: ReturnType<typeof startGrokFooterPolling> | undefined;
+	function refreshGrokSource(ctx: SessionContext) {
+		grokPolling?.dispose(); grokPolling = undefined;
+		grokContext = null;
+		grokWeekly = "Grok Weekly ?% left";
+		if (!features.footer || (ctx.mode && ctx.mode !== "tui")) return;
+		grokPolling = startGrokFooterPolling(
+			() => ctx.cwd,
+			() => ctx.modelRegistry ? ctx.modelRegistry.getApiKeyForProvider("xai") : Promise.resolve(undefined),
+			(stats) => { grokContext = stats.contextPercent; grokWeekly = stats.weekly; requestRender?.(); },
+		);
+	}
 	function refreshQuotaSource(ctx: SessionContext) {
 		quotaPolling?.dispose(); quotaPolling = undefined;
 		quotaError = undefined;
@@ -95,6 +184,11 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		cursor.reset();
+		openContext = ctx;
+		clear();
+		sessionGeneration++;
+		notifyOpenError = (message, kind) => ctx.ui.notify(message, kind);
 		quota = [];
 		registerTools(ctx.cwd, deps.getToolOptions?.(ctx));
 
@@ -120,7 +214,10 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 						const subscription = ctx.model?.provider === "openai-codex"
 							? quotaError && formattedQuota === "Codex weekly ? left" ? `Codex weekly ${quotaError}` : formattedQuota
 							: undefined;
-						return footerLinesFromContext(ctx, width, pi.getThinkingLevel?.(), subscription, footerData?.getGitBranch?.()).map((line) =>
+						return footerLinesFromContext(ctx, width, pi.getThinkingLevel?.(), subscription, footerData?.getGitBranch?.(), {
+							contextPercent: grokContext,
+							weekly: grokWeekly,
+						}).map((line) =>
 							truncateToWidth(theme?.fg ? theme.fg("muted", line) : line, Math.max(0, width)),
 						);
 					},
@@ -185,12 +282,21 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 			});
 		}
 		refreshQuotaSource(ctx);
+		refreshGrokSource(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
+		cursor.reset();
+		openContext = undefined;
+		clear();
+		sessionGeneration++;
+		notifyOpenError = undefined;
 		quotaPolling?.dispose(); quotaPolling = undefined;
 		quotaError = undefined;
 		quota = [];
+		grokPolling?.dispose(); grokPolling = undefined;
+		grokContext = null;
+		grokWeekly = "Grok Weekly ?% left";
 		requestRender = undefined;
 		suspendChrome?.dispose(); suspendChrome = undefined;
 		restoreTerminal?.();

@@ -8,7 +8,12 @@ export type FooterInput = {
 	percent: number | null | undefined;
 	thinkingLevel?: string;
 	branch?: string | null;
+	subscription?: string;
+	grokPercent?: number | null;
+	grokWeekly?: string;
 };
+
+export type GrokFooterInput = { contextPercent?: number | null; weekly?: string };
 
 export type FooterContext = {
 	cwd: string;
@@ -35,10 +40,19 @@ export function formatPercent(percent: number | null | undefined): string {
 	return String(Math.round(Number(percent)));
 }
 
+export function footerStats(input: { percent?: number | null; subscription?: string; grokPercent?: number | null; grokWeekly?: string }): string {
+	return [
+		`Codex Context ${formatPercent(input.percent)}% used`,
+		...(input.subscription ? [input.subscription] : []),
+		`Grok Context ${formatPercent(input.grokPercent)}% used`,
+		input.grokWeekly ?? "Grok Weekly ?% left",
+	].join(" │ ");
+}
+
 export function formatFooterLine(input: FooterInput): string {
 	const dir = `${cwdDisplayPath(input.cwd)}${input.branch ? ` (${input.branch})` : ""}`;
 	const model = (input.model ?? "").trim() || "unknown";
-	return [dir, [model, input.thinkingLevel].filter(Boolean).join(" "), `Context ${formatPercent(input.percent)}% used`].join(" │ ");
+	return [dir, [model, input.thinkingLevel].filter(Boolean).join(" "), footerStats(input)].join(" │ ");
 }
 
 export function modelDisplayName(model: FooterContext["model"]): string {
@@ -46,23 +60,27 @@ export function modelDisplayName(model: FooterContext["model"]): string {
 	return (model.name || model.id || "unknown").trim() || "unknown";
 }
 
-export function footerFromContext(ctx: FooterContext): string {
+export function footerFromContext(ctx: FooterContext, grok?: GrokFooterInput): string {
 	return formatFooterLine({
 		cwd: ctx.cwd,
 		model: modelDisplayName(ctx.model),
 		percent: ctx.getContextUsage?.()?.percent ?? null,
 		thinkingLevel: ctx.thinkingLevel,
 		branch: ctx.branch,
+		grokPercent: grok?.contextPercent,
+		grokWeekly: grok?.weekly,
 	});
 }
 
-export function footerLinesFromContext(ctx: FooterContext, width: number, thinkingLevel = ctx.thinkingLevel, subscription?: string, branch = ctx.branch): string[] {
+export function footerLinesFromContext(ctx: FooterContext, width: number, thinkingLevel = ctx.thinkingLevel, subscription?: string, branch = ctx.branch, grok?: GrokFooterInput): string[] {
 	if (width <= 0) return [""];
 	const identity = `${cwdDisplayPath(ctx.cwd)}${branch ? ` (${branch})` : ""} │ ${modelDisplayName(ctx.model)} ${thinkingLevel ?? "?"}`;
-	const stats = [
-		`Context ${formatPercent(ctx.getContextUsage?.()?.percent)}% used`,
-		...(subscription ? [subscription] : []),
-	].join(" │ ");
+	const stats = footerStats({
+		percent: ctx.getContextUsage?.()?.percent,
+		subscription,
+		grokPercent: grok?.contextPercent,
+		grokWeekly: grok?.weekly,
+	});
 	const available = width - visibleWidth(stats) - 3;
 	return [available > 0
 		? `${truncateToWidth(identity, available)} │ ${stats}`

@@ -28,13 +28,24 @@ export const renderJevMessage: MessageRenderer = (message, options, theme) => {
 			return [...header.render(width), ...(display.open ? contents.render(Math.max(0, width - 2)).map(line => `  ${line}`) : [])];
 		},
 		handleMouse(event) {
-			if (event.type !== "click" || event.button !== "left" || event.y !== 0) return undefined;
+			if (event.type !== "click" || event.button !== "left") return undefined;
 			display.open = !display.open;
 			return { handled: true };
 		},
 		invalidate() {},
 	};
 };
+
+/** Decode only the display copy; tool evidence delivered to the model is unchanged. */
+function discoveryDisplayText(text: string): string {
+	try {
+		const packet = JSON.parse(text);
+		if (!packet || typeof packet !== "object" || typeof packet.status !== "string" || typeof packet.evidence !== "string") return text;
+		const status: Record<string, string> = { evidence_found: "Source evidence found", no_evidence: "No source evidence found", unavailable: "Discovery unavailable" };
+		const limitations = Array.isArray(packet.limitations) ? packet.limitations.filter((value: unknown): value is string => typeof value === "string") : [];
+		return [status[packet.status] ?? packet.status, ...limitations.map((value: string) => `Note: ${value}`), packet.evidence ? "\n" + packet.evidence : ""].filter(Boolean).join("\n");
+	} catch { return text; }
+}
 
 /** Load the owner once, decorating its public API instead of patching installed files. */
 export async function registerStyledJev(pi: ExtensionAPI, factory: ExtensionFactory, enabled: boolean) {
@@ -43,9 +54,14 @@ export async function registerStyledJev(pi: ExtensionAPI, factory: ExtensionFact
 	const sendMessage: ExtensionAPI["sendMessage"] = (message, options) =>
 		pi.sendMessage(known(message.customType) ? { ...message, display: true } : message, options);
 	const registerTool: ExtensionAPI["registerTool"] = (tool) => {
-		if (tool.name !== "jev_advisory_assess") return pi.registerTool(tool);
+		if (tool.name !== "jev_advisory_assess" && tool.name !== "jev_discover") return pi.registerTool(tool);
 		const { renderCall, renderResult, renderShell } = wrapWithDiamondRenderer(tool);
-		pi.registerTool({ ...tool, renderCall, renderResult, renderShell });
+		pi.registerTool({ ...tool, renderCall, renderShell,
+			renderResult: tool.name === "jev_discover" ? (result, options, theme, context) => renderResult({
+				...result,
+				content: result.content.map(part => part.type === "text" ? { ...part, text: discoveryDisplayText(part.text) } : part),
+			}, options, theme, context) : renderResult,
+		});
 	};
 	await factory(new Proxy(pi, {
 		get(target, key, receiver) {

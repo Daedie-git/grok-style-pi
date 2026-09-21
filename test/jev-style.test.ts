@@ -63,3 +63,24 @@ test("discovery source evidence expands completely without changing its payload"
 	const lines = renderJevMessage(message, { expanded: true, outputPad: 1 }, theme)!.render(100);
 	assert.equal(lines.filter(line => line.includes("Source excerpt")).length, 5000);
 });
+
+test("delegated discovery uses a collapsed diamond without changing execution or evidence", async () => {
+	let styled: any;
+	const pi = { registerMessageRenderer() {}, registerTool(tool: any) { styled = tool; } } as any;
+	const result = { content: [{ type: "text", text: JSON.stringify({ status: "evidence_found", limitations: ["Selection may be incomplete."], evidence: "src/example.ts:1-2\n1: source" }) }] };
+	const execute = async () => result;
+	const parameters = { type: "object" };
+	await registerStyledJev(pi, api => api.registerTool({ name: "jev_discover", parameters, execute } as any), true);
+	assert.equal(styled.execute, execute);
+	assert.equal(styled.parameters, parameters);
+	assert.equal(await styled.execute(), result);
+	assert.equal(styled.renderShell, "self");
+	assert.deepEqual(styled.renderCall({}, theme, {}).render(100), ["◆ Jev discovery"]);
+	assert.deepEqual(styled.renderResult(result, { expanded: false, isPartial: false }, theme, {}).render(100), []);
+	const expanded = styled.renderResult(result, { expanded: true, isPartial: false }, theme, {}).render(100).join("\n");
+	assert.match(expanded, /Source evidence found/);
+	assert.match(expanded, /Note: Selection may be incomplete/);
+	assert.match(expanded, /src\/example.ts:1-2\n\s*1: source/);
+	assert.doesNotMatch(expanded, /"status"|\\n/);
+	assert.equal(JSON.parse(result.content[0].text).status, "evidence_found", "rendering preserves the model payload");
+});

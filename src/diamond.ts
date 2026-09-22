@@ -13,8 +13,6 @@ export const TOOL_SUMMARY_VERBS: Record<string, string> = {
 	find: "Found",
 	ls: "Listed",
 	get_subagent_result: "Read agent result",
-	jev_advisory_assess: "Jev advisory assessment",
-	jev_discover: "Jev discovery",
 };
 
 export type ToolArgs = Record<string, unknown> | undefined | null;

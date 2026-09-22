@@ -3,6 +3,8 @@
   "include": [
     "src/subagent-adapter.ts",
     "src/activity.ts",
-    "test/subagent-contract.test.ts"
+    "test/subagent-contract.test.ts",
+    "test/herdr-subagents.test.ts",
+    "test/fixtures/herdr-process.ts"
   ]
 }

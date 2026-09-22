@@ -45,7 +45,13 @@ test("agent launches collapse to a sanitized purpose summary without changing ex
 	for (const enabled of [true, false]) {
 		await registerStyledSubagents(pi, (api) => { api.registerTool(original); }, enabled);
 		assert.equal(registered!.execute, original.execute);
-		if (!enabled) { assert.equal(registered!, original); continue; }
+		assert.equal(registered!.promptSnippet, undefined);
+		assert.equal(registered!.promptGuidelines, undefined);
+		assert.match(registered!.description, /explicitly asked/);
+		if (!enabled) {
+			assert.equal(registered!.renderCall, original.renderCall);
+			continue;
+		}
 		const theme = { fg: (_: string, value: string) => value } as any;
 		const args = { subagent_type: "Explore", description: "Inspect semantic\ncontrol loop\x1b]52;c;attack\x07" };
 		assert.deepEqual(registered!.renderCall!(args, theme, {} as any).render(100), ["◆ Explore: Inspect semantic control loop"]);

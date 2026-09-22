@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Grok Build-inspired TUI chrome for Pi: GrokNight theme, cwd │ model │ N% ctx footer, focused composer frame, and diamond tool rows.",
   "type": "module",
+  "engines": {
+    "node": "^22.18.0 || >=24.0.0"
+  },
   "license": "MIT",
   "keywords": [
     "pi-package"
@@ -48,6 +51,7 @@
     "typescript": "5.9.3"
   },
   "dependencies": {
+    "jiti": "^2.7.0",
     "mdast-util-from-markdown": "^2.0.3"
   }
 }

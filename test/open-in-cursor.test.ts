@@ -51,6 +51,24 @@ test("openInCursor launches Cursor with the workspace folder and file:line", asy
 	assert.equal(createOpenHistory().rememberOpen({ path: "other.ts", line: 1, cwd: "/repo" }).path, absPath("other.ts", "/repo"));
 });
 
+test("without a mounted editor, a nested file opens at the workspace root with its line and column", async () => {
+	const root = await mkdtemp(join(tmpdir(), "grok-cursor-root-"));
+	try {
+		await mkdir(join(root, ".git"));
+		const cwd = join(root, "src", "nested");
+		await mkdir(cwd, { recursive: true });
+		const file = join(cwd, "main.ts");
+		const launched: { command: string; args: string[]; cwd?: string }[] = [];
+		await openInCursor({ path: file, line: 42, column: 3, cwd }, (command, args, options) => {
+			launched.push({ command, args, cwd: options.cwd });
+			return { once(event, listener) { if (event === "spawn") listener(); }, unref() {} };
+		}, join(root, "no-mount"));
+		assert.deepEqual(launched, [{
+			command: cursorLauncher(), args: ["--classic", "--goto", `${file}:42:3`, root], cwd: root,
+		}]);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("openInCursor talks to a running Cursor mount instead of remounting the AppImage", { skip: process.platform !== "linux" }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "grok-cursor-mount-"));
 	try {
@@ -87,7 +105,8 @@ test("ctrl+click opens the file without toggling an edit diamond", () => {
 	assert.equal(invalidated, 0);
 	assert.ok(tool.renderResult(result, { expanded: false }, theme, context).render(80).length > 0);
 	assert.deepEqual(opened, [{ path: "file.ts", line: 42, cwd: process.cwd() }]);
-	assert.deepEqual(header.handleMouse?.({ type: "click", button: "left", ctrl: false } as any), { handled: true });
+	assert.equal(header.handleMouse?.({ type: "click", button: "left", ctrl: false } as any), undefined);
+	assert.deepEqual(header.handleMouse?.({ type: "click", button: "left", ctrl: false, alt: true } as any), { handled: true });
 	assert.equal(invalidated, 1);
 	assert.deepEqual(tool.renderResult(result, { expanded: false }, theme, context).render(80), []);
 });

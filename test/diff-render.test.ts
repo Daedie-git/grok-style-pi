@@ -90,6 +90,42 @@ test("character highlights follow mapped lines instead of one shared prefix and 
 	assert.equal(marked(wordPainted[1], INSERT_CHAR_BG), "backgroundColour");
 });
 
+test("long lines, extra insertions, and wrapped padding stay bounded", () => {
+	const oldLine = `${"a".repeat(448)};`;
+	const newLine = `${"a".repeat(448)}.`;
+	const long = paintRows(buildDiffRows(`-1 ${oldLine}\n+1 ${newLine}`, theme, (text) => text.split("\n")), 80);
+	assert.equal(long.map((line) => marked(line, DELETE_CHAR_BG)).join(""), ";");
+	assert.equal(long.map((line) => marked(line, INSERT_CHAR_BG)).join(""), ".");
+
+	const mixed = buildDiffRows("-1 foo();\n+1 bar();\n+2 totally_added();", theme, (text) => text.split("\n"));
+	const mixedPainted = paintRows(mixed, 40);
+	assert.equal(marked(mixedPainted[0], DELETE_CHAR_BG), "foo");
+	assert.equal(marked(mixedPainted[1], INSERT_CHAR_BG), "bar");
+	assert.equal(marked(mixedPainted[2], INSERT_CHAR_BG), "");
+
+	const shifted = paintRows(buildDiffRows("-1 let a = 1;\n-2 let b = 1;\n+1 log();\n+2 let a = 2;\n+3 let b = 2;", theme, (text) => text.split("\n")), 40);
+	assert.equal(shifted.slice(0, 2).map((line) => marked(line, DELETE_CHAR_BG)).join("|"), "1|1");
+	assert.equal(shifted.slice(2).map((line) => marked(line, INSERT_CHAR_BG)).join("|"), "|2|2");
+
+	const brackets = paintRows(buildDiffRows("-1 [first_value]\n-2 [second_value]\n+1 (first_value)\n+2 (second_value)", theme, (text) => text.split("\n")), 40);
+	assert.equal(brackets.slice(0, 2).map((line) => marked(line, DELETE_CHAR_BG)).join("|"), "[]|[]");
+	assert.equal(brackets.slice(2).map((line) => marked(line, INSERT_CHAR_BG)).join("|"), "()|()");
+
+	const blank = paintRows(buildDiffRows(`-1 \n-2 ${"x".repeat(25_000)};\n+1 ${"x".repeat(65_536)}.`, theme, (text) => text.split("\n")), 80);
+	assert.equal(blank.map((line) => marked(line, DELETE_CHAR_BG)).join(""), ";");
+	assert.ok(blank.map((line) => marked(line, INSERT_CHAR_BG)).join("").endsWith("."));
+
+	const hugeOld = `${"a".repeat(1001)};`;
+	const hugeNew = `${"a".repeat(1001)}.`;
+	const huge = paintRows(buildDiffRows(`-1 ${hugeOld}\n+1 ${hugeNew}`, theme, (text) => text.split("\n")), 80);
+	assert.equal(huge.map((line) => marked(line, DELETE_CHAR_BG)).join(""), ";");
+	assert.equal(huge.map((line) => marked(line, INSERT_CHAR_BG)).join(""), ".");
+
+	const wrapped = paintRows(buildDiffRows("-1 old abcdefgh\n+1 new ijklmnop", theme, (text) => text.split("\n")), 12, "  ");
+	assert.ok(wrapped[0].endsWith(`old\x1b[48;2;${DELETE_BG}m    \x1b[0m`));
+	assert.equal(wrapped[0].includes(`\x1b[48;2;${DELETE_CHAR_BG}m `), false);
+});
+
 test("configured diff colors replace the default backgrounds", () => {
 	const palette = { ...defaultDiffPalette, insert: "1;2;3", insertChar: "4;5;6" };
 	const rows = buildDiffRows("-1 old\n+1 new", theme, (text) => text.split("\n"), palette);

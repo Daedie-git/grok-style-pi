@@ -106,6 +106,8 @@ test("created file diamonds start open, toggle locally and follow global expansi
 	assert.equal(stripTerminalSequences(tool.renderCall(context.args, theme, context).render(80)[0]), "◆ Creating new.ts");
 	const header = tool.renderCall(context.args, theme, context) as any;
 	header.handleMouse({ type: "click", button: "left" });
+	assert.ok(render().length);
+	header.handleMouse({ type: "click", button: "left", alt: true });
 	assert.deepEqual(render(), []);
 	assert.equal(stripTerminalSequences(header.render(80)[0]), "◆ Creating new.ts +1/-0");
 	header.handleMouse({ type: "click", button: "left" });

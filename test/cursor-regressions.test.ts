@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as agent from "@earendil-works/pi-coding-agent";
 import { absPath, createOpenHistory, openInCursor } from "../src/open-in-cursor.ts";
 import { BUILTIN_TOOL_NAMES, wrapWithDiamondRenderer } from "../src/tools.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
+import { dispatchFileLink } from "../src/file-link-bridge.ts";
+
+const cleanups: (() => void)[] = [];
+afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
 
 const click = { type: "click", button: "left", ctrl: true, x: 0, y: 0, width: 80, height: 1 } as any;
 const theme = { fg: (_: string, text: string) => text };
@@ -13,20 +17,32 @@ const theme = { fg: (_: string, text: string) => text };
 function harness(launch = async (_target: any) => {}, refreshCompileCommands?: any) {
 	const handlers: Record<string, Function> = {}, tools: Record<string, any> = {}, commands: Record<string, any> = {};
 	const notifications: any[] = [];
-	const ctx = { cwd: "/repo", hasUI: true, ui: { notify: (...args: any[]) => notifications.push(args), select: async (_title: string, labels: string[]) => labels[0] } };
+	let transform: ((markdown: string, context: any) => string) | undefined;
+	const ctx = { cwd: "/repo", hasUI: true, mode: "tui", ui: { notify: (...args: any[]) => notifications.push(args), select: async (_title: string, labels: string[]) => labels[0] } };
 	createGrokStyleExtension({
 		on: ((name: string, fn: Function) => { handlers[name] = fn; }) as any,
 		registerTool(tool) { tools[tool.name] = tool; },
 		registerCommand(name, command) { commands[name] = command; },
+		registerMarkdownTransformer(handler) { transform = handler; },
 	}, {
 		CustomEditor: class {} as any,
 		features: { footer: false, composer: false, terminalColors: false },
 		tools: Object.fromEntries(BUILTIN_TOOL_NAMES.map((name) => [name, () => ({ name, description: name, parameters: {}, execute: async () => ({ content: [] }) })])) as any,
 		openCursor: launch,
+		hyperlinks: () => true,
 		refreshCompileCommands,
 	});
 	const edit = (path: string, line = 1, isError = false, toolName = "edit") => handlers.tool_result({ toolName, input: { path }, details: { firstChangedLine: line }, isError }, ctx);
-	return { handlers, tools, commands, ctx, notifications, edit };
+	const markdown = (text: string) => transform?.(text, { messageType: "assistant", isStreaming: false, availableWidth: 80 });
+	const urlFor = (reference: string) => {
+		const text = markdown(`\`${reference}\``);
+		const url = /\(<([^>]+)>\)/.exec(text ?? "")?.[1];
+		assert.ok(url, text);
+		assert.match(url, /^grok-pi-file:/);
+		return url;
+	};
+	cleanups.push(() => handlers.session_shutdown({}, ctx));
+	return { handlers, tools, commands, ctx, notifications, edit, markdown, urlFor, openLink: dispatchFileLink };
 }
 
 test("Cursor targets normalize built-in @ and home forms", () => {
@@ -138,7 +154,7 @@ test("session switch cancels an outstanding picker and modifier failures notify"
 	assert.deepEqual(h.notifications.at(-1), ["Failed to open Cursor: missing Cursor", "error"]);
 });
 
-test("registered Ctrl-click and /open share one refresh per session workspace", async () => {
+test("registered file links, Ctrl-click and /open share one refresh per session workspace", async () => {
 	const order: string[] = [];
 	let opened!: () => void;
 	const firstOpen = new Promise<void>(resolve => { opened = resolve; });
@@ -152,12 +168,58 @@ test("registered Ctrl-click and /open share one refresh per session workspace", 
 	h.tools.read.renderCall({ path: "main.cpp" }, theme, { cwd: "/repo" }).handleMouse(click);
 	await firstOpen;
 	assert.deepEqual(order, ["refresh", "open"]);
+	const markdown = h.markdown("See `src/main.cpp:42:3`.");
+	const url = /\(<([^>]+)>\)/.exec(markdown ?? "")?.[1];
+	assert.ok(url, markdown);
+	await h.openLink(url);
+	assert.deepEqual(order, ["refresh", "open", "open"]);
 	h.edit("main.cpp");
 	await h.commands.open.handler("", h.ctx);
-	assert.deepEqual(order, ["refresh", "open", "open"]);
+	assert.deepEqual(order, ["refresh", "open", "open", "open"]);
 	h.handlers.session_shutdown({}, h.ctx);
 	h.handlers.session_start({}, h.ctx);
 	h.edit("main.cpp");
 	await h.commands.open.handler("", h.ctx);
-	assert.deepEqual(order, ["refresh", "open", "open", "refresh", "open"]);
+	assert.deepEqual(order, ["refresh", "open", "open", "open", "refresh", "open"]);
+});
+
+test("file links preserve line and column, leave web links alone and do not replace edited history", async () => {
+	const opened: any[] = [];
+	const h = harness(async target => { opened.push(target); });
+	h.handlers.session_start({}, h.ctx);
+	h.edit("edited.ts", 7);
+	assert.equal(h.markdown("[web](https://example.com)"), "[web](https://example.com)");
+	await h.openLink(h.urlFor("src/my-file.ts:42:3"));
+	assert.deepEqual(opened, [{ path: "/repo/src/my-file.ts", line: 42, column: 3, cwd: "/repo" }]);
+	await h.commands.open.handler("", h.ctx);
+	assert.equal(opened.at(-1).path, "/repo/edited.ts");
+});
+
+test("session replacement cancels a pending file-link open without launching the old target", async () => {
+	const opened: any[] = [];
+	let started!: () => void, release!: () => void;
+	const refreshing = new Promise<void>(resolve => { started = resolve; });
+	const pending = new Promise<void>(resolve => { release = resolve; });
+	const h = harness(async target => { opened.push(target); }, async () => {
+		started();
+		await pending;
+		return { status: "refreshed" };
+	});
+	Object.assign(h.ctx, { isProjectTrusted: () => true });
+	h.handlers.session_start({}, h.ctx);
+	const opening = assert.rejects(h.openLink(h.urlFor("src/a.ts:1:1")), /expired|could not/);
+	await refreshing;
+	h.handlers.session_shutdown({}, h.ctx);
+	h.handlers.session_start({}, h.ctx);
+	release();
+	await opening;
+	assert.deepEqual(opened, []);
+	assert.deepEqual(h.notifications, []);
+});
+
+test("file link launch failures notify and remain handled without a system fallback", async () => {
+	const h = harness(async () => { throw new Error("missing Cursor"); });
+	h.handlers.session_start({}, h.ctx);
+	await assert.rejects(h.openLink(h.urlFor("src/a.ts:1:1")), /could not/);
+	assert.deepEqual(h.notifications.at(-1), ["Failed to open Cursor: missing Cursor", "error"]);
 });

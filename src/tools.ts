@@ -97,6 +97,11 @@ function defaultModifierOpen(target: OpenTarget): void {
 	void openInCursor(target).catch(() => {});
 }
 
+/** An open diff closes only on Alt+click, so a normal click does not dismiss it. */
+function togglesOpen(event: TuiMouseEvent, open: boolean): boolean {
+	return event.type === "click" && event.button === "left" && !event.ctrl && (!open || event.alt);
+}
+
 function ctrlOpen(
 	event: TuiMouseEvent,
 	args: ToolArgs,
@@ -185,7 +190,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				}, (event) => {
 					const opened = ctrlOpen(event, args, 1, context?.cwd, onModifierOpen);
 					if (opened) return opened;
-					if (context?.state?.grokWrite?.kind !== "created" || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
+					if (context?.state?.grokWrite?.kind !== "created" || !context.invalidate || !togglesOpen(event, editDisplay(context, context.expanded ?? false).open)) return undefined;
 					const display = editDisplay(context, context.expanded ?? false);
 					display.open = !display.open;
 					context.invalidate();
@@ -204,7 +209,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 					const opened = ctrlOpen(event, args, line, context?.cwd, onModifierOpen);
 					if (opened) return opened;
 				}
-				if (!display || event.type !== "click" || event.button !== "left") return undefined;
+				if (!display || !togglesOpen(event, display.open)) return undefined;
 				display.open = !display.open;
 				context?.invalidate?.();
 				return { handled: true };
@@ -275,7 +280,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				handleMouse(event: TuiMouseEvent) {
 					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
 					if (opened) return opened;
-					if (!defaultOpen || !context?.state || !context.invalidate || event.type !== "click" || event.button !== "left") return undefined;
+					if (!defaultOpen || !context?.state || !context.invalidate || !togglesOpen(event, editDisplay(context, options.expanded).open)) return undefined;
 					const display = editDisplay(context, options.expanded);
 					display.open = !display.open;
 					context.invalidate();

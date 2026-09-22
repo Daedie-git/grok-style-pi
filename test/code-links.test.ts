@@ -8,6 +8,16 @@ test("cursor file URLs keep the line and column for the URL handler", () => {
 	assert.equal(cursorFileUrl("/repo/my file.ts", 1, 1), "cursor://file/repo/my%20file.ts:1:1");
 });
 
+test("file references use the supplied transport without changing web links", () => {
+	const targets: unknown[] = [];
+	const linked = linkifyCodeReferences("See `my file #1?.ts:42:3` and [web](https://example.com).", "/repo", () => true, reference => {
+		targets.push(reference);
+		return "grok-pi-file://open/session/target";
+	});
+	assert.deepEqual(targets, [{ path: "/repo/my file #1?.ts", line: 42, column: 3 }]);
+	assert.equal(linked, "See [`my file #1?.ts:42:3`](<grok-pi-file://open/session/target>) and [web](https://example.com).");
+});
+
 test("existing links and reference links preserve their entire formatted labels", () => {
 	const markdown = [
 		"[**`src/app.ts`**](https://example.com)",

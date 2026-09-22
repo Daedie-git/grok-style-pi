@@ -14,6 +14,8 @@ import {
 import { defaultFeatures, type Features } from "./features.ts";
 import { COMMUNICATION, installCommunication } from "./communication.ts";
 import { linkifyCodeReferences } from "./code-links.ts";
+import { createFileLinkBridge } from "./file-link-bridge.ts";
+import { installFileLinkHandler } from "./file-link-handler.ts";
 import { createOpenHistory, absPath, type OpenTarget } from "./open-in-cursor.ts";
 import { createCursorWorkspaceOpener, type CursorOpenContext, type CursorWorkspaceDeps } from "./cursor-workspace.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, type OriginalTool, type ToolFactoryMap, type BuiltinToolName } from "./tools.ts";
@@ -63,16 +65,27 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	const { rememberOpen, lastOpen, recentOpens, clear } = createOpenHistory();
 	const cursor = createCursorWorkspaceOpener({ open: deps.openCursor, refresh: deps.refreshCompileCommands });
 	let openContext: CursorOpenContext | undefined;
-	let notifyOpenError: ((message: string, kind: "error") => void) | undefined;
 	let sessionGeneration = 0;
 	let linkCwd = process.cwd();
+	const fileLinks = createFileLinkBridge(target => openTarget(target));
 	const linksEnabled = deps.hyperlinks ?? (() => {
 		try { return getCapabilities().hyperlinks; } catch { return false; }
 	});
 	pi.registerMarkdownTransformer?.((markdown, context) => {
 		if (!features.communication || context.messageType === "assistant-thinking" || !linksEnabled()) return markdown;
-		return linkifyCodeReferences(markdown, linkCwd);
+		return linkifyCodeReferences(markdown, linkCwd, undefined, process.platform === "linux"
+			? reference => fileLinks.urlFor({ ...reference, cwd: linkCwd })
+			: undefined);
 	});
+	async function openTarget(target: OpenTarget, ctx = openContext): Promise<boolean> {
+		const generation = sessionGeneration;
+		const notify = ctx?.ui.notify?.bind(ctx.ui);
+		try { return await cursor.open(target, ctx); }
+		catch (error) {
+			if (generation === sessionGeneration) notify?.(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return false;
+		}
+	}
 	pi.on("before_agent_start", (event) => {
 		if (!features.communication) return;
 		const options = event.systemPromptOptions as { sections?: Record<string, string> };
@@ -86,16 +99,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 	function registerTools(cwd: string, options?: ToolsOptions) {
 		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, {
-			onModifierOpen(target) {
-				const notify = notifyOpenError;
-				const generation = sessionGeneration;
-				void (async () => {
-					try { await cursor.open(target, openContext); }
-					catch (error) {
-						if (generation === sessionGeneration) notify?.(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
-					}
-				})();
-			},
+			onModifierOpen(target) { void openTarget(target); },
 		}) :
 			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](cwd, options?.[name]));
 		for (const tool of tools) {
@@ -120,12 +124,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 			ctx.ui.notify?.("No edited files in this session yet", "warning");
 			return;
 		}
-		try {
-			if (!await cursor.open(target, ctx)) return;
-			ctx.ui.notify?.(`Cursor ${target.path}:${target.line}`, "info");
-		} catch (error) {
-			ctx.ui.notify?.(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
-		}
+		if (await openTarget(target, ctx)) ctx.ui.notify?.(`Cursor ${target.path}:${target.line}`, "info");
 	}
 	pi.registerShortcut?.("ctrl+alt+o", {
 		description: "Open last edited file in Cursor at the change line",
@@ -145,14 +144,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 				const selected = await ctx.ui.select("Open in Cursor", labels);
 				if (!selected || generation !== sessionGeneration) return;
 				const target = recents[labels.indexOf(selected)];
-				if (target) {
-					try {
-						if (!await cursor.open(target, ctx)) return;
-						ctx.ui.notify(`Cursor ${target.path}:${target.line}`, "info");
-					} catch (error) {
-						ctx.ui.notify(`Failed to open Cursor: ${error instanceof Error ? error.message : String(error)}`, "error");
-					}
-				}
+				if (target && await openTarget(target, ctx)) ctx.ui.notify(`Cursor ${target.path}:${target.line}`, "info");
 				return;
 			}
 			await openLast(ctx);
@@ -213,7 +205,17 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 		openContext = ctx;
 		clear();
 		sessionGeneration++;
-		notifyOpenError = (message, kind) => ctx.ui.notify(message, kind);
+		if (process.platform === "linux" && ctx.mode === "tui" && features.communication && linksEnabled()) {
+			const generation = sessionGeneration;
+			const notify = ctx.ui.notify?.bind(ctx.ui);
+			const onError = (error: Error) => {
+				if (generation === sessionGeneration) notify?.(`Could not start file links: ${error.message}`, "error");
+			};
+			try {
+				installFileLinkHandler();
+				fileLinks.start(onError);
+			} catch (error) { onError(error instanceof Error ? error : new Error(String(error))); }
+		}
 		quota = [];
 		registerTools(ctx.cwd, deps.getToolOptions?.(ctx));
 
@@ -311,11 +313,11 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 
 	pi.on("session_shutdown", () => {
+		fileLinks.stop();
 		cursor.reset();
 		openContext = undefined;
 		clear();
 		sessionGeneration++;
-		notifyOpenError = undefined;
 		quotaPolling?.dispose(); quotaPolling = undefined;
 		quotaError = undefined;
 		quota = [];

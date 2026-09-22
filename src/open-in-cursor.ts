@@ -3,7 +3,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-export type OpenTarget = { path: string; line: number; cwd: string };
+export type OpenTarget = { path: string; line: number; column?: number; cwd: string };
 
 export type SpawnLike = (
 	command: string,
@@ -59,8 +59,9 @@ export function cursorLauncher(home = homedir(), exists = existsSync): string {
 	return exists(shim) ? shim : "cursor";
 }
 
-export function cursorArgs(file: string, line: number, workspace: string): string[] {
-	return ["--classic", "--goto", `${file}:${Math.max(1, line)}`, workspace];
+export function cursorArgs(file: string, line: number, workspace: string, column?: number): string[] {
+	const position = `${file}:${Math.max(1, line)}${column === undefined ? "" : `:${Math.max(1, column)}`}`;
+	return ["--classic", "--goto", position, workspace];
 }
 
 /** /tmp is shared: never execute a different user's lookalike or a writable/symlinked mount. */
@@ -133,7 +134,7 @@ export function resolveCursorInvocation(args: string[], tmpDir = "/tmp"): { comm
 export async function openInCursor(target: OpenTarget, spawnImpl: SpawnLike = spawn, tmpDir = "/tmp"): Promise<void> {
 	const remembered = { ...target, path: absPath(target.path, target.cwd) };
 	const workspace = workspaceFor(remembered.path, remembered.cwd);
-	const args = cursorArgs(remembered.path, remembered.line, workspace);
+	const args = cursorArgs(remembered.path, remembered.line, workspace, remembered.column);
 	const invocation = resolveCursorInvocation(args, tmpDir);
 	const launch = (invocation: ReturnType<typeof resolveCursorInvocation>) => new Promise<void>((resolveOpen, reject) => {
 		const child = spawnImpl(invocation.command, invocation.args, {

@@ -7,7 +7,7 @@ export type FileReference = { path: string; line: number; column: number };
 
 const LINE_SUFFIX = /(?::(\d+)(?::(\d+))?|#L(\d+)(?:C(\d+))?)$/;
 
-/** Cursor URL-handler target. Pi opens this with the system handler; do not spawn the Cursor CLI. */
+/** Fallback target for consumers without an extension-owned link transport. */
 export function cursorFileUrl(absolutePath: string, line = 1, column = 1): string {
 	const slash = absolutePath.replaceAll("\\", "/");
 	const rooted = slash.startsWith("/") ? slash : `/${slash}`;
@@ -68,16 +68,17 @@ function inlineCodeSpans(markdown: string): Span[] {
 	return spans;
 }
 
-/** Turn standalone inline-code file references into cursor:// links. Code blocks stay plain. */
+/** Turn standalone inline-code file references into links. Code blocks stay plain. */
 export function linkifyCodeReferences(
 	markdown: string,
 	cwd: string,
 	exists: (path: string) => boolean = existsSync,
+	urlFor: (reference: FileReference) => string = reference => cursorFileUrl(reference.path, reference.line, reference.column),
 ): string {
 	const replacements = inlineCodeSpans(markdown).flatMap((span) => {
 		const reference = parseFileReference(span.text);
 		const absolute = reference && resolveReference(reference, cwd, exists);
-		return absolute ? [{ ...span, replacement: markdownLink(markdown.slice(span.start, span.end), cursorFileUrl(absolute, reference.line, reference.column)) }] : [];
+		return absolute ? [{ ...span, replacement: markdownLink(markdown.slice(span.start, span.end), urlFor({ ...reference, path: absolute })) }] : [];
 	});
 	let result = markdown;
 	for (const span of replacements.sort((left, right) => right.start - left.start)) {

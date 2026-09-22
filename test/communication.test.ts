@@ -33,6 +33,6 @@ test("the extension installs the communication section and clickable file refere
 	handlers.get("before_agent_start")!({ systemPromptOptions: { sections } }, {});
 	assert.match(sections.communication, /Do not invent metaphors/);
 	const linked = transformer!("See `src/app.ts:9`.", { messageType: "assistant", isStreaming: false, availableWidth: 80 });
-	assert.match(linked, /cursor:\/\/file\//);
+	assert.match(linked, process.platform === "linux" ? /grok-pi-file:\/\/open\// : /cursor:\/\/file\//);
 	assert.equal(transformer!("`src/app.ts:9`", { messageType: "assistant-thinking", isStreaming: false, availableWidth: 80 }), "`src/app.ts:9`");
 });

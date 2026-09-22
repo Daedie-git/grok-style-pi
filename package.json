@@ -15,12 +15,14 @@
     "extensions",
     "integrations",
     "src",
+    "scripts",
     "themes",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "npm run typecheck && node --test test/*.test.ts",
+    "setup:file-links": "node scripts/install-file-links.mjs",
     "test:bat": "GROK_BAT_INTEGRATION=1 node --test test/highlight-bat.test.ts",
     "typecheck:subagents": "tsc -p tsconfig.subagents.json",
     "test:subagents": "node --test test/subagent-contract.test.ts",

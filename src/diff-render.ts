@@ -35,7 +35,7 @@ function diffChanges(a: string[], b: string[]): SeqDiff[] {
 	if (n === 0 && m === 0) return [];
 	if (n === 0) return [{ a: { start: 0, end: 0 }, b: { start: 0, end: m } }];
 	if (m === 0) return [{ a: { start: 0, end: n }, b: { start: 0, end: 0 } }];
-	if (n * m > 1_000_000) return [{ a: { start: 0, end: n }, b: { start: 0, end: m } }];
+	if (n * m > 1_000_000) return edgeDiff(a, b);
 	const width = m + 1;
 	const dp = new Uint32Array((n + 1) * width);
 	for (let i = n - 1; i >= 0; i--) {
@@ -308,6 +308,119 @@ function mergeShortGaps(diffs: SeqDiff[]): SeqDiff[] {
 	return merged;
 }
 
+function edgeDiff(a: string[], b: string[]): SeqDiff[] {
+	let start = 0;
+	const limit = Math.min(a.length, b.length);
+	while (start < limit && a[start] === b[start]) start++;
+	let end = 0;
+	while (end < limit - start && a[a.length - 1 - end] === b[b.length - 1 - end]) end++;
+	if (start >= a.length - end && start >= b.length - end) return [];
+	return [{ a: { start, end: a.length - end }, b: { start, end: b.length - end } }];
+}
+
+function sharedEdges(a: string, b: string): number {
+	const limit = Math.min(a.length, b.length);
+	let start = 0;
+	while (start < limit && a[start] === b[start]) start++;
+	let end = 0;
+	while (end < limit - start && a[a.length - 1 - end] === b[b.length - 1 - end]) end++;
+	return start + end;
+}
+
+function editDistance(a: string, b: string): number {
+	if (a === b) return 0;
+	if (a.length === 0 || b.length === 0) return a.length + b.length;
+	const prev = new Uint16Array(b.length + 1);
+	const next = new Uint16Array(b.length + 1);
+	for (let j = 0; j <= b.length; j++) prev[j] = j;
+	for (let i = 1; i <= a.length; i++) {
+		next[0] = i;
+		for (let j = 1; j <= b.length; j++) {
+			const keep = a[i - 1] === b[j - 1] ? 0 : 1;
+			next[j] = Math.min(prev[j] + 1, next[j - 1] + 1, prev[j - 1] + keep);
+		}
+		prev.set(next);
+	}
+	return prev[b.length];
+}
+
+/** Edit distance when the lines are short enough; otherwise shared ends plus an interior window. */
+function substitutionCost(a: string, b: string): number {
+	const indel = a.length + b.length;
+	let distance: number;
+	// An empty side makes the size product zero, so it must not enter the 16-bit distance table.
+	if (a.length > 0 && b.length > 0 && a.length <= 8_000 && b.length <= 8_000 && a.length * b.length <= 8_000) distance = editDistance(a, b);
+	else {
+		const windows = new Map<string, number>();
+		for (let i = 0; i <= a.length - 4; i++) {
+			const key = a.slice(i, i + 4);
+			windows.set(key, (windows.get(key) ?? 0) + 1);
+		}
+		let interior = 0;
+		const used = new Map<string, number>();
+		for (let i = 0; i <= b.length - 4; i++) {
+			const key = b.slice(i, i + 4);
+			const seen = used.get(key) ?? 0;
+			if (seen < (windows.get(key) ?? 0)) {
+				used.set(key, seen + 1);
+				interior++;
+			}
+		}
+		const shared = Math.min(a.length, b.length, Math.max(sharedEdges(a, b), interior));
+		distance = indel - 2 * shared;
+	}
+	// A longer line that merely shares a short tail must not outrank a closer match.
+	return distance * 2 < indel ? distance : indel;
+}
+
+/** Pair changed lines by edit cost so an insertion in the middle does not shift later replacements. */
+function alignPairs(oldLines: string[], newLines: string[]): Array<{ old: number; new: number }> {
+	const n = oldLines.length;
+	const m = newLines.length;
+	if (n === 1 && m === 1) return [{ old: 0, new: 0 }];
+	if (n === 0 || m === 0 || n * m > 10_000) return [];
+	const del = oldLines.map((line) => Math.max(1, line.length));
+	const ins = newLines.map((line) => Math.max(1, line.length));
+	const sub = oldLines.map((old) => newLines.map((line) => substitutionCost(old, line)));
+	const dp = Array.from({ length: n + 1 }, () => Array<number>(m + 1).fill(0));
+	const choice = Array.from({ length: n + 1 }, () => Array<number>(m + 1).fill(0));
+	for (let i = 1; i <= n; i++) {
+		dp[i][0] = dp[i - 1][0] + del[i - 1];
+		choice[i][0] = 1;
+	}
+	for (let j = 1; j <= m; j++) {
+		dp[0][j] = dp[0][j - 1] + ins[j - 1];
+		choice[0][j] = 2;
+	}
+	for (let i = 1; i <= n; i++) {
+		for (let j = 1; j <= m; j++) {
+			let cost = dp[i - 1][j] + del[i - 1];
+			let how = 1;
+			const insert = dp[i][j - 1] + ins[j - 1];
+			if (insert < cost) { cost = insert; how = 2; }
+			const replace = dp[i - 1][j - 1] + sub[i - 1][j - 1];
+			// A tie stays a gap so an equally costly later line does not steal an earlier match.
+			if (replace < cost) { cost = replace; how = 3; }
+			dp[i][j] = cost;
+			choice[i][j] = how;
+		}
+	}
+	const pairs: Array<{ old: number; new: number }> = [];
+	let i = n;
+	let j = m;
+	while (i > 0 || j > 0) {
+		const how = choice[i][j];
+		if (how === 3) {
+			pairs.push({ old: i - 1, new: j - 1 });
+			i--;
+			j--;
+		} else if (how === 2) j--;
+		else i--;
+	}
+	pairs.reverse();
+	return pairs;
+}
+
 function refineDiff(a: string[], b: string[]): SeqDiff[] {
 	let diffs = diffChanges(a, b);
 	diffs = joinByShifting(a, b, diffs);
@@ -362,7 +475,8 @@ function characterRanges(oldLines: string[], newLines: string[]): { old: Range[]
 	const newRanges = newLines.map(() => [] as Range[]);
 	const oldSlice = sliceOf(oldLines);
 	const newSlice = sliceOf(newLines);
-	if (oldSlice.tokens.length * newSlice.tokens.length > MAX_DIFF_CELLS) {
+	// A single oversized pair must not recurse: the same two lines would exceed the cap again.
+	if ((oldLines.length > 1 || newLines.length > 1) && oldSlice.tokens.length * newSlice.tokens.length > MAX_DIFF_CELLS) {
 		const paired = Math.min(oldLines.length, newLines.length);
 		for (let index = 0; index < paired; index++) {
 			const part = characterRanges([oldLines[index]], [newLines[index]]);
@@ -503,15 +617,15 @@ export function buildDiffRows(diff: string, theme: DiffPaint, highlight: (text: 
 		const newLines = added.map((row) => rows[row].content);
 		for (const block of diffChanges(oldLines, newLines)) {
 			if (block.a.start === block.a.end || block.b.start === block.b.end) continue;
-			const ranges = characterRanges(oldLines.slice(block.a.start, block.a.end), newLines.slice(block.b.start, block.b.end));
-			ranges.old.forEach((spans, line) => {
-				const row = removed[block.a.start + line];
-				highlighted[row] = paintRanges(highlighted[row], rows[row].content, withoutLeadingWhitespace(rows[row].content, spans), palette.deleteChar, palette.delete);
-			});
-			ranges.new.forEach((spans, line) => {
-				const row = added[block.b.start + line];
-				highlighted[row] = paintRanges(highlighted[row], rows[row].content, withoutLeadingWhitespace(rows[row].content, spans), palette.insertChar, palette.insert);
-			});
+			const oldSlice = oldLines.slice(block.a.start, block.a.end);
+			const newSlice = newLines.slice(block.b.start, block.b.end);
+			for (const pair of alignPairs(oldSlice, newSlice)) {
+				const ranges = characterRanges([oldSlice[pair.old]], [newSlice[pair.new]]);
+				const oldRow = removed[block.a.start + pair.old];
+				const newRow = added[block.b.start + pair.new];
+				highlighted[oldRow] = paintRanges(highlighted[oldRow], rows[oldRow].content, withoutLeadingWhitespace(rows[oldRow].content, ranges.old[0] ?? []), palette.deleteChar, palette.delete);
+				highlighted[newRow] = paintRanges(highlighted[newRow], rows[newRow].content, withoutLeadingWhitespace(rows[newRow].content, ranges.new[0] ?? []), palette.insertChar, palette.insert);
+			}
 		}
 	}
 	return rows.map((row, index) => {
@@ -538,7 +652,8 @@ function finishRow(line: string, width: number, kind: RenderRow["kind"], palette
 	if (!rgb) return line;
 	const body = line.replaceAll("\x1b[0m", "\x1b[39m");
 	const pad = " ".repeat(Math.max(0, width - visibleWidth(body)));
-	return `\x1b[48;2;${rgb}m${body}${pad}\x1b[0m`;
+	// A wrapped character span can still be active at the end of the body. Restore the row color before padding.
+	return `\x1b[48;2;${rgb}m${body}${pad ? `\x1b[48;2;${rgb}m${pad}` : ""}\x1b[0m`;
 }
 
 /** Wrap each logical row on its own, then paint that row's background. No style crosses into the next row. */

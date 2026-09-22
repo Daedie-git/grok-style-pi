@@ -328,12 +328,13 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 	};
 	return { ...wrapped, renderResult(result, options, theme, context) {
 		const owner = context?.state ?? context;
-		const keys = [result, context?.args, options.expanded, options.isPartial, context?.isError, context?.state?.grokEdit?.open,
+		// Pi creates a fresh result wrapper on every call, but preserves its content and details.
+		const keys = [result.content, result.details, context?.args, options.expanded, options.isPartial, context?.isError, context?.state?.grokEdit?.open,
 			styleColors(), ...(["toolOutput", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "muted", "error"] as const).map((token) => paint(theme, token, "x")), theme?.bg?.("customMessageBg", "x")];
 		const cached = owner && rendered.get(owner);
 		if (cached && keys.every((key, index) => key === cached.keys[index])) return cached.component;
 		const component = wrapped.renderResult(result, options, theme, context);
-		keys[5] = context?.state?.grokEdit?.open;
+		keys[6] = context?.state?.grokEdit?.open;
 		if (owner && !options.isPartial) rendered.set(owner, { keys, component });
 		return component;
 	} };

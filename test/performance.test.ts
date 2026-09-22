@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
+import { createEditToolDefinition, initTheme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { VisualPreparation, type VisualRequest, type VisualResult } from "../src/rendering/visual-preparation.ts";
 import { defaultStyleColors } from "../src/chrome/style-colors.ts";
@@ -42,6 +43,42 @@ test("unchanged tool layouts and result rebuilds reuse their completed lines", (
 	assert.notStrictEqual(component.render(8), narrow);
 	const recolored = tool.renderResult(result, { expanded: true }, { ...panel, fg: (_token, text) => `\x1b[31m${text}\x1b[0m` }, context);
 	assert.notStrictEqual(recolored, component);
+});
+
+test("Pi tool rows reuse completed result components across fresh result wrappers", async () => {
+	initTheme("dark");
+	const { ToolExecutionComponent } = await import(new URL("./modes/interactive/components/tool-execution.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+	const tool = wrapWithDiamondRenderer(createEditToolDefinition(process.cwd()));
+	const components: ReturnType<typeof tool.renderResult>[] = [];
+	const results: Parameters<typeof tool.renderResult>[0][] = [];
+	const row = new ToolExecutionComponent("edit", "cached-edit", { path: "fixture.ts" }, {}, {
+		...tool,
+		renderResult(...args: Parameters<typeof tool.renderResult>) {
+			const component = tool.renderResult(...args);
+			results.push(args[0]); components.push(component);
+			return component;
+		},
+	}, { requestRender() {} }, process.cwd());
+	const result = { content: [{ type: "text", text: "Edited fixture.ts" }], details: { diff: "+const value = 1;" }, isError: false };
+	row.updateResult(result);
+	const first = components.at(-1)!;
+	assert.match(stripTerminalSequences(row.render(80).join("\n")), /const value = 1;/);
+	for (let index = 0; index < 10; index++) {
+		const previousResult = results.at(-1);
+		row.invalidate();
+		row.render(80);
+		assert.notStrictEqual(results.at(-1), previousResult, "Pi supplies a fresh result wrapper");
+		assert.strictEqual(components.at(-1), first, "unchanged result data must reuse its component");
+	}
+
+	const changedDetails = { ...result, details: { diff: "+const value = 2;" } };
+	row.updateResult(changedDetails);
+	const updated = components.at(-1)!;
+	assert.notStrictEqual(updated, first);
+	assert.match(stripTerminalSequences(row.render(80).join("\n")), /const value = 2;/);
+	row.updateResult({ ...changedDetails, content: [{ type: "text", text: "Updated result text" }] });
+	assert.notStrictEqual(components.at(-1), updated);
+	assert.match(stripTerminalSequences(row.render(80).join("\n")), /Updated result text/);
 });
 
 test("rendering returns readable text before background syntax completes, then invalidates once", async () => {

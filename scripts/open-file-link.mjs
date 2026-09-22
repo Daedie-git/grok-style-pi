@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { dispatchFileLink } from "../src/file-link-bridge.ts";
+import { dispatchFileLink } from "../src/navigation/file-link-bridge.ts";
 
 try {
 	if (process.argv.length !== 3) throw new Error("Expected one Pi file link.");

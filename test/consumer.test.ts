@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import grokStylePi, { BUILTIN_TOOL_NAMES, createGrokStyleExtension } from "../extensions/index.ts";
-import { wrapWithDiamondRenderer } from "../src/tools.ts";
+import { wrapWithDiamondRenderer } from "../src/tools/renderer.ts";
 
 test("consumer loads the shipped factory and wires public APIs", async () => {
 	assert.equal(typeof grokStylePi, "function");

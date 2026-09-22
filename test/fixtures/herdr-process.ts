@@ -1,4 +1,4 @@
-import { HerdrStore } from "../../src/herdr-subagent-store.ts";
+import { HerdrStore } from "../../src/herdr/store.ts";
 
 const store = new HerdrStore(process.argv[2]);
 process.on("message", async (request: { id: number; operation: string; args: string[] }) => {

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { createCursorWorkspaceOpener } from "../src/cursor-workspace.ts";
+import { createCursorWorkspaceOpener } from "../src/navigation/cursor-workspace.ts";
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;

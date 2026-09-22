@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { cursorLauncher, findMountedCursor, isOwnedAppImageMount, openInCursor, type SpawnLike } from "../src/open-in-cursor.ts";
+import { cursorLauncher, findMountedCursor, isOwnedAppImageMount, openInCursor, type SpawnLike } from "../src/navigation/open-in-cursor.ts";
 
 async function fixture(t: TestContext, name = ".mount_cursor") {
 	const root = await mkdtemp(join(tmpdir(), "cursor-launcher-"));

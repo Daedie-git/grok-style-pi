@@ -3,16 +3,27 @@ import { parentPort, workerData } from "node:worker_threads";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./herdr-subagent-state.ts";
-import type { AgentRecord, HerdrTask, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./herdr-subagent-store.ts";
+import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
+import type { AgentRecord, HerdrTask, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 
 const { root } = workerData as { root: string };
 mkdirSync(root, { recursive: true });
 
 function database(name: string): DatabaseSync {
 	const db = new DatabaseSync(join(root, name));
-	db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
-	return db;
+	db.exec("PRAGMA busy_timeout=5000");
+	const deadline = Date.now() + 5000;
+	const sleeper = new Int32Array(new SharedArrayBuffer(4));
+	for (;;) {
+		try {
+			db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+			return db;
+		} catch (error) {
+			// Simultaneous first opens can report BUSY while enabling WAL despite busy_timeout.
+			if ((error as { errcode?: number }).errcode !== 5 || Date.now() >= deadline) { db.close(); throw error; }
+			Atomics.wait(sleeper, 0, 0, 25);
+		}
+	}
 }
 
 const db = database("control.sqlite");
@@ -44,6 +55,11 @@ transaction(() => {
 		CREATE TABLE IF NOT EXISTS launches (run TEXT PRIMARY KEY REFERENCES runs(id), data TEXT NOT NULL);
 		CREATE TABLE IF NOT EXISTS notices (run TEXT PRIMARY KEY REFERENCES runs(id), acknowledged INTEGER NOT NULL DEFAULT 0);
 		CREATE TABLE IF NOT EXISTS retired_owners (id TEXT PRIMARY KEY);
+		CREATE TABLE IF NOT EXISTS maintenance (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, expires INTEGER NOT NULL, next_at INTEGER NOT NULL);
+		INSERT OR IGNORE INTO maintenance(id,expires,next_at) VALUES(1,0,0);
+		CREATE INDEX IF NOT EXISTS active_runs ON runs(agent) WHERE json_extract(data,'$.phase') IN ('queued','starting','running','blocked');
+		CREATE INDEX IF NOT EXISTS recoverable_launches ON launches(run) WHERE json_extract(data,'$.stage') NOT IN ('published','closed','ambiguous');
+		CREATE INDEX IF NOT EXISTS pending_notices ON notices(run) WHERE acknowledged=0;
 		PRAGMA user_version=2;
 	`);
 });
@@ -134,6 +150,33 @@ const operations = {
 	findAgent: agent,
 	agentForSession(paneId: string, sessionFile: string): AgentRecord | undefined {
 		return decode<AgentRecord>(db.prepare("SELECT data FROM agents WHERE pane=? AND session_file=?").get(paneId, resolve(sessionFile)));
+	},
+	claimMaintenance(token: string, now: number): boolean {
+		// An early read avoids taking the write lock on every 200 ms tick in every pane.
+		const lease = db.prepare("SELECT expires,next_at FROM maintenance WHERE id=1").get()!;
+		if (Number(lease.expires) > now || Number(lease.next_at) > now) return false;
+		return Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + 5000, now, now).changes) === 1;
+	},
+	activeRuns(): Array<{ agent: AgentRecord; run: RunSnapshot }> {
+		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data FROM runs r JOIN agents a ON a.id=r.agent
+			WHERE json_extract(r.data,'$.phase') IN ('queued','starting','running','blocked')
+			AND json_extract(r.data,'$.deadline')>0 AND json_extract(a.data,'$.currentRunId')=r.id`).all()
+			.map((row) => ({ agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)) }));
+	},
+	finishMaintenance(token: string, observations: Array<{ ref: RunRef; alive: boolean }>, now: number): boolean {
+		return transaction(() => {
+			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
+			if (lease.token !== token || Number(lease.expires) <= now) return false;
+			for (const { ref, alive } of observations) {
+				if (!current(ref)) continue;
+				const value = run(ref);
+				if (isTerminal(value.phase)) continue;
+				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: "The Herdr pane closed before the agent finished." }, now);
+				if (next !== value) saveRun(next);
+			}
+			db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
+			return true;
+		});
 	},
 	listAgents(): AgentRecord[] {
 		return db.prepare("SELECT data FROM agents").all().map((row) => decode<AgentRecord>(row)!);
@@ -236,6 +279,9 @@ const operations = {
 			return saveRun(next);
 		});
 	},
+	recoverableLaunches(): LaunchRecord[] {
+		return db.prepare("SELECT data FROM launches WHERE json_extract(data,'$.stage') NOT IN ('published','closed','ambiguous')").all().map((row) => decode<LaunchRecord>(row)!);
+	},
 	launches(): LaunchRecord[] {
 		return db.prepare("SELECT data FROM launches").all().map((row) => decode<LaunchRecord>(row)!);
 	},
@@ -262,10 +308,11 @@ const operations = {
 		});
 	},
 	notices(parentPaneId: string): CompletionNotice[] {
-		return db.prepare("SELECT r.data FROM notices n JOIN runs r ON r.id=n.run WHERE n.acknowledged=0").all().flatMap((row) => {
+		return db.prepare(`SELECT r.data,a.data AS agent_data FROM notices n JOIN runs r ON r.id=n.run JOIN agents a ON a.id=r.agent
+			WHERE n.acknowledged=0 AND json_extract(a.data,'$.parentPaneId')=? AND json_extract(r.data,'$.phase') IN ('completed','failed','stopped')`).all(parentPaneId).map((row) => {
 			const value = decode<RunSnapshot>(row)!;
-			const record = agent(value.agentId)!;
-			return record.parentPaneId === parentPaneId && isTerminal(value.phase) ? [{ agentId: value.agentId, runId: value.runId, id: value.runId, agent: record, run: value }] : [];
+			const record = JSON.parse(String(row.agent_data)) as AgentRecord;
+			return { agentId: value.agentId, runId: value.runId, id: value.runId, agent: record, run: value };
 		});
 	},
 	acknowledgeNotice(runId: string): void {

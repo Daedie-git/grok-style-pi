@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseCodexQuota, formatCodexQuota } from "../src/subscription.ts";
+import { parseCodexQuota, formatCodexQuota } from "../src/extension/subscription.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
-import { BUILTIN_TOOL_NAMES } from "../src/tools.ts";
+import { BUILTIN_TOOL_NAMES } from "../src/tools/renderer.ts";
 
 const headers = {
 	"X-Codex-Primary-Used-Percent": "23.4",
@@ -66,7 +66,7 @@ const usage = { rate_limit: { primary_window: { used_percent: 54, limit_window_s
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 test("usage endpoint supports a weekly primary window and sends only scoped authentication", async () => {
-	const { fetchCodexUsage, parseCodexUsage } = await import("../src/subscription.ts");
+	const { fetchCodexUsage, parseCodexUsage } = await import("../src/extension/subscription.ts");
 	const windows = await fetchCodexUsage(token, new AbortController().signal, (async (url, options) => {
 		assert.equal(url, "https://chatgpt.com/backend-api/wham/usage");
 		assert.equal(new Headers(options?.headers).get("Authorization"), `Bearer ${token}`);
@@ -80,7 +80,7 @@ test("usage endpoint supports a weekly primary window and sends only scoped auth
 });
 
 test("quota polling does not overlap, discards disposed responses and sanitizes failures", async (t) => {
-	const { startCodexUsagePolling } = await import("../src/subscription.ts");
+	const { startCodexUsagePolling } = await import("../src/extension/subscription.ts");
 	let calls = 0, updates = 0;
 	let finish: (response: Response) => void;
 	let signal: AbortSignal;

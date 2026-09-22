@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { registerStyledSubagents } from "../src/subagent-result-style.ts";
+import { registerStyledSubagents } from "../src/subagents/result-style.ts";
 
 test("subagent result styling preserves execution and metadata, collapsing only its display", async () => {
 	const result = { content: [{ type: "text" as const, text: "Agent: abc\nType: Explore | Status: completed\nDescription: Find launch procedure\n\n" + "Complete output\n".repeat(80) }] };

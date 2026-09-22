@@ -1,10 +1,10 @@
 import { Worker } from "node:worker_threads";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { RunRef, RunSnapshot, ExecutionEvent } from "./herdr-subagent-state.ts";
-import type { StoreOperations } from "./herdr-subagent-worker.ts";
+import type { RunRef, RunSnapshot, ExecutionEvent } from "./state.ts";
+import type { StoreOperations } from "./worker.ts";
 
-export type { RunRef, RunSnapshot, ExecutionEvent } from "./herdr-subagent-state.ts";
+export type { RunRef, RunSnapshot, ExecutionEvent } from "./state.ts";
 
 export interface HerdrTask {
 	id: string;
@@ -74,7 +74,7 @@ export class HerdrStore {
 	private pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
 
 	constructor(root: string) {
-		this.worker = new Worker(new URL("./herdr-subagent-worker-entry.mjs", import.meta.url), {
+		this.worker = new Worker(new URL("./worker-entry.mjs", import.meta.url), {
 			workerData: { root }, execArgv: [],
 		});
 		this.worker.on("message", (reply: { id: number; value?: unknown; error?: string }) => {
@@ -86,8 +86,8 @@ export class HerdrStore {
 			if (this.pending.size === 0) this.worker.unref();
 		});
 		const fail = (error: Error) => {
-			this.failure = error;
-			for (const pending of this.pending.values()) pending.reject(error);
+			this.failure ??= error;
+			for (const pending of this.pending.values()) pending.reject(this.failure);
 			this.pending.clear();
 		};
 		this.worker.on("error", fail);
@@ -109,6 +109,9 @@ export class HerdrStore {
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }
 	findAgent(id: string) { return this.call("findAgent", id); }
 	agentForSession(paneId: string, sessionFile: string) { return this.call("agentForSession", paneId, sessionFile); }
+	claimMaintenance(token: string, now: number) { return this.call("claimMaintenance", token, now); }
+	activeRuns() { return this.call("activeRuns"); }
+	finishMaintenance(token: string, observations: Array<{ ref: RunRef; alive: boolean }>, now: number) { return this.call("finishMaintenance", token, observations, now); }
 	listAgents() { return this.call("listAgents"); }
 	read(ref: RunRef) { return this.call("read", ref); }
 	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now); }
@@ -122,6 +125,7 @@ export class HerdrStore {
 	commandDelivered(command: Command, token: string) { return this.call("commandDelivered", command, token); }
 	authorizeInput(ref: RunRef, commandId: string, token: string) { return this.call("authorizeInput", ref, commandId, token); }
 	recordExecutionEvent(ref: RunRef, token: string, event: ExecutionEvent, now: number) { return this.call("recordExecutionEvent", ref, token, event, now); }
+	recoverableLaunches() { return this.call("recoverableLaunches"); }
 	launches() { return this.call("launches"); }
 	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: { paneId?: string; tabId?: string; error?: string }, now: number) { return this.call("recordLaunch", ref, owner, stage, facts, now); }
 	claimLaunchRecovery(ref: RunRef, previousOwner: string, owner: string, now: number) { return this.call("claimLaunchRecovery", ref, previousOwner, owner, now); }

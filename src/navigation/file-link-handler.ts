@@ -11,7 +11,7 @@ export function fileLinkDesktopPath(dataHome = process.env.XDG_DATA_HOME || join
 }
 
 /** xdg-open keeps quote marks on Exec tokens and then falls through to the browser. */
-export function fileLinkDesktopContents(node = process.execPath, script = fileURLToPath(new URL("../scripts/open-file-link.mjs", import.meta.url))): string {
+export function fileLinkDesktopContents(node = process.execPath, script = fileURLToPath(new URL("../../scripts/open-file-link.mjs", import.meta.url))): string {
 	for (const argument of [node, script]) {
 		if (!SAFE_PATH.test(argument)) throw new Error("File-link setup requires Node and extension paths without spaces or special characters.");
 	}

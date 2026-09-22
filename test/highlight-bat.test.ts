@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { stripTerminalSequences as stripAnsi } from "@earendil-works/pi-tui";
-import { highlightLines } from "../src/highlight.ts";
+import { highlightLines } from "../src/rendering/highlight.ts";
 
 test("Grok Night colors punctuation and types that the Pi highlighter leaves plain", { skip: process.env.GROK_BAT_INTEGRATION !== "1" }, () => {
 	const lines = highlightLines("class Widget { int n_; };", "cpp", "widget.hpp", undefined);

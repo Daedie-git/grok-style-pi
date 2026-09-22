@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
-import { planCompileCommands, refreshCompileCommands } from "../src/compile-commands.ts";
+import { planCompileCommands, refreshCompileCommands } from "../src/navigation/compile-commands.ts";
 
 async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "compile commands "));

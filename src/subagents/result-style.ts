@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { wrapWithDiamondRenderer } from "./tools.ts";
+import { wrapWithDiamondRenderer } from "../tools/renderer.ts";
 
 const EXPLICIT_SUBAGENT_REQUEST = "Do not call this tool unless the user explicitly asked you to use a subagent, agent, or workflow. Do not launch one on your own for exploration, research, parallelism, or context management.";
 

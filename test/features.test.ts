@@ -3,10 +3,10 @@ import test from "node:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultFeatures, loadFeatures, saveFeatures, installFeatureSettings } from "../src/features.ts";
-import { defaultStyleColors, loadStyleColors } from "../src/style-colors.ts";
+import { defaultFeatures, loadFeatures, saveFeatures, installFeatureSettings } from "../src/extension/features.ts";
+import { defaultStyleColors, loadStyleColors } from "../src/chrome/style-colors.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
-import { BUILTIN_TOOL_NAMES } from "../src/tools.ts";
+import { BUILTIN_TOOL_NAMES } from "../src/tools/renderer.ts";
 
 function settingsFile(t: any) {
 	const dir = mkdtempSync(join(tmpdir(), "grok-features-"));

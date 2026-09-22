@@ -1,10 +1,10 @@
 import { getCapabilities } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { linkifyCodeReferences } from "../code-links.ts";
-import { createFileLinkBridge } from "../file-link-bridge.ts";
-import { installFileLinkHandler } from "../file-link-handler.ts";
-import { createOpenHistory, absPath, type OpenTarget } from "../open-in-cursor.ts";
-import { createCursorWorkspaceOpener, type CursorOpenContext } from "../cursor-workspace.ts";
+import { linkifyCodeReferences } from "../navigation/code-links.ts";
+import { createFileLinkBridge } from "../navigation/file-link-bridge.ts";
+import { installFileLinkHandler } from "../navigation/file-link-handler.ts";
+import { createOpenHistory, absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
+import { createCursorWorkspaceOpener, type CursorOpenContext } from "../navigation/cursor-workspace.ts";
 import type { ExtensionApiLike, GrokStyleDeps } from "./types.ts";
 
 type FileNavigationDeps = Pick<GrokStyleDeps, "openCursor" | "refreshCompileCommands" | "hyperlinks"> & {

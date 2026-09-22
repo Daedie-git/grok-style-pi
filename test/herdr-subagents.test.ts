@@ -8,14 +8,14 @@ import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { parseAgentFile } from "../src/herdr-agent-file.ts";
-import { createHerdrCli, agentsFromList, paneIdFromSplit, splitDirection, tabFromCreate, type HerdrClient } from "../src/herdr-client.ts";
-import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr-subagent-child.ts";
-import { createHerdrSubagents } from "../src/herdr-subagents.ts";
-import { HerdrRunner, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr-subagent-runner.ts";
-import { HerdrStore, type HerdrTask } from "../src/herdr-subagent-store.ts";
-import { isTerminal, type RunRef, type ExecutionEvent } from "../src/herdr-subagent-state.ts";
-import { selectSubagentRuntime } from "../src/herdr-subagent-runtime.ts";
+import { parseAgentFile } from "../src/herdr/agent-file.ts";
+import { createHerdrCli, agentsFromList, paneIdFromSplit, splitDirection, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
+import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
+import { createHerdrSubagents } from "../src/herdr/extension.ts";
+import { HerdrRunner, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
+import { HerdrStore, type HerdrTask } from "../src/herdr/store.ts";
+import { isTerminal, type RunRef, type ExecutionEvent } from "../src/herdr/state.ts";
+import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
 import { loadSubagentExtension } from "../integrations/subagents.ts";
 
 function request(extra: Partial<SpawnRequest> = {}): SpawnRequest {
@@ -45,7 +45,7 @@ function fakeClient(partial: Partial<HerdrClient> = {}) {
 		},
 		isAlive: async (name) => live.has(name),
 		showLabel: async (paneId, label) => { events.push(`label:${paneId}:${label}`); },
-		listAgents: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...live.values()],
+		listAgents: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...[...live].map(([name, value]) => ({ name, ...value }))],
 		createTab: async () => {
 			events.push("tab");
 			const paneId = `w1:p${sequence++}`;
@@ -708,14 +708,14 @@ test("confirmed departed agents release reservations without closing unrelated p
 test("the worker loads from an installed package path without Node TypeScript stripping", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "herdr-package-"));
 	const pkg = join(dir, "node_modules", "grok-style-pi");
-	mkdirSync(join(pkg, "src"), { recursive: true });
+	mkdirSync(join(pkg, "src", "herdr"), { recursive: true });
 	writeFileSync(join(pkg, "package.json"), '{"type":"module"}');
-	for (const name of ["herdr-subagent-store.ts", "herdr-subagent-state.ts", "herdr-subagent-worker.ts", "herdr-subagent-worker-entry.mjs"]) {
-		copyFileSync(fileURLToPath(new URL(`../src/${name}`, import.meta.url)), join(pkg, "src", name));
+	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs"]) {
+		copyFileSync(fileURLToPath(new URL(`../src/herdr/${name}`, import.meta.url)), join(pkg, "src", "herdr", name));
 	}
 	symlinkSync(fileURLToPath(new URL("../node_modules/jiti", import.meta.url)), join(dir, "node_modules", "jiti"), "dir");
 	try {
-		const loaded = await createJiti(import.meta.url).import<{ HerdrStore: typeof HerdrStore }>(join(pkg, "src", "herdr-subagent-store.ts"));
+		const loaded = await createJiti(import.meta.url).import<{ HerdrStore: typeof HerdrStore }>(join(pkg, "src", "herdr", "store.ts"));
 		const store = new loaded.HerdrStore(join(dir, "state"));
 		try { assert.deepEqual(await store.listAgents(), []); }
 		finally { await store.close(); }
@@ -830,8 +830,8 @@ test("slow Herdr maintenance does not block child cancellation polling", { timeo
 	const record = await f.runner.resolve(ref.agentId);
 	const sessionId = JSON.parse(readFileSync(record.sessionFile, "utf8").split("\n")[0]).id;
 	const healthStarted = deferred();
-	const healthResult = deferred<boolean>();
-	f.client.isAlive = async () => { healthStarted.resolve(); return healthResult.promise; };
+	const healthResult = deferred<Awaited<ReturnType<HerdrClient["listAgents"]>>>();
+	f.client.listAgents = async () => { healthStarted.resolve(); return healthResult.promise; };
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const sent: string[] = [];
 	let aborts = 0;
@@ -853,7 +853,69 @@ test("slow Herdr maintenance does not block child cancellation polling", { timeo
 		await handlers.get("agent_settled")!();
 		assert.equal((await f.runner.read(ref)).phase, "stopped");
 	} finally {
-		healthResult.resolve(true);
+		healthResult.resolve([{ name: record.herdrName, paneId: record.paneId }]);
 		await handlers.get("session_shutdown")!({ reason: "quit" });
 	}
+});
+
+test("background maintenance batches the fleet and shares its interval across runners", async (t) => {
+	const f = fixture(t);
+	const refs = await Promise.all([f.runner.spawn(request()), f.runner.spawn(request()), f.runner.spawn(request())]);
+	const peer = new HerdrRunner({ root: f.root, client: f.client });
+	t.after(() => peer.close());
+	let lists = 0;
+	const list = f.client.listAgents;
+	f.client.listAgents = async () => { lists++; return list(); };
+	f.client.isAlive = async () => { assert.fail("maintenance must batch liveness"); };
+	await Promise.all([f.runner.maintain(), peer.maintain()]);
+	await Promise.all([f.runner.maintain(), peer.maintain()]);
+	assert.equal(lists, 1);
+	assert.ok((await Promise.all(refs.map((ref) => f.runner.read(ref)))).every((run) => run.phase === "queued"));
+	f.live.delete(refs[0].agentId);
+	f.advance(1100);
+	await f.runner.maintain();
+	assert.equal(lists, 2);
+	assert.equal((await f.runner.read(refs[0])).phase, "failed");
+	assert.equal((await f.runner.read(refs[1])).phase, "queued");
+});
+
+test("maintenance leases fail over and fence stale replies and resumed runs", async (t) => {
+	const f = fixture(t);
+	const ref = await f.runner.spawn(request());
+	const now = Date.now();
+	assert.equal(await f.runner.store.claimMaintenance("old", now), true);
+	assert.equal(await f.runner.store.claimMaintenance("peer", now + 100), false);
+	assert.equal(await f.runner.store.claimMaintenance("peer", now + 5001), true);
+	assert.equal(await f.runner.store.finishMaintenance("old", [{ ref, alive: false }], now + 5002), false);
+	assert.equal((await f.runner.read(ref)).phase, "queued");
+	const c = await attach(f.runner, ref);
+	await c.start(); await c.finish("done");
+	const next = await f.runner.resume(ref.agentId, "continue");
+	assert.equal(await f.runner.store.finishMaintenance("peer", [{ ref, alive: false }], now + 5003), true);
+	assert.equal((await f.runner.read(next)).phase, "queued");
+});
+
+test("failed and incomplete fleet snapshots preserve unknown liveness", async (t) => {
+	const f = fixture(t);
+	const ref = await f.runner.spawn(request());
+	f.client.listAgents = async () => { throw new Error("transport unavailable"); };
+	await assert.rejects(f.runner.maintain(), /transport unavailable/);
+	assert.equal((await f.runner.read(ref)).phase, "queued");
+	f.advance(1100);
+	f.client.listAgents = async () => [{}];
+	await assert.rejects(f.runner.maintain(), /incomplete agent listing/);
+	assert.equal((await f.runner.read(ref)).phase, "queued");
+	f.advance(1100);
+	const record = await f.runner.resolve(ref.agentId);
+	f.client.listAgents = async () => [{ paneId: record.paneId }];
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(ref)).phase, "queued");
+});
+
+test("simultaneous first opens initialize WAL without losing a control worker", async () => {
+	const root = mkdtempSync(join(tmpdir(), "herdr-wal-startup-"));
+	const stores = Array.from({ length: 6 }, () => new HerdrStore(root));
+	try {
+		assert.deepEqual(await Promise.all(stores.map((store) => store.listAgents())), Array.from({ length: 6 }, () => []));
+	} finally { await Promise.all(stores.map((store) => store.close())); rmSync(root, { recursive: true, force: true }); }
 });

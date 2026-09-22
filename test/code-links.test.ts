@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cursorFileUrl, linkifyCodeReferences, parseFileReference } from "../src/code-links.ts";
+import { cursorFileUrl, linkifyCodeReferences, parseFileReference } from "../src/navigation/code-links.ts";
 
 test("cursor file URLs keep the line and column for the URL handler", () => {
 	assert.equal(cursorFileUrl("/repo/src/app.ts", 42, 3), "cursor://file/repo/src/app.ts:42:3");

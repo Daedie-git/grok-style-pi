@@ -1,3 +1,4 @@
+import { textTail } from "../utils/text-tail.ts";
 import { stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WriteSummary } from "./write-summary.ts";
 
@@ -104,6 +105,16 @@ export function extractResultText(result: ToolResult | undefined): string {
 		.filter((block) => block && typeof block.text === "string")
 		.map((block) => block.text as string)
 		.join("\n");
+}
+
+/** Bounded projection for activity; the original result remains untouched. */
+export function extractResultTail(result: ToolResult | undefined): string {
+	return textTail((function* () {
+		const blocks = result?.content ?? [];
+		for (let index = blocks.length - 1; index >= 0; index--) {
+			if (typeof blocks[index]?.text === "string") yield blocks[index].text!;
+		}
+	})());
 }
 
 export function extractResultDiff(result: ToolResult | undefined): string {

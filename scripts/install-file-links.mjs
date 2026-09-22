@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { installFileLinkHandler, fileLinkDesktopPath } from "../src/file-link-handler.ts";
+import { installFileLinkHandler, fileLinkDesktopPath } from "../src/navigation/file-link-handler.ts";
 
 if (process.platform !== "linux") throw new Error("File-link handler setup currently supports Linux only.");
 installFileLinkHandler();

@@ -5,12 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 import * as agent from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences as stripAnsi, visibleWidth } from "@earendil-works/pi-tui";
-import { textComponent } from "../src/diamond.ts";
+import { textComponent } from "../src/tools/diamond.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
-import { loadToolOptions } from "../src/tool-settings.ts";
-import { wrapWithDiamondRenderer, type DiamondTool } from "../src/tools.ts";
-import { DELETE_BG, DELETE_CHAR_BG, INSERT_BG, INSERT_CHAR_BG } from "../src/diff-render.ts";
-import { grokNightPath, loadThemeJson, resolveThemeColors } from "../src/theme.ts";
+import { loadToolOptions } from "../src/tools/settings.ts";
+import { wrapWithDiamondRenderer, type DiamondTool } from "../src/tools/renderer.ts";
+import { DELETE_BG, DELETE_CHAR_BG, INSERT_BG, INSERT_CHAR_BG } from "../src/rendering/diff-render.ts";
+import { grokNightPath, loadThemeJson, resolveThemeColors } from "../src/chrome/theme.ts";
 
 const theme = { fg: (token: string, text: string) => `\x1b[${token === "error" ? 31 : 90}m${text}\x1b[0m` };
 
@@ -174,7 +174,7 @@ test("registered tools honor global and trusted project shell/image settings", a
 
 
 test("text components reuse wrapped lines and recalculate on resize", async () => {
-	const { textComponent } = await import("../src/diamond.ts");
+	const { textComponent } = await import("../src/tools/diamond.ts");
 	const component = textComponent("long output with tabs\tand multiple words ".repeat(100));
 	const wide = component.render(80);
 	assert.strictEqual(component.render(80), wide);

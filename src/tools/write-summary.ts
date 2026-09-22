@@ -1,6 +1,6 @@
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import { generateDiffString, type ToolsOptions } from "@earendil-works/pi-coding-agent";
-import type { OriginalTool, ToolFactory } from "./tools.ts";
+import type { OriginalTool, ToolFactory } from "./renderer.ts";
 
 const MAX_BYTES = 64_000;
 const MAX_DIFF_LINES = 1_000;

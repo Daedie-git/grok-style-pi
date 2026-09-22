@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DIAMOND, extractResultText, formatToolCall, formatToolResult } from "../src/diamond.ts";
+import { DIAMOND, extractResultText, formatToolCall, formatToolResult } from "../src/tools/diamond.ts";
 
 test("formatToolCall is a one-line Grok-style summary", () => {
 	const call = formatToolCall("read", { path: "src/footer.ts" });

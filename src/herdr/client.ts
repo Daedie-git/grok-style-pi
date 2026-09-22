@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
 export interface HerdrAgentRef {
+	name?: string;
 	tabId?: string;
 	paneId?: string;
 }
@@ -12,7 +13,7 @@ export interface HerdrClient {
 	closePane(paneId: string): Promise<void>;
 	isAlive(name: string): Promise<boolean>;
 	showLabel(paneId: string, label: string): Promise<void>;
-	listAgents(): Promise<HerdrAgentRef[]>;
+	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
 	createTab(options: { cwd: string; label?: string }): Promise<{ tabId: string; paneId: string }>;
 }
 
@@ -41,6 +42,7 @@ export function agentsFromList(payload: unknown): HerdrAgentRef[] {
 	return agents.map((agent) => {
 		const record = object(agent);
 		return {
+			...(typeof record?.name === "string" ? { name: record.name } : {}),
 			tabId: typeof record?.tab_id === "string" ? record.tab_id : undefined,
 			paneId: typeof record?.pane_id === "string" ? record.pane_id : undefined,
 		};
@@ -100,8 +102,8 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env): HerdrClien
 				"--display-agent", label,
 			], env);
 		},
-		async listAgents() {
-			return agentsFromList(await call(bin, ["agent", "list"], env));
+		async listAgents(signal) {
+			return agentsFromList(await call(bin, ["agent", "list"], env, 2500, signal));
 		},
 		async createTab(options) {
 			const args = ["tab", "create", "--cwd", options.cwd, "--no-focus"];
@@ -151,9 +153,9 @@ function errorPayload(text: string): Record<string, unknown> | undefined {
 	catch { return undefined; } // Preserve plain or malformed CLI diagnostics instead of masking them with a parse error.
 }
 
-function call(bin: string, args: string[], env: NodeJS.ProcessEnv): Promise<unknown> {
+function call(bin: string, args: string[], env: NodeJS.ProcessEnv, timeout = 70_000, signal?: AbortSignal): Promise<unknown> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(bin, args, { env, timeout: 70_000, killSignal: "SIGKILL" });
+		const child = spawn(bin, args, { env, timeout, signal, killSignal: "SIGKILL" });
 		let stdout = "";
 		let stderr = "";
 		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });

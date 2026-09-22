@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { formatGrokWeekly, parseGrokCredits, readGrokContextPercent, startGrokFooterPolling } from "../src/grok-usage.ts";
+import { formatGrokWeekly, parseGrokCredits, readGrokContextPercent, startGrokFooterPolling } from "../src/extension/grok-usage.ts";
 
 const credits = {
 	config: {

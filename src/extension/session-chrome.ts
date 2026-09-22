@@ -1,17 +1,17 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { CustomEditor, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { applyComposerBorderColor, frameEditorLines } from "../composer.ts";
-import { footerLinesFromContext } from "../footer.ts";
-import { startGrokFooterPolling } from "../grok-usage.ts";
-import { formatCodexQuota, parseCodexQuota, startCodexUsagePolling, type QuotaWindow } from "../subscription.ts";
+import { applyComposerBorderColor, frameEditorLines } from "../chrome/composer.ts";
+import { footerLinesFromContext } from "../chrome/footer.ts";
+import { startGrokFooterPolling } from "./grok-usage.ts";
+import { formatCodexQuota, parseCodexQuota, startCodexUsagePolling, type QuotaWindow } from "./subscription.ts";
 import {
 	applyGrokTerminalChrome,
 	resetGrokTerminalChrome,
 	tuiWrite,
 	suspendTerminalChrome,
-} from "../terminal-chrome.ts";
-import type { Features } from "../features.ts";
+} from "../chrome/terminal-chrome.ts";
+import type { Features } from "./features.ts";
 import type { CustomEditorCtor, ExtensionApiLike, SessionContext, SessionUi } from "./types.ts";
 
 type SessionChromeDeps = {
@@ -79,13 +79,15 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		}
 
 		if (features.footer && typeof ctx.ui.setFooter === "function") {
-			ctx.ui.setFooter((tui: { requestRender?: () => void }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
+			ctx.ui.setFooter((tui: { requestRender?: (force?: boolean) => void }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
 				requestRender = () => tui.requestRender?.();
 				const write = tuiWrite(tui);
 				if (features.terminalColors && write && !restoreTerminal) {
 					applyGrokTerminalChrome(write);
 					suspendChrome ??= suspendTerminalChrome(write);
 					restoreTerminal = () => resetGrokTerminalChrome(write);
+					// Default-color changes also affect rows outside our components.
+					tui.requestRender?.(true);
 				}
 				const dispose = footerData?.onBranchChange?.(() => tui.requestRender?.());
 				return {
@@ -159,6 +161,8 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 					applyGrokTerminalChrome(write);
 					suspendChrome ??= suspendTerminalChrome(write);
 					restoreTerminal = () => resetGrokTerminalChrome(write);
+					// Default-color changes also affect rows outside our components.
+					tui.requestRender?.(true);
 				}
 				return new GrokComposer(tui, theme, keybindings);
 			});

@@ -1,8 +1,8 @@
 {
   "extends": "./tsconfig.json",
   "include": [
-    "src/subagent-adapter.ts",
-    "src/activity.ts",
+    "src/subagents/adapter.ts",
+    "src/activity/panel.ts",
     "test/subagent-contract.test.ts",
     "test/herdr-subagents.test.ts",
     "test/fixtures/herdr-process.ts"

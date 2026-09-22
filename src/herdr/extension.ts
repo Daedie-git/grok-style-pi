@@ -1,8 +1,8 @@
 import { defineTool, getAgentDir, truncateHead, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { createHerdrCli, type HerdrClient } from "./herdr-client.ts";
-import { createChildSession, type ChildSession, type ChildIdentity } from "./herdr-subagent-child.ts";
-import type { ExecutionEvent, RunRef } from "./herdr-subagent-state.ts";
+import { createHerdrCli, type HerdrClient } from "./client.ts";
+import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
+import type { ExecutionEvent, RunRef } from "./state.ts";
 import {
 	completionNotice,
 	readHerdrAgent,
@@ -11,8 +11,8 @@ import {
 	steerHerdrAgent,
 	type SpawnRequest,
 	type ToolText,
-} from "./herdr-subagent-runner.ts";
-import { herdrSubagentRoot } from "./herdr-subagent-store.ts";
+} from "./runner.ts";
+import { herdrSubagentRoot } from "./store.ts";
 
 export interface HerdrSubagentDeps {
 	env: NodeJS.ProcessEnv;
@@ -161,7 +161,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				await child?.poll();
 				if (stopped) return;
 				// Slow Herdr calls must not delay the child's command/cancellation polling.
-				health ??= current.reconcile().catch(reportError).finally(() => { health = undefined; });
+				health ??= current.maintain().catch(reportError).finally(() => { health = undefined; });
 				// A sendMessage call may only queue a message. Acknowledge only evidence actually in Pi's session.
 				const saved = ctx.sessionManager.getEntries();
 				for (const entry of saved.slice(receiptCursor)) {

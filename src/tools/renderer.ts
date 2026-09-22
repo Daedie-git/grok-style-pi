@@ -1,3 +1,4 @@
+import { layoutTool } from "../rendering/tool-layout.ts";
 import {
 	emptyComponent,
 	commandSummary,
@@ -15,11 +16,12 @@ import {
 	type ToolRenderContext,
 } from "./diamond.ts";
 import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { openInCursor, type OpenTarget } from "./open-in-cursor.ts";
-import { highlightLines, languageForPath } from "./highlight.ts";
-import { buildDiffRows, createdRows, paintRows, type DiffPalette, type RenderRow } from "./diff-render.ts";
-import { hexToRgb, styleColors } from "./style-colors.ts";
+import { truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { openInCursor, type OpenTarget } from "../navigation/open-in-cursor.ts";
+import type { VisualPreparation } from "../rendering/visual-preparation.ts";
+import { highlightLines, languageForPath } from "../rendering/highlight.ts";
+import { buildDiffRows, createdRows, type DiffPalette, type RenderRow } from "../rendering/diff-render.ts";
+import { hexToRgb, styleColors } from "../chrome/style-colors.ts";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
@@ -67,6 +69,7 @@ export type DiamondTool = OriginalTool & {
 };
 
 export type DiamondHooks = {
+	preparation?: VisualPreparation;
 	onModifierOpen?: (target: OpenTarget) => void;
 };
 
@@ -134,10 +137,7 @@ function activeDiffPalette(): DiffPalette {
 	};
 }
 
-function paintHighlighted(text: string, theme: ThemeLike | undefined, token: ThemeColor, lang: string | undefined, filePath?: string): string {
-	const lines = highlightLines(text, lang, filePath);
-	return lines ? lines.join("\n") : paint(theme, token, text);
-}
+const fallbackHighlight = () => undefined;
 
 function splitReadNotice(text: string): { code: string; notice: string } {
 	const match = /\n\n\[(?:Showing lines |\d+ more lines in file\.|Line \d+ is )[\s\S]*\]\s*$/.exec(text);
@@ -148,6 +148,8 @@ function splitReadNotice(text: string): { code: string; notice: string } {
 export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondHooks): DiamondTool {
 	const onModifierOpen = hooks?.onModifierOpen ?? defaultModifierOpen;
 	const execute = original.execute.bind(original);
+	const requests = new WeakMap<object, object>();
+	const rendered = new WeakMap<object, { keys: unknown[]; component: ReturnType<typeof textComponent> }>();
 	const shell = ["bash", "powershell"].includes(original.name);
 	const edit = original.name === "edit";
 	const write = original.name === "write";
@@ -158,7 +160,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			type: "string", maxLength: 160, description: write ? "Short human-readable description of this file's purpose, e.g. Fury control protocol helpers." : "Short human-readable summary of the command's purpose, e.g. Run unit tests. Do not repeat shell syntax.",
 		} },
 	} : original.parameters;
-	return {
+	const wrapped: DiamondTool = {
 		name: original.name,
 		label: original.label ?? original.name,
 		description: original.description,
@@ -216,6 +218,18 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			});
 		},
 		renderResult(result, options, theme, context) {
+			const owner = context?.state ?? context;
+			const preparation = context?.invalidate ? hooks?.preparation : undefined;
+			const ticket = {};
+			if (owner) requests.set(owner, ticket);
+			const notify = () => {
+				if (!owner || requests.get(owner) !== ticket) return;
+				rendered.delete(owner); context?.invalidate?.();
+			};
+			const highlightCode = (value: string, lang: string | undefined, filePath?: string) => {
+				const ready = owner && preparation?.request({ kind: "highlight", text: value, lang, filePath, colors: styleColors() }, owner, notify);
+				return ready?.lines ?? (value.length <= 8_000 ? highlightLines(value, lang, filePath, fallbackHighlight) : undefined);
+			};
 			if (shell && context?.state) {
 				const exitCode = context.isError && !options.isPartial ? /(?:^|\n)Command exited with code (-?\d+)\s*$/.exec(sanitizeToolText(extractResultText(result)))?.[1] : undefined;
 				if (exitCode !== undefined) context.state.grokExitCode = exitCode;
@@ -243,7 +257,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				if (/^\(no output\)(?:\n\nCommand exited with code -?\d+)?\s*$/.test(text)) text = text.replace(/^\(no output\)\s*/, "");
 				const command = sanitizeToolText(context.args.command);
 				const commandLang = original.name === "powershell" ? "powershell" : "bash";
-				const highlighted = context?.isError ? undefined : highlightLines(command, commandLang, undefined);
+				const highlighted = context?.isError ? undefined : highlightCode(command, commandLang);
 				const commandText = highlighted
 					? highlighted.map((line, index) => (index === 0 ? paint(theme, token, "$ ") : "") + line).join("\n")
 					: undefined;
@@ -251,7 +265,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				else text = [`$ ${command}`, text].filter(Boolean).join("\n\n");
 			} else if (original.name === "read" && !context?.isError && text) {
 				const { code, notice } = splitReadNotice(text);
-				const highlighted = highlightLines(code, lang, pathArg(context?.args));
+				const highlighted = highlightCode(code, lang, pathArg(context?.args));
 				if (highlighted) paintedText = [highlighted.join("\n"), notice ? paint(theme, "muted", notice) : ""].filter(Boolean).join("\n\n");
 			}
 			if (summary) {
@@ -259,24 +273,39 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				if (summary.kind === "created") {
 					paintedText = note;
 				} else if (summary.preview && !diff) {
-					paintedText = [note, paintHighlighted(sanitizeToolText(summary.preview), theme, token, lang, pathArg(context?.args))].filter(Boolean).join("\n\n");
+					paintedText = [note, (highlightCode(sanitizeToolText(summary.preview), lang, pathArg(context?.args))?.join("\n") ?? paint(theme, token, sanitizeToolText(summary.preview)))].filter(Boolean).join("\n\n");
 				} else text = sanitizeToolText([summary.note, summary.preview].filter(Boolean).join("\n\n"));
 			}
 			const paintDiff = {
 				paint: (token: "toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext", value: string) => paint(theme, token, value),
 			};
 			const palette = activeDiffPalette();
-			const highlight = (value: string) => highlightLines(value, lang, pathArg(context?.args));
+			const highlight = (value: string) => highlightCode(value, lang, pathArg(context?.args));
+			const fallbacks: Array<[string, string[]]> = [];
+			const fallbackRows = diff ? buildDiffRows(diff, paintDiff, (value) => {
+				const lines = value.length <= 8_000 ? highlightLines(value, lang, pathArg(context?.args), fallbackHighlight) : undefined;
+				if (lines) fallbacks.push([value, lines]);
+				return lines;
+			}, palette, !preparation) : [];
+			const preparedDiff = diff && owner ? preparation?.request({
+				kind: "diff", text: diff, fallbacks, lang, filePath: pathArg(context?.args), colors: styleColors(), palette,
+				paint: { toolDiffAdded: paintDiff.paint("toolDiffAdded", "\0"), toolDiffRemoved: paintDiff.paint("toolDiffRemoved", "\0"), toolDiffContext: paintDiff.paint("toolDiffContext", "\0") },
+			}, owner, notify) : undefined;
 			const rows: RenderRow[] = [
 				...(summary?.kind === "created" ? createdRows(sanitizeToolText(summary.preview), paintDiff, highlight) : []),
-				...(diff ? buildDiffRows(diff, paintDiff, highlight, palette) : []),
+				...(preparedDiff?.rows ?? fallbackRows),
 			];
 			let prose = paintedText ?? (text ? paint(theme, token, text) : "");
 			if (!prose && rows.length === 0 && context?.isError) prose = paint(theme, "error", "error");
 			if (!prose && rows.length === 0) return emptyComponent();
-			const body = textComponent(prose);
+			const background = original.name === "read" && !context?.isError ? theme?.bg?.("customMessageBg", "\0") : undefined;
+			const large = rows.length > 200 || prose.length + rows.reduce((sum, row) => sum + row.text.length, 0) > 16_000;
+			const plainRows = large && preparation ? rows.map((row) => ({ ...row, text: sanitizeToolText(row.text) })) : rows;
+			const plainProse = large && preparation ? sanitizeToolText(prose) : prose;
+			let cachedWidth: number | undefined;
+			let cachedLines: string[] = [];
 			return {
-				invalidate() { body.invalidate(); },
+				invalidate() { cachedWidth = undefined; },
 				handleMouse(event: TuiMouseEvent) {
 					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
 					if (opened) return opened;
@@ -287,17 +316,27 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 					return { handled: true };
 				},
 				render(width: number) {
-					const indent = width > 2 ? "  " : "";
-					const proseLines = prose ? body.render(Math.max(0, width - indent.length)).map((line) => indent + line) : [];
-					const painted = paintRows(rows, width, indent, palette);
-					const lines = proseLines.length && painted.length ? [...proseLines, "", ...painted] : [...proseLines, ...painted];
-					// GrokNight bg_dark is #1c1c1c, lighter than the #141414 transcript, for expanded read panels.
-					if (original.name !== "read" || context?.isError || !theme?.bg) return lines;
-					return lines.map((line) => theme.bg!("customMessageBg", line + " ".repeat(Math.max(0, width - visibleWidth(line)))));
+					if (width === cachedWidth) return cachedLines;
+					cachedWidth = width;
+					const layout = large && owner ? preparation?.request({
+						kind: "layout", text: prose, rows, width, palette, background, colors: styleColors(),
+					}, owner, notify) : undefined;
+					return cachedLines = layout?.lines ?? layoutTool(plainProse, plainRows, width, palette, background);
 				},
 			};
 		},
 	};
+	return { ...wrapped, renderResult(result, options, theme, context) {
+		const owner = context?.state ?? context;
+		const keys = [result, context?.args, options.expanded, options.isPartial, context?.isError, context?.state?.grokEdit?.open,
+			styleColors(), ...(["toolOutput", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "muted", "error"] as const).map((token) => paint(theme, token, "x")), theme?.bg?.("customMessageBg", "x")];
+		const cached = owner && rendered.get(owner);
+		if (cached && keys.every((key, index) => key === cached.keys[index])) return cached.component;
+		const component = wrapped.renderResult(result, options, theme, context);
+		keys[5] = context?.state?.grokEdit?.open;
+		if (owner && !options.isPartial) rendered.set(owner, { keys, component });
+		return component;
+	} };
 }
 
 export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}, hooks?: DiamondHooks): DiamondTool[] {

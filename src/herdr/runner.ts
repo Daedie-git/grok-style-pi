@@ -2,12 +2,12 @@ import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { HerdrClient, HerdrAgentRef } from "./herdr-client.ts";
-import { splitDirection } from "./herdr-client.ts";
-import { parseAgentFile } from "./herdr-agent-file.ts";
-import { HerdrStore, type AgentRecord, type CompletionNotice, type HerdrTask } from "./herdr-subagent-store.ts";
-import { isTerminal, type RunRef, type RunSnapshot } from "./herdr-subagent-state.ts";
-import { taskMessage } from "./herdr-subagent-child.ts";
+import type { HerdrClient, HerdrAgentRef } from "./client.ts";
+import { splitDirection } from "./client.ts";
+import { parseAgentFile } from "./agent-file.ts";
+import { HerdrStore, type AgentRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
+import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
+import { taskMessage } from "./child.ts";
 
 export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -129,6 +129,36 @@ export class HerdrRunner {
 			if (isTerminal(value.phase) || value.phase === "blocked") return value;
 			await this.sleep(POLL_MS);
 		}
+	}
+
+	/** One batched observation per fleet interval. The lease fences late replies after failover. */
+	maintain(): Promise<void> {
+		if (this.maintenance) return this.maintenance;
+		this.maintenance = this.track((async () => {
+			const token = randomUUID();
+			if (!(await this.store.claimMaintenance(token, this.now()))) return;
+			try {
+				const runs = await this.store.activeRuns();
+				const agents = runs.length ? await this.deps.client.listAgents(this.stopping.signal) : [];
+				check(this.stopping.signal);
+				if (agents.some((agent) => !agent.paneId)) throw new Error("Herdr returned an incomplete agent listing");
+				const names = new Set(agents.flatMap((agent) => agent.name ? [agent.name] : []));
+				const unnamedPanes = new Set(agents.filter((agent) => !agent.name).map((agent) => agent.paneId));
+				// An older/incomplete listing at the right pane is unknown, not proof of death.
+				const observations = runs.flatMap(({ agent, run }) => !names.has(agent.herdrName) && unnamedPanes.has(agent.paneId) ? [] : [
+					{ ref: { agentId: run.agentId, runId: run.runId }, alive: names.has(agent.herdrName) },
+				]);
+				await this.store.finishMaintenance(token, observations, this.now());
+				if (await this.store.tryPlacementLock(token)) {
+					try { await this.recoverLaunches(); }
+					finally { await this.store.releasePlacementLock(token); }
+				}
+			} catch (error) {
+				await this.store.finishMaintenance(token, [], this.now());
+				throw error;
+			}
+		})()).finally(() => { this.maintenance = undefined; });
+		return this.maintenance;
 	}
 
 	/** Explicit lifecycle maintenance; never performed by read() or wait(). */
@@ -299,7 +329,7 @@ export class HerdrRunner {
 	}
 
 	private async recoverLaunches(): Promise<void> {
-		for (const pending of await this.store.launches()) {
+		for (const pending of await this.store.recoverableLaunches()) {
 			if (pending.owner === this.owner || pending.stage === "published" || pending.stage === "closed" || pending.stage === "ambiguous") continue;
 			if (ownerAlive(pending.owner) && !(await this.store.ownerRetired(pending.owner))) continue;
 			if (!(await this.store.claimLaunchRecovery(pending, pending.owner, this.owner, this.now()))) continue;
@@ -400,7 +430,7 @@ async function usingRunner(deps: RunnerDeps, body: (runner: HerdrRunner) => Prom
 	const timer = deps.runner ? undefined : setInterval(() => {
 		if (busy) return;
 		busy = true;
-		void runner.reconcile().catch(() => undefined).finally(() => { busy = false; });
+		void runner.maintain().catch(() => undefined).finally(() => { busy = false; });
 	}, POLL_MS);
 	timer?.unref();
 	try { return await body(runner); }

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Theme } from "@earendil-works/pi-coding-agent";
-import { ActivityViewer } from "../src/activity-ui.ts";
-import { GROK_FG, GROK_BG, GROK_CURSOR } from "../src/terminal-chrome.ts";
+import { ActivityViewer } from "../src/activity/ui.ts";
+import { GROK_FG, GROK_BG, GROK_CURSOR } from "../src/chrome/terminal-chrome.ts";
 import {
 	grokNightPath,
 	loadThemeJson,
@@ -10,7 +10,7 @@ import {
 	REQUIRED_COLOR_TOKENS,
 	resolveThemeColors,
 	unresolvedVarRefs,
-} from "../src/theme.ts";
+} from "../src/chrome/theme.ts";
 
 test("GrokNight defines every required Pi color token and resolves vars", () => {
 	const theme = loadThemeJson(grokNightPath());

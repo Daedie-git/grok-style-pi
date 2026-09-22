@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { buildDiffRows, defaultDiffPalette, DELETE_BG, DELETE_CHAR_BG, emphasizeSpan, INSERT_BG, INSERT_CHAR_BG, paintRows } from "../src/diff-render.ts";
+import { buildDiffRows, defaultDiffPalette, DELETE_BG, DELETE_CHAR_BG, emphasizeSpan, INSERT_BG, INSERT_CHAR_BG, paintRows } from "../src/rendering/diff-render.ts";
 
 const theme = {
 	paint: (token: string, text: string) => `\x1b[${token === "toolDiffAdded" ? 32 : token === "toolDiffRemoved" ? 31 : 90}m${text}\x1b[39m`,

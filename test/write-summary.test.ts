@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { INSERT_BG } from "../src/diff-render.ts";
-import { withWriteSummary, writeSummary, countLines } from "../src/write-summary.ts";
-import { wrapWithDiamondRenderer } from "../src/tools.ts";
+import { INSERT_BG } from "../src/rendering/diff-render.ts";
+import { withWriteSummary, writeSummary, countLines } from "../src/tools/write-summary.ts";
+import { wrapWithDiamondRenderer } from "../src/tools/renderer.ts";
 
 const theme = { fg: (token: string, text: string) => `\x1b[${token === "toolDiffAdded" ? 32 : token === "toolDiffRemoved" ? 31 : 90}m${text}\x1b[0m` };
 

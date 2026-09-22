@@ -379,6 +379,12 @@ function alignPairs(oldLines: string[], newLines: string[]): Array<{ old: number
 	const m = newLines.length;
 	if (n === 1 && m === 1) return [{ old: 0, new: 0 }];
 	if (n === 0 || m === 0 || n * m > 10_000) return [];
+	let work = 0;
+	for (const old of oldLines) for (const next of newLines) {
+		const cells = old.length * next.length;
+		work += cells > 0 && cells <= 8_000 ? cells : old.length + next.length;
+		if (work > 1_000_000) return [];
+	}
 	const del = oldLines.map((line) => Math.max(1, line.length));
 	const ins = newLines.map((line) => Math.max(1, line.length));
 	const sub = oldLines.map((old) => newLines.map((line) => substitutionCost(old, line)));
@@ -579,7 +585,7 @@ export const defaultDiffPalette: DiffPalette = {
 	deleteChar: DELETE_CHAR_BG,
 };
 
-export function buildDiffRows(diff: string, theme: DiffPaint, highlight: (text: string) => string[] | undefined, palette: DiffPalette = defaultDiffPalette): RenderRow[] {
+export function buildDiffRows(diff: string, theme: DiffPaint, highlight: (text: string) => string[] | undefined, palette: DiffPalette = defaultDiffPalette, refine = true): RenderRow[] {
 	const rows = diff.split("\n").map(classify);
 	const oldLines: string[] = [];
 	const newLines: string[] = [];
@@ -599,7 +605,7 @@ export function buildDiffRows(diff: string, theme: DiffPaint, highlight: (text: 
 		return "";
 	});
 	// Line diff first. Character ranges are painted only where a removed line maps to an added line.
-	for (let index = 0; index < rows.length;) {
+	for (let index = 0; refine && index < rows.length;) {
 		if (rows[index].kind !== "remove" && rows[index].kind !== "add") {
 			index++;
 			continue;

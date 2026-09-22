@@ -1,7 +1,8 @@
+import { VisualPreparation } from "./rendering/visual-preparation.ts";
 import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
-import { defaultFeatures } from "./features.ts";
-import { COMMUNICATION, installCommunication } from "./communication.ts";
-import { BUILTIN_TOOL_NAMES, createDiamondTools, type BuiltinToolName } from "./tools.ts";
+import { defaultFeatures } from "./extension/features.ts";
+import { COMMUNICATION, installCommunication } from "./extension/communication.ts";
+import { BUILTIN_TOOL_NAMES, createDiamondTools, type BuiltinToolName } from "./tools/renderer.ts";
 import { createFileNavigation } from "./extension/file-navigation.ts";
 import { createSessionChrome } from "./extension/session-chrome.ts";
 import type { ExtensionApiLike, GrokStyleDeps } from "./extension/types.ts";
@@ -10,6 +11,8 @@ export type { SessionUi, SessionContext, ExtensionApiLike, CustomEditorCtor, Gro
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
 	const features = { ...defaultFeatures, ...deps.features };
+	const preparation = new VisualPreparation();
+	let started = false;
 	const navigation = createFileNavigation(pi, { ...deps, communication: features.communication });
 	const chrome = createSessionChrome(pi, { CustomEditor: deps.CustomEditor, features });
 
@@ -26,6 +29,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 	function registerTools(cwd: string, options?: ToolsOptions) {
 		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, {
+			preparation,
 			onModifierOpen(target) { void navigation.openTarget(target); },
 		}) :
 			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](cwd, options?.[name]));
@@ -39,11 +43,15 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	registerTools(process.cwd());
 
 	pi.on("session_start", (_event, ctx) => {
+		if (started) preparation.reset();
+		started = true;
+		// Paint terminal colors before filesystem setup and tool settings can block.
+		chrome.startSession(ctx);
 		navigation.startSession(ctx);
 		registerTools(ctx.cwd, deps.getToolOptions?.(ctx));
-		chrome.startSession(ctx);
 	});
 	pi.on("session_shutdown", () => {
+		preparation.reset();
 		navigation.dispose();
 		chrome.dispose();
 	});

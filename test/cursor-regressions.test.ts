@@ -3,10 +3,10 @@ import test, { afterEach } from "node:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as agent from "@earendil-works/pi-coding-agent";
-import { absPath, createOpenHistory, openInCursor } from "../src/open-in-cursor.ts";
-import { BUILTIN_TOOL_NAMES, wrapWithDiamondRenderer } from "../src/tools.ts";
+import { absPath, createOpenHistory, openInCursor } from "../src/navigation/open-in-cursor.ts";
+import { BUILTIN_TOOL_NAMES, wrapWithDiamondRenderer } from "../src/tools/renderer.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
-import { dispatchFileLink } from "../src/file-link-bridge.ts";
+import { dispatchFileLink } from "../src/navigation/file-link-bridge.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });

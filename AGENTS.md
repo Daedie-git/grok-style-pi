@@ -8,7 +8,7 @@ Stay on documented Pi extension APIs: `setFooter`, `setEditorComponent` wrapping
 
 `createGrokStyleExtension` takes injected factories. Wire real Pi objects only in an entrypoint. Load exactly one of `extensions/index.ts` or `integrations/subagents.ts`.
 
-`src/subagent-adapter.ts` owns run identity, subscriptions, and cancellation for in-process Pi Subagents. The activity UI consumes its projections. `integrations/subagents.ts` loads `src/herdr-subagents.ts` when `HERDR_ENV=1`, and Pi Subagents otherwise. Do not merge those runners. The Herdr runner does not use the adapter.
+`src/subagents/adapter.ts` owns run identity, subscriptions, and cancellation for in-process Pi Subagents. The activity UI consumes its projections. `integrations/subagents.ts` loads `src/herdr/extension.ts` when `HERDR_ENV=1`, and Pi Subagents otherwise. Do not merge those runners. The Herdr runner does not use the adapter.
 
 Match the existing TypeScript style: tabs, and `.ts` import specifiers.
 

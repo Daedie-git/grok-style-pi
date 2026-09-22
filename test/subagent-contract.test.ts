@@ -8,8 +8,8 @@ import { AgentManager } from "@tintinweb/pi-subagents/dist/agent-manager.js";
 import type { AgentRecord as NativeRecord } from "@tintinweb/pi-subagents/dist/types.js";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, getModel, type AssistantMessage } from "@earendil-works/pi-ai/compat";
-import { SubagentAdapter } from "../src/subagent-adapter.ts";
-import type { Activity } from "../src/activity-ui.ts";
+import { SubagentAdapter } from "../src/subagents/adapter.ts";
+import type { Activity } from "../src/activity/ui.ts";
 
 // Real manager, resume runner, AgentSession, agent loop and cancellation.
 // Only model transport is replaced, so tests need no credentials or network.

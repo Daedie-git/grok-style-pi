@@ -1,5 +1,5 @@
-import { HerdrStore, type AgentRecord, type Command, type HerdrTask } from "./herdr-subagent-store.ts";
-import { isTerminal, type ExecutionEvent, type RunRef } from "./herdr-subagent-state.ts";
+import { HerdrStore, type AgentRecord, type Command, type HerdrTask } from "./store.ts";
+import { isTerminal, type ExecutionEvent, type RunRef } from "./state.ts";
 
 export interface ChildMessenger {
 	sendUserMessage(text: string, options?: { deliverAs?: "steer" | "followUp" }): void;

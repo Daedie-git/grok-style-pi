@@ -1,9 +1,9 @@
 import type { ToolsOptions, ModelRegistry, ExtensionAPI, CustomEditor } from "@earendil-works/pi-coding-agent";
-import type { FooterContext } from "../footer.ts";
-import type { Features } from "../features.ts";
-import type { OpenTarget } from "../open-in-cursor.ts";
-import type { CursorWorkspaceDeps } from "../cursor-workspace.ts";
-import type { OriginalTool, ToolFactoryMap } from "../tools.ts";
+import type { FooterContext } from "../chrome/footer.ts";
+import type { Features } from "./features.ts";
+import type { OpenTarget } from "../navigation/open-in-cursor.ts";
+import type { CursorWorkspaceDeps } from "../navigation/cursor-workspace.ts";
+import type { OriginalTool, ToolFactoryMap } from "../tools/renderer.ts";
 
 export type SessionUi = {
 	theme?: { fg?(token: string, text: string): string };

@@ -1,9 +1,9 @@
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { loadFeatures } from "../src/features.ts";
-import { createHerdrSubagents } from "../src/herdr-subagents.ts";
-import { selectSubagentRuntime } from "../src/herdr-subagent-runtime.ts";
-import { registerStyledSubagents } from "../src/subagent-result-style.ts";
+import { loadFeatures } from "../src/extension/features.ts";
+import { createHerdrSubagents } from "../src/herdr/extension.ts";
+import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
+import { registerStyledSubagents } from "../src/subagents/result-style.ts";
 
 export async function loadSubagentExtension(
 	pi: ExtensionAPI,

@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { createFileLinkBridge, dispatchFileLink } from "../src/file-link-bridge.ts";
-import { fileLinkDesktopContents } from "../src/file-link-handler.ts";
-import type { OpenTarget } from "../src/open-in-cursor.ts";
+import { createFileLinkBridge, dispatchFileLink } from "../src/navigation/file-link-bridge.ts";
+import { fileLinkDesktopContents } from "../src/navigation/file-link-handler.ts";
+import type { OpenTarget } from "../src/navigation/open-in-cursor.ts";
 
 const target = { path: "/repo/my file #1?.ts", line: 42, column: 3, cwd: "/repo" };
 

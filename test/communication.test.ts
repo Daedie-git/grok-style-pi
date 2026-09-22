@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { COMMUNICATION, installCommunication } from "../src/communication.ts";
+import { COMMUNICATION, installCommunication } from "../src/extension/communication.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
-import { BUILTIN_TOOL_NAMES } from "../src/tools.ts";
+import { BUILTIN_TOOL_NAMES } from "../src/tools/renderer.ts";
 
 test("communication rules lead with the answer and describe file references", () => {
 	assert.match(COMMUNICATION, /Lead with the answer/);

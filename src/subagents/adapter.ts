@@ -1,7 +1,8 @@
+import { textTail } from "../utils/text-tail.ts";
 import { randomUUID } from "node:crypto";
 import type { AgentSession, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { compactArgs, extractResultText } from "./diamond.ts";
-import { plainText, type Activity } from "./activity-ui.ts";
+import { compactArgs, extractResultTail } from "../tools/diamond.ts";
+import { plainText, type Activity } from "../activity/ui.ts";
 
 export type AgentInvocation = {
 	modelName?: string; modelId?: string; thinking?: string;
@@ -37,6 +38,7 @@ type AgentEvent = { id: string; type?: string; description?: string; status?: st
 type Run = {
 	identity: RunIdentity; status: RunStatus; activity: Activity;
 	session?: AgentRecord["session"]; unsubscribe?: () => void;
+	transcriptCache?: { messages: unknown; length: number; last: unknown; text: string };
 	liveMessage?: unknown; tools: Map<string, { label: string; output: string }>;
 	lastUser?: WeakRef<object>; cancelled: boolean; rpcAllowed: boolean; completedAt?: number; result?: string; error?: string;
 };
@@ -58,12 +60,14 @@ export function agentRecord(id: string): AgentRecord | undefined {
 function messageText(message: unknown): string {
 	const msg = object(message);
 	if (!msg) return "";
-	const content = string(msg.content) ?? (Array.isArray(msg.content) ? msg.content.map((value: unknown) => {
-		const block = object(value);
-		if (!block) return "";
-		if (block.type === "toolCall") return `${string(block.name) ?? "tool"} ${compactArgs(object(block.arguments), 500)}`;
-		return string(block.text) ?? string(block.thinking) ?? "";
-	}).filter(Boolean).join("\n") : "");
+	const content = string(msg.content)?.slice(-64000) ?? (Array.isArray(msg.content) ? textTail((function* () {
+		for (let index = (msg.content as unknown[]).length - 1; index >= 0; index--) {
+			const block = object((msg.content as unknown[])[index]);
+			if (!block) continue;
+			if (block.type === "toolCall") yield `${string(block.name) ?? "tool"} ${compactArgs(object(block.arguments), 500)}`;
+			else yield string(block.text) ?? string(block.thinking) ?? "";
+		}
+	})()) : "");
 	return content ? `${string(msg.role) ?? "activity"}${msg.toolName ? ` · ${String(msg.toolName)}` : ""}\n${content}` : "";
 }
 
@@ -79,8 +83,8 @@ export class SubagentAdapter {
 	private pendingStops = new Set<() => void>();
 	private bus: Bus;
 	private lookup: (id: string) => AgentRecord | undefined;
-	private publish: (entry: Activity, newRun: boolean) => void;
-	constructor(bus: Bus, lookup: (id: string) => AgentRecord | undefined, publish: (entry: Activity, newRun: boolean) => void) {
+	private publish: (entry: Activity, newRun: boolean, streaming?: boolean) => void;
+	constructor(bus: Bus, lookup: (id: string) => AgentRecord | undefined, publish: (entry: Activity, newRun: boolean, streaming?: boolean) => void) {
 		this.bus = bus; this.lookup = lookup; this.publish = publish;
 		for (const [event, status] of [["created", "queued"], ["started", "running"], ["completed", "completed"], ["failed", "error"]] as const) {
 			this.listeners.push(bus.on(`subagents:${event}`, (data: unknown) => this.observe(data, status)));
@@ -140,41 +144,51 @@ export class SubagentAdapter {
 		run.activity.model = runtime;
 		run.activity.startedAt = record.startedAt ?? run.activity.startedAt;
 		run.activity.endedAt = record.completedAt;
-		if (record.session && run.session !== record.session) { run.unsubscribe?.(); run.unsubscribe = undefined; run.session = record.session; }
+		if (record.session && run.session !== record.session) { run.unsubscribe?.(); run.unsubscribe = undefined; run.session = record.session; run.transcriptCache = undefined; }
 		if (active(effective)) {
 			const current = run;
 			run.activity.stop = run.session?.abort || run.rpcAllowed || effective === "queued" ? () => this.stop(current) : undefined;
 			this.subscribe(run);
 			run.activity.transcript = () => this.transcript(current);
 		} else {
+			run.transcriptCache = undefined;
 			const diagnostic = error ?? "";
 			const text = this.transcript(run) || result || "";
 			run.activity.output = (diagnostic && !text.includes(diagnostic) ? `${text}\n${diagnostic}` : text).slice(-64000);
 			run.activity.transcript = undefined; run.activity.detail = undefined; run.activity.stop = undefined;
 			run.activity.endedAt ??= Date.now();
-			run.unsubscribe?.(); run.unsubscribe = undefined; run.tools.clear(); run.liveMessage = undefined; run.session = undefined;
+			run.unsubscribe?.(); run.unsubscribe = undefined; run.tools.clear(); run.liveMessage = undefined; run.session = undefined; run.transcriptCache = undefined;
 		}
 		if (changed) this.publish(run.activity, newRun);
 		return changed;
 	}
 	private transcript(run: Run): string {
-		return [...(run.session?.state.messages.slice(-100).map(messageText) ?? []),
-			...(run.liveMessage ? [messageText(run.liveMessage)] : []),
-			...[...run.tools.values()].map((tool) => `${tool.label}\n${tool.output}`)].filter(Boolean).join("\n\n");
+		const messages = run.session?.state.messages;
+		const cached = run.transcriptCache;
+		if (cached && cached.messages === messages && cached.length === messages?.length && cached.last === messages?.at(-1)) return cached.text;
+		const text = textTail((function* () {
+			const tools = [...run.tools.values()];
+			for (let index = tools.length - 1; index >= 0; index--) yield `${tools[index].label}\n${tools[index].output}`;
+			if (run.liveMessage) yield messageText(run.liveMessage);
+			for (let index = (messages?.length ?? 0) - 1, count = 0; index >= 0 && count < 100; index--, count++) yield messageText(messages![index]);
+		})(), 64000, "\n\n");
+		run.transcriptCache = { messages, length: messages?.length ?? 0, last: messages?.at(-1), text };
+		return text;
 	}
 	private subscribe(run: Run) {
 		if (!run.session || run.unsubscribe) return;
 		run.unsubscribe = run.session.subscribe((event) => {
 			if (!this.current(run)) return;
+			run.transcriptCache = undefined;
 			if (event.type === "message_update") run.liveMessage = event.message;
 			if (event.type === "message_end") run.liveMessage = undefined;
 			if (event.type === "tool_execution_start") run.tools.set(event.toolCallId, { label: `${event.toolName} ${compactArgs(event.args)}`, output: "" });
 			if (event.type === "tool_execution_update") run.tools.set(event.toolCallId, {
-				label: run.tools.get(event.toolCallId)?.label ?? event.toolName, output: extractResultText(event.partialResult).slice(-64000),
+				label: run.tools.get(event.toolCallId)?.label ?? event.toolName, output: extractResultTail(event.partialResult),
 			});
 			if (event.type === "tool_execution_end") run.tools.delete(event.toolCallId);
 			run.activity.detail = [...run.tools.values()].at(-1)?.label;
-			this.publish(run.activity, false);
+			this.publish(run.activity, false, true);
 		});
 	}
 	private async stop(run: Run) {

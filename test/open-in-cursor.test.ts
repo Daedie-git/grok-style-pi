@@ -11,8 +11,8 @@ import {
 	openInCursor,
 	createOpenHistory,
 	workspaceFor,
-} from "../src/open-in-cursor.ts";
-import { wrapWithDiamondRenderer, BUILTIN_TOOL_NAMES } from "../src/tools.ts";
+} from "../src/navigation/open-in-cursor.ts";
+import { wrapWithDiamondRenderer, BUILTIN_TOOL_NAMES } from "../src/tools/renderer.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 
 const theme = { fg: (_token: string, text: string) => text };

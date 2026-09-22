@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CURSOR_MARKER, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import { FOCUS_BORDER_TOKEN, IDLE_BORDER_TOKEN } from "../src/composer.ts";
-import { formatToolCall } from "../src/diamond.ts";
-import { frameEditorLines } from "../src/composer.ts";
+import { FOCUS_BORDER_TOKEN, IDLE_BORDER_TOKEN } from "../src/chrome/composer.ts";
+import { formatToolCall } from "../src/tools/diamond.ts";
+import { frameEditorLines } from "../src/chrome/composer.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
-import { BUILTIN_TOOL_NAMES, wrapWithDiamondRenderer, type OriginalTool, type ToolFactoryMap } from "../src/tools.ts";
+import { BUILTIN_TOOL_NAMES, wrapWithDiamondRenderer, type OriginalTool, type ToolFactoryMap } from "../src/tools/renderer.ts";
 
 class MockEditor {
 	focused = false;
@@ -190,7 +190,7 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 });
 
 test("real composer wraps Pi's suspend action once and honors shortcut interception", async (t) => {
-	const { grokTerminalOscApply, grokTerminalOscReset } = await import("../src/terminal-chrome.ts");
+	const { grokTerminalOscApply, grokTerminalOscReset } = await import("../src/chrome/terminal-chrome.ts");
 	const handlers = new Map<string, Function>();
 	let editorFactory: Function;
 	const writes: string[] = [];
@@ -232,4 +232,28 @@ test("shell schema accepts optional summaries and renderer shows them", async ()
 	assert.equal(tool.renderCall(args, {}).render(80)[0], "◆ Verify shell rendering");
 	const result = await tool.execute("summary", args, new AbortController().signal);
 	assert.equal(result.content[0].text, "summary-test");
+});
+
+test("startup applies terminal background before loading tool settings", () => {
+	const handlers = new Map<string, Function>();
+	const writes: string[] = [];
+	createGrokStyleExtension({
+		on(event, handler) { handlers.set(event, handler); },
+		registerTool() {},
+	}, {
+		CustomEditor: MockEditor,
+		tools: factories(),
+		features: { communication: false },
+		getToolOptions() {
+			assert.ok(writes.some(text => text.includes("\x1b]11;")), "background is still unchanged when startup reaches tool settings");
+			return {};
+		},
+	});
+	try {
+		handlers.get("session_start")!({}, { cwd: process.cwd(), hasUI: true, ui: {
+			setFooter(factory: Function) {
+				factory({ terminal: { write(text: string) { writes.push(text); } }, requestRender() {} }, {});
+			},
+		} });
+	} finally { handlers.get("session_shutdown")!(); }
 });

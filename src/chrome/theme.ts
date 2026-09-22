@@ -64,7 +64,7 @@ export type ThemeJson = {
 
 export function grokNightPath(): string {
 	const here = dirname(fileURLToPath(import.meta.url));
-	return join(here, "..", "themes", "groknight.json");
+	return join(here, "..", "..", "themes", "groknight.json");
 }
 
 export function loadThemeJson(path: string): ThemeJson {

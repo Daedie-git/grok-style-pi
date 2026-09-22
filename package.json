@@ -25,6 +25,7 @@
   ],
   "scripts": {
     "test": "npm run typecheck && node --test test/*.test.ts",
+    "bench:performance": "node scripts/benchmark-performance.ts",
     "setup:file-links": "node scripts/install-file-links.mjs",
     "test:bat": "GROK_BAT_INTEGRATION=1 node --test test/highlight-bat.test.ts",
     "typecheck:subagents": "tsc -p tsconfig.subagents.json",

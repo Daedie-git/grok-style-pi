@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ActivityPanel, ActivityViewer, isActive, plainText, type Activity } from "./activity-ui.ts";
-import { extractResultText, type ToolResult } from "./diamond.ts";
-import type { OriginalTool } from "./tools.ts";
+import { ActivityPanel, ActivityViewer, isActive, plainText, type Activity } from "./ui.ts";
+import { extractResultTail, type ToolResult } from "../tools/diamond.ts";
+import type { OriginalTool } from "../tools/renderer.ts";
 
-import { SubagentAdapter, agentRecord } from "./subagent-adapter.ts";
+import { SubagentAdapter, agentRecord } from "../subagents/adapter.ts";
 
 /** Preserve distinct diagnostics without repeating output embedded in shell errors. */
 export function mergeActivityOutput(output: string, diagnostic: string): string {
@@ -22,6 +22,7 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 	let closeViewer: (() => void) | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let generation = 0;
+	let frame: ReturnType<typeof setTimeout> | undefined;
 	const list = () => [...entries.values()].sort((a, b) => Number(isActive(b)) - Number(isActive(a)) || b.startedAt - a.startedAt);
 	const report = (error: unknown) => ctx?.ui.notify(plainText(error instanceof Error ? error.message : String(error)), "error");
 	const safely = (action: () => void | Promise<void>) => { void Promise.resolve().then(action).catch(report); };
@@ -30,7 +31,14 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 		adapter?.forget(id);
 		entries.delete(id);
 	}
-	function changed() {
+	function changed(defer = false) {
+		if (defer) {
+			frame ??= setTimeout(() => { frame = undefined; changed(); }, 16);
+			frame.unref?.();
+			return;
+		}
+		if (frame) clearTimeout(frame);
+		frame = undefined;
 		const finished = list().filter((entry) => !isActive(entry));
 		for (const entry of finished.slice(12)) remove(entry.id);
 		redraw?.();
@@ -95,6 +103,8 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 	}
 	function cleanup() {
 		generation++;
+		if (frame) clearTimeout(frame);
+		frame = undefined;
 		closeViewer?.(); closeViewer = undefined; viewerRedraw = undefined;
 		if (timer) clearInterval(timer);
 		timer = undefined;
@@ -113,10 +123,10 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 			return new ActivityPanel(visibleEntries, theme,
 				(entry) => safely(() => view(entry)), (entry) => safely(() => act(entry)), () => safely(choose), dismiss);
 		}, { placement: "aboveEditor" });
-		if (pi.events) adapter = new SubagentAdapter(pi.events, getAgentRecord, (entry, newRun) => {
+		if (pi.events) adapter = new SubagentAdapter(pi.events, getAgentRecord, (entry, newRun, streaming) => {
 			if (newRun) hidden.delete(entry.id);
 			entries.set(entry.id, entry);
-			changed();
+			changed(streaming);
 		});
 	});
 	pi.on("session_shutdown", cleanup);
@@ -137,11 +147,11 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 				const version = generation;
 				try {
 					const result = await tool.execute(id, args, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, (partial) => {
-						entry.output = extractResultText(partial).slice(-64000);
-						if (version === generation) changed();
+						entry.output = extractResultTail(partial);
+						if (version === generation) changed(true);
 						onUpdate?.(partial);
 					}, context);
-					entry.output = extractResultText(result as ToolResult).slice(-64000);
+					entry.output = extractResultTail(result as ToolResult);
 					entry.status = controller.signal.aborted ? "stopped" : "completed";
 					return result;
 				} catch (error) {

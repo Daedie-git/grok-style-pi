@@ -1,5 +1,5 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { colorLabels, featureSettingsPath, readSettingsObject, saveStyleColor, writeSettingsObject, type ColorKey } from "./style-colors.ts";
+import { colorLabels, featureSettingsPath, readSettingsObject, saveStyleColor, writeSettingsObject, type ColorKey } from "../chrome/style-colors.ts";
 
 export { featureSettingsPath };
 

@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { highlightCode, initTheme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences as stripAnsi } from "@earendil-works/pi-tui";
-import { INSERT_BG } from "../src/diff-render.ts";
-import { highlightLines, languageForPath } from "../src/highlight.ts";
-import { wrapWithDiamondRenderer, type OriginalTool } from "../src/tools.ts";
+import { INSERT_BG } from "../src/rendering/diff-render.ts";
+import { highlightLines, languageForPath } from "../src/rendering/highlight.ts";
+import { wrapWithDiamondRenderer, type OriginalTool } from "../src/tools/renderer.ts";
 
 initTheme("dark");
 

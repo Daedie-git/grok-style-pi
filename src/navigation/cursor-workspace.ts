@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { refreshCompileCommands } from "./compile-commands.ts";
-import { sanitizeToolText } from "./diamond.ts";
+import { sanitizeToolText } from "../tools/diamond.ts";
 import { findGitRoot, openInCursor, workspaceFor, type OpenTarget } from "./open-in-cursor.ts";
 
 export type CursorOpenContext = {

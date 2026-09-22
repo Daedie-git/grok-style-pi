@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { ActivityPanel, ActivityViewer, type Activity } from "../src/activity-ui.ts";
-import { installActivityPanel } from "../src/activity.ts";
-import { subagentRuntimeLabel } from "../src/subagent-adapter.ts";
-import { wrapWithDiamondRenderer } from "../src/tools.ts";
+import { ActivityPanel, ActivityViewer, type Activity } from "../src/activity/ui.ts";
+import { installActivityPanel } from "../src/activity/panel.ts";
+import { subagentRuntimeLabel } from "../src/subagents/adapter.ts";
+import { wrapWithDiamondRenderer } from "../src/tools/renderer.ts";
 
 const theme = { fg: (_token: string, text: string) => text };
 const click = (x: number, y: number) => ({ type: "click", button: "left", x, y } as any);
@@ -264,7 +264,7 @@ test("real failed shell output is retained once with its exit status", async (t)
 });
 
 test("diagnostic merging retains the size limit and distinct failures", async () => {
-	const { mergeActivityOutput } = await import("../src/activity.ts");
+	const { mergeActivityOutput } = await import("../src/activity/panel.ts");
 	assert.equal(mergeActivityOutput("output", "output\nfailed"), "output\nfailed");
 	assert.equal(mergeActivityOutput("output\nfailed", "failed"), "output\nfailed");
 	const output = mergeActivityOutput("x".repeat(64000), "independent failure");
@@ -526,4 +526,43 @@ test("viewer scrollbar handles real fullscreen press/drag/release dispatch in an
 	send(0, 49, 7); // Adjacent border is part of the generous scrollbar hit target.
 	send(0, 49, 7, true);
 	assert.match(viewer.render(40)[3], /line 0/);
+});
+
+test("streaming events share a frame and completed activity redraws immediately", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+	const listeners = new Set<Function>();
+	const record = { status: "running", session: {
+		state: { messages: [] }, subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
+	} };
+	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
+	h.events.emit("subagents:started", { id: "stream" });
+	const before = h.redraws();
+	for (let index = 0; index < 100; index++) for (const emit of listeners) emit({ type: "message_update", message: { content: `token ${index}` } });
+	assert.equal(h.redraws(), before);
+	t.mock.timers.tick(16);
+	assert.equal(h.redraws(), before + 1);
+	assert.match(h.controller.list()[0].transcript!(), /token 99/);
+	record.status = "completed";
+	h.events.emit("subagents:completed", { id: "stream" });
+	assert.equal(h.redraws(), before + 2);
+});
+
+test("live transcript preparation is lazy, bounded and reused until a session event", (t) => {
+	let reads = 0;
+	const listeners = new Set<Function>();
+	const record = { status: "running", session: {
+		state: { messages: [{ role: "assistant", get content() { reads++; return "x".repeat(100_000); } }] },
+		subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
+	} };
+	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
+	h.events.emit("subagents:started", { id: "large" });
+	assert.equal(reads, 0);
+	const entry = h.controller.list()[0];
+	assert.equal(entry.transcript!().length, 64_000);
+	const firstReads = reads;
+	entry.transcript!(); entry.transcript!();
+	assert.equal(reads, firstReads);
+	for (const emit of listeners) emit({ type: "message_end" });
+	entry.transcript!();
+	assert.ok(reads > firstReads);
 });

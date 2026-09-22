@@ -6,7 +6,7 @@ import {
 	FOCUS_BORDER_TOKEN,
 	IDLE_BORDER_TOKEN,
 	renderComposerFrame,
-} from "../src/composer.ts";
+} from "../src/chrome/composer.ts";
 
 test("composerBorderToken is muted idle and brighter focused", () => {
 	assert.equal(composerBorderToken(false), IDLE_BORDER_TOKEN);

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { cwdDisplayPath, cwdBasename, footerFromContext, footerLinesFromContext, formatFooterLine, formatPercent } from "../src/footer.ts";
+import { cwdDisplayPath, cwdBasename, footerFromContext, footerLinesFromContext, formatFooterLine, formatPercent } from "../src/chrome/footer.ts";
 
 test("cwdBasename uses the last path segment", () => {
 	assert.equal(cwdBasename("/home/aim/git/fury"), "fury");

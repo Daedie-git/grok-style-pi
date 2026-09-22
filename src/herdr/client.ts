@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 
 export interface HerdrAgentRef {
 	name?: string;
@@ -9,7 +10,7 @@ export interface HerdrAgentRef {
 export interface HerdrClient {
 	layout(paneId: string): Promise<unknown>;
 	split(options: { paneId: string; direction: "right" | "down"; cwd: string }): Promise<{ paneId: string }>;
-	startPi(options: { name: string; paneId: string; args: string[] }): Promise<void>;
+	startPi(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
 	closePane(paneId: string): Promise<void>;
 	isAlive(name: string): Promise<boolean>;
 	showLabel(paneId: string, label: string): Promise<void>;
@@ -59,7 +60,10 @@ export function splitDirection(layout: unknown): "right" | "down" {
 	return "down";
 }
 
-export function createHerdrCli(env: NodeJS.ProcessEnv = process.env): HerdrClient {
+export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
+	now: () => Date.now(),
+	sleep: (ms: number, signal?: AbortSignal): Promise<void> => delay(ms, undefined, { signal }),
+}): HerdrClient {
 	const bin = env.HERDR_BIN_PATH || "herdr";
 	return {
 		async layout(paneId) {
@@ -76,11 +80,25 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env): HerdrClien
 			], env);
 			return { paneId: paneIdFromSplit(payload) };
 		},
-		async startPi(options) {
-			await call(bin, [
-				"agent", "start", options.name, "--kind", "pi", "--pane", options.paneId, "--timeout", "60000",
-				"--", ...options.args,
-			], env);
+		async startPi(options, signal) {
+			const deadline = timing.now() + 60_000;
+			for (;;) {
+				signal?.throwIfAborted();
+				try {
+					await call(bin, [
+						"agent", "start", options.name, "--kind", "pi", "--pane", options.paneId, "--timeout", "60000",
+						"--", ...options.args,
+					], env, 70_000, signal);
+					return;
+				} catch (error) {
+					// This rejection happens before launch. Never retry ambiguous startup or transport failures.
+					if (!(error instanceof HerdrCliError)
+						|| error.message !== `agent target pane ${options.paneId} is not an available shell`) throw error;
+					const remaining = deadline - timing.now();
+					if (remaining <= 0) throw new Error(`Timed out after 60 seconds waiting for shell readiness in ${options.paneId}: ${error.message}`);
+					await timing.sleep(Math.min(250, remaining), signal);
+				}
+			}
 		},
 		async closePane(paneId) {
 			await call(bin, ["pane", "close", paneId], env);

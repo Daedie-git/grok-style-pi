@@ -274,7 +274,7 @@ export class HerdrRunner {
 			await this.store.recordLaunch(ref, this.owner, "starting-pi", {}, this.now());
 			check(signal);
 			task.paneId = paneId!;
-			await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile) });
+			await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile) }, signal);
 			check(signal);
 			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now());
 			published = true;

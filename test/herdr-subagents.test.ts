@@ -738,6 +738,55 @@ test("the CLI distinguishes missing agents from transport failures on either out
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("CLI launch waits for shell startup, bounds waiting, and never retries ambiguous failures", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-shell-"));
+	const bin = join(dir, "herdr.mjs");
+	const trace = join(dir, "calls");
+	writeFileSync(bin, `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+appendFileSync(process.env.TRACE, "start\\n");
+const count = readFileSync(process.env.TRACE, "utf8").trim().split("\\n").length;
+if (count <= Number(process.env.FAILURES)) {
+ console.error(JSON.stringify({ error: { code: "invalid_state", message: process.env.FAILURE } }));
+ process.exit(1);
+}
+console.log(JSON.stringify({ result: {} }));
+`, { mode: 0o755 });
+	const options = { name: "review", paneId: "w1:p2", args: ["--model", "openai-codex/gpt-6-astra"] };
+	const unavailable = "agent target pane w1:p2 is not an available shell";
+	let now = 0;
+	let waits = 0;
+	const cli = (failures: number, failure = unavailable, sleep?: (ms: number, signal?: AbortSignal) => Promise<void>) => {
+		writeFileSync(trace, "");
+		now = 0;
+		waits = 0;
+		return createHerdrCli({ ...process.env, HERDR_BIN_PATH: bin, TRACE: trace, FAILURES: String(failures), FAILURE: failure }, {
+			now: () => now,
+			sleep: sleep ?? (async () => { now += 30_000; waits++; }),
+		});
+	};
+	const calls = () => readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).length;
+	try {
+		await cli(2).startPi(options);
+		assert.equal(calls(), 3);
+		assert.equal(waits, 2);
+		await assert.rejects(cli(100).startPi(options), /60 seconds waiting for shell readiness in w1:p2/);
+		assert.equal(calls(), 3);
+		for (const failure of ["connection lost", "agent readiness timed out", "agent target pane w1:p3 is not an available shell"]) {
+			await assert.rejects(cli(100, failure).startPi(options), { message: failure });
+			assert.equal(calls(), 1);
+		}
+		const controller = new AbortController();
+		await assert.rejects(cli(100, unavailable, async (_ms, signal) => {
+			controller.abort();
+			signal!.throwIfAborted();
+		}).startPi(options, controller.signal), { name: "AbortError" });
+		assert.equal(calls(), 1);
+		await assert.rejects(cli(0).startPi(options, controller.signal), { name: "AbortError" });
+		assert.equal(calls(), 0);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a fresh Agent spawn proceeds when Herdr reports its unused name on stderr", async (t) => {
 	const f = fixture(t);
 	const bin = join(f.root, "herdr.mjs");

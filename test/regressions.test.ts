@@ -9,6 +9,7 @@ import { textComponent } from "../src/diamond.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { loadToolOptions } from "../src/tool-settings.ts";
 import { wrapWithDiamondRenderer, type DiamondTool } from "../src/tools.ts";
+import { DELETE_BG, DELETE_CHAR_BG, INSERT_BG, INSERT_CHAR_BG } from "../src/diff-render.ts";
 import { grokNightPath, loadThemeJson, resolveThemeColors } from "../src/theme.ts";
 
 const theme = { fg: (token: string, text: string) => `\x1b[${token === "error" ? 31 : 90}m${text}\x1b[0m` };
@@ -57,8 +58,9 @@ test("expanded real edits retain their diff", async (t) => {
 	const rendered = defaultLines.join("\n");
 	assert.ok(rendered.includes(actualTheme.getFgAnsi("toolDiffAdded")), "actual edits must contain green ANSI styling");
 	assert.ok(rendered.includes(actualTheme.getFgAnsi("toolDiffRemoved")), "actual edits must contain red ANSI styling");
-	// Pi's emphasis helper follows terminal color support (unlike RGB fg).
-	if (actualTheme.inverse("x") !== "x") assert.match(rendered, /\x1b\[7m/);
+	assert.match(rendered, new RegExp(`\\x1b\\[48;2;${DELETE_CHAR_BG}m`));
+	assert.match(rendered, new RegExp(`\\x1b\\[48;2;${INSERT_CHAR_BG}m`));
+	assert.doesNotMatch(rendered, /\x1b\[7m/);
 	const expanded = defaultLines.map(stripAnsi).join("\n");
 	assert.match(expanded, /Successfully replaced/);
 	assert.match(expanded, /-.*before/);
@@ -81,8 +83,8 @@ test("expanded diffs color changes without coloring ordinary output as a diff", 
 		assert.ok(lines.some((line) => line.includes("\x1b[90m+++ b/file")));
 		assert.ok(lines.some((line) => line.includes("\x1b[31m-1 ")));
 		assert.ok(lines.some((line) => line.includes("\x1b[32m+1 ")));
-		assert.ok(lines.some((line) => line.includes("\x1b[48;2;66;14;20m")));
-		assert.ok(lines.some((line) => line.includes("\x1b[48;2;6;56;6m")));
+		assert.ok(lines.some((line) => line.includes(`\x1b[48;2;${DELETE_BG}m`)));
+		assert.ok(lines.some((line) => line.includes(`\x1b[48;2;${INSERT_BG}m`)));
 		assert.match(stripAnsi(lines.join("\n")), /-1 old/);
 		assert.match(stripAnsi(lines.join("\n")), /\+1 new/);
 		assert.doesNotMatch(lines.join("\n"), /payload|\x1b\]/);
@@ -113,13 +115,11 @@ test("edits start open, collapse by clicking their diamond, and follow global ex
 
 test("replacement emphasis isolates changed text and keeps terminal controls sanitized", () => {
 	const tool = wrapWithDiamondRenderer(agent.createEditToolDefinition(process.cwd()));
-	const emphasized: string[] = [];
-	const paint = { ...theme, inverse(text: string) { emphasized.push(text); return `\x1b[7m${text}\x1b[27m`; } };
 	const result = { content: [], details: { diff: "- 42 return old_value;\n+ 42 return new_value;\x1b]52;c;attack\x07" } };
-	const output = tool.renderResult(result, { expanded: false }, paint).render(80).join("\n");
-	assert.deepEqual(emphasized, ["old", "new"]);
-	assert.doesNotMatch(output, /attack|\x1b\]/);
-	assert.match(output, /\x1b\[7mnew\x1b\[27m/);
+	const output = tool.renderResult(result, { expanded: false }, theme).render(80).join("\n");
+	assert.match(output, new RegExp(`\\x1b\\[48;2;${DELETE_CHAR_BG}mold\\x1b\\[48;2;`));
+	assert.match(output, new RegExp(`\\x1b\\[48;2;${INSERT_CHAR_BG}mnew\\x1b\\[48;2;`));
+	assert.doesNotMatch(output, /attack|\x1b\]|\x1b\[7m/);
 });
 
 test("registered tools honor global and trusted project shell/image settings", async (t) => {

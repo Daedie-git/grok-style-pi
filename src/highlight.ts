@@ -3,7 +3,9 @@ import { copyFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFileSync, writeFileSync } from "node:fs";
 import { getLanguageFromPath, highlightCode } from "@earendil-works/pi-coding-agent";
+import { defaultStyleColors, styleColors, type StyleColors } from "./style-colors.ts";
 
 const GROK_NIGHT_THEME = join(dirname(fileURLToPath(import.meta.url)), "../themes/grok-night.tmTheme");
 const CACHE_LIMIT = 64;
@@ -56,8 +58,16 @@ export function languageForPath(filePath: string | undefined): string | undefine
 }
 
 let batMissing = false;
-let batCache: string | undefined;
 const highlightCaches = new WeakMap<HighlightAttempt, Map<string, string[]>>();
+const batCaches = new Map<string, string>();
+
+export function themeWithComments(source: string, colors: StyleColors): string {
+	const marks = { comment: "\u0000comment\u0000", commentDoc: "\u0000comment-doc\u0000", commentDocEmphasized: "\u0000comment-doc-emphasized\u0000" };
+	let theme = source;
+	for (const key of ["comment", "commentDoc", "commentDocEmphasized"] as const) theme = theme.replaceAll(defaultStyleColors[key], marks[key]);
+	for (const key of ["comment", "commentDoc", "commentDocEmphasized"] as const) theme = theme.replaceAll(marks[key], colors[key]);
+	return theme;
+}
 
 function remember(cache: Map<string, string[]>, key: string, lines: string[]): string[] {
 	if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value!);
@@ -69,11 +79,14 @@ function colored(lines: string[]): string[] | undefined {
 	return lines.join("").includes("\x1b[") ? lines : undefined;
 }
 
-function grokBatCache(): string | undefined {
-	if (batCache) return batCache;
-	const dir = join(tmpdir(), "grok-style-pi-bat");
+function grokBatCache(colors: StyleColors = styleColors()): string | undefined {
+	const custom = colors.comment !== defaultStyleColors.comment || colors.commentDoc !== defaultStyleColors.commentDoc || colors.commentDocEmphasized !== defaultStyleColors.commentDocEmphasized;
+	const dir = custom ? join(tmpdir(), "grok-style-pi-bat", `${colors.comment}${colors.commentDoc}${colors.commentDocEmphasized}`.replaceAll("#", "")) : join(tmpdir(), "grok-style-pi-bat");
+	const cached = batCaches.get(dir);
+	if (cached) return cached;
 	mkdirSync(join(dir, "themes"), { recursive: true });
-	copyFileSync(GROK_NIGHT_THEME, join(dir, "themes", "grok-night.tmTheme"));
+	if (custom) writeFileSync(join(dir, "themes", "grok-night.tmTheme"), themeWithComments(readFileSync(GROK_NIGHT_THEME, "utf8"), colors));
+	else copyFileSync(GROK_NIGHT_THEME, join(dir, "themes", "grok-night.tmTheme"));
 	const built = spawnSync("bat", ["cache", "--build"], {
 		env: { ...process.env, BAT_CONFIG_DIR: dir, BAT_CACHE_PATH: join(dir, "cache") },
 		stdio: "ignore",
@@ -84,7 +97,7 @@ function grokBatCache(): string | undefined {
 		return undefined;
 	}
 	if (built.status !== 0) return undefined;
-	batCache = dir;
+	batCaches.set(dir, dir);
 	return dir;
 }
 

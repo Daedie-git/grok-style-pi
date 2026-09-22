@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultFeatures, loadFeatures, saveFeatures, installFeatureSettings } from "../src/features.ts";
+import { defaultStyleColors, loadStyleColors } from "../src/style-colors.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { BUILTIN_TOOL_NAMES } from "../src/tools.ts";
 
@@ -23,6 +24,12 @@ test("feature preferences default on, persist and reject malformed values", (t) 
 	assert.deepEqual(loadFeatures(path), { ...defaultFeatures, composer: false });
 	writeFileSync(path, '{"activity":"false"}');
 	assert.throws(() => loadFeatures(path), /must be true or false/);
+	writeFileSync(path, '{"footer":true,"colors":{"diffInsert":"#112233"}}');
+	saveFeatures({ ...defaultFeatures, composer: false }, path);
+	assert.equal(loadStyleColors(path).diffInsert, "#112233");
+	assert.equal(JSON.parse(readFileSync(path, "utf8")).composer, false);
+	writeFileSync(path, '{"colors":{"comment":"blue"}}');
+	assert.throws(() => loadStyleColors(path), /#rrggbb/);
 });
 
 test("settings command supports menu toggles, all-off, validation and cancellation", async (t) => {
@@ -46,6 +53,13 @@ test("settings command supports menu toggles, all-off, validation and cancellati
 	await command.handler("", ctx);
 	assert.deepEqual(loadFeatures(path), before);
 	assert.ok(notices.some((message) => message.includes("/reload")));
+	await command.handler("color comment #a0a8b8", ctx);
+	assert.equal(loadStyleColors(path).comment, "#a0a8b8");
+	assert.equal(loadFeatures(path).activity, true);
+	await command.handler("color comment reset", ctx);
+	assert.deepEqual(loadStyleColors(path), defaultStyleColors);
+	await command.handler("color comment blue", ctx);
+	assert.match(notices.at(-1)!, /Usage/);
 });
 
 class Editor {

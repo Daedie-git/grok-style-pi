@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { buildDiffRows, emphasizeSpan, paintRows } from "../src/diff-render.ts";
+import { buildDiffRows, defaultDiffPalette, DELETE_BG, DELETE_CHAR_BG, emphasizeSpan, INSERT_BG, INSERT_CHAR_BG, paintRows } from "../src/diff-render.ts";
 
 const theme = {
 	paint: (token: string, text: string) => `\x1b[${token === "toolDiffAdded" ? 32 : token === "toolDiffRemoved" ? 31 : 90}m${text}\x1b[39m`,
 	inverse: (text: string) => `\x1b[7m${text}\x1b[27m`,
 };
+
+function marked(line: string, bg: string): string {
+	return line.split(`\x1b[48;2;${bg}m`).slice(1)
+		.map((part) => stripTerminalSequences(part.split(/\x1b\[48;2;/)[0])).join("");
+}
 
 test("diff rows keep source characters and do not leak backgrounds across kinds", () => {
 	const rows = buildDiffRows("-1 😀foo\n+1 😀bar\n 2 kept", theme, (text) => text.split("\n"));
@@ -14,10 +19,10 @@ test("diff rows keep source characters and do not leak backgrounds across kinds"
 	assert.match(stripTerminalSequences(lines[0]), /😀foo/);
 	assert.match(stripTerminalSequences(lines[1]), /😀bar/);
 	assert.match(stripTerminalSequences(lines[2]), /kept/);
-	assert.match(lines[0], /\x1b\[48;2;66;14;20m/);
-	assert.match(lines[1], /\x1b\[48;2;6;56;6m/);
-	assert.doesNotMatch(lines[1], /48;2;66;14;20/);
-	assert.doesNotMatch(lines[2], /48;2;6;56;6|48;2;66;14;20/);
+	assert.match(lines[0], new RegExp(`\\x1b\\[48;2;${DELETE_BG}m`));
+	assert.match(lines[1], new RegExp(`\\x1b\\[48;2;${INSERT_BG}m`));
+	assert.doesNotMatch(lines[1], new RegExp(`48;2;${DELETE_BG}|48;2;${DELETE_CHAR_BG}`));
+	assert.doesNotMatch(lines[2], new RegExp(`48;2;${INSERT_BG}|48;2;${DELETE_BG}|48;2;${INSERT_CHAR_BG}|48;2;${DELETE_CHAR_BG}`));
 	assert.ok(lines.every((line) => line.endsWith("\x1b[0m") || !line.includes("48;2;")));
 	const long = buildDiffRows("-1 removed\n+1 added\n " + "context ".repeat(12), theme, (text) => text.split("\n"));
 	const narrow = paintRows(long, 10, "");
@@ -43,6 +48,55 @@ test("emphasis preserves graphemes split across syntax colors and keeps syntax s
 	const rows = buildDiffRows("-1 " + plain + "\n+1 " + plain.replace("foo", "bar"), theme,
 		(text) => text.split("\n").map((line) => line.replace("true", "\x1b[31mtrue\x1b[0m")));
 	assert.deepEqual(rows.map((row) => stripTerminalSequences(row.text)), ["-1 " + plain, "+1 " + plain.replace("foo", "bar")]);
+});
+
+test("character highlights follow mapped lines instead of one shared prefix and suffix", () => {
+	const rows = buildDiffRows([
+		"-1 return old_value;",
+		"+1 return new_value;",
+		"-2 keep();",
+		"+2 keep();",
+		"-3 only removed",
+		" 4 context",
+		"+5 only added",
+	].join("\n"), theme, (text) => text.split("\n"));
+	const painted = paintRows(rows, 80);
+	assert.equal(marked(painted[0], DELETE_CHAR_BG), "old");
+	assert.equal(marked(painted[1], INSERT_CHAR_BG), "new");
+	assert.equal(marked(painted[2], DELETE_CHAR_BG), "");
+	assert.equal(marked(painted[3], INSERT_CHAR_BG), "");
+	assert.equal(marked(painted[4], DELETE_CHAR_BG), "");
+	assert.equal(marked(painted[6], INSERT_CHAR_BG), "");
+	assert.doesNotMatch(painted.join("\n"), /\x1b\[7m/);
+
+	const split = buildDiffRows("-1 const a = 1; const b = 2;\n+1 const a = 9; const b = 8;", theme, (text) => text.split("\n"));
+	const splitPainted = paintRows(split, 80);
+	assert.equal(marked(splitPainted[0], DELETE_CHAR_BG), "12");
+	assert.equal(marked(splitPainted[1], INSERT_CHAR_BG), "98");
+
+	const swallowed = buildDiffRows("-1 XX..YY\n+1 AA..BB", theme, (text) => text.split("\n"));
+	assert.equal(marked(paintRows(swallowed, 40)[0], DELETE_CHAR_BG), "XX..YY");
+	const kept = buildDiffRows("-1 XX | YY\n+1 AA | BB", theme, (text) => text.split("\n"));
+	assert.equal(marked(paintRows(kept, 40)[0], DELETE_CHAR_BG), "XXYY");
+
+	const indented = buildDiffRows("-1     return old;\n+1         return new;", theme, (text) => text.split("\n"));
+	const indentedPainted = paintRows(indented, 40);
+	assert.equal(marked(indentedPainted[0], DELETE_CHAR_BG), "old");
+	assert.equal(marked(indentedPainted[1], INSERT_CHAR_BG), "new");
+
+	const word = buildDiffRows("-1 backgroundColor\n+1 backgroundColour", theme, (text) => text.split("\n"));
+	const wordPainted = paintRows(word, 40);
+	assert.equal(marked(wordPainted[0], DELETE_CHAR_BG), "backgroundColor");
+	assert.equal(marked(wordPainted[1], INSERT_CHAR_BG), "backgroundColour");
+});
+
+test("configured diff colors replace the default backgrounds", () => {
+	const palette = { ...defaultDiffPalette, insert: "1;2;3", insertChar: "4;5;6" };
+	const rows = buildDiffRows("-1 old\n+1 new", theme, (text) => text.split("\n"), palette);
+	const painted = paintRows(rows, 40, "", palette).join("\n");
+	assert.match(painted, /\x1b\[48;2;1;2;3m/);
+	assert.match(painted, /\x1b\[48;2;4;5;6mnew/);
+	assert.doesNotMatch(painted, new RegExp(`48;2;${INSERT_BG}|48;2;${INSERT_CHAR_BG}`));
 });
 
 test("emphasis inserts into highlighted text without splitting a grapheme", () => {

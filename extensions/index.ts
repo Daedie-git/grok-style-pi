@@ -1,4 +1,5 @@
 import { loadFeatures, installFeatureSettings } from "../src/features.ts";
+import { loadStyleColors, useStyleColors } from "../src/style-colors.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { loadToolOptions } from "../src/tool-settings.ts";
 import { installActivityPanel } from "../src/activity.ts";
@@ -13,6 +14,7 @@ export { wrapWithDiamondRenderer, BUILTIN_TOOL_NAMES } from "../src/tools.ts";
 export default async function grokStylePi(pi: ExtensionAPI): Promise<void> {
 	const agent = await import("@earendil-works/pi-coding-agent");
 	const features = loadFeatures();
+	useStyleColors(loadStyleColors());
 	installFeatureSettings(pi);
 	const activity = features.activity ? installActivityPanel(pi) : undefined;
 	createGrokStyleExtension(pi, {

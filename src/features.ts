@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { colorLabels, featureSettingsPath, readSettingsObject, saveStyleColor, writeSettingsObject, type ColorKey } from "./style-colors.ts";
+
+export { featureSettingsPath };
 
 export const featureLabels = {
 	footer: "Footer (model, and context and usage for the active model)",
@@ -13,14 +13,9 @@ export const featureLabels = {
 } as const;
 export type Features = Record<keyof typeof featureLabels, boolean>;
 export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true };
-export const featureSettingsPath = () => join(getAgentDir(), "grok-style.json");
 
 export function loadFeatures(path = featureSettingsPath()): Features {
-	let data: unknown;
-	try { data = JSON.parse(readFileSync(path, "utf8")); }
-	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...defaultFeatures }; throw error; }
-	if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Grok settings must be a JSON object");
-	const values = data as Record<string, unknown>;
+	const values = readSettingsObject(path);
 	const result = { ...defaultFeatures };
 	for (const key of Object.keys(featureLabels) as (keyof Features)[]) {
 		if (key in values) {
@@ -32,20 +27,28 @@ export function loadFeatures(path = featureSettingsPath()): Features {
 }
 
 export function saveFeatures(features: Features, path = featureSettingsPath()) {
-	mkdirSync(dirname(path), { recursive: true });
-	const temporary = `${path}.${randomUUID()}.tmp`;
-	writeFileSync(temporary, JSON.stringify(features, null, 2) + "\n", { mode: 0o600 });
-	renameSync(temporary, path);
+	writeSettingsObject({ ...readSettingsObject(path), ...features }, path);
 }
 
 export function installFeatureSettings(pi: ExtensionAPI, path = featureSettingsPath()) {
 	pi.registerCommand?.("grok-style", {
-		description: "Toggle Grok features: /grok-style [feature|all] [on|off]",
+		description: "Toggle Grok features or set a diff/comment color: /grok-style [feature|all|color] ...",
 		handler: async (args, ctx) => {
 			try {
 				const settings = loadFeatures(path);
 				const keys = Object.keys(featureLabels) as (keyof Features)[];
+				const colorKeys = Object.keys(colorLabels) as ColorKey[];
 				const parts = args.trim().split(/\s+/);
+				if (parts[0] === "color") {
+					const [, key, value] = parts;
+					if (parts.length !== 3 || !colorKeys.includes(key as ColorKey) || !value || (value !== "reset" && !/^#[0-9a-fA-F]{6}$/.test(value))) {
+						ctx.ui.notify(`Usage: /grok-style color <${colorKeys.join("|")}> <#rrggbb|reset>`, "warning");
+						return;
+					}
+					saveStyleColor(key as ColorKey, value === "reset" ? undefined : value, path);
+					ctx.ui.notify("Grok color saved. Run /reload to apply.", "info");
+					return;
+				}
 				if (!args.trim()) {
 					const labels = keys.map((key) => `${settings[key] ? "On" : "Off"} · ${featureLabels[key]}`);
 					const selected = await ctx.ui.select("Grok features — select to toggle (apply with /reload)", labels);

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { INSERT_BG } from "../src/diff-render.ts";
 import { withWriteSummary, writeSummary, countLines } from "../src/write-summary.ts";
 import { wrapWithDiamondRenderer } from "../src/tools.ts";
 
@@ -33,7 +34,7 @@ test("writes distinguish new files from replacements and render contents or colo
 		const output = tool.renderResult(result, { expanded: true }, theme, context).render(100).join("\n");
 		assert.doesNotMatch(output, /Successfully wrote|attack|\x1b\]/);
 		if (verb === "Creating") {
-			assert.match(output, /\x1b\[48;2;6;56;6m/);
+			assert.match(output, new RegExp(`\\x1b\\[48;2;${INSERT_BG}m`));
 			assert.match(stripTerminalSequences(output), /\+1 old\s+\n\s+\+2 line/);
 		}
 		else {
@@ -100,7 +101,7 @@ test("created file diamonds start open, toggle locally and follow global expansi
 	const result = { content: [{ type: "text", text: "Successfully wrote" }], details: { grokWrite: { kind: "created", lines: 1, preview: "hello\n" } } };
 	const render = () => tool.renderResult(result, { expanded: context.expanded }, theme, context).render(80);
 	assert.match(render().join("\n"), /\x1b\[32m\+1 /);
-	assert.match(render().join("\n"), /\x1b\[48;2;6;56;6m/);
+	assert.match(render().join("\n"), new RegExp(`\\x1b\\[48;2;${INSERT_BG}m`));
 	assert.match(stripTerminalSequences(render().join("\n")), /\+1 hello/);
 	assert.equal(stripTerminalSequences(tool.renderCall(context.args, theme, context).render(80)[0]), "◆ Creating new.ts");
 	const header = tool.renderCall(context.args, theme, context) as any;

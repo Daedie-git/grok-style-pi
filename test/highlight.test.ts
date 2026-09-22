@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { highlightCode, initTheme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences as stripAnsi } from "@earendil-works/pi-tui";
+import { INSERT_BG } from "../src/diff-render.ts";
 import { highlightLines, languageForPath } from "../src/highlight.ts";
 import { wrapWithDiamondRenderer, type OriginalTool } from "../src/tools.ts";
 
@@ -84,7 +85,7 @@ test("new C++ files keep a green gutter and highlight the source", () => {
 		{ args: { path: "widget.h", content: source }, state: {} },
 	).render(120).join("\n");
 	assert.ok(output.includes("\x1b[32m+1 "));
-	assert.ok(output.includes("\x1b[48;2;6;56;6m"));
+	assert.ok(output.includes(`\x1b[48;2;${INSERT_BG}m`));
 	assert.ok(output.includes("\x1b["));
 	assert.match(stripAnsi(output), /\+1 class Widget \{\};/);
 });

@@ -18,7 +18,8 @@ import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openInCursor, type OpenTarget } from "./open-in-cursor.ts";
 import { highlightLines, languageForPath } from "./highlight.ts";
-import { buildDiffRows, createdRows, paintRows, type RenderRow } from "./diff-render.ts";
+import { buildDiffRows, createdRows, paintRows, type DiffPalette, type RenderRow } from "./diff-render.ts";
+import { hexToRgb, styleColors } from "./style-colors.ts";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
@@ -38,7 +39,6 @@ export type ThemeLike = {
 	fg?: (token: ThemeColor, text: string) => string;
 	/** GrokNight code-block panel: `#1c1c1c`, mapped to customMessageBg. */
 	bg?: (token: "customMessageBg", text: string) => string;
-	inverse?: (text: string) => string;
 };
 
 function editDisplay(context: ToolRenderContext | undefined, expanded: boolean) {
@@ -117,6 +117,16 @@ function changedLine(details: unknown): number {
 
 function pathArg(args: ToolArgs): string | undefined {
 	return typeof args?.path === "string" ? args.path : undefined;
+}
+
+function activeDiffPalette(): DiffPalette {
+	const colors = styleColors();
+	return {
+		insert: hexToRgb(colors.diffInsert),
+		delete: hexToRgb(colors.diffDelete),
+		insertChar: hexToRgb(colors.diffInsertChar),
+		deleteChar: hexToRgb(colors.diffDeleteChar),
+	};
 }
 
 function paintHighlighted(text: string, theme: ThemeLike | undefined, token: ThemeColor, lang: string | undefined, filePath?: string): string {
@@ -249,17 +259,17 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			}
 			const paintDiff = {
 				paint: (token: "toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext", value: string) => paint(theme, token, value),
-				inverse: theme.inverse,
 			};
+			const palette = activeDiffPalette();
 			const highlight = (value: string) => highlightLines(value, lang, pathArg(context?.args));
 			const rows: RenderRow[] = [
 				...(summary?.kind === "created" ? createdRows(sanitizeToolText(summary.preview), paintDiff, highlight) : []),
-				...(diff ? buildDiffRows(diff, paintDiff, highlight) : []),
+				...(diff ? buildDiffRows(diff, paintDiff, highlight, palette) : []),
 			];
-			const prose = paintedText ?? (text ? paint(theme, token, text) : "");
-			const proseSource = prose || (rows.length === 0 && context?.isError ? paint(theme, "error", "error") : "");
-			if (!proseSource && rows.length === 0) return emptyComponent();
-			const body = textComponent(proseSource);
+			let prose = paintedText ?? (text ? paint(theme, token, text) : "");
+			if (!prose && rows.length === 0 && context?.isError) prose = paint(theme, "error", "error");
+			if (!prose && rows.length === 0) return emptyComponent();
+			const body = textComponent(prose);
 			return {
 				invalidate() { body.invalidate(); },
 				handleMouse(event: TuiMouseEvent) {
@@ -273,9 +283,9 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				},
 				render(width: number) {
 					const indent = width > 2 ? "  " : "";
-					const prose = proseSource ? body.render(Math.max(0, width - indent.length)).map((line) => indent + line) : [];
-					const painted = paintRows(rows, width, indent);
-					const lines = prose.length && painted.length ? [...prose, "", ...painted] : [...prose, ...painted];
+					const proseLines = prose ? body.render(Math.max(0, width - indent.length)).map((line) => indent + line) : [];
+					const painted = paintRows(rows, width, indent, palette);
+					const lines = proseLines.length && painted.length ? [...proseLines, "", ...painted] : [...proseLines, ...painted];
 					// GrokNight bg_dark is #1c1c1c, lighter than the #141414 transcript, for expanded read panels.
 					if (original.name !== "read" || context?.isError || !theme?.bg) return lines;
 					return lines.map((line) => theme.bg!("customMessageBg", line + " ".repeat(Math.max(0, width - visibleWidth(line)))));

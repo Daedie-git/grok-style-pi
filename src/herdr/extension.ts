@@ -60,7 +60,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.registerTool(defineTool({
 			name: "Agent",
 			label: "Agent",
-			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. schedule and isolation are not available here.",
+			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here.",
 			parameters: Type.Object({
 				prompt: Type.String({ description: "The task for the agent to perform." }),
 				description: Type.String({ description: "A short (3-5 word) description of the task (shown in UI)." }),
@@ -72,7 +72,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				run_in_background: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false to wait for the result, or for blocked." })),
 				resume: Type.Optional(Type.String({ description: "Agent ID to resume after its current run has finished." })),
 				isolated: Type.Optional(Type.Boolean({ description: "If true, the child may use only built-in tools." })),
-				inherit_context: Type.Optional(Type.Boolean({ description: "If true, clone this session file into the child. Default: false." })),
+				inherit_context: Type.Optional(Type.Boolean({ description: "Must remain false. The orchestrating agent provides all needed context in the prompt." })),
 			}),
 			execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 				const request: SpawnRequest = {

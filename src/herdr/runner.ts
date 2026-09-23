@@ -259,7 +259,7 @@ export class HerdrRunner {
 				await this.recoverLaunches();
 				check(signal);
 				const target = await this.choosePlacement(request, signal);
-				await this.store.recordLaunch(ref!, this.owner, "creating", { tabId: target.tabId }, this.now());
+				await this.store.recordLaunch(ref!, this.owner, "creating", { tabId: target.tabId, direction: target.direction }, this.now());
 				check(signal);
 				// Once issued, pane creation is never blindly retried: its outcome may be ambiguous.
 				creationIssued = true;
@@ -323,6 +323,8 @@ export class HerdrRunner {
 			else unknown++;
 		}
 		if (needsNewTab(panes.size + unknown)) return { newTab: true };
+		const previous = launches.find((launch) => launch.tabId === request.tabId && launch.stage !== "closed" && launch.paneId && panes.has(launch.paneId) && launch.direction);
+		if (previous?.direction) return { newTab: false, tabId: request.tabId, direction: previous.direction === "right" ? "down" : "right" };
 		const layout = await this.deps.client.layout(request.paneId);
 		check(signal);
 		return { newTab: false, tabId: request.tabId, direction: splitDirection(layout) };

@@ -3,6 +3,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, utimesSync, copyFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -494,6 +495,20 @@ test("concurrent placement counts durable reservations even before Herdr sees Pi
 	assert.equal(f.events.filter((event) => event === "tab").length, 1);
 });
 
+test("successive spawns alternate split directions within a tab", async (t) => {
+	const f = fixture(t);
+	await f.runner.spawn(request());
+	await f.runner.spawn(request());
+	assert.deepEqual(f.events.filter((event) => event.startsWith("split:")), ["split:right", "split:down"]);
+});
+
+test("a narrow tab splits down first, then right", async (t) => {
+	const f = fixture(t, { layout: async () => ({ columns: 60, rows: 40 }) });
+	await f.runner.spawn(request());
+	await f.runner.spawn(request());
+	assert.deepEqual(f.events.filter((event) => event.startsWith("split:")), ["split:down", "split:right"]);
+});
+
 test("observed panes and reservations are deduplicated for capacity", async (t) => {
 	const f = fixture(t);
 	await f.runner.spawn(request());
@@ -860,6 +875,10 @@ test("tool names and durable notification receipts survive extension reload", { 
 	const ctx = { isIdle: () => true, abort() {}, ui: { notify() {} }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => "/parent/session.jsonl", getSessionId: () => "parent" } };
 	const first = create();
 	assert.deepEqual(first.tools.map((tool) => tool.name), ["Agent", "get_subagent_result", "steer_subagent"]);
+	const agentTool = first.tools[0];
+	assert.match(agentTool.description, /Keep inherit_context false/);
+	assert.match(agentTool.parameters.properties.inherit_context.description, /Must remain false/);
+	assert.match(agentTool.parameters.properties.inherit_context.description, /provides all needed context in the prompt/);
 	await first.handlers.get("session_start")!({}, ctx);
 	await eventually(async () => queued.length === 1);
 	assert.equal((await f.runner.store.notices("w1:p1")).length, 1, "queued messages are not delivery receipts");
@@ -959,6 +978,41 @@ test("failed and incomplete fleet snapshots preserve unknown liveness", async (t
 	f.client.listAgents = async () => [{ paneId: record.paneId }];
 	await f.runner.maintain();
 	assert.equal((await f.runner.read(ref)).phase, "queued");
+});
+
+test("database contention reports operation and SQLite diagnostics without task arguments", async () => {
+	const root = mkdtempSync(join(tmpdir(), "herdr-db-diagnostics-"));
+	const store = new HerdrStore(root);
+	let blocker: DatabaseSync | undefined;
+	let starting: HerdrStore | undefined;
+	try {
+		await store.listAgents();
+		blocker = new DatabaseSync(join(root, "control.sqlite"));
+		blocker.exec("BEGIN IMMEDIATE");
+		starting = new HerdrStore(root);
+		const diagnostic = (operation: string) => (error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /\[DEBUG-herdr-db\]/);
+			assert.ok(error.message.includes(`operation=${operation}`));
+			assert.match(error.message, /code=ERR_SQLITE_ERROR errcode=5/);
+			assert.match(error.message, /database is locked/);
+			assert.ok(error.message.includes(`node=${process.version}`));
+			assert.ok(error.message.includes(`pid=${process.pid}`));
+			assert.ok(!error.message.includes("private-owner-argument"));
+			return true;
+		};
+		await Promise.all([
+			assert.rejects(store.retireOwner("private-owner-argument"), diagnostic("retireOwner")),
+			assert.rejects(starting.listAgents(), diagnostic("initialize control.sqlite schema")),
+		]);
+		blocker.exec("ROLLBACK");
+		await store.retireOwner("recovered");
+		assert.equal(await store.ownerRetired("recovered"), true);
+	} finally {
+		blocker?.close();
+		await Promise.all([store.close(), starting?.close()]);
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("simultaneous first opens initialize WAL without losing a control worker", async () => {

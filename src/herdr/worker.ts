@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { parentPort, workerData } from "node:worker_threads";
+import { parentPort, threadId, workerData } from "node:worker_threads";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -26,8 +26,19 @@ function database(name: string): DatabaseSync {
 	}
 }
 
-const db = database("control.sqlite");
-const placement = database("placement.sqlite");
+// Temporary diagnostics: never include operation arguments, prompts, or stored task data.
+function databaseDiagnostics<T>(operation: string, body: () => T): T {
+	try { return body(); }
+	catch (error) {
+		const sqlite = error as { code?: string; errcode?: number } | null;
+		if (sqlite?.code !== "ERR_SQLITE_ERROR" && typeof sqlite?.errcode !== "number") throw error;
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`[DEBUG-herdr-db] operation=${operation} code=${sqlite.code ?? "unknown"} errcode=${sqlite.errcode ?? "unknown"} node=${process.version} pid=${process.pid} thread=${threadId}: ${message}`, { cause: error });
+	}
+}
+
+const db = databaseDiagnostics("initialize control.sqlite", () => database("control.sqlite"));
+const placement = databaseDiagnostics("initialize placement.sqlite", () => database("placement.sqlite"));
 // The placement lock is retried asynchronously by the caller. Control operations use another connection.
 placement.exec("PRAGMA busy_timeout=0");
 let placementOwner: string | undefined;
@@ -44,7 +55,7 @@ function transaction<T>(body: () => T): T {
 	}
 }
 
-transaction(() => {
+databaseDiagnostics("initialize control.sqlite schema", () => transaction(() => {
 	const version = Number(db.prepare("PRAGMA user_version").get()?.user_version);
 	if (version !== 0 && version !== 2) throw new Error(`Unsupported Herdr protocol version ${version}`);
 	db.exec(`
@@ -62,7 +73,7 @@ transaction(() => {
 		CREATE INDEX IF NOT EXISTS pending_notices ON notices(run) WHERE acknowledged=0;
 		PRAGMA user_version=2;
 	`);
-});
+}));
 
 function decode<T>(row: Record<string, unknown> | undefined): T | undefined {
 	return row ? JSON.parse(String(row.data)) as T : undefined;
@@ -285,7 +296,7 @@ const operations = {
 	launches(): LaunchRecord[] {
 		return db.prepare("SELECT data FROM launches").all().map((row) => decode<LaunchRecord>(row)!);
 	},
-	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: { paneId?: string; tabId?: string; error?: string }, now: number): void {
+	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: { paneId?: string; tabId?: string; direction?: "right" | "down"; error?: string }, now: number): void {
 		transaction(() => {
 			const value = launch(ref);
 			if (value.owner !== owner) throw new Error("Launch ownership changed");
@@ -353,7 +364,7 @@ parentPort!.on("message", (request: { id: number; operation: keyof StoreOperatio
 	try {
 		const operation = operations[request.operation] as (...args: unknown[]) => unknown;
 		if (typeof operation !== "function") throw new Error("Unknown Herdr control operation");
-		parentPort!.postMessage({ id: request.id, value: operation(...request.args) });
+		parentPort!.postMessage({ id: request.id, value: databaseDiagnostics(request.operation, () => operation(...request.args)) });
 	} catch (error) {
 		parentPort!.postMessage({ id: request.id, error: error instanceof Error ? error.message : String(error) });
 	}

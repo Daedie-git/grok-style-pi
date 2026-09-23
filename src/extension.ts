@@ -3,6 +3,7 @@ import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { defaultFeatures } from "./extension/features.ts";
 import { COMMUNICATION, installCommunication } from "./extension/communication.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, type BuiltinToolName } from "./tools/renderer.ts";
+import { createShowImageTool } from "./tools/show-image.ts";
 import { createFileNavigation } from "./extension/file-navigation.ts";
 import { createSessionChrome } from "./extension/session-chrome.ts";
 import type { ExtensionApiLike, GrokStyleDeps } from "./extension/types.ts";
@@ -37,6 +38,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
 			pi.registerTool({ ...registered, label: registered.label ?? registered.name });
 		}
+		if (features.toolStyling) pi.registerTool(createShowImageTool(cwd));
 	}
 	// Pi rebuilds transcript rows before session_start on reload. Register the
 	// renderers during extension load, then refresh execution options at startup.

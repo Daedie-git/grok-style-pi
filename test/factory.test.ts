@@ -155,14 +155,16 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 
 	assert.deepEqual(
 		registered.map((tool) => tool.name),
-		[...BUILTIN_TOOL_NAMES],
+		[...BUILTIN_TOOL_NAMES, "show_image"],
 	);
 	for (const tool of registered) {
 		assert.equal(tool.renderShell, "self", `${String(tool.name)} should own its shell`);
 		assert.equal(typeof tool.renderCall, "function");
 		assert.equal(typeof tool.renderResult, "function");
-		const executed = await (tool.execute as Function)("id", {}, undefined, undefined, ctx);
-		assert.equal(executed.content[0].text, `exec-${tool.name}`);
+		if (tool.name !== "show_image") {
+			const executed = await (tool.execute as Function)("id", {}, undefined, undefined, ctx);
+			assert.equal(executed.content[0].text, `exec-${tool.name}`);
+		}
 	}
 
 	assert.ok(footerFactory);

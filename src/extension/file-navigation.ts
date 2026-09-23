@@ -2,6 +2,7 @@ import { getCapabilities } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { linkifyCodeReferences } from "../navigation/code-links.ts";
 import { createFileLinkBridge } from "../navigation/file-link-bridge.ts";
+import { isImagePath, openImage } from "../navigation/open-image.ts";
 import { installFileLinkHandler } from "../navigation/file-link-handler.ts";
 import { createOpenHistory, absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { createCursorWorkspaceOpener, type CursorOpenContext } from "../navigation/cursor-workspace.ts";
@@ -18,7 +19,7 @@ export function createFileNavigation(pi: ExtensionApiLike, deps: FileNavigationD
 	let openContext: CursorOpenContext | undefined;
 	let sessionGeneration = 0;
 	let linkCwd = process.cwd();
-	const fileLinks = createFileLinkBridge(target => openTarget(target));
+	const fileLinks = createFileLinkBridge(target => openLinkedTarget(target));
 	const linksEnabled = deps.hyperlinks ?? (() => {
 		try { return getCapabilities().hyperlinks; } catch { return false; }
 	});
@@ -28,6 +29,17 @@ export function createFileNavigation(pi: ExtensionApiLike, deps: FileNavigationD
 			? reference => fileLinks.urlFor({ ...reference, cwd: linkCwd })
 			: undefined);
 	});
+	async function openLinkedTarget(target: OpenTarget): Promise<boolean> {
+		if (!isImagePath(target.path)) return openTarget(target);
+		const generation = sessionGeneration;
+		try {
+			await openImage(target);
+			return generation === sessionGeneration;
+		} catch (error) {
+			if (generation === sessionGeneration) openContext?.ui.notify?.(`Failed to open image: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return false;
+		}
+	}
 	async function openTarget(target: OpenTarget, ctx = openContext): Promise<boolean> {
 		const generation = sessionGeneration;
 		const notify = ctx?.ui.notify?.bind(ctx.ui);

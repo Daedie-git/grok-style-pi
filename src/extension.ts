@@ -4,6 +4,7 @@ import { defaultFeatures } from "./extension/features.ts";
 import { COMMUNICATION, installCommunication } from "./extension/communication.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, type BuiltinToolName } from "./tools/renderer.ts";
 import { createShowImageTool } from "./tools/show-image.ts";
+import { createShowVideoTool } from "./tools/show-video.ts";
 import { createFileNavigation } from "./extension/file-navigation.ts";
 import { createSessionChrome } from "./extension/session-chrome.ts";
 import type { ExtensionApiLike, GrokStyleDeps } from "./extension/types.ts";
@@ -14,6 +15,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	const features = { ...defaultFeatures, ...deps.features };
 	const preparation = new VisualPreparation();
 	let started = false;
+	const videoTool = features.toolStyling ? createShowVideoTool(process.cwd()) : undefined;
 	const navigation = createFileNavigation(pi, { ...deps, communication: features.communication });
 	const chrome = createSessionChrome(pi, { CustomEditor: deps.CustomEditor, features });
 
@@ -38,13 +40,17 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
 			pi.registerTool({ ...registered, label: registered.label ?? registered.name });
 		}
-		if (features.toolStyling) pi.registerTool(createShowImageTool(cwd));
+		if (features.toolStyling) {
+			pi.registerTool(createShowImageTool(cwd));
+			if (videoTool) pi.registerTool(videoTool);
+		}
 	}
 	// Pi rebuilds transcript rows before session_start on reload. Register the
 	// renderers during extension load, then refresh execution options at startup.
 	registerTools(process.cwd());
 
 	pi.on("session_start", (_event, ctx) => {
+		videoTool?.startSession();
 		if (started) preparation.reset();
 		started = true;
 		// Paint terminal colors before filesystem setup and tool settings can block.
@@ -52,7 +58,10 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 		navigation.startSession(ctx);
 		registerTools(ctx.cwd, deps.getToolOptions?.(ctx));
 	});
+	pi.on("session_tree", () => videoTool?.pauseAll());
+	pi.on("session_compact", () => videoTool?.pauseAll());
 	pi.on("session_shutdown", () => {
+		videoTool?.dispose();
 		preparation.reset();
 		navigation.dispose();
 		chrome.dispose();

@@ -65,8 +65,9 @@ test("consumer loads the shipped factory and wires public APIs", async () => {
 		},
 	);
 
-	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length + 1);
+	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length + 2);
 	assert.ok(registered.some((tool) => tool.name === "show_image" && tool.renderShell === "self"));
+	assert.ok(registered.some((tool) => tool.name === "show_video" && tool.renderShell === "self"));
 	assert.ok(footerSet);
 	assert.ok(editorSet);
 	for (const name of BUILTIN_TOOL_NAMES) {
@@ -121,8 +122,9 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 		assert.equal(tool.promptSnippet, native.promptSnippet);
 		assert.deepEqual((tool.promptGuidelines as string[]).slice(0, native.promptGuidelines?.length), native.promptGuidelines);
 	}
-	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length + 1);
+	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length + 2);
 	assert.ok(registered.some((tool) => tool.name === "show_image" && tool.renderShell === "self"));
+	assert.ok(registered.some((tool) => tool.name === "show_video" && tool.renderShell === "self"));
 	for (const name of BUILTIN_TOOL_NAMES) {
 		const tool = registered.find((item) => item.name === name);
 		assert.ok(tool, `missing ${name}`);

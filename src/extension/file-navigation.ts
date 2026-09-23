@@ -2,7 +2,7 @@ import { getCapabilities } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { linkifyCodeReferences } from "../navigation/code-links.ts";
 import { createFileLinkBridge } from "../navigation/file-link-bridge.ts";
-import { isImagePath, openImage } from "../navigation/open-image.ts";
+import { isMediaPath, openMedia } from "../navigation/open-media.ts";
 import { installFileLinkHandler } from "../navigation/file-link-handler.ts";
 import { createOpenHistory, absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { createCursorWorkspaceOpener, type CursorOpenContext } from "../navigation/cursor-workspace.ts";
@@ -30,13 +30,13 @@ export function createFileNavigation(pi: ExtensionApiLike, deps: FileNavigationD
 			: undefined);
 	});
 	async function openLinkedTarget(target: OpenTarget): Promise<boolean> {
-		if (!isImagePath(target.path)) return openTarget(target);
+		if (!isMediaPath(target.path)) return openTarget(target);
 		const generation = sessionGeneration;
 		try {
-			await openImage(target);
+			await openMedia(target);
 			return generation === sessionGeneration;
 		} catch (error) {
-			if (generation === sessionGeneration) openContext?.ui.notify?.(`Failed to open image: ${error instanceof Error ? error.message : String(error)}`, "error");
+			if (generation === sessionGeneration) openContext?.ui.notify?.(`Failed to open media: ${error instanceof Error ? error.message : String(error)}`, "error");
 			return false;
 		}
 	}

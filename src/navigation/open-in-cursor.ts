@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter } from "node:path";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 
 export type OpenTarget = { path: string; line: number; column?: number; cwd: string };
 
@@ -56,38 +55,34 @@ export function createOpenHistory() {
 }
 
 export function cursorLauncher(home = homedir(), exists = existsSync): string {
-	if (process.platform === "win32") {
-		const command = findWindowsCursorCommand(home, exists);
-		return command?.cmd ?? "cursor";
-	}
 	const shim = join(home, ".local", "bin", "cursor");
 	return exists(shim) ? shim : "cursor";
 }
 
-function findWindowsCursorCommand(home = homedir(), exists = existsSync): { exe: string; cli: string; cmd: string } | undefined {
-	const roots = [
-		process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs", "cursor"),
-		join(home, "AppData", "Local", "Programs", "cursor"),
-		process.env.ProgramFiles && join(process.env.ProgramFiles, "Cursor"),
-		process.env["ProgramFiles(x86)"] && join(process.env["ProgramFiles(x86)"]!, "Cursor"),
-	].filter((value): value is string => Boolean(value));
-	for (const root of roots) {
-		const exe = join(root, "Cursor.exe");
-		const cli = join(root, "resources", "app", "out", "cli.js");
-		const cmd = join(root, "resources", "app", "bin", "cursor.cmd");
-		if (exists(exe) && exists(cli)) return { exe, cli, cmd };
-	}
-	return undefined;
-}
+type WindowsDiscovery = { home: string; env: NodeJS.ProcessEnv; exists: (path: string) => boolean };
 
-function windowsPathCommand(command: string, envPath = process.env.PATH ?? ""): string | undefined {
-	const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map((ext) => ext.toLowerCase());
-	for (const dir of envPath.split(delimiter)) {
+function findWindowsCursorCommand({ home, env, exists }: WindowsDiscovery): { exe: string; cli: string } | undefined {
+	const roots = [
+		env.LOCALAPPDATA && win32.join(env.LOCALAPPDATA, "Programs", "cursor"),
+		win32.join(home, "AppData", "Local", "Programs", "cursor"),
+		env.ProgramFiles && win32.join(env.ProgramFiles, "Cursor"),
+		env["ProgramFiles(x86)"] && win32.join(env["ProgramFiles(x86)"]!, "Cursor"),
+	].filter((value): value is string => Boolean(value));
+	for (const entry of (env.Path ?? env.PATH ?? "").split(";")) {
+		const dir = entry.replace(/^"(.*)"$/, "$1");
 		if (!dir) continue;
-		for (const ext of extensions) {
-			const candidate = join(dir, command.toLowerCase().endsWith(ext) ? command : command + ext);
-			if (existsSync(candidate)) return candidate;
+		roots.push(dir);
+		// Cursor's PATH shim normally lives under resources/app/bin, not beside Cursor.exe.
+		if (win32.basename(dir).toLowerCase() === "bin" &&
+			win32.basename(win32.dirname(dir)).toLowerCase() === "app" &&
+			win32.basename(win32.dirname(win32.dirname(dir))).toLowerCase() === "resources") {
+			roots.push(win32.dirname(win32.dirname(win32.dirname(dir))));
 		}
+	}
+	for (const root of new Set(roots)) {
+		const exe = win32.join(root, "Cursor.exe");
+		const cli = win32.join(root, "resources", "app", "out", "cli.js");
+		if (exists(exe) && exists(cli)) return { exe, cli };
 	}
 	return undefined;
 }
@@ -151,12 +146,15 @@ export function findMountedCursor(tmpDir = "/tmp"): { electron: string; cli: str
 	return undefined;
 }
 
-export function resolveCursorInvocation(args: string[], tmpDir = "/tmp"): { command: string; args: string[]; env: NodeJS.ProcessEnv; mounted?: boolean } {
-	if (process.platform === "win32") {
-		const installed = findWindowsCursorCommand();
-		if (installed) return { command: installed.exe, args: [installed.cli, ...args], env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" } };
-		const cursor = windowsPathCommand("cursor") ?? "cursor";
-		return { command: "cmd.exe", args: ["/d", "/s", "/c", cursor, ...args], env: process.env };
+export function resolveCursorInvocation(args: string[], tmpDir = "/tmp", options: {
+	platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; home?: string; exists?: (path: string) => boolean;
+} = {}): { command: string; args: string[]; env: NodeJS.ProcessEnv; mounted?: boolean } {
+	const platform = options.platform ?? process.platform;
+	const env = options.env ?? process.env;
+	if (platform === "win32") {
+		const installed = findWindowsCursorCommand({ home: options.home ?? homedir(), env, exists: options.exists ?? existsSync });
+		if (installed) return { command: installed.exe, args: [installed.cli, ...args], env: { ...env, ELECTRON_RUN_AS_NODE: "1" } };
+		throw new Error("Cursor.exe and resources/app/out/cli.js were not found. Install Cursor or add its installation directory to PATH.");
 	}
 	const mounted = findMountedCursor(tmpDir);
 	if (mounted) {

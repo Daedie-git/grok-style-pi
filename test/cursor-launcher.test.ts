@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import test, { type TestContext } from "node:test";
-import { cursorLauncher, findMountedCursor, isOwnedAppImageMount, openInCursor, type SpawnLike } from "../src/navigation/open-in-cursor.ts";
+import { cursorLauncher, findMountedCursor, isOwnedAppImageMount, openInCursor, resolveCursorInvocation, type SpawnLike } from "../src/navigation/open-in-cursor.ts";
 
 async function fixture(t: TestContext, name = ".mount_cursor") {
 	const root = await mkdtemp(join(tmpdir(), "cursor-launcher-"));
@@ -19,6 +19,37 @@ async function fixture(t: TestContext, name = ".mount_cursor") {
 }
 
 const linux = { skip: process.platform !== "linux" };
+
+test("Windows Cursor discovery launches only a direct exe and cli, including PATH installs", () => {
+	const root = `C:\\Programs & % "Custom"\\Cursor`;
+	const exe = win32.join(root, "Cursor.exe");
+	const cli = win32.join(root, "resources", "app", "out", "cli.js");
+	const bin = win32.join(root, "resources", "app", "bin");
+	const position = `C:\\work & % "quoted"\\file.ts:9`;
+	const args = ["--classic", "--goto", position, `C:\\work & % "quoted"`];
+	const exists = (path: string) => path === exe || path === cli || path === win32.join(bin, "cursor.cmd");
+	for (const path of [root, bin]) {
+		const env = { PATH: `C:\\other;"${path}"`, PATHEXT: ".CMD;.EXE" };
+		assert.deepEqual(resolveCursorInvocation(args, "/no-mount", { platform: "win32", home: "C:\\nobody", env, exists }), {
+			command: exe, args: [cli, ...args], env: { ...env, ELECTRON_RUN_AS_NODE: "1" },
+		});
+	}
+	const env = { LOCALAPPDATA: `C:\\Users\\me & %\\AppData\\Local` };
+	const localRoot = win32.join(env.LOCALAPPDATA, "Programs", "cursor");
+	assert.equal(resolveCursorInvocation(args, "/no-mount", {
+		platform: "win32", home: "C:\\nobody", env,
+		exists: (path) => path === win32.join(localRoot, "Cursor.exe") || path === win32.join(localRoot, "resources", "app", "out", "cli.js"),
+	}).command, win32.join(localRoot, "Cursor.exe"));
+});
+
+test("Windows Cursor discovery rejects command shims without a direct exe and cli", () => {
+	const bin = `C:\\Cursor\\resources\\app\\bin`;
+	const env = { Path: bin, PATHEXT: ".CMD;.EXE" };
+	const exists = (path: string) => path === win32.join(bin, "cursor.cmd");
+	assert.throws(() => resolveCursorInvocation(["--goto", `C:\\a & % "quoted".ts:1`], "/no-mount", {
+		platform: "win32", home: "C:\\nobody", env, exists,
+	}), /Cursor\.exe.*cli\.js.*PATH/);
+});
 
 test("root-owned AppImage metadata requires the current user's FUSE mount", () => {
 	const info = "263 58 0:76 / /tmp/.mount_cursor ro,nosuid,nodev - fuse.Cursor.AppImage Cursor.AppImage ro,user_id=1000,group_id=1000";

@@ -16,11 +16,11 @@ import {
 	type ToolRenderContext,
 } from "./diamond.ts";
 import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openInCursor, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import type { VisualPreparation } from "../rendering/visual-preparation.ts";
 import { highlightLines, languageForPath } from "../rendering/highlight.ts";
-import { buildDiffRows, createdRows, type DiffPalette, type RenderRow } from "../rendering/diff-render.ts";
+import { buildDiffRows, createdRows, paintRows, type DiffPalette, type RenderRow } from "../rendering/diff-render.ts";
 import { hexToRgb, styleColors } from "../chrome/style-colors.ts";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
@@ -82,7 +82,20 @@ export type DiamondTool = OriginalTool & {
 export type DiamondHooks = {
 	preparation?: VisualPreparation;
 	onModifierOpen?: (target: OpenTarget) => void;
+	onCodeLocation?: (path: string, line: number, endLine?: number) => void;
+	hasActiveSelection?: () => boolean | undefined;
 };
+
+type CodePoint = { x: number; y: number; line: number };
+type CodeSelection = {
+	content: unknown; details: unknown; args: unknown;
+	anchor?: CodePoint; dragged?: boolean;
+	range?: { start: CodePoint; end: CodePoint; width: number };
+};
+
+// All diamond tools registered together share mouse selection state, but no
+// transcript state or mutable component is retained after their hooks expire.
+const selectionGroups = new WeakMap<DiamondHooks, { active?: CodeSelection }>();
 
 export type ToolFactory<N extends BuiltinToolName = BuiltinToolName> = (cwd: string, options?: ToolsOptions[N]) => OriginalTool;
 
@@ -161,6 +174,9 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 	const execute = original.execute.bind(original);
 	const requests = new WeakMap<object, object>();
 	const rendered = new WeakMap<object, { keys: unknown[]; component: ReturnType<typeof textComponent> }>();
+	const selections = new WeakMap<object, CodeSelection>();
+	const selectionGroup = hooks ? selectionGroups.get(hooks) ?? {} : {};
+	if (hooks) selectionGroups.set(hooks, selectionGroup);
 	const shell = ["bash", "powershell"].includes(original.name);
 	const edit = original.name === "edit";
 	const write = original.name === "write";
@@ -260,7 +276,14 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			const defaultOpen = edit || summary?.kind === "created";
 			const display = defaultOpen ? editDisplay(context, options.expanded) : toolDisplay(context, options.expanded);
 			const open = display.open;
-			if (options.isPartial || !open) return emptyComponent();
+			if (options.isPartial || !open) {
+				if (owner) {
+					const selection = selections.get(owner);
+					if (selectionGroup.active === selection) selectionGroup.active = undefined;
+					selections.delete(owner);
+				}
+				return emptyComponent();
+			}
 			const diff = sanitizeToolText(extractResultDiff(result));
 			let { text } = formatToolResult({ ...result, details: undefined }, { ...options, expanded: true });
 			const token = context?.isError ? "error" : "toolOutput";
@@ -318,11 +341,76 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			const plainProse = large && preparation ? sanitizeToolText(prose) : prose;
 			let cachedWidth: number | undefined;
 			let cachedLines: string[] = [];
+			let codeLines: Array<number | undefined> = [];
+			const path = pathArg(context?.args);
+			const readSource = original.name === "read" && !context?.isError && text ? splitReadNotice(text).code : "";
+			const readCode = readSource && !result.content?.some((block) => block.type === "image") &&
+				!/^Read image file \[[^\]\n]+\](?:\n|$)/.test(readSource) &&
+				!/^\[(?:Showing lines |\d+ more lines in file\.|Line \d+ is )/.test(readSource)
+				? readSource.split("\n") : [];
+			const previewStart = summary?.preview && summary.kind !== "created" && !diff
+				? (summary.note ? sanitizeToolText(summary.note).split("\n").length + 1 : 0) : -1;
+			const previewLength = previewStart >= 0 ? sanitizeToolText(summary!.preview).split("\n").length : 0;
+			const diffLines = diff ? diff.split("\n") : [];
+			const previousSelection = owner && selections.get(owner);
+			const selection = previousSelection && previousSelection.content === result.content && previousSelection.details === result.details && previousSelection.args === context?.args
+				? previousSelection : { content: result.content, details: result.details, args: context?.args } as CodeSelection;
+			if (selectionGroup.active === previousSelection && selection !== previousSelection) selectionGroup.active = undefined;
+			if (owner) selections.set(owner, selection);
 			return {
 				invalidate() { cachedWidth = undefined; },
 				handleMouse(event: TuiMouseEvent) {
 					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
-					if (opened) return opened;
+					if (opened) { selection.range = undefined; selectionGroup.active = undefined; return opened; }
+					const location = event.button === "left" && !event.alt && !event.ctrl &&
+						Number.isInteger(event.y) && event.y >= 0 && Number.isInteger(event.x) && event.x >= 0 && event.x < (cachedWidth ?? 0)
+						? codeLines[event.y] : undefined;
+					const point = location === undefined ? undefined : { x: event.x, y: event.y, line: location };
+					if (event.type === "press") {
+						if (selectionGroup.active && (selectionGroup.active !== selection || hooks?.hasActiveSelection?.() === false)) {
+							selectionGroup.active.range = undefined;
+							selectionGroup.active = undefined;
+						}
+						selection.anchor = point;
+						selection.dragged = false;
+					} else if (event.type === "drag" && selection.anchor) {
+						selection.dragged = true;
+						selection.range = undefined;
+						if (selectionGroup.active === selection) selectionGroup.active = undefined;
+					} else if (event.type === "release") {
+						let end = point;
+						// A selection can finish in the read continuation notice or the
+						// gap after source rows. Retain the source portion of the drag.
+						if (!end && selection.anchor && Number.isInteger(event.y)) {
+							const forward = event.y > selection.anchor.y;
+							for (let y = event.y; forward ? y > selection.anchor.y : y < selection.anchor.y; y += forward ? -1 : 1) {
+								const sourceLine = codeLines[y];
+								if (sourceLine !== undefined) {
+									end = { x: forward ? (cachedWidth ?? 1) - 1 : 0, y, line: sourceLine };
+									break;
+								}
+							}
+						}
+						if (selection.dragged && selection.anchor && end && end.line !== selection.anchor.line) {
+							const forward = selection.anchor.y < end.y || selection.anchor.y === end.y && selection.anchor.x < end.x;
+							selection.range = { start: forward ? selection.anchor : end, end: forward ? end : selection.anchor, width: cachedWidth ?? 0 };
+							selectionGroup.active = selection;
+						}
+						selection.anchor = undefined;
+						selection.dragged = false;
+					}
+					if (event.type === "click" && point && path && hooks?.onCodeLocation) {
+						const range = selectionGroup.active === selection ? selection.range : undefined;
+						const inside = range && range.width === cachedWidth &&
+								(point.y > range.start.y || point.y === range.start.y && point.x >= range.start.x) &&
+								(point.y < range.end.y || point.y === range.end.y && point.x <= range.end.x);
+						selection.range = undefined;
+						selectionGroup.active = undefined;
+						hooks.onCodeLocation(sanitizeToolText(path), inside && range ? Math.min(range.start.line, range.end.line) : point.line,
+							inside && range ? Math.max(range.start.line, range.end.line) : undefined);
+						return { handled: true };
+					}
+					if (event.type === "click") { selection.range = undefined; selectionGroup.active = undefined; }
 					if (!context?.state || !context.invalidate || !togglesOpen(event, display.open, defaultOpen)) return undefined;
 					display.open = !display.open;
 					context.invalidate();
@@ -330,11 +418,44 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				},
 				render(width: number) {
 					if (width === cachedWidth) return cachedLines;
+					if (cachedWidth !== undefined && cachedWidth !== width) {
+						selection.anchor = undefined;
+						selection.range = undefined;
+						if (selectionGroup.active === selection) selectionGroup.active = undefined;
+					}
 					cachedWidth = width;
 					const layout = large && owner ? preparation?.request({
 						kind: "layout", text: prose, rows, width, palette, background, colors: styleColors(),
 					}, owner, notify) : undefined;
-					return cachedLines = layout?.lines ?? layoutTool(plainProse, plainRows, width, palette, background);
+					cachedLines = layout?.lines ?? layoutTool(plainProse, plainRows, width, palette, background);
+					codeLines = [];
+					if (!fileRow || !path || !hooks?.onCodeLocation) return cachedLines;
+					// Use the same wrapping width as layoutTool, so a click on a continuation
+					// row still refers to the logical source line rather than the next one.
+					const inner = Math.max(0, width - (width > 2 ? 2 : 0));
+					if (prose) {
+						for (const [index, source] of plainProse.replace(/\t/g, "   ").split("\n").entries()) {
+							const wraps = source && inner > 0 ? wrapTextWithAnsi(source, inner).length : 1;
+							const number = index < readCode.length ? Math.max(1, Math.trunc(line)) + index :
+								index >= previewStart && previewStart >= 0 && index < previewStart + previewLength ? index - previewStart + 1 : undefined;
+							for (let row = 0; row < wraps; row++) codeLines.push(number);
+						}
+					}
+					if (prose && rows.length) codeLines.push(undefined); // blank separator
+					const createdCount = summary?.kind === "created" ? rows.length - diffLines.length : 0;
+					let lineDelta = 0;
+					for (const [index, row] of plainRows.entries()) {
+							const source = diffLines[index - createdCount];
+							const numbered = source && /^[ +\-]\s*(\d+) /.exec(source);
+							// Pi prints old-file numbers on unchanged context, but new-file
+							// numbers on additions. Account for preceding inserted/deleted lines.
+							const number = index < createdCount ? index + 1 : numbered && (row.kind === "add" || row.kind === "remove" || row.kind === "context")
+								? Number(numbered[1]) + (row.kind === "context" ? lineDelta : 0) : undefined;
+							if (row.kind === "add") lineDelta++;
+							if (row.kind === "remove") lineDelta--;
+							for (let part = 0; part < paintRows([row], width, width > 2 ? "  " : "", palette).length; part++) codeLines.push(number);
+						}
+					return cachedLines;
 				},
 			};
 		},

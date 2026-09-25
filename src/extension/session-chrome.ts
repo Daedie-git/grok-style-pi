@@ -16,7 +16,7 @@ import type { CustomEditorCtor, ExtensionApiLike, SessionContext, SessionUi } fr
 
 type SessionChromeDeps = {
 	CustomEditor: CustomEditorCtor;
-	features: Pick<Features, "footer" | "composer" | "terminalColors">;
+	features: Pick<Features, "footer" | "composer" | "terminalColors" | "toolStyling">;
 };
 
 /** Owns footer polling, the framed editor, and their shared terminal colors. */
@@ -53,6 +53,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		});
 	}
 	let requestRender: (() => void) | undefined;
+	let hasActiveSelection: (() => boolean) | undefined;
 	pi.on("after_provider_response", (event, ctx) => {
 		if (ctx.model?.provider !== "openai-codex") return;
 		const headers = (event as { headers?: Record<string, string> }).headers;
@@ -79,7 +80,8 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		}
 
 		if (features.footer && typeof ctx.ui.setFooter === "function") {
-			ctx.ui.setFooter((tui: { requestRender?: (force?: boolean) => void }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
+			ctx.ui.setFooter((tui: { requestRender?: (force?: boolean) => void; hasActiveSelection?: () => boolean }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
+				hasActiveSelection = tui.hasActiveSelection?.bind(tui);
 				requestRender = () => tui.requestRender?.();
 				const write = tuiWrite(tui);
 				if (features.terminalColors && write && !restoreTerminal) {
@@ -109,7 +111,9 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 			});
 		}
 
-		if ((features.composer || features.terminalColors) && typeof ctx.ui.setEditorComponent === "function") {
+		// Even without visual chrome, styled tool selections need the public
+		// editor factory's TUI to detect when a native selection was dismissed.
+		if ((features.composer || features.terminalColors || features.toolStyling) && typeof ctx.ui.setEditorComponent === "function") {
 			const Editor = deps.CustomEditor;
 			class GrokComposer extends Editor {
 				private suspendHandler: (() => void) | undefined;
@@ -156,6 +160,8 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 				}
 			}
 			ctx.ui.setEditorComponent((...[tui, theme, keybindings]: ConstructorParameters<typeof CustomEditor>) => {
+				hasActiveSelection = "hasActiveSelection" in tui && typeof tui.hasActiveSelection === "function"
+					? tui.hasActiveSelection.bind(tui) : undefined;
 				const write = tuiWrite(tui);
 				if (features.terminalColors && write && !restoreTerminal) {
 					applyGrokTerminalChrome(write);
@@ -179,10 +185,11 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		grokContext = null;
 		grokWeekly = "Weekly ?% left";
 		requestRender = undefined;
+		hasActiveSelection = undefined;
 		suspendChrome?.dispose(); suspendChrome = undefined;
 		restoreTerminal?.();
 		restoreTerminal = undefined;
 	}
 
-	return { startSession, dispose };
+	return { startSession, dispose, hasActiveSelection: () => hasActiveSelection?.() };
 }

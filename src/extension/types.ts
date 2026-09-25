@@ -10,6 +10,8 @@ export type SessionUi = {
 	setFooter?(factory: unknown): void;
 	setStatus?: (id: string, text: string | undefined) => void;
 	setEditorComponent?(factory: unknown): void;
+	getEditorText?(): string;
+	pasteToEditor?(text: string): void;
 };
 
 export type SessionContext = FooterContext & {

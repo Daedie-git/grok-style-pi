@@ -115,6 +115,25 @@ test("edits start open, collapse by clicking their diamond, and follow global ex
 	assert.deepEqual(tool.renderResult(result, { expanded: true, isPartial: true }, theme, context).render(80), []);
 });
 
+test("collapsed diamonds open and close with normal clicks", () => {
+	const tool = wrapWithDiamondRenderer(agent.createBashToolDefinition(process.cwd()));
+	const result = { content: [{ type: "text", text: "line 1\nline 2" }] };
+	let invalidated = 0;
+	const context = { state: {}, expanded: false, invalidate: () => { invalidated++; } };
+	const body = () => tool.renderResult(result, { expanded: context.expanded }, theme, context).render(80);
+	const click = () => (tool.renderCall({ command: "printf 'line'" }, theme, context) as any).handleMouse({ type: "click", button: "left" });
+	assert.deepEqual(body(), []);
+	assert.deepEqual(click(), { handled: true });
+	assert.ok(body().join("\n").includes("line 2"));
+	assert.deepEqual(click(), { handled: true });
+	assert.deepEqual(body(), []);
+	assert.equal(invalidated, 2);
+	context.expanded = true;
+	assert.ok(body().length > 0);
+	context.expanded = false;
+	assert.deepEqual(body(), []);
+});
+
 test("replacement emphasis isolates changed text and keeps terminal controls sanitized", () => {
 	const tool = wrapWithDiamondRenderer(agent.createEditToolDefinition(process.cwd()));
 	const result = { content: [], details: { diff: "- 42 return old_value;\n+ 42 return new_value;\x1b]52;c;attack\x07" } };

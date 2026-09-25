@@ -1,6 +1,19 @@
 import { homedir } from "node:os";
-import { sep } from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+function slashPath(path: string): string {
+	return path.replace(/[\\/]+/g, "/").replace(/\/+$/, "");
+}
+
+function comparablePath(path: string): string {
+	const normalized = slashPath(path);
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function displaySeparator(...paths: string[]): string {
+	const path = paths.find((value) => value.includes("\\") || value.includes("/")) ?? "";
+	return path.includes("\\") && !path.includes("/") ? "\\" : "/";
+}
 
 export type FooterInput = {
 	cwd: string;
@@ -31,9 +44,18 @@ export function cwdBasename(cwd: string): string {
 }
 
 export function cwdDisplayPath(cwd: string, home = homedir()): string {
-	if (cwd === home) return "~";
-	if (cwd.startsWith(home.endsWith(sep) ? home : home + sep)) return "~" + sep + cwd.slice(home.length).replace(/^[\\/]+/, "");
-	return cwd || ".";
+	if (!cwd) return ".";
+	const cwdSlash = slashPath(cwd);
+	const homeSlash = slashPath(home);
+	const comparableCwd = comparablePath(cwd);
+	const comparableHome = comparablePath(home);
+	if (comparableCwd === comparableHome) return "~";
+	if (comparableCwd.startsWith(comparableHome + "/")) {
+		const separator = displaySeparator(home, cwd);
+		const suffix = cwdSlash.slice(homeSlash.length).replace(/^\/+/, "").replaceAll("/", separator);
+		return `~${separator}${suffix}`;
+	}
+	return cwd;
 }
 
 export function formatPercent(percent: number | null | undefined): string {

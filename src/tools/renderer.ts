@@ -54,6 +54,17 @@ function editDisplay(context: ToolRenderContext | undefined, expanded: boolean) 
 	return state.grokEdit;
 }
 
+function toolDisplay(context: ToolRenderContext | undefined, expanded: boolean) {
+	const state = context?.state;
+	if (!state) return { open: expanded, expanded };
+	state.grokTool ??= { open: expanded, expanded };
+	if (state.grokTool.expanded !== expanded) {
+		state.grokTool.expanded = expanded;
+		state.grokTool.open = expanded;
+	}
+	return state.grokTool;
+}
+
 export type OriginalTool = Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "name" | "description" | "parameters" | "execute"> &
 	Partial<Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "label" | "promptSnippet" | "promptGuidelines" | "prepareArguments" | "constrainedSampling" | "executionMode">>;
 
@@ -101,8 +112,8 @@ function defaultModifierOpen(target: OpenTarget): void {
 }
 
 /** An open diff closes only on Alt+click, so a normal click does not dismiss it. */
-function togglesOpen(event: TuiMouseEvent, open: boolean): boolean {
-	return event.type === "click" && event.button === "left" && !event.ctrl && (!open || event.alt);
+function togglesOpen(event: TuiMouseEvent, open: boolean, requireAltToClose = true): boolean {
+	return event.type === "click" && event.button === "left" && !event.ctrl && (!open || !requireAltToClose || event.alt);
 }
 
 function ctrlOpen(
@@ -192,8 +203,10 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				}, (event) => {
 					const opened = ctrlOpen(event, args, 1, context?.cwd, onModifierOpen);
 					if (opened) return opened;
-					if (context?.state?.grokWrite?.kind !== "created" || !context.invalidate || !togglesOpen(event, editDisplay(context, context.expanded ?? false).open)) return undefined;
-					const display = editDisplay(context, context.expanded ?? false);
+					if (!context?.state || !context.invalidate) return undefined;
+					const created = context.state.grokWrite?.kind === "created";
+					const display = created ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false);
+					if (!togglesOpen(event, display.open, created)) return undefined;
 					display.open = !display.open;
 					context.invalidate();
 					return { handled: true };
@@ -203,7 +216,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			const target = shell || original.name === "Agent" ? "" : compactArgs(args, Infinity);
 			const label = paint(theme, failed ? "error" : "toolTitle", title) +
 				(target ? " " + paint(theme, failed ? "error" : "text", target) : "");
-			const display = edit && context?.state && context.invalidate ? editDisplay(context, context.expanded ?? false) : undefined;
+			const display = context?.state && context.invalidate ? edit ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false) : undefined;
 			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), (event) => {
 				if (fileRow) {
 					// Pi calls renderCall before renderResult populates the shared change line.
@@ -211,7 +224,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 					const opened = ctrlOpen(event, args, line, context?.cwd, onModifierOpen);
 					if (opened) return opened;
 				}
-				if (!display || !togglesOpen(event, display.open)) return undefined;
+				if (!display || !togglesOpen(event, display.open, edit)) return undefined;
 				display.open = !display.open;
 				context?.invalidate?.();
 				return { handled: true };
@@ -245,7 +258,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			const line = edit ? changedLine(result.details) : original.name === "read" && typeof context?.args?.offset === "number" ? context.args.offset : 1;
 			if (edit && context?.state) editDisplay(context, options.expanded).line = line;
 			const defaultOpen = edit || summary?.kind === "created";
-			const open = defaultOpen ? editDisplay(context, options.expanded).open : options.expanded;
+			const display = defaultOpen ? editDisplay(context, options.expanded) : toolDisplay(context, options.expanded);
+			const open = display.open;
 			if (options.isPartial || !open) return emptyComponent();
 			const diff = sanitizeToolText(extractResultDiff(result));
 			let { text } = formatToolResult({ ...result, details: undefined }, { ...options, expanded: true });
@@ -309,8 +323,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 				handleMouse(event: TuiMouseEvent) {
 					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
 					if (opened) return opened;
-					if (!defaultOpen || !context?.state || !context.invalidate || !togglesOpen(event, editDisplay(context, options.expanded).open)) return undefined;
-					const display = editDisplay(context, options.expanded);
+					if (!context?.state || !context.invalidate || !togglesOpen(event, display.open, defaultOpen)) return undefined;
 					display.open = !display.open;
 					context.invalidate();
 					return { handled: true };
@@ -329,12 +342,13 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 	return { ...wrapped, renderResult(result, options, theme, context) {
 		const owner = context?.state ?? context;
 		// Pi creates a fresh result wrapper on every call, but preserves its content and details.
-		const keys = [result.content, result.details, context?.args, options.expanded, options.isPartial, context?.isError, context?.state?.grokEdit?.open,
+		const keys = [result.content, result.details, context?.args, options.expanded, options.isPartial, context?.isError, context?.state?.grokEdit?.open, context?.state?.grokTool?.open,
 			styleColors(), ...(["toolOutput", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "muted", "error"] as const).map((token) => paint(theme, token, "x")), theme?.bg?.("customMessageBg", "x")];
 		const cached = owner && rendered.get(owner);
 		if (cached && keys.every((key, index) => key === cached.keys[index])) return cached.component;
 		const component = wrapped.renderResult(result, options, theme, context);
 		keys[6] = context?.state?.grokEdit?.open;
+		keys[7] = context?.state?.grokTool?.open;
 		if (owner && !options.isPartial) rendered.set(owner, { keys, component });
 		return component;
 	} };

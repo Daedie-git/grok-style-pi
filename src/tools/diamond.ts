@@ -35,7 +35,7 @@ export type ToolRenderContext = {
 	args?: ToolArgs;
 	expanded?: boolean;
 	cwd?: string;
-	state?: { grokEdit?: { open: boolean; expanded: boolean; line?: number }; grokWrite?: WriteSummary; grokExitCode?: string };
+	state?: { grokEdit?: { open: boolean; expanded: boolean; line?: number }; grokTool?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokExitCode?: string };
 	invalidate?: () => void;
 };
 

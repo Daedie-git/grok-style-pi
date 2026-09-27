@@ -90,8 +90,12 @@ type CodePoint = { x: number; y: number; line: number };
 type CodeSelection = {
 	content: unknown; details: unknown; args: unknown;
 	anchor?: CodePoint; dragged?: boolean;
+	lastClick?: { x: number; y: number; at: number }; suppressClick?: boolean;
 	range?: { start: CodePoint; end: CodePoint; width: number };
 };
+
+// Match Pi TUI's double-click interval for the native text-selection path.
+const DOUBLE_CLICK_INTERVAL_MS = 500;
 
 // All diamond tools registered together share mouse selection state, but no
 // transcript state or mutable component is retained after their hooks expire.
@@ -367,9 +371,20 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 						? codeLines[event.y] : undefined;
 					const point = location === undefined ? undefined : { x: event.x, y: event.y, line: location };
 					if (event.type === "press") {
+						// A moved release does not produce a click, so expire suppression on every new press.
+						selection.suppressClick = false;
+						const previous = selection.lastClick;
+						selection.lastClick = undefined;
 						if (selectionGroup.active && (selectionGroup.active !== selection || hooks?.hasActiveSelection?.() === false)) {
 							selectionGroup.active.range = undefined;
 							selectionGroup.active = undefined;
+						}
+						// Native text selection turns a second press into a word selection before
+						// Pi can send a clickCount: 2 click, so handle that press here.
+						if (point && path && hooks?.onCodeLocation && previous && previous.x === point.x && previous.y === point.y && Date.now() - previous.at <= DOUBLE_CLICK_INTERVAL_MS) {
+							selection.suppressClick = true;
+							hooks.onCodeLocation(sanitizeToolText(path), point.line);
+							return { handled: true };
 						}
 						selection.anchor = point;
 						selection.dragged = false;
@@ -391,13 +406,17 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 								}
 							}
 						}
-						if (selection.dragged && selection.anchor && end && end.line !== selection.anchor.line) {
+						if (selection.dragged && selection.anchor && end && (end.y !== selection.anchor.y || end.x !== selection.anchor.x)) {
 							const forward = selection.anchor.y < end.y || selection.anchor.y === end.y && selection.anchor.x < end.x;
 							selection.range = { start: forward ? selection.anchor : end, end: forward ? end : selection.anchor, width: cachedWidth ?? 0 };
 							selectionGroup.active = selection;
 						}
 						selection.anchor = undefined;
 						selection.dragged = false;
+					}
+					if (event.type === "click" && selection.suppressClick) {
+						selection.suppressClick = false;
+						return { handled: true };
 					}
 					if (event.type === "click" && point && path && hooks?.onCodeLocation) {
 						const range = selectionGroup.active === selection ? selection.range : undefined;
@@ -406,8 +425,13 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 								(point.y < range.end.y || point.y === range.end.y && point.x <= range.end.x);
 						selection.range = undefined;
 						selectionGroup.active = undefined;
-						hooks.onCodeLocation(sanitizeToolText(path), inside && range ? Math.min(range.start.line, range.end.line) : point.line,
-							inside && range ? Math.max(range.start.line, range.end.line) : undefined);
+						// Captured or directly dispatched clicks may carry Pi's click count instead.
+						if (inside || event.clickCount === 2) {
+							hooks.onCodeLocation(sanitizeToolText(path), inside && range ? Math.min(range.start.line, range.end.line) : point.line,
+								inside && range && range.start.line !== range.end.line ? Math.max(range.start.line, range.end.line) : undefined);
+						} else {
+							selection.lastClick = { x: point.x, y: point.y, at: Date.now() };
+						}
 						return { handled: true };
 					}
 					if (event.type === "click") { selection.range = undefined; selectionGroup.active = undefined; }

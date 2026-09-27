@@ -7,12 +7,14 @@ import { textComponent } from "../src/tools/diamond.ts";
 import { createSessionChrome } from "../src/extension/session-chrome.ts";
 
 const theme = { fg: (_token: string, value: string) => value } as any;
-const click = (y: number, x = 4, alt = false) => ({ type: "click", button: "left", x, y, alt, width: 32 } as const);
+// Renderer-only tests use a dispatched double-click event; fullscreen tests send presses and releases.
+const click = (y: number, x = 4, alt = false) => ({ type: "click", button: "left", x, y, alt, width: 32, clickCount: 2 } as const);
+const singleClick = (y: number, x = 4) => ({ ...click(y, x), clickCount: 1 } as const);
 const tool = (name: string, onCodeLocation: (path: string, line: number, endLine?: number) => void) => wrapWithDiamondRenderer({
 	name, description: "", parameters: {}, execute: async () => ({ content: [] }),
 } as any, { onCodeLocation });
 
-test("read code clicks use the requested offset on wrapped rows, but not the continuation notice", () => {
+test("read code double clicks use the requested offset on wrapped rows, but not the continuation notice", () => {
 	const locations: string[] = [];
 	const read = tool("read", (path, line) => locations.push(`${path}:${line}`));
 	const context = { args: { path: "src/file.ts", offset: 40 }, state: {}, expanded: true, invalidate() {} };
@@ -20,6 +22,10 @@ test("read code clicks use the requested offset on wrapped rows, but not the con
 	const lines = result.render(32).map(stripTerminalSequences);
 	const second = lines.findIndex((line) => line.includes("next();"));
 	assert.ok(second > 1, "first source line wraps");
+	assert.deepEqual(result.handleMouse?.(singleClick(0)), { handled: true });
+	assert.deepEqual(result.handleMouse?.({ type: "press", button: "left", x: 5, y: 0, width: 32 }), undefined);
+	assert.deepEqual(result.handleMouse?.(singleClick(1, 5)), { handled: true });
+	assert.deepEqual(locations, []);
 	for (let y = 0; y < second; y++) assert.deepEqual(result.handleMouse?.(click(y)), { handled: true });
 	assert.deepEqual(result.handleMouse?.(click(second)), { handled: true });
 	assert.deepEqual(locations, [...Array(second).fill("src/file.ts:40"), "src/file.ts:41"]);
@@ -66,7 +72,7 @@ test("the extension appends clicked references to the current draft and releases
 	assert.equal(draft, "Please src/a.ts:7  inspect [paste:1] src/a.ts:8  src/a.ts:7  src/a.ts:7-8 ");
 });
 
-test("drag-selected code clicks insert a line range, with single clicks unchanged", () => {
+test("drag-selected code clicks insert a line range, while a single click outside the selection does not insert", () => {
 	const locations: string[] = [];
 	const read = tool("read", (path, line, endLine) => locations.push(`${path}:${line}${endLine ? `-${endLine}` : ""}`));
 	const context = { args: { path: "src/a.ts", offset: 40 }, state: {}, expanded: true, invalidate() {} };
@@ -76,10 +82,27 @@ test("drag-selected code clicks insert a line range, with single clicks unchange
 	assert.equal(result.handleMouse?.(mouse("press", 2)), undefined);
 	assert.equal(result.handleMouse?.(mouse("drag", 0)), undefined);
 	assert.equal(result.handleMouse?.(mouse("release", 0)), undefined);
-	assert.deepEqual(result.handleMouse?.(click(1)), { handled: true });
+	assert.deepEqual(result.handleMouse?.(singleClick(1)), { handled: true });
+	assert.deepEqual(locations, ["src/a.ts:40-42"]);
+	result.handleMouse?.(singleClick(3));
 	assert.deepEqual(locations, ["src/a.ts:40-42"]);
 	result.handleMouse?.(click(3));
 	assert.deepEqual(locations, ["src/a.ts:40-42", "src/a.ts:43"]);
+});
+
+test("clicking a drag selection across wrapped rows of one source line inserts its location", () => {
+	const locations: string[] = [];
+	const read = tool("read", (path, line, end) => locations.push(`${path}:${line}${end ? `-${end}` : ""}`));
+	const result = read.renderResult({ content: [{ type: "text", text: "const longName = 123456789012345678901234567890;" }] },
+		{ expanded: true }, theme, { args: { path: "a.ts", offset: 40 }, state: {}, expanded: true, invalidate() {} });
+	const lines = result.render(20).map(stripTerminalSequences);
+	assert.ok(lines.length >= 3);
+	const mouse = (type: "press" | "drag" | "release", y: number) => ({ type, button: "left", x: 4, y, width: 20 } as const);
+	result.handleMouse?.(mouse("press", 0));
+	result.handleMouse?.(mouse("drag", 2));
+	result.handleMouse?.(mouse("release", 2));
+	result.handleMouse?.(singleClick(1));
+	assert.deepEqual(locations, ["a.ts:40"]);
 });
 
 test("selection ending on a notice keeps only the selected source lines", () => {
@@ -171,6 +194,11 @@ test("fullscreen drag selection reaches the diamond without stealing native sele
 	send(0, 2, true);
 	send(0, 5); // Click the second diamond, dismissing the first selection.
 	send(0, 5, true);
+	assert.deepEqual(locations, ["a.ts:1-3"]);
+	send(0, 5);
+	send(0, 5, true);
+	send(0, 1);
+	send(0, 1, true);
 	send(0, 1);
 	send(0, 1, true);
 	assert.deepEqual(locations, ["a.ts:1-3", "b.ts:2", "a.ts:2"]);
@@ -182,7 +210,84 @@ test("fullscreen drag selection reaches the diamond without stealing native sele
 	assert.equal(tui.hasActiveSelection(), false);
 	send(0, 1);
 	send(0, 1, true);
+	send(0, 1);
+	send(0, 1, true);
 	assert.deepEqual(locations, ["a.ts:1-3", "b.ts:2", "a.ts:2", "a.ts:2"]);
+});
+
+test("a moved second press does not swallow the next selected-range click", async () => {
+	const { TuiAltScreen, VStack } = await import("@earendil-works/pi-tui");
+	const locations: string[] = [];
+	let tui: InstanceType<typeof TuiAltScreen>;
+	const read = wrapWithDiamondRenderer({ name: "read", description: "", parameters: {}, execute: async () => ({ content: [] }) } as any,
+		{ onCodeLocation: (path, line, end) => locations.push(`${path}:${line}${end ? `-${end}` : ""}`), hasActiveSelection: () => tui.hasActiveSelection() });
+	const result = read.renderResult({ content: [{ type: "text", text: "one\ntwo\nthree" }] },
+		{ expanded: true }, theme, { args: { path: "a.ts" }, state: {}, expanded: true, invalidate() {} });
+	tui = new TuiAltScreen({ columns: 60, rows: 24, write() {} } as any, false, undefined, { copyOnSelect: false });
+	const screen = tui as any;
+	screen.requestRender = () => {};
+	tui.setLayoutRoot(new VStack([result]));
+	screen.altScreenActive = true;
+	screen.doRender();
+	const send = (button: number, x: number, y: number, release = false) => screen.handleMouseEvent({ button, x, y, release });
+	send(0, 5, 0);
+	send(0, 5, 0, true);
+	send(0, 5, 0); // The second press inserts immediately.
+	send(32, 6, 0);
+	send(0, 6, 0, true); // Movement prevents Pi from dispatching a click.
+	send(0, 5, 0);
+	send(32, 5, 2);
+	send(0, 5, 2, true);
+	assert.equal(tui.hasActiveSelection(), true);
+	send(0, 5, 1);
+	send(0, 5, 1, true);
+	assert.deepEqual(locations, ["a.ts:1", "a.ts:1-3"]);
+});
+
+test("a double-click in another diamond clears the previous selection", () => {
+	const locations: string[] = [];
+	const hooks = { onCodeLocation: (path: string, line: number, end?: number) => locations.push(`${path}:${line}${end ? `-${end}` : ""}`) };
+	const make = (path: string) => {
+		const read = wrapWithDiamondRenderer({ name: "read", description: "", parameters: {}, execute: async () => ({ content: [] }) } as any, hooks);
+		const result = read.renderResult({ content: [{ type: "text", text: "one\ntwo\nthree" }] },
+			{ expanded: true }, theme, { args: { path }, state: {}, expanded: true, invalidate() {} });
+		result.render(60);
+		return result;
+	};
+	const a = make("a.ts");
+	const b = make("b.ts");
+	a.handleMouse?.(singleClick(0));
+	b.handleMouse?.({ type: "press", button: "left", x: 4, y: 0, width: 60 });
+	b.handleMouse?.({ type: "drag", button: "left", x: 4, y: 2, width: 60 });
+	b.handleMouse?.({ type: "release", button: "left", x: 4, y: 2, width: 60 });
+	a.handleMouse?.({ type: "press", button: "left", x: 4, y: 0, width: 60 });
+	assert.deepEqual(locations, ["a.ts:1"]);
+	b.handleMouse?.(singleClick(1)); // A stale range must not insert on a later click.
+	assert.deepEqual(locations, ["a.ts:1"]);
+});
+
+test("fullscreen selection across wrapped rows of one source line inserts one location", async () => {
+	const { TuiAltScreen, VStack } = await import("@earendil-works/pi-tui");
+	const locations: string[] = [];
+	let tui: InstanceType<typeof TuiAltScreen>;
+	const read = wrapWithDiamondRenderer({ name: "read", description: "", parameters: {}, execute: async () => ({ content: [] }) } as any,
+		{ onCodeLocation: (path, line, end) => locations.push(`${path}:${line}${end ? `-${end}` : ""}`), hasActiveSelection: () => tui.hasActiveSelection() });
+	const result = read.renderResult({ content: [{ type: "text", text: "const longName = 123456789012345678901234567890;" }] },
+		{ expanded: true }, theme, { args: { path: "a.ts", offset: 40 }, state: {}, expanded: true, invalidate() {} });
+	tui = new TuiAltScreen({ columns: 20, rows: 12, write() {} } as any, false, undefined, { copyOnSelect: false });
+	const screen = tui as any;
+	screen.requestRender = () => {};
+	tui.setLayoutRoot(new VStack([result]));
+	screen.altScreenActive = true;
+	screen.doRender();
+	const send = (button: number, y: number, release = false) => screen.handleMouseEvent({ button, x: 4, y, release });
+	send(0, 0);
+	send(32, 2);
+	send(0, 2, true);
+	assert.equal(tui.hasActiveSelection(), true);
+	send(0, 1);
+	send(0, 1, true);
+	assert.deepEqual(locations, ["a.ts:40"]);
 });
 
 test("styled tools observe fullscreen selection with all visual chrome disabled", () => {

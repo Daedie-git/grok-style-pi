@@ -117,6 +117,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 			const Editor = deps.CustomEditor;
 			class GrokComposer extends Editor {
 				private suspendHandler: (() => void) | undefined;
+				private clearHandler: (() => void) | undefined;
 
 				override handleInput(data: string) {
 					const handler = this.actionHandlers?.get("app.suspend");
@@ -124,6 +125,12 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 						const chrome = suspendChrome;
 						this.suspendHandler = () => chrome.run(handler);
 						this.actionHandlers!.set("app.suspend", this.suspendHandler);
+					}
+					// Like Codex, a cleared draft stays recoverable with Up instead of being discarded.
+					const clear = this.actionHandlers?.get("app.clear");
+					if (clear && clear !== this.clearHandler) {
+						this.clearHandler = () => { this.addToHistory(this.getExpandedText()); clear(); };
+						this.actionHandlers!.set("app.clear", this.clearHandler);
 					}
 					super.handleInput?.(data);
 				}

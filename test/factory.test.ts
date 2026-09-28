@@ -224,6 +224,28 @@ test("real composer wraps Pi's suspend action once and honors shortcut intercept
 	assert.equal(process.listenerCount("SIGCONT"), initialListeners);
 });
 
+test("clearing the composer keeps the draft in prompt history", () => {
+	let editorFactory: Function;
+	createGrokStyleExtension({ on(event, handler) { if (event === "session_start") handler({}, { cwd: process.cwd(), hasUI: true, ui: {
+		setEditorComponent(factory: Function) { editorFactory = factory; },
+	} }); }, registerTool() {} }, { CustomEditor, tools: factories(), features: { terminalColors: false } });
+	const editor = editorFactory!(
+		{ terminal: { rows: 30 }, requestRender() {} },
+		{ borderColor: (text: string) => text, selectList: {} },
+		{ matches: (data: string, action: string) => (data === "\x03" && action === "app.clear") || (data === "\x1b[A" && action === "tui.editor.cursorUp") },
+	);
+	// Pi copies its handlers after constructing the custom editor.
+	editor.actionHandlers.set("app.clear", () => editor.setText(""));
+	editor.setText("a draft worth keeping");
+	editor.handleInput("\x03");
+	assert.equal(editor.getText(), "");
+	editor.handleInput("\x03");
+	editor.handleInput("\x1b[A");
+	assert.equal(editor.getText(), "a draft worth keeping");
+	editor.handleInput("\x1b[A");
+	assert.equal(editor.getText(), "a draft worth keeping", "an empty clear adds no entry");
+});
+
 test("shell schema accepts optional summaries and renderer shows them", async () => {
 	const { createBashTool } = await import("@earendil-works/pi-coding-agent");
 	const tool = wrapWithDiamondRenderer(createBashTool(process.cwd()));

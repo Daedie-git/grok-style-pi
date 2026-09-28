@@ -1015,6 +1015,24 @@ test("database contention reports operation and SQLite diagnostics without task 
 	}
 });
 
+test("a busy database skips the maintenance tick and idle command polls without taking the write lock", async (t) => {
+	const f = fixture(t);
+	const ref = await f.runner.spawn(request());
+	const record = await f.runner.resolve(ref.agentId);
+	const binding = (await f.runner.store.attach(record.paneId, record.sessionFile, "session"))!;
+	assert.ok(await f.runner.store.claimNextCommand(ref.agentId, binding.token, false));
+	const blocker = new DatabaseSync(join(f.root, "control.sqlite"));
+	t.after(() => blocker.close());
+	blocker.exec("BEGIN IMMEDIATE");
+	try {
+		const started = Date.now();
+		assert.equal(await f.runner.store.claimNextCommand(ref.agentId, binding.token, false), undefined);
+		assert.equal(await f.runner.store.claimMaintenance("blocked", Date.now()), false);
+		assert.ok(Date.now() - started < 2000);
+	} finally { blocker.exec("ROLLBACK"); }
+	assert.equal(await f.runner.store.claimMaintenance("free", Date.now()), true);
+});
+
 test("simultaneous first opens initialize WAL without losing a control worker", async () => {
 	const root = mkdtempSync(join(tmpdir(), "herdr-wal-startup-"));
 	const stores = Array.from({ length: 6 }, () => new HerdrStore(root));

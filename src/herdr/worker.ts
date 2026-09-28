@@ -8,19 +8,22 @@ import type { AgentRecord, HerdrTask, LaunchRecord, LaunchStage, Command, ChildB
 
 const { root } = workerData as { root: string };
 mkdirSync(root, { recursive: true });
+const BUSY_MS = 5000;
+const MAINTENANCE_BUSY_MS = 250;
 
 function database(name: string): DatabaseSync {
 	const db = new DatabaseSync(join(root, name));
-	db.exec("PRAGMA busy_timeout=5000");
-	const deadline = Date.now() + 5000;
+	db.exec(`PRAGMA busy_timeout=${BUSY_MS}`);
+	const deadline = Date.now() + BUSY_MS;
 	const sleeper = new Int32Array(new SharedArrayBuffer(4));
 	for (;;) {
 		try {
-			db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+			// WAL with NORMAL survives process crashes; only a power loss can drop the latest commits.
+			db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;");
 			return db;
 		} catch (error) {
 			// Simultaneous first opens can report BUSY while enabling WAL despite busy_timeout.
-			if ((error as { errcode?: number }).errcode !== 5 || Date.now() >= deadline) { db.close(); throw error; }
+			if (!isBusy(error) || Date.now() >= deadline) { db.close(); throw error; }
 			Atomics.wait(sleeper, 0, 0, 25);
 		}
 	}
@@ -42,6 +45,10 @@ const placement = databaseDiagnostics("initialize placement.sqlite", () => datab
 // The placement lock is retried asynchronously by the caller. Control operations use another connection.
 placement.exec("PRAGMA busy_timeout=0");
 let placementOwner: string | undefined;
+
+function isBusy(error: unknown): boolean {
+	return (error as { errcode?: number } | null)?.errcode === 5;
+}
 
 function transaction<T>(body: () => T): T {
 	db.exec("BEGIN IMMEDIATE");
@@ -129,6 +136,19 @@ function publish(ref: RunRef, prompt: string, notify: boolean, now: number): Run
 	return saveRun({ ...value, deadline: now + START_TIMEOUT_MS, updatedAt: now });
 }
 
+function nextCommand(agentId: string, token: string, streaming: boolean): { value: RunSnapshot; command: Command } | undefined {
+	if (!owns(agentId, token)) return undefined;
+	const record = agent(agentId)!;
+	const value = run({ agentId, runId: record.currentRunId });
+	if (isTerminal(value.phase)) return undefined;
+	const pending = commands(value).filter((command) => command.state === "queued");
+	const command = pending.find((item) => item.type === "abort") ?? pending.find((item) => {
+		if (value.cancelRequested) return false;
+		return item.type === "prompt" ? !streaming && value.phase === "queued" : value.accepted && streaming;
+	});
+	return command && { value, command };
+}
+
 const operations = {
 	assertProtocolReady(): void {
 		// Never silently mix the shared-status protocol with run-scoped control. Legacy files remain untouched.
@@ -166,7 +186,11 @@ const operations = {
 		// An early read avoids taking the write lock on every 200 ms tick in every pane.
 		const lease = db.prepare("SELECT expires,next_at FROM maintenance WHERE id=1").get()!;
 		if (Number(lease.expires) > now || Number(lease.next_at) > now) return false;
-		return Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + 5000, now, now).changes) === 1;
+		// Maintenance is best-effort and retried every tick, so a busy database only means another pane is writing.
+		db.exec(`PRAGMA busy_timeout=${MAINTENANCE_BUSY_MS}`);
+		try { return Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + 5000, now, now).changes) === 1; }
+		catch (error) { if (isBusy(error)) return false; throw error; }
+		finally { db.exec(`PRAGMA busy_timeout=${BUSY_MS}`); }
 	},
 	activeRuns(): Array<{ agent: AgentRecord; run: RunSnapshot }> {
 		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data FROM runs r JOIN agents a ON a.id=r.agent
@@ -251,17 +275,12 @@ const operations = {
 		});
 	},
 	claimNextCommand(agentId: string, token: string, streaming: boolean): Command | undefined {
+		// Children poll every 200 ms; only take the write lock when a command is claimable.
+		if (!nextCommand(agentId, token, streaming)) return undefined;
 		return transaction(() => {
-			if (!owns(agentId, token)) return undefined;
-			const record = agent(agentId)!;
-			const value = run({ agentId, runId: record.currentRunId });
-			if (isTerminal(value.phase)) return undefined;
-			const pending = commands(value).filter((command) => command.state === "queued");
-			const command = pending.find((item) => item.type === "abort") ?? pending.find((item) => {
-				if (value.cancelRequested) return false;
-				return item.type === "prompt" ? !streaming && value.phase === "queued" : value.accepted && streaming;
-			});
-			if (!command) return undefined;
+			const next = nextCommand(agentId, token, streaming);
+			if (!next) return undefined;
+			const { value, command } = next;
 			command.state = "dispatching";
 			db.prepare("UPDATE commands SET data=? WHERE id=?").run(JSON.stringify(command), command.id);
 			if (command.type === "prompt") saveRun({ ...value, phase: "starting", updatedAt: Date.now() });
@@ -345,7 +364,7 @@ const operations = {
 		if (placementOwner) return false;
 		try { placement.exec("BEGIN IMMEDIATE"); }
 		catch (error) {
-			if ((error as { errcode?: number }).errcode === 5 || /database is locked/.test(String(error))) return false;
+			if (isBusy(error) || /database is locked/.test(String(error))) return false;
 			throw error;
 		}
 		placementOwner = owner;

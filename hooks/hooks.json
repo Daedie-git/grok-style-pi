@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar\" session-start",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

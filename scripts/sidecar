@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# Claude's pi review sidecar, hosted in a herdr pane beside the Claude pane.
+#
+#   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
+#   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
+#   sidecar restart              start the sidecar in a new pane when the pane holding its name runs another pi session
+#   sidecar status               print the sidecar's herdr agent state
+#   sidecar note TEXT            share context on ongoing work; no review
+#   sidecar plan FILE [CONTEXT]  review a plan; prints the report
+#   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
+#   sidecar ask TEXT             follow-up request; prints the report
+set -euo pipefail
+
+STATE_DIR="$HOME/.cache/claude-sidecar"
+REQUEST_DIR="$STATE_DIR/requests"
+REPORT_DIR="$STATE_DIR/reports"
+PLUGIN_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SIDECAR_HOME="$PLUGIN_ROOT/sidecar"
+MODEL="${SIDECAR_MODEL:-openai-codex/gpt-6.1-sol}"
+THINKING="${SIDECAR_THINKING:-high}"
+NOTE_TIMEOUT_MS=300000
+REVIEW_TIMEOUT_MS=3600000
+
+die() { echo "sidecar: $*" >&2; exit 1; }
+
+require_herdr() {
+  [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || die "not running inside a herdr pane"
+}
+
+# One sidecar per Claude pane, so /clear and compaction keep the same reviewer.
+agent_name() {
+  echo "${SIDECAR_AGENT:-sc-$(tr 'A-Z:' 'a-z-' <<<"$HERDR_PANE_ID")}"
+}
+
+# The pi session is keyed by the Claude session, so a restarted sidecar resumes its context.
+pi_session_id() {
+  local marker
+  marker="$STATE_DIR/$(agent_name).session"
+  if [[ -n "${SIDECAR_PI_SESSION:-}" ]]; then
+    echo "$SIDECAR_PI_SESSION"
+  elif [[ -s "$marker" ]]; then
+    head -n 1 "$marker"
+  else
+    echo "cc-pane-$(tr 'A-Z:' 'a-z-' <<<"$HERDR_PANE_ID")"
+  fi
+}
+
+agent_status() {
+  local status
+  status=$(herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null) || true
+  echo "${status:-missing}"
+}
+
+agent_session_file() {
+  herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null || true
+}
+
+# True when the pi in the sidecar's pane runs the session this sidecar was started with. herdr relaunches a bare `pi`
+# (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
+agent_runs_sidecar_session() {
+  [[ $(agent_session_file "$1") == *"_$(pi_session_id).jsonl" ]]
+}
+
+split_direction() {
+  local rect
+  rect=$(herdr pane layout --pane "$HERDR_PANE_ID" |
+    jq -r --arg p "$HERDR_PANE_ID" '.result.layout.panes[] | select(.pane_id == $p) | .rect | "\(.width) \(.height)"')
+  read -r w h <<<"$rect"
+  # Terminal cells are about twice as tall as wide.
+  if (( w > 2 * h + h / 5 )); then echo right; else echo down; fi
+}
+
+# Call while holding the per-agent identity lock. Atomic replacement also
+# protects readers that only need the already-published session identifier.
+publish_session() {
+  local marker
+  marker=$(mktemp "$STATE_DIR/$1.session.XXXXXX")
+  printf '%s\n' "$2" >"$marker"
+  mv -f -- "$marker" "$STATE_DIR/$1.session"
+}
+
+cmd_start() {
+  require_herdr
+  ( flock 8; start_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+cmd_restart() {
+  require_herdr
+  ( flock 8; restart_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+# These helpers run with the startup lock held; recursive calls keep that lock.
+start_unlocked() {
+  require_herdr
+  local name session pane
+  name=$(agent_name)
+  {
+    flock 7
+    session=$(pi_session_id)
+    publish_session "$name" "$session"
+  } 7>"$STATE_DIR/$name.identity.lock"
+  if [[ $(agent_status "$name") != missing ]]; then
+    if agent_runs_sidecar_session "$name"; then
+      echo "$name already running"
+    else
+      restart_unlocked
+    fi
+    return
+  fi
+  pane=${1:-$(herdr pane split --pane "$HERDR_PANE_ID" --direction "$(split_direction)" --ratio 0.6 \
+    --cwd "$PWD" --no-focus | jq -r '.result.pane.pane_id')}
+  # A fresh pane is busy until its shell reaches the prompt.
+  local attempt err
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    if err=$(herdr agent start "$name" --kind pi --pane "$pane" --timeout 60000 -- \
+      --session-id "$session" -n claude-sidecar \
+      --model "$MODEL" --thinking "$THINKING" \
+      --tools read,bash,edit,write,grep,find,ls,submit_review \
+      -e "$SIDECAR_HOME/sidecar.ts" \
+      --append-system-prompt "$SIDECAR_HOME/reviewer.md" 2>&1 >/dev/null); then
+      echo "$name started in $pane (pi session $session)"
+      return
+    fi
+    [[ $err == *agent_pane_busy* ]] || die "$err"
+    sleep 0.5
+  done
+  die "$err"
+}
+
+# The sidecar's name is taken by a pi that does not run the sidecar session (a bare pi that herdr restored after a
+# reboot, or a session someone resumed in that pane). Leave that pi running under another name and start the sidecar
+# in a new pane, so nothing anyone is using gets quit.
+restart_unlocked() {
+  require_herdr
+  local name other
+  name=$(agent_name)
+  if [[ $(agent_status "$name") == missing ]] || agent_runs_sidecar_session "$name"; then
+    start_unlocked
+    return
+  fi
+  other="$name-other-$(date +%H%M%S)"
+  herdr agent rename "$name" "$other" >/dev/null || die "could not rename $name"
+  echo "$name: the pi in that pane runs $(agent_session_file "$other"), not the sidecar session; left it running as $other and starting the sidecar in a new pane" >&2
+  start_unlocked
+}
+
+# SessionStart hook: publish the sidecar identity to this Claude session's
+# Bash environment, then start the sidecar without blocking Claude's startup.
+cmd_session_start() {
+  local input sid pid argv
+  input=$(cat)
+  [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || exit 0
+  local dependency
+  for dependency in herdr pi jq flock setsid; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+      echo "sidecar: missing dependency $dependency; skipping startup" >&2
+      exit 0
+    fi
+  done
+  # Headless `claude -p` runs get no sidecar.
+  pid=$PPID
+  while (( pid > 1 )); do
+    mapfile -d '' argv <"/proc/$pid/cmdline" 2>/dev/null || argv=()
+    # Native Claude, or the npm CLI launched through a Node interpreter.
+    if [[ ${#argv[@]} -gt 0 ]] && {
+      [[ ${argv[0]##*/} == claude ]] ||
+      [[ ${argv[0]##*/} == node && ${#argv[@]} -gt 1 &&
+         ( ${argv[1]##*/} == claude || ${argv[1]} == */claude-code/cli.js ) ]];
+    }; then
+      for arg in "${argv[@]:1}"; do
+        [[ $arg == -p || $arg == --print ]] && exit 0
+      done
+      break
+    fi
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+  done
+  sid=$(jq -r '.session_id // empty' <<<"$input")
+  [[ -n "$sid" ]] || exit 0
+  export SIDECAR_AGENT SIDECAR_PI_SESSION
+  SIDECAR_AGENT=$(agent_name)
+  # Publish identity atomically, including while detached startup is pending.
+  # A separate short-lived lock keeps /clear from waiting for pane startup.
+  {
+    flock 7
+    if [[ -s "$STATE_DIR/$SIDECAR_AGENT.session" ]]; then
+      SIDECAR_PI_SESSION=$(<"$STATE_DIR/$SIDECAR_AGENT.session")
+    else
+      SIDECAR_PI_SESSION="cc-$sid"
+    fi
+    publish_session "$SIDECAR_AGENT" "$SIDECAR_PI_SESSION"
+    if [[ -n "${CLAUDE_ENV_FILE:-}" ]]; then
+      printf 'export SIDECAR_AGENT=%q SIDECAR_PI_SESSION=%q\n' "$SIDECAR_AGENT" "$SIDECAR_PI_SESSION" >>"$CLAUDE_ENV_FILE"
+    fi
+  } 7>"$STATE_DIR/$SIDECAR_AGENT.identity.lock"
+  setsid "$0" start >>"$STATE_DIR/$SIDECAR_AGENT.log" 2>&1 </dev/null &
+  jq -n --arg agent "$SIDECAR_AGENT" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext:
+    "A pi review sidecar (\($agent)) runs beside you in herdr. Follow the claude-sidecar:sidecar-review skill: brief it at milestones, send it complex plans, and run an adversarial diff review after each implementation."}}'
+}
+
+# Wait until the sidecar can take a prompt; the human may be talking to it.
+wait_until_ready() {
+  local name=$1 status
+  status=$(agent_status "$name")
+  if [[ $status == missing ]]; then
+    cmd_start >&2
+    status=$(agent_status "$name")
+  fi
+  if [[ $status == working || $status == unknown ]]; then
+    herdr agent wait "$name" --timeout "$REVIEW_TIMEOUT_MS" >/dev/null || true
+    status=$(agent_status "$name")
+  fi
+  if [[ $status != missing ]] && ! agent_runs_sidecar_session "$name"; then
+    cmd_restart >&2
+    status=$(agent_status "$name")
+  fi
+  case $status in
+    idle|done) ;;
+    blocked) die "$name is blocked on a question or approval in its pane; ask the user to handle it" ;;
+    *) die "$name is not ready (status: $status)" ;;
+  esac
+}
+
+send() {
+  local name=$1 text=$2 timeout=$3
+  herdr agent prompt "$name" "$text" --wait --timeout "$timeout" >/dev/null
+}
+
+cmd_note() {
+  require_herdr
+  [[ $# -ge 1 ]] || die "usage: sidecar note TEXT"
+  local name
+  name=$(agent_name)
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  wait_until_ready "$name"
+  send "$name" "[note] $*" "$NOTE_TIMEOUT_MS"
+  echo "noted"
+}
+
+# Sends a request whose body is in a file and prints the submitted report.
+request() {
+  local kind=$1 body=$2 name id req report status
+  name=$(agent_name)
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  req=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-$kind-$name.XXXXXX.md")
+  id=${req##*/}
+  id=${id%.md}
+  report="$REPORT_DIR/$id.md"
+  printf '%s\n' "$body" >"$req"
+  wait_until_ready "$name"
+  send "$name" "[request $id] Read $req and do what it asks. Finish by calling submit_review with request_id $id." "$REVIEW_TIMEOUT_MS"
+  if [[ -f "$report" ]]; then
+    echo "# Sidecar report ($report)"
+    cat "$report"
+    return
+  fi
+  status=$(agent_status "$name")
+  echo "sidecar: no report submitted for $id (status: $status). Recent pane output:" >&2
+  herdr agent read "$name" --source recent-unwrapped --lines 60 >&2 || true
+  if ! agent_runs_sidecar_session "$name"; then
+    echo "sidecar: $name runs pi session '$(agent_session_file "$name")', not '$(pi_session_id)'; run: sidecar restart" >&2
+  fi
+  exit 2
+}
+
+cmd_plan() {
+  require_herdr
+  [[ $# -ge 1 && -f "$1" ]] || die "usage: sidecar plan FILE [CONTEXT]"
+  local file
+  file=$(realpath "$1")
+  request plan "# Plan review
+
+Review the plan in \`$file\` before implementation starts.
+
+Look for: wrong assumptions about the existing code, missing steps or cases, ownership/lifecycle/concurrency problems, conflicts with ADRs and documented contracts, ordering mistakes, and simpler alternatives that would clearly be better. Verify claims against the repository.
+
+## Context from Claude
+${2:-(none)}"
+}
+
+cmd_diff() {
+  require_herdr
+  local base=${1:-HEAD} id diff root f
+  git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
+  root=$(git rev-parse --show-toplevel)
+  id="$(date +%Y%m%d-%H%M%S)-$(agent_name)"
+  diff=$(mktemp "$REQUEST_DIR/$id.XXXXXX.diff")
+  {
+    echo "# Commits since $base"
+    git log --oneline "$base..HEAD"
+    echo
+    echo "# Diff: $base..working tree"
+    git diff "$base"
+    echo
+    echo "# Untracked files"
+    while IFS= read -r -d '' f; do
+      git -C "$root" diff --no-index -- /dev/null "$f" || true
+    done < <(git -C "$root" ls-files --others --exclude-standard -z)
+  } >"$diff"
+  [[ -s "$diff" ]] || die "no changes since $base"
+  request diff "# Adversarial implementation review
+
+Find bugs in the change in \`$diff\` (repository: \`$(git rev-parse --show-toplevel)\`, base \`$base\`).
+
+Read the diff, then read the surrounding code it touches and its callers. Hunt for real defects: logic errors, broken invariants, lifecycle and ownership mistakes, races, missed error paths, edge inputs, stale callers, and behaviour that contradicts the intent below or earlier agreed decisions. Give each finding a concrete failure scenario. Skip style.
+
+## Intent and context from Claude
+${2:-(none)}"
+}
+
+cmd_ask() {
+  require_herdr
+  [[ $# -ge 1 ]] || die "usage: sidecar ask TEXT"
+  request ask "# Follow-up from Claude
+
+$*"
+}
+
+cmd_status() {
+  require_herdr
+  local name
+  name=$(agent_name)
+  echo "$name: $(agent_status "$name") (pi session $(pi_session_id))"
+  if [[ $(agent_status "$name") != missing ]] && ! agent_runs_sidecar_session "$name"; then
+    echo "$name runs $(agent_session_file "$name"), not the sidecar session; run: sidecar restart" >&2
+    return 1
+  fi
+}
+
+mkdir -p "$REQUEST_DIR" "$REPORT_DIR"
+case "${1:-}" in
+  session-start) shift; cmd_session_start "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  restart) shift; cmd_restart "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  note) shift; cmd_note "$@" ;;
+  plan) shift; cmd_plan "$@" ;;
+  diff) shift; cmd_diff "$@" ;;
+  ask) shift; cmd_ask "$@" ;;
+  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac

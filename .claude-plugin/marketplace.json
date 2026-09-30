@@ -1,0 +1,12 @@
+{
+  "name": "daedie-sidecar",
+  "owner": { "name": "Daedie-git" },
+  "metadata": { "description": "Persistent second-opinion reviewers for Claude Code." },
+  "plugins": [
+    {
+      "name": "claude-sidecar",
+      "source": "./",
+      "description": "Persistent pi review partner for Claude Code in Herdr."
+    }
+  ]
+}

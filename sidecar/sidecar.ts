@@ -18,6 +18,9 @@ const alwaysBlocked: [RegExp, string][] = [
   [/\bglab\s+api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE)/i, "glab api writes"],
   [/\bgh\s+(pr|issue)\s+(comment|create|edit|merge|close|review)\b/, "gh writes"],
   [/\bsudo\b/, "sudo"],
+  // Work for a request happens in the sidecar's own turn, where Claude can track it and this guard applies.
+  [/(^|[;&|(`]|\$\()\s*(exec\s+|nohup\s+|setsid\s+(-\S+\s+)*|timeout\s+\S+\s+)*(pi|codex|claude)(\s|$)/m, "spawning agent processes"],
+  [/(^|[;&|(`]|\$\()\s*(setsid|nohup|disown)\b/m, "detaching processes"],
 ];
 
 function checkBash(command: string): string | undefined {
@@ -25,7 +28,7 @@ function checkBash(command: string): string | undefined {
   return undefined;
 }
 
-const guidance = "Pushing and GitLab writes are Claude's job.";
+const guidance = "Pushing and GitLab writes are Claude's job. Do request work yourself, in this turn; background tasks that end within the turn are fine.";
 
 export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event) => {

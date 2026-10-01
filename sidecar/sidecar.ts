@@ -10,13 +10,9 @@ import { join } from "node:path";
 const stateDir = join(homedir(), ".cache", "claude-sidecar");
 const reportDir = join(stateDir, "reports");
 
-// The sidecar may inspect, build, test, and edit anywhere, including Claude's
-// checkout, but never pushes or writes to GitLab. A guardrail, not a sandbox.
+// The sidecar may inspect, build, test, edit, push and merge anywhere, including Claude's
+// checkout. A guardrail, not a sandbox.
 const alwaysBlocked: [RegExp, string][] = [
-  [/\bgit\b.*\s(push|send-email)\b/, "git push"],
-  [/\bglab\b.*\b(note|approve|revoke|merge|update|close|reopen|create|delete|rebase)\b/, "glab writes"],
-  [/\bglab\s+api\b.*(-X|--method)\s*(POST|PUT|PATCH|DELETE)/i, "glab api writes"],
-  [/\bgh\s+(pr|issue)\s+(comment|create|edit|merge|close|review)\b/, "gh writes"],
   [/\bsudo\b/, "sudo"],
   // Work for a request happens in the sidecar's own turn, where Claude can track it and this guard applies.
   [/(^|[;&|(`]|\$\()\s*(exec\s+|nohup\s+|setsid\s+(-\S+\s+)*|timeout\s+\S+\s+)*(pi|codex|claude)(\s|$)/m, "spawning agent processes"],
@@ -28,7 +24,7 @@ function checkBash(command: string): string | undefined {
   return undefined;
 }
 
-const guidance = "Pushing and GitLab writes are Claude's job. Do request work yourself, in this turn; background tasks that end within the turn are fine.";
+const guidance = "Do request work yourself, in this turn; background tasks that end within the turn are fine.";
 
 export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event) => {

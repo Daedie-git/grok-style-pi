@@ -5,7 +5,7 @@ description: Second-opinion review by a persistent pi agent in a Herdr pane. Use
 
 # Sidecar review
 
-A long-lived pi agent in a herdr split pane reviews your work and remembers the session's history: notes you sent, past reviews, findings you rejected. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). It never pushes or writes to GitLab; you review its changes and push.
+A long-lived pi agent in a herdr split pane reviews your work and remembers the session's history: notes you sent, past reviews, findings you rejected. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative.
 
 ## Brief it
 

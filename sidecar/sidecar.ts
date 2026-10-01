@@ -43,12 +43,19 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       request_id: Type.String({ description: "The request_id given in the request, verbatim" }),
       report: Type.String({ description: "Complete Markdown report" }),
+      needs_answer: Type.Optional(Type.String({
+        description:
+          "Set to ONE concrete question when you are blocked on a decision only Claude or the user can make, instead of finishing. " +
+          "Claude answers with `sidecar answer` and you resume the same task. Do not use it for questions you can resolve from the code.",
+      })),
     }),
     async execute(_id, params) {
       if (!/^[A-Za-z0-9._-]+$/.test(params.request_id)) throw new Error(`invalid request_id: ${params.request_id}`);
       await mkdir(reportDir, { recursive: true });
       const path = join(reportDir, `${params.request_id}.md`);
       await writeFile(path, params.report);
+      const marker = join(reportDir, `${params.request_id}.needs-answer`);
+      if (params.needs_answer?.trim()) await writeFile(marker, params.needs_answer.replace(/\s+/g, " ").trim() + "\n");
       return { content: [{ type: "text", text: `Delivered to Claude (${path}).` }], details: undefined };
     },
   });

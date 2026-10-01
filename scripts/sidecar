@@ -9,6 +9,7 @@
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
 #   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
 #   sidecar ask TEXT             follow-up request; prints the report
+#   sidecar answer TEXT          answer the sidecar's pending question (exit 3 from a request); resumes that task
 set -euo pipefail
 
 STATE_DIR="$HOME/.cache/claude-sidecar"
@@ -18,6 +19,7 @@ PLUGIN_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SIDECAR_HOME="$PLUGIN_ROOT/sidecar"
 MODEL="${SIDECAR_MODEL:-openai-codex/gpt-6.1-sol}"
 THINKING="${SIDECAR_THINKING:-high}"
+INFLIGHT=
 NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
 
@@ -237,12 +239,25 @@ cmd_note() {
   echo "noted"
 }
 
-# Sends a request whose body is in a file and prints the submitted report.
+# Sends a request and prints the submitted report. Exit codes: 0 report delivered, 2 no report,
+# 3 the sidecar is blocked on a question (first line `NEEDS_ANSWER: ...`; reply with `sidecar answer`),
+# 4 an identical request is already in flight.
 request() {
-  local kind=$1 body=$2 name id req report status
+  local kind=$1 body=$2 name id req report status hash pending
   name=$(agent_name)
+  hash=$(sha256sum <<<"$body" | cut -d' ' -f1)
   exec 9>"$STATE_DIR/$name.lock"
-  flock 9
+  if ! flock -n 9; then
+    if [[ -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
+      echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
+      exit 4
+    fi
+    echo "sidecar: another request is in flight; waiting for it" >&2
+    flock 9
+  fi
+  INFLIGHT="$STATE_DIR/$name.inflight"
+  printf '%s\n' "$hash" >"$INFLIGHT"
+  trap 'rm -f -- "$INFLIGHT"' EXIT
   req=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-$kind-$name.XXXXXX.md")
   id=${req##*/}
   id=${id%.md}
@@ -251,6 +266,16 @@ request() {
   wait_until_ready "$name"
   send "$name" "[request $id] Read $req and do what it asks. Finish by calling submit_review with request_id $id." "$REVIEW_TIMEOUT_MS"
   if [[ -f "$report" ]]; then
+    pending="$REPORT_DIR/$id.needs-answer"
+    if [[ -s "$pending" ]]; then
+      echo "$id" >"$STATE_DIR/$name.pending"
+      echo "NEEDS_ANSWER: $(head -n 1 "$pending")"
+      echo "# Sidecar report ($report)"
+      cat "$report"
+      echo "sidecar: blocked on a question; reply with: sidecar answer TEXT" >&2
+      exit 3
+    fi
+    rm -f -- "$STATE_DIR/$name.pending"
     echo "# Sidecar report ($report)"
     cat "$report"
     return
@@ -317,6 +342,20 @@ cmd_ask() {
 $*"
 }
 
+cmd_answer() {
+  require_herdr
+  [[ $# -ge 1 ]] || die "usage: sidecar answer TEXT"
+  local name prev
+  name=$(agent_name)
+  [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question; use sidecar ask or sidecar note"
+  prev=$(<"$STATE_DIR/$name.pending")
+  request answer "# Answer from Claude
+
+You were blocked on request \`$prev\` and asked a question. Answer: $*
+
+Continue that original task to completion with this answer; do not restart finished work. If a genuinely new blocker appears, submit it with needs_answer."
+}
+
 cmd_status() {
   require_herdr
   local name
@@ -338,5 +377,6 @@ case "${1:-}" in
   plan) shift; cmd_plan "$@" ;;
   diff) shift; cmd_diff "$@" ;;
   ask) shift; cmd_ask "$@" ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+  answer) shift; cmd_answer "$@" ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
 esac

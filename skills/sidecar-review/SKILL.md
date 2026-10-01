@@ -48,6 +48,10 @@ The report prints on completion. Every finding is a claim to verify, not an inst
 
 Done when every finding is confirmed-and-fixed or rejected-with-reason, and the user has that list.
 
+## Questions from the sidecar
+
+When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` first, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"/home/aim/git/claude-sidecar/scripts/sidecar" answer "<decision and constraints>"`; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Never redirect a request's output to `/dev/null`: the report is the only place a question or result appears.
+
 ## When it misbehaves
 
 - Outside Herdr (`HERDR_ENV` is not `1`): explain that the sidecar requires an interactive Claude session inside Herdr, and continue without a sidecar review.

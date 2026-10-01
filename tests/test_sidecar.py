@@ -40,7 +40,10 @@ elif args[:2] == ['agent', 'prompt']:
     if prompt.startswith('[request '):
         request_id = prompt.split(']', 1)[0].split()[1]
         reports = home / '.cache/claude-sidecar/reports'
+        time.sleep(float(os.environ.get('HERDR_PROMPT_DELAY', '0')))
         (reports / (request_id + '.md')).write_text('## Verdict\nship\n')
+        if os.environ.get('FAKE_QUESTION'):
+            (reports / (request_id + '.needs-answer')).write_text(os.environ['FAKE_QUESTION'] + '\n')
 '''
 
 
@@ -168,6 +171,33 @@ class LauncherTests(unittest.TestCase):
             self.assertIn('ship', self.run_cli('ask', 'Review the design').stdout)
         reports = list((self.home / '.cache/claude-sidecar/reports').glob('*.md'))
         self.assertEqual(len(reports), 2)
+
+    def test_question_exit_code_and_answer_resume(self):
+        env = dict(self.env, FAKE_QUESTION='May I add X?')
+        result = self.run_cli('ask', 'Do the work', env=env, check=False)
+        self.assertEqual(result.returncode, 3)
+        self.assertTrue(result.stdout.startswith('NEEDS_ANSWER: May I add X?'))
+        answered = self.run_cli('answer', 'Yes, with constraint Y')
+        self.assertIn('ship', answered.stdout)
+        request_files = sorted((self.home / '.cache/claude-sidecar/requests').glob('*-answer-*.md'))
+        self.assertIn('Yes, with constraint Y', request_files[0].read_text())
+        self.assertFalse(self.run_cli('answer', 'again', check=False).returncode == 0)
+
+    def test_answer_without_pending_question(self):
+        result = self.run_cli('answer', 'hello', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no pending question', result.stderr)
+
+    def test_identical_inflight_request_rejected(self):
+        env = dict(self.env, HERDR_PROMPT_DELAY='1.5')
+        self.run_cli('start')
+        with ThreadPoolExecutor(1) as pool:
+            first = pool.submit(self.run_cli, 'ask', 'Same body', env=env)
+            time.sleep(0.7)
+            second = self.run_cli('ask', 'Same body', env=env, check=False)
+            self.assertEqual(second.returncode, 4)
+            self.assertIn('already in flight', second.stderr)
+            self.assertIn('ship', first.result().stdout)
 
     def test_blocked_agent_preserved(self):
         self.run_cli('start')

@@ -31,6 +31,10 @@ claude plugin validate .claude-plugin/marketplace.json
 
 Tests use a fake Herdr and isolated home directories; they never start a real model session.
 
+## Blocked questions
+
+A sidecar that cannot continue without a decision submits its report with `needs_answer`. The launcher then prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.
+
 ## Install from GitHub
 
 This repository includes a single-plugin marketplace. In Claude Code:

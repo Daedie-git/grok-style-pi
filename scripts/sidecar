@@ -22,6 +22,8 @@ THINKING="${SIDECAR_THINKING:-high}"
 INFLIGHT=
 NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
+# After the sidecar settles without a report, recheck for this long before declaring the request abandoned.
+SETTLE_GRACE_S="${SIDECAR_SETTLE_GRACE_S:-15}"
 
 die() { echo "sidecar: $*" >&2; exit 1; }
 
@@ -239,9 +241,28 @@ cmd_note() {
   echo "noted"
 }
 
+# Returns once the report exists, the sidecar is blocked in its pane, or it stays settled without a report
+# (an aborted turn, failed compaction, or a forgotten submit_review).
+await_report() {
+  local name=$1 report=$2 status
+  while [[ ! -f "$report" ]]; do
+    status=$(agent_status "$name")
+    case $status in
+      working|unknown) herdr agent wait "$name" >/dev/null 2>&1 || sleep 5 ;;
+      blocked)
+        echo "sidecar: $name is blocked on a question or approval in its pane; ask the user to handle it" >&2
+        exit 5 ;;
+      *)
+        sleep "$SETTLE_GRACE_S"
+        [[ -f "$report" || $(agent_status "$name") == working ]] && continue
+        return 0 ;;
+    esac
+  done
+}
+
 # Sends a request and prints the submitted report. Exit codes: 0 report delivered, 2 no report,
 # 3 the sidecar is blocked on a question (first line `NEEDS_ANSWER: ...`; reply with `sidecar answer`),
-# 4 an identical request is already in flight.
+# 4 an identical request is already in flight, 5 the sidecar is blocked in its pane.
 request() {
   local kind=$1 body=$2 name id req report status hash pending
   name=$(agent_name)
@@ -264,7 +285,9 @@ request() {
   report="$REPORT_DIR/$id.md"
   printf '%s\n' "$body" >"$req"
   wait_until_ready "$name"
-  send "$name" "[request $id] Read $req and do what it asks. Finish by calling submit_review with request_id $id." "$REVIEW_TIMEOUT_MS"
+  # Requests may run for hours: wait without a deadline until a report arrives or the sidecar settles without one.
+  herdr agent prompt "$name" "[request $id] Read $req and do what it asks. Finish by calling submit_review with request_id $id." --wait >/dev/null || true
+  await_report "$name" "$report"
   if [[ -f "$report" ]]; then
     pending="$REPORT_DIR/$id.needs-answer"
     if [[ -s "$pending" ]]; then

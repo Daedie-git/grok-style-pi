@@ -33,6 +33,9 @@ elif args[:2] == ['agent', 'start']:
     session = args[args.index('--session-id') + 1]
     with state_path.open('x') as output:
         json.dump({'agent_status': 'idle', 'agent_session': {'value': '/tmp/time_' + session + '.jsonl'}}, output)
+elif args[:2] == ['agent', 'wait']:
+    while state_path.exists() and json.loads(state_path.read_text())['agent_status'] == 'working':
+        time.sleep(0.05)
 elif args[:2] == ['agent', 'rename']:
     state_path.unlink()
 elif args[:2] == ['agent', 'prompt']:
@@ -41,6 +44,20 @@ elif args[:2] == ['agent', 'prompt']:
         request_id = prompt.split(']', 1)[0].split()[1]
         reports = home / '.cache/claude-sidecar/reports'
         time.sleep(float(os.environ.get('HERDR_PROMPT_DELAY', '0')))
+        if os.environ.get('FAKE_NO_REPORT'):
+            sys.exit(0)
+        if os.environ.get('FAKE_LATE_REPORT'):
+            # The turn outlives the prompt call: report lands later, then the agent settles.
+            state['agent_status'] = 'working'
+            state_path.write_text(json.dumps(state))
+            import subprocess
+            subprocess.Popen([sys.executable, '-c', (
+                'import json,pathlib,time,sys;time.sleep(1);'
+                'pathlib.Path(sys.argv[1]).write_text("## Verdict\\nlate ship\\n");'
+                's=json.loads(pathlib.Path(sys.argv[2]).read_text());s["agent_status"]="idle";'
+                'pathlib.Path(sys.argv[2]).write_text(json.dumps(s))'),
+                str(reports / (request_id + '.md')), str(state_path)])
+            sys.exit(0)
         (reports / (request_id + '.md')).write_text('## Verdict\nship\n')
         if os.environ.get('FAKE_QUESTION'):
             (reports / (request_id + '.needs-answer')).write_text(os.environ['FAKE_QUESTION'] + '\n')
@@ -198,6 +215,23 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(second.returncode, 4)
             self.assertIn('already in flight', second.stderr)
             self.assertIn('ship', first.result().stdout)
+
+    def test_settled_without_report_fails_fast(self):
+        env = dict(self.env, FAKE_NO_REPORT='1', SIDECAR_SETTLE_GRACE_S='0')
+        result = self.run_cli('ask', 'Do the work', env=env, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('no report submitted', result.stderr)
+
+    def test_waits_for_report_after_prompt_returns(self):
+        env = dict(self.env, FAKE_LATE_REPORT='1', SIDECAR_SETTLE_GRACE_S='0')
+        self.run_cli('start')
+        result = self.run_cli('ask', 'Long task', env=env)
+        self.assertIn('late ship', result.stdout)
+
+    def test_requests_have_no_deadline(self):
+        self.run_cli('ask', 'Review')
+        prompts = [c for c in self.calls() if c[:2] == ['agent', 'prompt'] and c[3].startswith('[request ')]
+        self.assertNotIn('--timeout', prompts[0])
 
     def test_blocked_agent_preserved(self):
         self.run_cli('start')

@@ -48,9 +48,13 @@ The report prints on completion. Every finding is a claim to verify, not an inst
 
 Done when every finding is confirmed-and-fixed or rejected-with-reason, and the user has that list.
 
+## Long-running requests
+
+`plan`, `diff`, `ask` and `answer` wait without a deadline until the sidecar submits its report, so an implementation task that takes hours is one command. Run every request with the Bash tool's `run_in_background: true` and let its completion notice wake you. Never detach it yourself with `&`, `( … &)`, `nohup` or `setsid`, and never redirect its output to `/dev/null`: the harness then cannot notify you, and the report or question goes unseen. If the sidecar's turn ends without a report (an aborted turn or failed context compaction), the command exits 2 with the pane's recent output within seconds; send the task again with `ask`.
+
 ## Questions from the sidecar
 
-When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` first, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"/home/aim/git/claude-sidecar/scripts/sidecar" answer "<decision and constraints>"`; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Never redirect a request's output to `/dev/null`: the report is the only place a question or result appears.
+When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` first, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"/home/aim/git/claude-sidecar/scripts/sidecar" answer "<decision and constraints>"`; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
 
 ## When it misbehaves
 

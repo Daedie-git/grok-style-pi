@@ -306,7 +306,10 @@ export class HerdrRunner {
 			return ref;
 		} catch (error) {
 			if (published) { await this.cancel(ref); throw error; }
-			const failure = await this.cleanup(ref, paneId, message(error), signal.aborted, creationIssued);
+			// Closing a pane changes the grid, so it must not interleave with another placement.
+			const failure = paneId
+				? await this.withPlacement(() => this.cleanup(ref!, paneId, message(error), signal.aborted, creationIssued), new AbortController().signal)
+				: await this.cleanup(ref, paneId, message(error), signal.aborted, creationIssued);
 			throw new Error(failure);
 		}
 	}
@@ -327,8 +330,8 @@ export class HerdrRunner {
 		const fresh: Placement = { newTab: true, column: "left" };
 		// Without the caller's workspace, a managed tab could belong to another project.
 		if (!request.workspaceId) return fresh;
-		let observed: HerdrAgentRef[];
-		try { observed = await this.deps.client.listAgents(); }
+		let panes: HerdrAgentRef[];
+		try { panes = await this.deps.client.listPanes({ workspaceId: request.workspaceId, signal }); }
 		catch { check(signal); return fresh; }
 		check(signal);
 		const launches = await this.store.launches();
@@ -340,16 +343,18 @@ export class HerdrRunner {
 			const live: LaunchRecord[] = [];
 			let unknown = false;
 			for (const pending of pendingOnTab) {
-				if (pending.stage === "published" && pending.paneId && !observed.some((item) => item.paneId === pending.paneId)) {
+				// A shell left by an exited agent still occupies its pane; only a vanished pane frees the slot.
+				if (pending.stage === "published" && pending.paneId && !panes.some((item) => item.paneId === pending.paneId)) {
 					const alive = await this.deps.client.isAlive(pending.agentId);
 					check(signal);
 					if (!alive) { await this.store.releasePlacement(pending); continue; }
 				}
-				if (pending.paneId && pending.column) live.push(pending);
+				// A pane under cleanup may be closing and cannot be split.
+				if (pending.paneId && pending.column && pending.stage !== "cleanup") live.push(pending);
 				else unknown = true;
 			}
-			// A pane this runner did not place leaves the grid shape unknown.
-			const foreign = observed.some((item) => item.tabId === tabId && !live.some((launch) => launch.paneId === item.paneId));
+			// A pane this runner did not place, or no longer tracks, leaves the grid shape unknown.
+			const foreign = panes.some((item) => item.tabId === tabId && !live.some((launch) => launch.paneId === item.paneId));
 			if (unknown || foreign || !live.length || needsNewTab(live.length)) continue;
 			const target = refill(live);
 			if (target) return { newTab: false, tabId, ...target };

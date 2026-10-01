@@ -10,7 +10,7 @@ import { createJiti } from "jiti";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { parseAgentFile } from "../src/herdr/agent-file.ts";
-import { createHerdrCli, agentsFromList, paneIdFromSplit, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
+import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
 import { HerdrRunner, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
@@ -44,11 +44,14 @@ function fakeClient(partial: Partial<HerdrClient> = {}) {
 		},
 		closePane: async (paneId) => {
 			events.push(`close:${paneId}`);
+			tabs.delete(paneId);
 			for (const [name, value] of live) if (value.paneId === paneId) live.delete(name);
 		},
 		isAlive: async (name) => live.has(name),
 		showLabel: async (paneId, label) => { events.push(`label:${paneId}:${label}`); },
 		listAgents: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...[...live].map(([name, value]) => ({ name, ...value }))],
+		listPanes: async (options) => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...[...tabs].map(([paneId, tabId]) => ({ paneId, tabId }))]
+			.filter((pane) => !options?.workspaceId || pane.paneId.startsWith(`${options.workspaceId}:`)),
 		createTab: async (options) => {
 			events.push("tab");
 			tabWorkspaces.push(options.workspaceId);
@@ -60,7 +63,7 @@ function fakeClient(partial: Partial<HerdrClient> = {}) {
 		},
 		...partial,
 	};
-	return { client, events, live, splits, tabWorkspaces };
+	return { client, events, live, splits, tabWorkspaces, panes: tabs };
 }
 
 function fixture(t: TestContext, partial: Partial<HerdrClient> = {}) {
@@ -410,7 +413,7 @@ test("background notices belong to runs and remain pending until acknowledged", 
 	assert.equal((await f.runner.store.notices("w1:p1"))[0].runId, second.runId);
 });
 
-for (const stage of ["isAlive", "listAgents", "split", "createTab", "startPi", "showLabel"] as const) {
+for (const stage of ["isAlive", "listPanes", "split", "createTab", "startPi", "showLabel"] as const) {
 	test(`cancellation during ${stage} never releases an unintended prompt`, async (t) => {
 		const f = fixture(t);
 		if (stage === "split") await f.runner.spawn(request({ name: "seed" }));
@@ -497,7 +500,7 @@ test("ambiguous pane creation is not retried and keeps a capacity reservation", 
 
 test("concurrent placement counts durable reservations even before Herdr sees Pi", async (t) => {
 	const f = fixture(t);
-	f.client.listAgents = async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, { paneId: "w1:other", tabId: "w1:t1" }];
+	f.client.listPanes = async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, { paneId: "w1:other", tabId: "w1:t1" }];
 	await Promise.all(Array.from({ length: 8 }, () => f.runner.spawn(request())));
 	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 6);
 	assert.equal(f.events.filter((event) => event === "tab").length, 2);
@@ -524,7 +527,10 @@ async function fullGrid(t: TestContext) {
 	for (let index = 0; index < 4; index++) await f.runner.spawn(request());
 	const [right, leftDown, rightDown] = f.splits;
 	const grid = { topLeft: right.paneId, topRight: right.createdPaneId, bottomLeft: leftDown.createdPaneId, bottomRight: rightDown.createdPaneId };
-	const vacate = (paneId: string) => { for (const [name, value] of f.live) if (value.paneId === paneId) f.live.delete(name); };
+	const vacate = (paneId: string) => {
+		for (const [name, value] of f.live) if (value.paneId === paneId) f.live.delete(name);
+		f.panes.delete(paneId);
+	};
 	return { ...f, grid, vacate };
 }
 
@@ -557,11 +563,43 @@ test("a managed tab holding a pane this runner did not place is not refilled", a
 	const f = fixture(t);
 	await f.runner.spawn(request());
 	const [managed] = [...f.live.values()];
-	const listAgents = f.client.listAgents;
-	f.client.listAgents = async () => [...await listAgents(), { paneId: "w1:foreign", tabId: managed.tabId }];
+	f.panes.set("w1:foreign", managed.tabId);
 	await f.runner.spawn(request());
 	assert.equal(f.events.filter((event) => event === "tab").length, 2);
 	assert.equal(f.splits.length, 0);
+});
+
+test("an exited agent's retained shell keeps its slot occupied", async (t) => {
+	const f = await fullGrid(t);
+	const [name] = [...f.live].find(([, value]) => value.paneId === f.grid.bottomLeft)!;
+	f.live.delete(name);
+	await f.runner.spawn(request());
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
+	assert.equal(f.splits.length, 3);
+});
+
+test("pane cleanup is serialized with placement and never offers a closing pane", async (t) => {
+	const closing = deferred();
+	const closed = deferred();
+	let fail = true;
+	const f = fixture(t);
+	const startPi = f.client.startPi;
+	f.client.startPi = async (options) => {
+		if (fail) { fail = false; throw new Error("start failed"); }
+		return startPi(options);
+	};
+	const closePane = f.client.closePane;
+	f.client.closePane = async (paneId) => { closing.resolve(); await closed.promise; return closePane(paneId); };
+	const failing = assert.rejects(f.runner.spawn(request()), /start failed/);
+	await closing.promise;
+	const next = f.runner.spawn(request());
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	closed.resolve();
+	await failing;
+	await next;
+	assert.equal(f.splits.length, 0);
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
 });
 
 test("placement stays within the caller's Herdr workspace", async (t) => {
@@ -589,7 +627,7 @@ test("observed panes and reservations are deduplicated for capacity", async (t) 
 });
 
 test("unknown occupancy chooses a new tab", async (t) => {
-	const f = fixture(t, { listAgents: async () => { throw new Error("unavailable"); } });
+	const f = fixture(t, { listPanes: async () => { throw new Error("unavailable"); } });
 	await f.runner.spawn(request());
 	assert.equal(f.events[0], "tab");
 	assert.equal(f.events.some((event) => event.startsWith("split:")), false);
@@ -784,6 +822,7 @@ test("confirmed departed agents release reservations without closing unrelated p
 	const f = fixture(t);
 	const first = await f.runner.spawn(request());
 	await f.runner.spawn(request());
+	f.panes.delete(f.live.get(first.agentId)!.paneId);
 	f.live.delete(first.agentId);
 	await f.runner.spawn(request());
 	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 2);
@@ -889,6 +928,7 @@ if (operation === "agent get") {
 }
 const results = {
 	"agent list": { agents: [{ tab_id: "w1:t1", pane_id: "w1:p1" }] },
+	"pane list": { panes: [{ tab_id: "w1:t1", pane_id: "w1:p1" }] },
 	"pane split": { pane: { pane_id: "w1:p2" } },
 	"tab create": { tab: { tab_id: "w1:t2" }, root_pane: { pane_id: "w1:p2" } },
 };
@@ -922,6 +962,8 @@ test("agent files, naming, capacity, and Herdr payload contracts remain intact",
 	assert.deepEqual(tabFromCreate({ result: { tab: { tab_id: "w1:t2" }, root_pane: { pane_id: "w1:p8" } } }), { tabId: "w1:t2", paneId: "w1:p8" });
 	assert.deepEqual(agentsFromList({ result: { agents: [{ tab_id: "w1:t1", pane_id: "w1:p1" }] } }), [{ tabId: "w1:t1", paneId: "w1:p1" }]);
 	assert.throws(() => agentsFromList({}), /agents array/);
+	assert.deepEqual(panesFromList({ result: { panes: [{ tab_id: "w1:t2", pane_id: "w1:p3", agent: null }] } }), [{ tabId: "w1:t2", paneId: "w1:p3" }]);
+	assert.throws(() => panesFromList({}), /panes array/);
 });
 
 test("tool names and durable notification receipts survive extension reload", { timeout: 15_000 }, async (t) => {

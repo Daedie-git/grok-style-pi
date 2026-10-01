@@ -14,6 +14,8 @@ export interface HerdrClient {
 	isAlive(name: string): Promise<boolean>;
 	showLabel(paneId: string, label: string): Promise<void>;
 	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
+	/** Every physical pane, including shells whose agent has exited. */
+	listPanes(options?: { workspaceId?: string; signal?: AbortSignal }): Promise<HerdrAgentRef[]>;
 	createTab(options: { cwd: string; label?: string; workspaceId?: string }): Promise<{ tabId: string; paneId: string }>;
 }
 
@@ -36,11 +38,19 @@ export function tabFromCreate(payload: unknown): { tabId: string; paneId: string
 }
 
 export function agentsFromList(payload: unknown): HerdrAgentRef[] {
+	return refsFromList(payload, "agents", "agent list");
+}
+
+export function panesFromList(payload: unknown): HerdrAgentRef[] {
+	return refsFromList(payload, "panes", "pane list");
+}
+
+function refsFromList(payload: unknown, key: string, operation: string): HerdrAgentRef[] {
 	const result = object(object(payload)?.result) ?? object(payload);
-	const agents = result?.agents;
-	if (!Array.isArray(agents)) throw new Error("Herdr agent list did not return an agents array");
-	return agents.map((agent) => {
-		const record = object(agent);
+	const items = result?.[key];
+	if (!Array.isArray(items)) throw new Error(`Herdr ${operation} did not return a ${key} array`);
+	return items.map((item) => {
+		const record = object(item);
 		return {
 			...(typeof record?.name === "string" ? { name: record.name } : {}),
 			tabId: typeof record?.tab_id === "string" ? record.tab_id : undefined,
@@ -104,6 +114,11 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 		},
 		async listAgents(signal) {
 			return agentsFromList(await call(bin, ["agent", "list"], env, 2500, signal));
+		},
+		async listPanes(options = {}) {
+			const args = ["pane", "list"];
+			if (options.workspaceId) args.push("--workspace", options.workspaceId);
+			return panesFromList(await call(bin, args, env, 2500, options.signal));
 		},
 		async createTab(options) {
 			const args = ["tab", "create", "--cwd", options.cwd, "--no-focus"];

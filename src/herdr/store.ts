@@ -38,9 +38,14 @@ export interface LaunchRecord extends RunRef {
 	tabId?: string;
 	paneId?: string;
 	direction?: "right" | "down";
+	/** Grid column in a runner-created tab; set only on launches placed by column. */
+	column?: "left" | "right";
+	workspaceId?: string;
 	error?: string;
 	updatedAt: number;
 }
+
+export type LaunchFacts = Partial<Pick<LaunchRecord, "paneId" | "tabId" | "direction" | "column" | "workspaceId" | "error">>;
 
 export interface Command extends RunRef {
 	id: string;
@@ -128,7 +133,7 @@ export class HerdrStore {
 	recordExecutionEvent(ref: RunRef, token: string, event: ExecutionEvent, now: number) { return this.call("recordExecutionEvent", ref, token, event, now); }
 	recoverableLaunches() { return this.call("recoverableLaunches"); }
 	launches() { return this.call("launches"); }
-	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: { paneId?: string; tabId?: string; direction?: "right" | "down"; error?: string }, now: number) { return this.call("recordLaunch", ref, owner, stage, facts, now); }
+	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: LaunchFacts, now: number) { return this.call("recordLaunch", ref, owner, stage, facts, now); }
 	claimLaunchRecovery(ref: RunRef, previousOwner: string, owner: string, now: number) { return this.call("claimLaunchRecovery", ref, previousOwner, owner, now); }
 	failLaunch(ref: RunRef, owner: string, error: string, stopped: boolean, now: number) { return this.call("failLaunch", ref, owner, error, stopped, now); }
 	notices(parentPaneId: string) { return this.call("notices", parentPaneId); }

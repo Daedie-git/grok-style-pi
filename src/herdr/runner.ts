@@ -3,15 +3,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { HerdrClient, HerdrAgentRef } from "./client.ts";
-import { splitDirection } from "./client.ts";
 import { parseAgentFile } from "./agent-file.ts";
-import { HerdrStore, type AgentRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
+import { HerdrStore, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
 
 export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-export const MAX_AGENTS_PER_TAB = 3;
+export const MAX_AGENTS_PER_TAB = 4;
 const POLL_MS = 200;
 
 export interface SpawnRequest {
@@ -29,6 +28,7 @@ export interface SpawnRequest {
 	cwd: string;
 	paneId: string;
 	tabId?: string;
+	workspaceId?: string;
 	sessionFile?: string;
 	agentDir?: string;
 }
@@ -50,6 +50,28 @@ export interface ToolText {
 
 export function needsNewTab(agentsOnTab: number, limit = MAX_AGENTS_PER_TAB): boolean {
 	return agentsOnTab >= limit;
+}
+
+interface Placement {
+	newTab: boolean;
+	tabId?: string;
+	paneId?: string;
+	direction?: "right" | "down";
+	column: "left" | "right";
+}
+
+/** Restores a two-column grid: one column splits right; otherwise the shorter column splits down. */
+function refill(live: LaunchRecord[]): Pick<Placement, "paneId" | "direction" | "column"> | undefined {
+	const left = live.filter((launch) => launch.column === "left");
+	const right = live.filter((launch) => launch.column === "right");
+	if (!left.length || !right.length) {
+		const only = left.length ? left : right;
+		// Two stacked panes cannot become columns by splitting right or down.
+		if (only.length !== 1) return undefined;
+		return { paneId: only[0].paneId, direction: "right", column: only === left ? "right" : "left" };
+	}
+	const shorter = left.length <= right.length ? left : right;
+	return { paneId: shorter[0].paneId, direction: "down", column: shorter[0].column! };
 }
 
 export function paneLabel(id: string, model?: string, thinking?: string): string {
@@ -259,13 +281,13 @@ export class HerdrRunner {
 				await this.recoverLaunches();
 				check(signal);
 				const target = await this.choosePlacement(request, signal);
-				await this.store.recordLaunch(ref!, this.owner, "creating", { tabId: target.tabId, direction: target.direction }, this.now());
+				await this.store.recordLaunch(ref!, this.owner, "creating", { tabId: target.tabId, direction: target.direction, column: target.column, workspaceId: request.workspaceId }, this.now());
 				check(signal);
 				// Once issued, pane creation is never blindly retried: its outcome may be ambiguous.
 				creationIssued = true;
 				const created = target.newTab
-					? await this.deps.client.createTab({ cwd: request.cwd, label: request.description })
-					: await this.deps.client.split({ paneId: request.paneId, direction: target.direction!, cwd: request.cwd });
+					? await this.deps.client.createTab({ cwd: request.cwd, label: request.description, workspaceId: request.workspaceId })
+					: await this.deps.client.split({ paneId: target.paneId!, direction: target.direction!, cwd: request.cwd });
 				paneId = created.paneId;
 				await this.store.recordLaunch(ref!, this.owner, "pane-created", { paneId, tabId: "tabId" in created && typeof created.tabId === "string" ? created.tabId : target.tabId }, this.now());
 				check(signal);
@@ -301,33 +323,38 @@ export class HerdrRunner {
 		finally { await this.store.releasePlacementLock(token); }
 	}
 
-	private async choosePlacement(request: SpawnRequest, signal: AbortSignal): Promise<{ newTab: boolean; tabId?: string; direction?: "right" | "down" }> {
-		if (!request.tabId) return { newTab: true };
+	private async choosePlacement(request: SpawnRequest, signal: AbortSignal): Promise<Placement> {
+		const fresh: Placement = { newTab: true, column: "left" };
+		// Without the caller's workspace, a managed tab could belong to another project.
+		if (!request.workspaceId) return fresh;
 		let observed: HerdrAgentRef[];
 		try { observed = await this.deps.client.listAgents(); }
-		catch { check(signal); return { newTab: true }; }
+		catch { check(signal); return fresh; }
 		check(signal);
 		const launches = await this.store.launches();
 		check(signal);
-		const panes = new Set(observed.filter((item) => item.tabId === request.tabId && item.paneId).map((item) => item.paneId!));
-		panes.add(request.paneId);
-		let unknown = observed.filter((item) => item.tabId === request.tabId && !item.paneId).length;
-		for (const pending of launches) {
-			if (pending.tabId !== request.tabId || pending.stage === "closed") continue;
-			if (pending.stage === "published" && pending.paneId && !panes.has(pending.paneId)) {
-				const alive = await this.deps.client.isAlive(pending.agentId);
-				check(signal);
-				if (!alive) { await this.store.releasePlacement(pending); continue; }
+		// Only fill grid tabs this runner fleet created in the caller's workspace, never the orchestrator's tab.
+		const tabs = new Set(launches.filter((launch) => launch.tabId && launch.column && !launch.direction && launch.workspaceId === request.workspaceId).map((launch) => launch.tabId!));
+		for (const tabId of tabs) {
+			const pendingOnTab = launches.filter((launch) => launch.tabId === tabId && launch.stage !== "closed");
+			const live: LaunchRecord[] = [];
+			let unknown = false;
+			for (const pending of pendingOnTab) {
+				if (pending.stage === "published" && pending.paneId && !observed.some((item) => item.paneId === pending.paneId)) {
+					const alive = await this.deps.client.isAlive(pending.agentId);
+					check(signal);
+					if (!alive) { await this.store.releasePlacement(pending); continue; }
+				}
+				if (pending.paneId && pending.column) live.push(pending);
+				else unknown = true;
 			}
-			if (pending.paneId) panes.add(pending.paneId);
-			else unknown++;
+			// A pane this runner did not place leaves the grid shape unknown.
+			const foreign = observed.some((item) => item.tabId === tabId && !live.some((launch) => launch.paneId === item.paneId));
+			if (unknown || foreign || !live.length || needsNewTab(live.length)) continue;
+			const target = refill(live);
+			if (target) return { newTab: false, tabId, ...target };
 		}
-		if (needsNewTab(panes.size + unknown)) return { newTab: true };
-		const previous = launches.find((launch) => launch.tabId === request.tabId && launch.stage !== "closed" && launch.paneId && panes.has(launch.paneId) && launch.direction);
-		if (previous?.direction) return { newTab: false, tabId: request.tabId, direction: previous.direction === "right" ? "down" : "right" };
-		const layout = await this.deps.client.layout(request.paneId);
-		check(signal);
-		return { newTab: false, tabId: request.tabId, direction: splitDirection(layout) };
+		return fresh;
 	}
 
 	private async recoverLaunches(): Promise<void> {

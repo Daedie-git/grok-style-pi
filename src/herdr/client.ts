@@ -8,14 +8,13 @@ export interface HerdrAgentRef {
 }
 
 export interface HerdrClient {
-	layout(paneId: string): Promise<unknown>;
 	split(options: { paneId: string; direction: "right" | "down"; cwd: string }): Promise<{ paneId: string }>;
 	startPi(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
 	closePane(paneId: string): Promise<void>;
 	isAlive(name: string): Promise<boolean>;
 	showLabel(paneId: string, label: string): Promise<void>;
 	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
-	createTab(options: { cwd: string; label?: string }): Promise<{ tabId: string; paneId: string }>;
+	createTab(options: { cwd: string; label?: string; workspaceId?: string }): Promise<{ tabId: string; paneId: string }>;
 }
 
 export function paneIdFromSplit(payload: unknown): string {
@@ -50,29 +49,12 @@ export function agentsFromList(payload: unknown): HerdrAgentRef[] {
 	});
 }
 
-/** Wide panes split right. Missing geometry, and narrow or tall panes, split down. */
-export function splitDirection(layout: unknown): "right" | "down" {
-	const result = object(object(layout)?.result) ?? object(layout);
-	const columns = numberField(result, ["columns", "width", "cols"]);
-	const rows = numberField(result, ["rows", "height"]);
-	if (columns == null || rows == null) return "down";
-	if (columns >= 100 && columns > rows * 1.5) return "right";
-	return "down";
-}
-
 export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 	now: () => Date.now(),
 	sleep: (ms: number, signal?: AbortSignal): Promise<void> => delay(ms, undefined, { signal }),
 }): HerdrClient {
 	const bin = env.HERDR_BIN_PATH || "herdr";
 	return {
-		async layout(paneId) {
-			try {
-				return await call(bin, ["pane", "layout", "--pane", paneId], env);
-			} catch {
-				return undefined;
-			}
-		},
 		async split(options) {
 			const payload = await call(bin, [
 				"pane", "split", "--pane", options.paneId, "--direction", options.direction,
@@ -125,6 +107,7 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 		},
 		async createTab(options) {
 			const args = ["tab", "create", "--cwd", options.cwd, "--no-focus"];
+			if (options.workspaceId) args.push("--workspace", options.workspaceId);
 			if (options.label) args.push("--label", options.label);
 			return tabFromCreate(await call(bin, args, env));
 		},
@@ -133,15 +116,6 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 
 function object(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
-}
-
-function numberField(value: Record<string, unknown> | undefined, keys: string[]): number | undefined {
-	if (!value) return undefined;
-	for (const key of keys) {
-		const found = value[key];
-		if (typeof found === "number" && Number.isFinite(found)) return found;
-	}
-	return undefined;
 }
 
 function parsePayload(stdout: string): unknown {

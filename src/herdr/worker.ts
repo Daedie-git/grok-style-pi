@@ -4,7 +4,7 @@ import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
-import type { AgentRecord, HerdrTask, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
+import type { AgentRecord, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 
 const { root } = workerData as { root: string };
 mkdirSync(root, { recursive: true });
@@ -315,7 +315,7 @@ const operations = {
 	launches(): LaunchRecord[] {
 		return db.prepare("SELECT data FROM launches").all().map((row) => decode<LaunchRecord>(row)!);
 	},
-	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: { paneId?: string; tabId?: string; direction?: "right" | "down"; error?: string }, now: number): void {
+	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: LaunchFacts, now: number): void {
 		transaction(() => {
 			const value = launch(ref);
 			if (value.owner !== owner) throw new Error("Launch ownership changed");

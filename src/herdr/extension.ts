@@ -90,6 +90,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					cwd: ctx.cwd,
 					paneId: deps.env.HERDR_PANE_ID ?? "",
 					tabId: deps.env.HERDR_TAB_ID,
+					workspaceId: deps.env.HERDR_WORKSPACE_ID,
 					sessionFile: ctx.sessionManager.getSessionFile(),
 					agentDir: deps.agentDir,
 				};

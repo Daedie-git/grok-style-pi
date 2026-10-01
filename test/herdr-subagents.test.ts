@@ -10,7 +10,7 @@ import { createJiti } from "jiti";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { parseAgentFile } from "../src/herdr/agent-file.ts";
-import { createHerdrCli, agentsFromList, paneIdFromSplit, splitDirection, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
+import { createHerdrCli, agentsFromList, paneIdFromSplit, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
 import { HerdrRunner, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
@@ -20,20 +20,22 @@ import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
 import { loadSubagentExtension } from "../integrations/subagents.ts";
 
 function request(extra: Partial<SpawnRequest> = {}): SpawnRequest {
-	return { prompt: "Find the launch path", description: "Find launch path", subagentType: "Explore", runInBackground: true, cwd: "/work", paneId: "w1:p1", tabId: "w1:t1", ...extra };
+	return { prompt: "Find the launch path", description: "Find launch path", subagentType: "Explore", runInBackground: true, cwd: "/work", paneId: "w1:p1", tabId: "w1:t1", workspaceId: "w1", ...extra };
 }
 
 function fakeClient(partial: Partial<HerdrClient> = {}) {
 	const events: string[] = [];
 	const live = new Map<string, { paneId: string; tabId: string }>();
 	const tabs = new Map<string, string>();
+	const splits: { paneId: string; direction: "right" | "down"; createdPaneId: string }[] = [];
+	const tabWorkspaces: (string | undefined)[] = [];
 	let sequence = 2;
 	const client: HerdrClient = {
-		layout: async () => ({ columns: 120, rows: 40 }),
 		split: async (options) => {
 			events.push(`split:${options.direction}`);
-			const paneId = `w1:p${sequence++}`;
-			tabs.set(paneId, "w1:t1");
+			const paneId = `${options.paneId.split(":")[0]}:p${sequence++}`;
+			tabs.set(paneId, tabs.get(options.paneId) ?? "w1:t1");
+			splits.push({ paneId: options.paneId, direction: options.direction, createdPaneId: paneId });
 			return { paneId };
 		},
 		startPi: async (options) => {
@@ -47,16 +49,18 @@ function fakeClient(partial: Partial<HerdrClient> = {}) {
 		isAlive: async (name) => live.has(name),
 		showLabel: async (paneId, label) => { events.push(`label:${paneId}:${label}`); },
 		listAgents: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...[...live].map(([name, value]) => ({ name, ...value }))],
-		createTab: async () => {
+		createTab: async (options) => {
 			events.push("tab");
-			const paneId = `w1:p${sequence++}`;
-			const tabId = `w1:t${sequence++}`;
+			tabWorkspaces.push(options.workspaceId);
+			const workspace = options.workspaceId ?? "w1";
+			const paneId = `${workspace}:p${sequence++}`;
+			const tabId = `${workspace}:t${sequence++}`;
 			tabs.set(paneId, tabId);
 			return { tabId, paneId };
 		},
 		...partial,
 	};
-	return { client, events, live };
+	return { client, events, live, splits, tabWorkspaces };
 }
 
 function fixture(t: TestContext, partial: Partial<HerdrClient> = {}) {
@@ -147,7 +151,7 @@ test("spawn publishes only after Pi starts and returns both identities", async (
 	const result = await spawnHerdrAgent(request(), { ...f, runner: f.runner });
 	assert.match(result.text, /Agent ID: explore/);
 	assert.match(result.text, /Run ID:/);
-	assert.deepEqual(f.events, ["split:right", "start:explore", "label:w1:p2:explore"]);
+	assert.deepEqual(f.events, ["tab", "start:explore", "label:w1:p2:explore"]);
 	const ref = { agentId: String(result.details.agentId), runId: String(result.details.runId) };
 	assert.equal((await f.runner.read(ref)).phase, "queued");
 	assert.equal((await f.runner.store.launches())[0].stage, "published");
@@ -406,9 +410,11 @@ test("background notices belong to runs and remain pending until acknowledged", 
 	assert.equal((await f.runner.store.notices("w1:p1"))[0].runId, second.runId);
 });
 
-for (const stage of ["isAlive", "listAgents", "layout", "split", "createTab", "startPi", "showLabel"] as const) {
+for (const stage of ["isAlive", "listAgents", "split", "createTab", "startPi", "showLabel"] as const) {
 	test(`cancellation during ${stage} never releases an unintended prompt`, async (t) => {
 		const f = fixture(t);
+		if (stage === "split") await f.runner.spawn(request({ name: "seed" }));
+		f.events.length = 0;
 		const controller = new AbortController();
 		const original = f.client[stage].bind(f.client) as (...args: any[]) => Promise<any>;
 		(f.client[stage] as (...args: any[]) => Promise<any>) = async (...args) => {
@@ -424,6 +430,7 @@ for (const stage of ["isAlive", "listAgents", "layout", "split", "createTab", "s
 			assert.equal(f.events.some((event) => event.startsWith("label:")), false);
 		}
 		for (const agent of await f.runner.store.listAgents()) {
+			if (agent.id === "seed") continue;
 			const run = await f.runner.read({ agentId: agent.id, runId: agent.currentRunId });
 			assert.equal(run.accepted, false);
 			assert.ok(isTerminal(run.phase));
@@ -480,42 +487,105 @@ test("cleanup failures remain visible and retain the reservation", async (t) => 
 
 test("ambiguous pane creation is not retried and keeps a capacity reservation", async (t) => {
 	const f = fixture(t, { split: async () => { throw new Error("reply lost"); } });
+	await f.runner.spawn(request({ name: "seed" }));
 	await assert.rejects(f.runner.spawn(request()), /outcome is unknown/);
-	const pending = (await f.runner.store.launches())[0];
+	const pending = (await f.runner.store.launches())[1];
 	assert.equal(pending.stage, "ambiguous");
-	assert.equal(pending.tabId, "w1:t1");
+	assert.equal(pending.tabId, "w1:t3");
 	assert.equal(pending.paneId, undefined);
 });
 
 test("concurrent placement counts durable reservations even before Herdr sees Pi", async (t) => {
 	const f = fixture(t);
 	f.client.listAgents = async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, { paneId: "w1:other", tabId: "w1:t1" }];
-	await Promise.all([f.runner.spawn(request()), f.runner.spawn(request())]);
-	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 1);
-	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	await Promise.all(Array.from({ length: 8 }, () => f.runner.spawn(request())));
+	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 6);
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
 });
 
-test("successive spawns alternate split directions within a tab", async (t) => {
+test("eight subagents fill two dedicated tabs with balanced four-pane grids", async (t) => {
+	const f = fixture(t);
+	for (let index = 0; index < 8; index++) await f.runner.spawn(request());
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
+	const counts = new Map<string, number>();
+	for (const agent of f.live.values()) counts.set(agent.tabId, (counts.get(agent.tabId) ?? 0) + 1);
+	assert.deepEqual([...counts.values()], [4, 4]);
+	assert.equal(counts.has("w1:t1"), false);
+	for (let index = 0; index < f.splits.length; index += 3) {
+		const [right, leftDown, rightDown] = f.splits.slice(index, index + 3);
+		assert.deepEqual([right.direction, leftDown.direction, rightDown.direction], ["right", "down", "down"]);
+		assert.equal(leftDown.paneId, right.paneId);
+		assert.equal(rightDown.paneId, right.createdPaneId);
+	}
+});
+
+async function fullGrid(t: TestContext) {
+	const f = fixture(t);
+	for (let index = 0; index < 4; index++) await f.runner.spawn(request());
+	const [right, leftDown, rightDown] = f.splits;
+	const grid = { topLeft: right.paneId, topRight: right.createdPaneId, bottomLeft: leftDown.createdPaneId, bottomRight: rightDown.createdPaneId };
+	const vacate = (paneId: string) => { for (const [name, value] of f.live) if (value.paneId === paneId) f.live.delete(name); };
+	return { ...f, grid, vacate };
+}
+
+for (const [slot, expected] of [["topLeft", "bottomLeft"], ["topRight", "bottomRight"], ["bottomLeft", "topLeft"], ["bottomRight", "topRight"]] as const) {
+	test(`refilling a vacated ${slot} pane splits the shorter column down`, async (t) => {
+		const f = await fullGrid(t);
+		f.vacate(f.grid[slot]);
+		await f.runner.spawn(request());
+		assert.equal(f.events.filter((event) => event === "tab").length, 1);
+		assert.deepEqual({ paneId: f.splits.at(-1)!.paneId, direction: f.splits.at(-1)!.direction }, { paneId: f.grid[expected], direction: "down" });
+	});
+}
+
+test("a vacated column is restored by splitting right, and stacked panes open a new tab", async (t) => {
+	const f = await fullGrid(t);
+	f.vacate(f.grid.topLeft);
+	f.vacate(f.grid.bottomLeft);
+	f.vacate(f.grid.bottomRight);
+	await f.runner.spawn(request());
+	assert.deepEqual({ paneId: f.splits.at(-1)!.paneId, direction: f.splits.at(-1)!.direction }, { paneId: f.grid.topRight, direction: "right" });
+	const g = await fullGrid(t);
+	g.vacate(g.grid.topLeft);
+	g.vacate(g.grid.bottomLeft);
+	await g.runner.spawn(request());
+	assert.equal(g.events.filter((event) => event === "tab").length, 2);
+	assert.equal(g.splits.length, 3);
+});
+
+test("a managed tab holding a pane this runner did not place is not refilled", async (t) => {
 	const f = fixture(t);
 	await f.runner.spawn(request());
+	const [managed] = [...f.live.values()];
+	const listAgents = f.client.listAgents;
+	f.client.listAgents = async () => [...await listAgents(), { paneId: "w1:foreign", tabId: managed.tabId }];
 	await f.runner.spawn(request());
-	assert.deepEqual(f.events.filter((event) => event.startsWith("split:")), ["split:right", "split:down"]);
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
+	assert.equal(f.splits.length, 0);
 });
 
-test("a narrow tab splits down first, then right", async (t) => {
-	const f = fixture(t, { layout: async () => ({ columns: 60, rows: 40 }) });
+test("placement stays within the caller's Herdr workspace", async (t) => {
+	const f = fixture(t);
 	await f.runner.spawn(request());
-	await f.runner.spawn(request());
-	assert.deepEqual(f.events.filter((event) => event.startsWith("split:")), ["split:down", "split:right"]);
+	await f.runner.spawn(request({ paneId: "w2:p1", tabId: "w2:t1", workspaceId: "w2" }));
+	await f.runner.spawn(request({ workspaceId: undefined }));
+	assert.equal(f.splits.length, 0);
+	assert.deepEqual(f.tabWorkspaces, ["w1", "w2", undefined]);
+	await f.runner.spawn(request({ paneId: "w2:p1", tabId: "w2:t1", workspaceId: "w2" }));
+	assert.equal(f.splits.length, 1);
+	assert.match(f.splits[0].paneId, /^w2:/);
 });
 
 test("observed panes and reservations are deduplicated for capacity", async (t) => {
 	const f = fixture(t);
 	await f.runner.spawn(request());
 	await f.runner.spawn(request());
-	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 2);
+	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 1);
+	await f.runner.spawn(request());
 	await f.runner.spawn(request());
 	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	await f.runner.spawn(request());
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
 });
 
 test("unknown occupancy chooses a new tab", async (t) => {
@@ -716,7 +786,9 @@ test("confirmed departed agents release reservations without closing unrelated p
 	await f.runner.spawn(request());
 	f.live.delete(first.agentId);
 	await f.runner.spawn(request());
-	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 3);
+	assert.equal(f.events.filter((event) => event.startsWith("split:")).length, 2);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	assert.equal((await f.runner.store.launches()).find((launch) => launch.agentId === first.agentId)?.stage, "closed");
 	assert.equal(f.events.filter((event) => event.startsWith("close:")).length, 0);
 });
 
@@ -817,8 +889,8 @@ if (operation === "agent get") {
 }
 const results = {
 	"agent list": { agents: [{ tab_id: "w1:t1", pane_id: "w1:p1" }] },
-	"pane layout": { columns: 120, rows: 40 },
 	"pane split": { pane: { pane_id: "w1:p2" } },
+	"tab create": { tab: { tab_id: "w1:t2" }, root_pane: { pane_id: "w1:p2" } },
 };
 console.log(JSON.stringify({ result: results[operation] ?? {} }));
 `, { mode: 0o755 });
@@ -831,10 +903,11 @@ console.log(JSON.stringify({ result: results[operation] ?? {} }));
 		const calls: string[][] = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.deepEqual(calls[0], ["agent", "get", "relay-correctness"]);
 		assert.ok(calls.some((args) => args[0] === "agent" && args[1] === "start" && args[2] === "relay-correctness"));
+		assert.deepEqual(calls.find((args) => args[0] === "tab" && args[1] === "create")?.slice(-4), ["--workspace", "w1", "--label", "Find launch path"]);
 	} finally { await runner.close(); }
 });
 
-test("agent files, naming, geometry, and Herdr payload contracts remain intact", () => {
+test("agent files, naming, capacity, and Herdr payload contracts remain intact", () => {
 	const parsed = parseAgentFile("---\ntools:\n  - read\n  - grep\nmax_turns: 4\nextensions: false\n---\nQuote the files.\n");
 	assert.deepEqual(parsed.tools, ["read", "grep"]);
 	assert.equal(parsed.maxTurns, 4);
@@ -843,10 +916,9 @@ test("agent files, naming, geometry, and Herdr payload contracts remain intact",
 	assert.equal(herdrAgentName("Auth Audit!!!", "Explore"), "auth-audit");
 	assert.equal(herdrAgentName("a".repeat(40), "Explore").length, 31);
 	assert.equal(paneIdFromSplit({ result: { pane: { pane_id: "w1:p4" } } }), "w1:p4");
-	assert.equal(splitDirection({ result: { columns: 160, rows: 20 } }), "right");
-	assert.equal(splitDirection(undefined), "down");
 	assert.equal(needsNewTab(2), false);
-	assert.equal(needsNewTab(3), true);
+	assert.equal(needsNewTab(3), false);
+	assert.equal(needsNewTab(4), true);
 	assert.deepEqual(tabFromCreate({ result: { tab: { tab_id: "w1:t2" }, root_pane: { pane_id: "w1:p8" } } }), { tabId: "w1:t2", paneId: "w1:p8" });
 	assert.deepEqual(agentsFromList({ result: { agents: [{ tab_id: "w1:t1", pane_id: "w1:p1" }] } }), [{ tabId: "w1:t1", paneId: "w1:p1" }]);
 	assert.throws(() => agentsFromList({}), /agents array/);

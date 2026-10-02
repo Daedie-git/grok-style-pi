@@ -115,7 +115,7 @@ test("closed codemode headers track progress, failed calls, and cancellations in
 	assert.equal(update(false), "◆ codemode · Read 1 file · Run 1 command · 1 failed");
 	calls[1].status = "cancelled";
 	assert.equal(update(false), "◆ codemode · Read 1 file · Run 1 command · 1 cancelled");
-	assert.equal(summaryFor([{ name: "bash", status: "error" }], false, true), "◆ Failed: codemode · Run shell command · 1 failed");
+	assert.equal(summaryFor([{ name: "bash", status: "error" }], false, true), "◆ Failed: codemode · Run shell command");
 });
 
 test("codemode summary safely falls back for truncated arguments and malformed history", () => {

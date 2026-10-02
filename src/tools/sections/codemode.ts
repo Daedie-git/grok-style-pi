@@ -61,7 +61,8 @@ function callSummary(view: SectionView): string | undefined {
 	const failed = calls.filter(call => call.status === "error").length;
 	const cancelled = calls.filter(call => call.status === "cancelled").length;
 	if (view.isPartial || calls.some(call => call.status === "running")) parts.push(`${finished}/${calls.length} finished`);
-	if (failed) parts.push(`${failed} failed`);
+	// The "Failed:" title already reports a single failed call.
+	if (failed && !(view.isError && failed === 1)) parts.push(`${failed} failed`);
 	if (cancelled) parts.push(`${cancelled} cancelled`);
 	return `· ${parts.join(" · ")}`;
 }
@@ -69,11 +70,11 @@ function callSummary(view: SectionView): string | undefined {
 function nestedCalls(details: unknown): string {
 	return callsFrom(details).map(value => {
 		const icon = typeof value.status === "string" ? ({ running: "…", ok: "✓", error: "✗", cancelled: "⊘" } as Record<string, string>)[value.status] ?? "…" : "…";
-		const args = typeof value.args === "string" ? ` ${value.args}` : "";
+		const args = typeof value.args === "string" ? ` ${sanitizeToolText(value.args)}` : "";
 		const duration = typeof value.durationMs === "number" && Number.isFinite(value.durationMs) ? ` ${Math.round(value.durationMs)}ms` : "";
 		const cost = typeof value.cost === "number" && Number.isFinite(value.cost) ? ` $${value.cost.toPrecision(3)}` : "";
-		const error = typeof value.error === "string" ? `\n${value.error}` : "";
-		return `${icon} ${value.name}${args}${duration}${cost}${error}`;
+		const error = typeof value.error === "string" ? `\n${sanitizeToolText(value.error)}` : "";
+		return `${icon} ${sanitizeToolText(value.name)}${args}${duration}${cost}${error}`;
 	}).filter(Boolean).join("\n");
 }
 

@@ -1,18 +1,23 @@
 import { defineTool, getAgentDir, truncateHead, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { createHerdrCli, type HerdrClient } from "./client.ts";
+import { hostname } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHerdrCli, findHerdrMachine, type HerdrClient } from "./client.ts";
 import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
 import type { ExecutionEvent, RunRef } from "./state.ts";
 import {
 	completionNotice,
+	qualifiedAgentId,
 	readHerdrAgent,
 	HerdrRunner,
+	splitAgentId,
 	spawnHerdrAgent,
 	steerHerdrAgent,
 	type SpawnRequest,
 	type ToolText,
 } from "./runner.ts";
-import { herdrSubagentRoot } from "./store.ts";
+import { herdrSubagentRoot, sshChannel, type StoreChannelFactory } from "./store.ts";
 
 export interface HerdrSubagentDeps {
 	env: NodeJS.ProcessEnv;
@@ -21,23 +26,93 @@ export interface HerdrSubagentDeps {
 	agentDir: string;
 	sleep: (ms: number) => Promise<void>;
 	now: () => number;
+	/** Herdr CLI routed to a saved SSH machine. */
+	machineClient: (machine: string) => HerdrClient;
+	/** Opens the coordination store that lives on a saved SSH machine. */
+	machineChannel: (machine: string) => Promise<StoreChannelFactory>;
+	/** Distinguishes this machine's panes in a remote store, where pane IDs belong to another server. */
+	hostname: string;
+}
+
+/** The remote store runs this package's worker entry, by default at the same path as here. */
+export function remoteWorkerEntry(env: NodeJS.ProcessEnv): string {
+	const pkg = env.GROK_HERDR_REMOTE_PACKAGE?.replace(/\/+$/, "");
+	return pkg ? `${pkg}/src/herdr/worker-entry.mjs` : fileURLToPath(new URL("./worker-entry.mjs", import.meta.url));
 }
 
 const POLL_MS = 200;
 
 export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {}): ExtensionFactory {
+	const env = overrides.env ?? process.env;
 	const deps: HerdrSubagentDeps = {
-		env: overrides.env ?? process.env,
-		root: overrides.root ?? herdrSubagentRoot(overrides.env ?? process.env),
-		client: overrides.client ?? createHerdrCli(overrides.env ?? process.env),
+		env,
+		root: overrides.root ?? herdrSubagentRoot(env),
+		client: overrides.client ?? createHerdrCli(env),
 		agentDir: overrides.agentDir ?? getAgentDir(),
 		sleep: overrides.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
 		now: overrides.now ?? Date.now,
+		machineClient: overrides.machineClient ?? ((machine) => createHerdrCli(env, undefined, machine)),
+		machineChannel: overrides.machineChannel ?? (async (machine) => sshChannel({
+			target: (await findHerdrMachine(machine, env)).target,
+			node: env.GROK_HERDR_REMOTE_NODE,
+			entry: remoteWorkerEntry(env),
+		})),
+		hostname: overrides.hostname ?? hostname(),
 	};
+	const paneId = deps.env.HERDR_PANE_ID ?? "";
+	// Remote stores key notices by this pane; a bare pane ID could name one of that machine's own panes.
+	const parentKey = (machine?: string) => machine && paneId ? `${deps.hostname}/${paneId}` : paneId;
 	return (pi: ExtensionAPI) => {
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
 		const getRunner = () => runner ??= new HerdrRunner(deps);
+		/** One runner, and one SSH store channel, per saved machine used by this session. */
+		const machines = new Map<string, Promise<HerdrRunner>>();
+		const machineRunners = new Map<string, HerdrRunner>();
+		const recordedMachines = new Set<string>();
+		/** Owners whose channel dropped. A reconnect retires them so the machine can recover their launches. */
+		const lostOwners = new Map<string, string[]>();
+		/** Saved receipts whose machine is unreachable; retried each tick. */
+		const pendingReceipts = new Map<string, string>();
+		const machineRunner = (machine: string): Promise<HerdrRunner> => {
+			let pending = machines.get(machine);
+			if (!pending) {
+				pending = deps.machineChannel(machine).then(async (channel) => {
+					const opened = new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine });
+					for (const owner of lostOwners.get(machine) ?? []) await opened.store.retireOwner(owner);
+					lostOwners.delete(machine);
+					if (machines.get(machine) === pending) machineRunners.set(machine, opened);
+					return opened;
+				});
+				machines.set(machine, pending);
+				pending.catch(() => machines.delete(machine));
+			}
+			return pending;
+		};
+		const dropMachine = async (machine: string) => {
+			const pending = machines.get(machine);
+			const stale = machineRunners.get(machine);
+			machines.delete(machine);
+			machineRunners.delete(machine);
+			if (stale?.store.failed) lostOwners.set(machine, [...lostOwners.get(machine) ?? [], stale.owner]);
+			// A channel still opening is closed once it opens, so shutdown never leaves an SSH process behind.
+			await (await pending?.catch(() => undefined))?.close().catch(() => undefined);
+		};
+		const remember = (machine: string) => {
+			// Reload reopens the machines this session used, so their completion notices still arrive.
+			if (recordedMachines.has(machine)) return;
+			recordedMachines.add(machine);
+			pi.appendEntry("herdr-remote-machine", { machine });
+		};
+		const route = async (agentId: string) => {
+			const { id, machine } = splitAgentId(agentId);
+			return { id, runner: machine ? await machineRunner(machine) : getRunner() };
+		};
+		const remoteWorkspace = async (machine: string, cwd: string) => {
+			// Reuse the workspace already open in that directory, so its tabs form the same grid.
+			try { return (await deps.machineClient(machine).listPanes()).find((pane) => pane.cwd === cwd)?.workspaceId; }
+			catch { return undefined; }
+		};
 		let child: ChildSession | undefined;
 		let stopped = false;
 		let tick: Promise<void> | undefined;
@@ -60,7 +135,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.registerTool(defineTool({
 			name: "Agent",
 			label: "Agent",
-			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here.",
+			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>.",
 			parameters: Type.Object({
 				prompt: Type.String({ description: "The task for the agent to perform." }),
 				description: Type.String({ description: "A short (3-5 word) description of the task (shown in UI)." }),
@@ -73,8 +148,15 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				resume: Type.Optional(Type.String({ description: "Agent ID to resume after its current run has finished." })),
 				isolated: Type.Optional(Type.Boolean({ description: "If true, the child may use only built-in tools." })),
 				inherit_context: Type.Optional(Type.Boolean({ description: "Must remain false. The orchestrating agent provides all needed context in the prompt." })),
+				machine: Type.Optional(Type.String({ description: "Saved Herdr SSH machine (label or profile ID) to run on. Only when the user asks. Ignored with resume; the agent ID names its machine." })),
+				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine. Defaults to this session's directory." })),
 			}),
 			execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+				const target = params.resume ? await route(params.resume) : undefined;
+				const machine = target ? target.runner.machine : params.machine?.trim() || undefined;
+				if (machine && params.inherit_context) throw new Error("inherit_context cannot clone this session onto another machine.");
+				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
+				const cwd = machine ? params.machine_cwd?.trim() || ctx.cwd : ctx.cwd;
 				const request: SpawnRequest = {
 					prompt: params.prompt,
 					description: params.description,
@@ -84,17 +166,21 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					thinking: params.thinking,
 					maxTurns: params.max_turns,
 					runInBackground: params.run_in_background !== false,
-					resume: params.resume,
+					resume: target?.id,
 					isolated: params.isolated,
 					inheritContext: params.inherit_context,
-					cwd: ctx.cwd,
-					paneId: deps.env.HERDR_PANE_ID ?? "",
-					tabId: deps.env.HERDR_TAB_ID,
-					workspaceId: deps.env.HERDR_WORKSPACE_ID,
+					cwd,
+					definitionsCwd: ctx.cwd,
+					paneId: parentKey(machine),
+					// The caller's tab and workspace are local; remote agents fill grid tabs on that machine.
+					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
+					workspaceId: !machine ? deps.env.HERDR_WORKSPACE_ID : target ? undefined : await remoteWorkspace(machine, cwd),
 					sessionFile: ctx.sessionManager.getSessionFile(),
 					agentDir: deps.agentDir,
 				};
-				const result = await spawnHerdrAgent(request, { ...deps, signal, runner: getRunner() });
+				// Record the machine first: a launch that loses its channel must still be reconnected and its owner retired.
+				if (machine) remember(machine);
+				const result = await spawnHerdrAgent(request, { ...deps, signal, runner: current });
 				return toolResult(result);
 			},
 		}));
@@ -111,7 +197,8 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				verbose: Type.Optional(Type.Boolean({ description: "If true, note that the full conversation is in the Herdr pane. Default: false." })),
 			}),
 			execute: async (_toolCallId, params, signal) => {
-				const result = await readHerdrAgent(deps.root, params.agent_id, { wait: params.wait, verbose: params.verbose, runId: params.run_id }, { ...deps, signal, runner: getRunner() });
+				const { id, runner: current } = await route(params.agent_id);
+				const result = await readHerdrAgent(deps.root, id, { wait: params.wait, verbose: params.verbose, runId: params.run_id }, { ...deps, signal, runner: current });
 				return toolResult(result);
 			},
 		}));
@@ -126,7 +213,8 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				message: Type.String({ description: "The steering message. It appears as a user message in the child." }),
 			}),
 			execute: async (_toolCallId, params) => {
-				const result = await steerHerdrAgent(deps.root, params.agent_id, params.message, { ...deps, runner: getRunner() });
+				const { id, runner: current } = await route(params.agent_id);
+				const result = await steerHerdrAgent(deps.root, id, params.message, { ...deps, runner: current });
 				return toolResult(result);
 			},
 		}));
@@ -135,6 +223,8 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			stopped = false;
 			streaming = !ctx.isIdle();
 			queuedNotices.clear();
+			recordedMachines.clear();
+			pendingReceipts.clear();
 			receiptCursor = 0;
 			messenger.abort = () => { void ctx.abort(); };
 			const current = getRunner();
@@ -142,6 +232,8 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			let checkpoint: ChildIdentity["checkpoint"];
 			for (const entry of entries) {
 				if (entry.type === "custom" && entry.customType === "herdr-execution-checkpoint") checkpoint = entry.data as ChildIdentity["checkpoint"];
+				const used = entry.type === "custom" && entry.customType === "herdr-remote-machine" ? (entry.data as { machine?: unknown } | undefined)?.machine : undefined;
+				if (typeof used === "string") recordedMachines.add(used);
 			}
 			const messages = ctx.sessionManager.getBranch().flatMap((entry) => entry.type === "message" ? [entry.message] : []);
 			assistant = messages.map(assistantText).filter(Boolean).at(-1) ?? "";
@@ -152,32 +244,68 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			}, messenger);
 			if (timer) clearInterval(timer);
 			let lastError = "";
-			let health: Promise<void> | undefined;
+			const health = new Map<HerdrRunner, Promise<void>>();
+			// Each machine polls on its own, so a stalled SSH call never delays local coordination or other machines.
+			const machinePolls = new Map<string, Promise<void>>();
+			const reconnectAt = new Map<string, number>();
 			const reportError = (error: unknown) => {
 				const message = error instanceof Error ? error.message : String(error);
 				if (!stopped && message !== lastError) ctx.ui.notify(`Herdr coordination: ${message}`, "error");
 				lastError = message;
 			};
+			const deliver = async (source: HerdrRunner) => {
+				for (const notice of await source.store.notices(parentKey(source.machine))) {
+					if (stopped || queuedNotices.has(notice.id)) continue;
+					pi.sendMessage({
+						customType: "herdr-subagent-notification", content: completionNotice(notice, source.machine), display: true,
+						details: { noticeId: notice.id, agentId: qualifiedAgentId(notice.agentId, source.machine), runId: notice.runId, machine: source.machine },
+					}, { deliverAs: "followUp", triggerTurn: true });
+					queuedNotices.add(notice.id);
+				}
+			};
 			const poll = async () => {
 				await child?.poll();
 				if (stopped) return;
+				// Reopen machines this session used. A lost SSH channel is retried every ten seconds, not every tick.
+				for (const machine of recordedMachines) {
+					if (machines.has(machine) || (reconnectAt.get(machine) ?? 0) > deps.now()) continue;
+					reconnectAt.set(machine, deps.now() + 10_000);
+					machineRunner(machine).catch(reportError);
+				}
 				// Slow Herdr calls must not delay the child's command/cancellation polling.
-				health ??= current.maintain().catch(reportError).finally(() => { health = undefined; });
+				for (const source of [current, ...machineRunners.values()]) {
+					if (!health.has(source)) health.set(source, source.maintain().catch(reportError).finally(() => health.delete(source)));
+				}
 				// A sendMessage call may only queue a message. Acknowledge only evidence actually in Pi's session.
 				const saved = ctx.sessionManager.getEntries();
 				for (const entry of saved.slice(receiptCursor)) {
 					if (entry.type !== "custom_message" || entry.customType !== "herdr-subagent-notification") continue;
-					const noticeId = (entry.details as { noticeId?: string } | undefined)?.noticeId;
-					if (noticeId) { await current.store.acknowledgeNotice(noticeId); queuedNotices.delete(noticeId); }
+					const details = entry.details as { noticeId?: string; machine?: string } | undefined;
+					if (details?.noticeId) pendingReceipts.set(details.noticeId, details.machine ?? "");
 				}
 				receiptCursor = saved.length;
-				for (const notice of await current.store.notices(deps.env.HERDR_PANE_ID ?? "")) {
-					if (stopped || queuedNotices.has(notice.id)) continue;
-					pi.sendMessage({
-						customType: "herdr-subagent-notification", content: completionNotice(notice), display: true,
-						details: { noticeId: notice.id, agentId: notice.agentId, runId: notice.runId },
-					}, { deliverAs: "followUp", triggerTurn: true });
-					queuedNotices.add(notice.id);
+				for (const [machine, source] of machineRunners) {
+					if (machinePolls.has(machine)) continue;
+					machinePolls.set(machine, pollMachine(machine, source).finally(() => machinePolls.delete(machine)));
+				}
+				await acknowledge("", current);
+				await deliver(current);
+			};
+			const acknowledge = async (machine: string, source: HerdrRunner) => {
+				for (const [noticeId, owner] of pendingReceipts) {
+					if (owner !== machine) continue;
+					await source.store.acknowledgeNotice(noticeId);
+					pendingReceipts.delete(noticeId);
+					queuedNotices.delete(noticeId);
+				}
+			};
+			const pollMachine = async (machine: string, source: HerdrRunner) => {
+				try {
+					await acknowledge(machine, source);
+					await deliver(source);
+				} catch (error) {
+					reportError(new Error(`${machine}: ${error instanceof Error ? error.message : String(error)}`));
+					if (source.store.failed) await dropMachine(machine);
 				}
 			};
 			timer = setInterval(() => {
@@ -196,6 +324,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			child = undefined;
 			await runner?.close();
 			runner = undefined;
+			for (const machine of [...machines.keys()]) await dropMachine(machine);
 		});
 		pi.on("input", (event) => child?.input(event.text));
 		pi.on("agent_start", async () => {

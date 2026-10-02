@@ -1,12 +1,15 @@
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, threadId, workerData } from "node:worker_threads";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
+import { herdrSubagentRoot } from "./store.ts";
 import type { AgentRecord, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 
-const { root } = workerData as { root: string };
+// A worker thread receives its root; a remote stdio process takes an optional root argument.
+const root = (workerData as { root?: string } | null)?.root ?? process.argv[2] ?? herdrSubagentRoot();
 mkdirSync(root, { recursive: true });
 const BUSY_MS = 5000;
 const MAINTENANCE_BUSY_MS = 250;
@@ -165,6 +168,14 @@ const operations = {
 				throw new Error(`Legacy Herdr agent ${entry.name} is still active. Finish or stop legacy runs before switching to protocol 2.`);
 			}
 		}
+	},
+	/** Session files live beside the store, so a remote store creates them on its own machine. */
+	createSession(header: Record<string, unknown>, copyFrom?: string): string {
+		mkdirSync(join(root, "sessions"), { recursive: true });
+		const path = join(root, "sessions", `${randomUUID()}.jsonl`);
+		if (copyFrom) copyFileSync(copyFrom, path);
+		else writeFileSync(path, JSON.stringify(header) + "\n", { flag: "wx" });
+		return path;
 	},
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number): RunRef | undefined {
 		return transaction(() => {
@@ -379,12 +390,40 @@ const operations = {
 
 export type StoreOperations = typeof operations;
 
-parentPort!.on("message", (request: { id: number; operation: keyof StoreOperations; args: unknown[] }) => {
+function serve(request: { id: number; operation: keyof StoreOperations; args: unknown[] }) {
 	try {
+		if (!Array.isArray(request.args)) throw new Error("Malformed Herdr control request");
 		const operation = operations[request.operation] as (...args: unknown[]) => unknown;
 		if (typeof operation !== "function") throw new Error("Unknown Herdr control operation");
-		parentPort!.postMessage({ id: request.id, value: databaseDiagnostics(request.operation, () => operation(...request.args)) });
+		return { id: request.id, value: databaseDiagnostics(request.operation, () => operation(...request.args)) };
 	} catch (error) {
-		parentPort!.postMessage({ id: request.id, error: error instanceof Error ? error.message : String(error) });
+		return { id: request.id, error: error instanceof Error ? error.message : String(error) };
 	}
-});
+}
+
+if (parentPort) parentPort.on("message", (request) => parentPort!.postMessage(serve(request)));
+else {
+	// A remote parent's PID cannot be probed here, so this channel's lifetime stands in for the parent's.
+	// Ending the channel, including by a parent crash, retires every launch owner seen on it.
+	const owners = new Set<string>();
+	const ownerArgument: Partial<Record<keyof StoreOperations, number>> = { reserveAgent: 2, recordLaunch: 1, claimLaunchRecovery: 2 };
+	const finish = () => {
+		for (const owner of owners) {
+			try { operations.retireOwner(owner); } catch {}
+		}
+		process.exit(0);
+	};
+	// Requests are serial, matching the worker's single message queue.
+	createInterface({ input: process.stdin }).on("line", (line) => {
+		let request: Parameters<typeof serve>[0] | undefined;
+		try { request = JSON.parse(line); }
+		catch { return; } // A stray line must not end the process and drop the placement lock it holds.
+		if (typeof request?.id !== "number") return;
+		const index = ownerArgument[request.operation];
+		const owner = index === undefined || !Array.isArray(request.args) ? undefined : request.args[index];
+		if (typeof owner === "string") owners.add(owner);
+		process.stdout.write(JSON.stringify(serve(request)) + "\n");
+	}).on("close", finish);
+	process.on("SIGHUP", finish);
+	process.on("SIGTERM", finish);
+}

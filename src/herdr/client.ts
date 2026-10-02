@@ -5,6 +5,16 @@ export interface HerdrAgentRef {
 	name?: string;
 	tabId?: string;
 	paneId?: string;
+	workspaceId?: string;
+	cwd?: string;
+}
+
+/** A saved SSH machine from `herdr machine list --json`. */
+export interface HerdrMachine {
+	id: string;
+	label: string;
+	target: string;
+	enabled: boolean;
 }
 
 export interface HerdrClient {
@@ -16,7 +26,7 @@ export interface HerdrClient {
 	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
 	/** Every physical pane, including shells whose agent has exited. */
 	listPanes(options?: { workspaceId?: string; signal?: AbortSignal }): Promise<HerdrAgentRef[]>;
-	createTab(options: { cwd: string; label?: string; workspaceId?: string }): Promise<{ tabId: string; paneId: string }>;
+	createTab(options: { cwd: string; label?: string; workspaceId?: string }): Promise<{ tabId: string; paneId: string; workspaceId?: string }>;
 }
 
 export function paneIdFromSplit(payload: unknown): string {
@@ -27,14 +37,15 @@ export function paneIdFromSplit(payload: unknown): string {
 	return paneId;
 }
 
-export function tabFromCreate(payload: unknown): { tabId: string; paneId: string } {
+export function tabFromCreate(payload: unknown): { tabId: string; paneId: string; workspaceId?: string } {
 	const result = object(object(payload)?.result) ?? object(payload);
 	const tabId = object(result?.tab)?.tab_id;
+	const workspaceId = object(result?.tab)?.workspace_id;
 	const paneId = object(result?.root_pane)?.pane_id;
 	if (typeof tabId !== "string" || !tabId || typeof paneId !== "string" || !paneId) {
 		throw new Error("Herdr tab create did not return a tab and root pane");
 	}
-	return { tabId, paneId };
+	return { tabId, paneId, ...(typeof workspaceId === "string" ? { workspaceId } : {}) };
 }
 
 export function agentsFromList(payload: unknown): HerdrAgentRef[] {
@@ -55,18 +66,46 @@ function refsFromList(payload: unknown, key: string, operation: string): HerdrAg
 			...(typeof record?.name === "string" ? { name: record.name } : {}),
 			tabId: typeof record?.tab_id === "string" ? record.tab_id : undefined,
 			paneId: typeof record?.pane_id === "string" ? record.pane_id : undefined,
+			...(typeof record?.workspace_id === "string" ? { workspaceId: record.workspace_id } : {}),
+			...(typeof record?.cwd === "string" ? { cwd: record.cwd } : {}),
 		};
 	});
 }
 
+export function machinesFromList(payload: unknown): HerdrMachine[] {
+	if (!Array.isArray(payload)) throw new Error("Herdr machine list did not return an array");
+	return payload.flatMap((item) => {
+		const record = object(item);
+		if (typeof record?.id !== "string" || typeof record.label !== "string" || typeof record.target !== "string") return [];
+		return [{ id: record.id, label: record.label, target: record.target, enabled: record.enabled !== false }];
+	});
+}
+
+/** Resolves a saved machine the way `herdr --machine` does: profile ID first, then a unique label. */
+export async function findHerdrMachine(selector: string, env: NodeJS.ProcessEnv = process.env): Promise<HerdrMachine> {
+	const machines = machinesFromList(await call(env.HERDR_BIN_PATH || "herdr", ["machine", "list", "--json"], env, 10_000));
+	const byId = machines.find((machine) => machine.id === selector);
+	const byLabel = machines.filter((machine) => machine.label === selector);
+	if (!byId && byLabel.length > 1) throw new Error(`Herdr machine label '${selector}' is ambiguous; use its profile ID.`);
+	const machine = byId ?? byLabel[0];
+	if (!machine) throw new Error(`Unknown Herdr machine '${selector}'. Add it with herdr machine add, then check herdr machine list.`);
+	if (!machine.enabled) throw new Error(`Herdr machine '${selector}' is disabled.`);
+	return machine;
+}
+
+/** With `machine`, every command is routed to that saved SSH machine's Herdr server. Pane IDs are then remote. */
 export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 	now: () => Date.now(),
 	sleep: (ms: number, signal?: AbortSignal): Promise<void> => delay(ms, undefined, { signal }),
-}): HerdrClient {
+}, machine?: string): HerdrClient {
 	const bin = env.HERDR_BIN_PATH || "herdr";
+	const prefix = machine ? ["--machine", machine] : [];
+	// Listings cross SSH when routed to a machine.
+	const listTimeout = machine ? 10_000 : 2500;
+	const routed = (binary: string, args: string[], ...rest: CallOptions) => call(binary, [...prefix, ...args], ...rest);
 	return {
 		async split(options) {
-			const payload = await call(bin, [
+			const payload = await routed(bin, [
 				"pane", "split", "--pane", options.paneId, "--direction", options.direction,
 				"--cwd", options.cwd, "--no-focus",
 			], env);
@@ -77,7 +116,7 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 			for (;;) {
 				signal?.throwIfAborted();
 				try {
-					await call(bin, [
+					await routed(bin, [
 						"agent", "start", options.name, "--kind", "pi", "--pane", options.paneId, "--timeout", "60000",
 						"--", ...options.args,
 					], env, 70_000, signal);
@@ -93,11 +132,11 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 			}
 		},
 		async closePane(paneId) {
-			await call(bin, ["pane", "close", paneId], env);
+			await routed(bin, ["pane", "close", paneId], env);
 		},
 		async isAlive(name) {
 			try {
-				await call(bin, ["agent", "get", name], env);
+				await routed(bin, ["agent", "get", name], env);
 				return true;
 			} catch (error) {
 				if (error instanceof HerdrCliError && error.code === "agent_not_found") return false;
@@ -105,7 +144,7 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 			}
 		},
 		async showLabel(paneId, label) {
-			await call(bin, [
+			await routed(bin, [
 				"pane", "report-metadata", paneId,
 				"--source", "custom:grok-style-pi",
 				"--agent", "pi",
@@ -113,18 +152,18 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 			], env);
 		},
 		async listAgents(signal) {
-			return agentsFromList(await call(bin, ["agent", "list"], env, 2500, signal));
+			return agentsFromList(await routed(bin, ["agent", "list"], env, listTimeout, signal));
 		},
 		async listPanes(options = {}) {
 			const args = ["pane", "list"];
 			if (options.workspaceId) args.push("--workspace", options.workspaceId);
-			return panesFromList(await call(bin, args, env, 2500, options.signal));
+			return panesFromList(await routed(bin, args, env, listTimeout, options.signal));
 		},
 		async createTab(options) {
 			const args = ["tab", "create", "--cwd", options.cwd, "--no-focus"];
 			if (options.workspaceId) args.push("--workspace", options.workspaceId);
 			if (options.label) args.push("--label", options.label);
-			return tabFromCreate(await call(bin, args, env));
+			return tabFromCreate(await routed(bin, args, env));
 		},
 	};
 }
@@ -159,6 +198,8 @@ function errorPayload(text: string): Record<string, unknown> | undefined {
 	try { return object(object(parsePayload(text))?.error); }
 	catch { return undefined; } // Preserve plain or malformed CLI diagnostics instead of masking them with a parse error.
 }
+
+type CallOptions = [env: NodeJS.ProcessEnv, timeout?: number, signal?: AbortSignal];
 
 function call(bin: string, args: string[], env: NodeJS.ProcessEnv, timeout = 70_000, signal?: AbortSignal): Promise<unknown> {
 	return new Promise((resolve, reject) => {

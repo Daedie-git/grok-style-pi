@@ -1,10 +1,10 @@
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { HerdrClient, HerdrAgentRef } from "./client.ts";
 import { parseAgentFile } from "./agent-file.ts";
-import { HerdrStore, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
+import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
 
@@ -12,6 +12,7 @@ export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 export const MAX_AGENTS_PER_TAB = 4;
 const POLL_MS = 200;
+const CLOSE_GRACE_MS = 2000;
 
 export interface SpawnRequest {
 	prompt: string;
@@ -26,6 +27,8 @@ export interface SpawnRequest {
 	isolated?: boolean;
 	inheritContext?: boolean;
 	cwd: string;
+	/** Where agent definitions are read, when `cwd` is on another machine. */
+	definitionsCwd?: string;
 	paneId: string;
 	tabId?: string;
 	workspaceId?: string;
@@ -36,11 +39,15 @@ export interface SpawnRequest {
 export interface RunnerDeps {
 	client: HerdrClient;
 	root: string;
+	/** Reaches a store other than the local worker over `root`, such as a saved machine's store over SSH. */
+	channel?: StoreChannelFactory;
 	sleep?: (ms: number) => Promise<void>;
 	now?: () => number;
 	signal?: AbortSignal;
 	/** The extension shares one runner across tools and session maintenance. */
 	runner?: HerdrRunner;
+	/** Saved Herdr machine whose panes and store this runner uses. Omitted for the local server. */
+	machine?: string;
 }
 
 export interface ToolText {
@@ -74,6 +81,20 @@ function refill(live: { paneId?: string; column?: "left" | "right" }[]): Pick<Pl
 	return { paneId: shorter[0].paneId, direction: "down", column: shorter[0].column! };
 }
 
+/** Remote agent IDs carry their machine so later tool calls route back to it. Agent names never contain `@`. */
+export function qualifiedAgentId(id: string, machine?: string): string {
+	return machine ? `${id}@${machine}` : id;
+}
+
+export function splitAgentId(value: string): { id: string; machine?: string } {
+	const at = value.indexOf("@");
+	return at < 0 ? { id: value } : { id: value.slice(0, at), machine: value.slice(at + 1) };
+}
+
+function paneText(paneId: string, machine?: string): string {
+	return machine ? `${paneId} on ${machine}` : paneId;
+}
+
 export function paneLabel(id: string, model?: string, thinking?: string): string {
 	const detail = [model?.split("/").pop(), thinking].filter(Boolean).join("-");
 	return [id.replace(/^herdr-/, ""), detail].filter(Boolean).join(" · ");
@@ -90,7 +111,9 @@ export function herdrAgentName(preferred: string | undefined, fallback: string):
 /** Owns launch effects and recovery. Waiters only observe immutable run identities. */
 export class HerdrRunner {
 	readonly store: HerdrStore;
-	private owner = `${process.pid}:${randomUUID()}`;
+	readonly machine?: string;
+	/** The machine part lets a runner on another machine sharing this store tell that it cannot probe the PID. */
+	readonly owner = `${process.pid}:${randomUUID()}:${MACHINE}`;
 	private stopping = new AbortController();
 	private active = new Set<Promise<unknown>>();
 	private maintenance?: Promise<void>;
@@ -100,7 +123,8 @@ export class HerdrRunner {
 
 	constructor(privateDeps: RunnerDeps) {
 		this.deps = privateDeps;
-		this.store = new HerdrStore(privateDeps.root);
+		this.store = new HerdrStore(privateDeps.channel ?? privateDeps.root);
+		this.machine = privateDeps.machine;
 		this.now = privateDeps.now ?? Date.now;
 		this.sleep = privateDeps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
 	}
@@ -218,8 +242,13 @@ export class HerdrRunner {
 	close(): Promise<void> {
 		return this.closing ??= (async () => {
 			this.stopping.abort();
-			await Promise.allSettled([...this.active]);
-			try { await this.store.retireOwner(this.owner); }
+			// A stalled remote channel must not hold shutdown. Closing the store rejects whatever still waits, and the
+			// remote worker retires this owner when its channel ends.
+			const bounded = <T>(work: Promise<T>) => this.deps.channel
+				? Promise.race([work, new Promise<void>((resolve) => setTimeout(resolve, CLOSE_GRACE_MS).unref())])
+				: work;
+			await bounded(Promise.allSettled([...this.active]));
+			try { await bounded(this.store.retireOwner(this.owner)); }
 			finally { await this.store.close(); }
 		})();
 	}
@@ -246,9 +275,9 @@ export class HerdrRunner {
 		if (request.inheritContext && (!request.sessionFile || !existsSync(request.sessionFile))) throw new Error("inherit_context was set, but this session has no file to clone.");
 		const definition = loadAgent(request);
 		const base = herdrAgentName(request.name, request.subagentType);
-		const sessionFile = join(this.deps.root, "sessions", `${randomUUID()}.jsonl`);
 		let ref: RunRef | undefined;
 		let task: HerdrTask | undefined;
+		let sessionFile: string | undefined;
 		for (let attempt = 0; attempt < 100; attempt++) {
 			check(signal);
 			const suffix = attempt === 0 ? "" : `-${attempt + 1}`;
@@ -263,6 +292,12 @@ export class HerdrRunner {
 				thinking: request.thinking ?? definition?.thinking, parentPaneId: request.paneId,
 				createdAt: new Date(this.now()).toISOString(),
 			};
+			// The store creates the file on its own machine. A failed reservation leaves only an unused empty session.
+			sessionFile ??= await this.store.createSession(
+				{ type: "session", version: 3, id: randomUUID(), timestamp: task.createdAt, cwd: request.cwd },
+				request.inheritContext ? request.sessionFile : undefined,
+			);
+			check(signal);
 			ref = await this.store.reserveAgent(task, sessionFile, this.owner, this.now());
 			if (ref) break;
 		}
@@ -272,11 +307,6 @@ export class HerdrRunner {
 		let creationIssued = false;
 		try {
 			check(signal);
-			await mkdir(join(this.deps.root, "sessions"), { recursive: true });
-			check(signal);
-			if (request.inheritContext) await copyFile(request.sessionFile!, sessionFile);
-			else await writeFile(sessionFile, JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: task.createdAt, cwd: request.cwd }) + "\n", { flag: "wx" });
-			check(signal);
 			await this.withPlacement(async () => {
 				await this.recoverLaunches();
 				check(signal);
@@ -285,18 +315,20 @@ export class HerdrRunner {
 				check(signal);
 				// Once issued, pane creation is never blindly retried: its outcome may be ambiguous.
 				creationIssued = true;
-				const created = target.newTab
+				const created: { paneId: string; tabId?: string; workspaceId?: string } = target.newTab
 					? await this.deps.client.createTab({ cwd: request.cwd, label: request.description, workspaceId: request.workspaceId })
 					: await this.deps.client.split({ paneId: target.paneId!, direction: target.direction!, cwd: request.cwd });
 				paneId = created.paneId;
-				await this.store.recordLaunch(ref!, this.owner, "pane-created", { paneId, tabId: "tabId" in created && typeof created.tabId === "string" ? created.tabId : target.tabId }, this.now());
+				// A tab opened without a known workspace records where Herdr put it, so later spawns can refill it.
+				const workspaceId = request.workspaceId ?? created.workspaceId;
+				await this.store.recordLaunch(ref!, this.owner, "pane-created", { paneId, tabId: created.tabId ?? target.tabId, workspaceId }, this.now());
 				check(signal);
 			}, signal);
 			check(signal);
 			await this.store.recordLaunch(ref, this.owner, "starting-pi", {}, this.now());
 			check(signal);
 			task.paneId = paneId!;
-			await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile) }, signal);
+			await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile!) }, signal);
 			check(signal);
 			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now());
 			published = true;
@@ -421,8 +453,23 @@ export class HerdrRunner {
 	}
 }
 
+/** Stable across hostname changes, and distinct for machines that share a hostname. */
+function machineIdentity(): string {
+	for (const path of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+		try {
+			const id = readFileSync(path, "utf8").trim();
+			if (id) return id;
+		} catch {}
+	}
+	return hostname().replaceAll(":", "-");
+}
+const MACHINE = machineIdentity();
+
 function ownerAlive(owner: string): boolean {
-	const pid = Number(owner.split(":")[0]);
+	const [process_, , machine] = owner.split(":");
+	// A PID on another machine cannot be probed here; only retirement proves that owner is gone.
+	if (machine && machine !== MACHINE) return true;
+	const pid = Number(process_);
 	if (!Number.isInteger(pid) || pid <= 0) return true;
 	try { process.kill(pid, 0); return true; }
 	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
@@ -436,10 +483,11 @@ export async function spawnHerdrAgent(request: SpawnRequest, deps: RunnerDeps): 
 			: await runner.spawn(request, deps.signal);
 		const record = await runner.resolve(ref.agentId);
 		const snapshot = await runner.read(ref);
-		if (deps.signal?.aborted) return text(formatStatus(record, snapshot), { ...ref, paneId: record.paneId, status: snapshot.phase });
+		const shown = { ...ref, agentId: qualifiedAgentId(ref.agentId, runner.machine) };
+		if (deps.signal?.aborted) return text(formatStatus(record, snapshot, runner.machine), { ...shown, paneId: record.paneId, status: snapshot.phase });
 		if (request.runInBackground) return text(
-			`Agent ${request.resume ? "resumed" : "started"} in a Herdr pane.\nAgent ID: ${ref.agentId}\nRun ID: ${ref.runId}\nPane: ${record.paneId}\nType: ${record.type}\nDescription: ${record.description}\n\nYou will be notified when this run completes.\nUse get_subagent_result for full results, or steer_subagent to send messages.\nDo not duplicate this agent's work.`,
-			{ ...ref, status: "background", paneId: record.paneId },
+			`Agent ${request.resume ? "resumed" : "started"} in a Herdr pane.\nAgent ID: ${shown.agentId}\nRun ID: ${ref.runId}\nPane: ${paneText(record.paneId, runner.machine)}\nType: ${record.type}\nDescription: ${record.description}\n\nYou will be notified when this run completes.\nUse get_subagent_result for full results, or steer_subagent to send messages.\nDo not duplicate this agent's work.`,
+			{ ...shown, status: "background", paneId: record.paneId },
 		);
 		return resultForRun(runner, record, ref, true, deps.signal);
 	});
@@ -450,7 +498,7 @@ export async function readHerdrAgent(root: string, agentId: string, options: { w
 		const record = await runner.resolve(agentId);
 		const ref = { agentId: record.id, runId: options.runId ?? record.currentRunId };
 		const result = await resultForRun(runner, record, ref, options.wait === true, deps.signal);
-		if (options.verbose) result.text += `\n\nFull conversation is in Herdr pane ${record.paneId}.`;
+		if (options.verbose) result.text += `\n\nFull conversation is in Herdr pane ${paneText(record.paneId, runner.machine)}.`;
 		return result;
 	});
 }
@@ -460,13 +508,14 @@ export async function steerHerdrAgent(root: string, agentId: string, messageText
 		const record = await runner.resolve(agentId);
 		const ref = { agentId: record.id, runId: record.currentRunId };
 		await runner.steer(ref, messageText);
-		return text(`Steering message sent to agent ${record.id}. The agent will process it after its current tool execution.\nPane: ${record.paneId}`, { ...ref });
+		return text(`Steering message sent to agent ${qualifiedAgentId(record.id, runner.machine)}. The agent will process it after its current tool execution.\nPane: ${paneText(record.paneId, runner.machine)}`, { ...ref, agentId: qualifiedAgentId(ref.agentId, runner.machine) });
 	});
 }
 
-export function completionNotice(notice: CompletionNotice): string {
+export function completionNotice(notice: CompletionNotice, machine?: string): string {
 	const preview = (notice.run.result || notice.run.error || "No output.").slice(0, 500);
-	return `Background agent ${notice.run.phase}: ${notice.agent.description}\nAgent ID: ${notice.agentId}\nRun ID: ${notice.runId}\nPane: ${notice.agent.paneId}\n\n${preview}\n\nUse get_subagent_result with agent_id "${notice.agentId}" and run_id "${notice.runId}" for full output.`;
+	const agentId = qualifiedAgentId(notice.agentId, machine);
+	return `Background agent ${notice.run.phase}: ${notice.agent.description}\nAgent ID: ${agentId}\nRun ID: ${notice.runId}\nPane: ${paneText(notice.agent.paneId, machine)}\n\n${preview}\n\nUse get_subagent_result with agent_id "${agentId}" and run_id "${notice.runId}" for full output.`;
 }
 
 async function resultForRun(runner: HerdrRunner, record: AgentRecord, ref: RunRef, wait: boolean, signal?: AbortSignal): Promise<ToolText> {
@@ -481,7 +530,7 @@ async function resultForRun(runner: HerdrRunner, record: AgentRecord, ref: RunRe
 		snapshot = await runner.cancel(ref);
 	}
 	if (isTerminal(snapshot.phase)) await runner.store.acknowledgeNotice(ref.runId);
-	return text(formatStatus(record, snapshot), { ...ref, status: snapshot.phase, paneId: record.paneId });
+	return text(formatStatus(record, snapshot, runner.machine), { ...ref, agentId: qualifiedAgentId(ref.agentId, runner.machine), status: snapshot.phase, paneId: record.paneId });
 }
 
 async function usingRunner(deps: RunnerDeps, body: (runner: HerdrRunner) => Promise<ToolText>): Promise<ToolText> {
@@ -514,17 +563,18 @@ function piArgs(task: HerdrTask, sessionFile: string): string[] {
 }
 
 function loadAgent(request: SpawnRequest) {
-	for (const dir of [join(request.cwd, ".pi", "agents"), request.agentDir ? join(request.agentDir, "agents") : ""].filter(Boolean)) {
+	for (const dir of [join(request.definitionsCwd ?? request.cwd, ".pi", "agents"), request.agentDir ? join(request.agentDir, "agents") : ""].filter(Boolean)) {
 		const path = join(dir, `${request.subagentType}.md`);
 		if (existsSync(path)) return parseAgentFile(readFileSync(path, "utf8"));
 	}
 	return undefined;
 }
 
-function formatStatus(record: AgentRecord, snapshot: RunSnapshot): string {
-	const header = `Agent: ${record.id}\nRun: ${snapshot.runId}\nType: ${record.type} | Status: ${snapshot.phase}\nDescription: ${record.description}\nPane: ${record.paneId}\n`;
+function formatStatus(record: AgentRecord, snapshot: RunSnapshot, machine?: string): string {
+	const pane = paneText(record.paneId, machine);
+	const header = `Agent: ${qualifiedAgentId(record.id, machine)}\nRun: ${snapshot.runId}\nType: ${record.type} | Status: ${snapshot.phase}\nDescription: ${record.description}\nPane: ${pane}\n`;
 	if (snapshot.cancelRequested && !isTerminal(snapshot.phase)) return `${header}\nCancellation requested; waiting for the child to stop.`;
-	if (snapshot.phase === "blocked") return `${header}\nAgent is blocked in Herdr pane ${record.paneId}. Answer the prompt there.`;
+	if (snapshot.phase === "blocked") return `${header}\nAgent is blocked in Herdr pane ${pane}. Answer the prompt there.`;
 	if (!isTerminal(snapshot.phase)) return `${header}\nAgent is still ${snapshot.phase}. Use wait: true or check back later.`;
 	return `${header}\n${[snapshot.result, snapshot.error].filter(Boolean).join("\n\n") || "No output."}`;
 }

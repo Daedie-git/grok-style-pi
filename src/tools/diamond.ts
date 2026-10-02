@@ -1,6 +1,7 @@
 import { textTail } from "../utils/text-tail.ts";
 import { stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WriteSummary } from "./write-summary.ts";
+import type { SectionSummary } from "./section.ts";
 
 export const DIAMOND = "◆";
 
@@ -35,7 +36,7 @@ export type ToolRenderContext = {
 	args?: ToolArgs;
 	expanded?: boolean;
 	cwd?: string;
-	state?: { grokEdit?: { open: boolean; expanded: boolean; line?: number }; grokTool?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokExitCode?: string };
+	state?: { grokEdit?: { open: boolean; expanded: boolean; line?: number }; grokTool?: { open: boolean; expanded: boolean }; grokWrite?: WriteSummary; grokExitCode?: string; grokSection?: { args: ToolArgs; summary: SectionSummary; isError: boolean; hasResult: boolean } };
 	invalidate?: () => void;
 };
 
@@ -65,7 +66,7 @@ export function compactArgs(args: ToolArgs, maxLength = 60): string {
 }
 
 export function toolVerb(name: string): string {
-	return TOOL_SUMMARY_VERBS[name] ?? name;
+	return Object.hasOwn(TOOL_SUMMARY_VERBS, name) ? TOOL_SUMMARY_VERBS[name] : name;
 }
 
 export function commandSummary(args: ToolArgs): string {

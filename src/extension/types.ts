@@ -4,6 +4,7 @@ import type { Features } from "./features.ts";
 import type { OpenTarget } from "../navigation/open-in-cursor.ts";
 import type { CursorWorkspaceDeps } from "../navigation/cursor-workspace.ts";
 import type { OriginalTool, ToolFactoryMap } from "../tools/renderer.ts";
+import type { SectionTable } from "../tools/section.ts";
 
 export type SessionUi = {
 	theme?: { fg?(token: string, text: string): string };
@@ -36,9 +37,14 @@ export type ExtensionApiLike = {
 
 export type CustomEditorCtor = typeof CustomEditor;
 
+export type GrokStyleRuntime = {
+	styleTool<T extends OriginalTool>(tool: T): T;
+};
+
 export type GrokStyleDeps = {
 	CustomEditor: CustomEditorCtor;
 	tools: ToolFactoryMap;
+	sections?: SectionTable;
 	getToolOptions?: (ctx: SessionContext) => ToolsOptions;
 	wrapTool?: (tool: OriginalTool) => OriginalTool;
 	features?: Partial<Features>;

@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { wrapWithDiamondRenderer } from "../tools/renderer.ts";
+import { registerToolExtension, type ToolTransform } from "../tools/register-extension.ts";
 
 const EXPLICIT_SUBAGENT_REQUEST = "Do not call this tool unless the user explicitly asked you to use a subagent, agent, or workflow. Do not launch one on your own for exploration, research, parallelism, or context management.";
 
@@ -21,14 +22,9 @@ export function withoutSubagentInitiative<T extends InitiativeTool>(tool: T): T 
 }
 
 /** Decorate registration, preserving the owning extension's execution and metadata. */
-export async function registerStyledSubagents(pi: ExtensionAPI, factory: ExtensionFactory, enabled: boolean) {
-	await factory({
-		...pi,
-		registerTool(tool) {
-			const gated = withoutSubagentInitiative(tool);
-			if (!enabled || !["Agent", "get_subagent_result"].includes(gated.name)) return pi.registerTool(gated);
-			const { renderCall, renderResult, renderShell } = wrapWithDiamondRenderer(gated);
-			pi.registerTool({ ...gated, renderCall, renderResult, renderShell });
-		},
+export async function registerStyledSubagents(pi: ExtensionAPI, factory: ExtensionFactory, enabled: boolean, styleTool: ToolTransform = wrapWithDiamondRenderer) {
+	await registerToolExtension(pi, factory, (tool) => {
+		const gated = withoutSubagentInitiative(tool);
+		return enabled && ["Agent", "get_subagent_result"].includes(gated.name) ? styleTool(gated) : gated;
 	});
 }

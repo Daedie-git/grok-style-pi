@@ -1,4 +1,8 @@
-import { layoutTool } from "../rendering/tool-layout.ts";
+import { activeDiffPalette, createSectionLayouts, paint } from "./section-layout.ts";
+import { editDisplay, toolDisplay, togglesOpen } from "./section-state.ts";
+import { withDiamondSection, type SectionTable } from "./section.ts";
+import { DEFAULT_SECTIONS } from "./sections/index.ts";
+import { withToolDescriptions } from "./guidance.ts";
 import {
 	emptyComponent,
 	commandSummary,
@@ -19,9 +23,8 @@ import type { ToolsOptions, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openInCursor, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import type { VisualPreparation } from "../rendering/visual-preparation.ts";
-import { highlightLines, languageForPath } from "../rendering/highlight.ts";
-import { buildDiffRows, createdRows, paintRows, type DiffPalette, type RenderRow } from "../rendering/diff-render.ts";
-import { hexToRgb, styleColors } from "../chrome/style-colors.ts";
+import { languageForPath } from "../rendering/highlight.ts";
+import { createdRows, paintRows, type RenderRow } from "../rendering/diff-render.ts";
 import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
@@ -42,28 +45,6 @@ export type ThemeLike = {
 	/** GrokNight code-block panel: `#1c1c1c`, mapped to customMessageBg. */
 	bg?: (token: "customMessageBg", text: string) => string;
 };
-
-function editDisplay(context: ToolRenderContext | undefined, expanded: boolean) {
-	const state = context?.state;
-	if (!state) return { open: true, expanded };
-	state.grokEdit ??= { open: true, expanded };
-	if (state.grokEdit.expanded !== expanded) {
-		state.grokEdit.expanded = expanded;
-		state.grokEdit.open = expanded;
-	}
-	return state.grokEdit;
-}
-
-function toolDisplay(context: ToolRenderContext | undefined, expanded: boolean) {
-	const state = context?.state;
-	if (!state) return { open: expanded, expanded };
-	state.grokTool ??= { open: expanded, expanded };
-	if (state.grokTool.expanded !== expanded) {
-		state.grokTool.expanded = expanded;
-		state.grokTool.open = expanded;
-	}
-	return state.grokTool;
-}
 
 export type OriginalTool = Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "name" | "description" | "parameters" | "execute"> &
 	Partial<Pick<import("@earendil-works/pi-coding-agent").ToolDefinition, "label" | "promptSnippet" | "promptGuidelines" | "prepareArguments" | "constrainedSampling" | "executionMode">>;
@@ -105,10 +86,6 @@ export type ToolFactory<N extends BuiltinToolName = BuiltinToolName> = (cwd: str
 
 export type ToolFactoryMap = { [N in BuiltinToolName]: ToolFactory<N> };
 
-function paint(theme: ThemeLike | undefined, token: ThemeColor, text: string): string {
-	return theme?.fg ? theme.fg(token, text) : text;
-}
-
 function callComponent(
 	label: string | (() => string),
 	onRowClick?: (event: TuiMouseEvent) => { handled: true } | undefined,
@@ -126,11 +103,6 @@ function callComponent(
 function defaultModifierOpen(target: OpenTarget): void {
 	// Standalone renderers have no notification UI. Never leak a launcher rejection.
 	void openInCursor(target).catch(() => {});
-}
-
-/** An open diff closes only on Alt+click, so a normal click does not dismiss it. */
-function togglesOpen(event: TuiMouseEvent, open: boolean, requireAltToClose = true): boolean {
-	return event.type === "click" && event.button === "left" && !event.ctrl && (!open || !requireAltToClose || event.alt);
 }
 
 function ctrlOpen(
@@ -155,29 +127,21 @@ function pathArg(args: ToolArgs): string | undefined {
 	return typeof args?.path === "string" ? args.path : undefined;
 }
 
-function activeDiffPalette(): DiffPalette {
-	const colors = styleColors();
-	return {
-		insert: hexToRgb(colors.diffInsert),
-		delete: hexToRgb(colors.diffDelete),
-		insertChar: hexToRgb(colors.diffInsertChar),
-		deleteChar: hexToRgb(colors.diffDeleteChar),
-	};
-}
-
-const fallbackHighlight = () => undefined;
-
 function splitReadNotice(text: string): { code: string; notice: string } {
 	const match = /\n\n\[(?:Showing lines |\d+ more lines in file\.|Line \d+ is )[\s\S]*\]\s*$/.exec(text);
 	if (!match || match.index === undefined) return { code: text, notice: "" };
 	return { code: text.slice(0, match.index), notice: text.slice(match.index + 2) };
 }
 
-export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondHooks): DiamondTool {
+export function wrapWithDiamondRenderer<T extends OriginalTool>(original: T, hooks?: DiamondHooks, sections: SectionTable = DEFAULT_SECTIONS): T & DiamondTool {
+	const section = Object.hasOwn(sections, original.name) ? sections[original.name] : undefined;
+	if (section) return withDiamondSection(original, section, hooks);
+	return wrapSpecializedRenderer(original, hooks) as T & DiamondTool;
+}
+
+function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): DiamondTool {
 	const onModifierOpen = hooks?.onModifierOpen ?? defaultModifierOpen;
-	const execute = original.execute.bind(original);
-	const requests = new WeakMap<object, object>();
-	const rendered = new WeakMap<object, { keys: unknown[]; component: ReturnType<typeof textComponent> }>();
+	const layouts = createSectionLayouts(hooks);
 	const selections = new WeakMap<object, CodeSelection>();
 	const selectionGroup = hooks ? selectionGroups.get(hooks) ?? {} : {};
 	if (hooks) selectionGroups.set(hooks, selectionGroup);
@@ -185,24 +149,9 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 	const edit = original.name === "edit";
 	const write = original.name === "write";
 	const fileRow = original.name === "read" || edit || write;
-	const schema = original.parameters as Record<string, any>;
-	const parameters = (shell || write) && schema?.type === "object" ? {
-		...original.parameters, properties: { ...schema.properties, description: {
-			type: "string", maxLength: 160, description: write ? "Short human-readable description of this file's purpose, e.g. Fury control protocol helpers." : "Short human-readable summary of the command's purpose, e.g. Run unit tests. Do not repeat shell syntax.",
-		} },
-	} : original.parameters;
 	const wrapped: DiamondTool = {
-		name: original.name,
-		label: original.label ?? original.name,
-		description: original.description,
-		parameters,
-		promptSnippet: original.promptSnippet,
-		promptGuidelines: shell || write ? [...original.promptGuidelines ?? [], write ? "Include a concise description of the file’s purpose for the write summary." : "Include a concise description of the command’s purpose for the activity display."] : original.promptGuidelines,
-		prepareArguments: original.prepareArguments,
-		constrainedSampling: original.constrainedSampling,
-		executionMode: original.executionMode,
+		...original,
 		renderShell: "self",
-		execute: (...args: Parameters<typeof original.execute>) => execute(...args),
 		renderCall(args, theme, context) {
 			const failed = context?.isError;
 			if (write) {
@@ -252,17 +201,8 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 		},
 		renderResult(result, options, theme, context) {
 			const owner = context?.state ?? context;
-			const preparation = context?.invalidate ? hooks?.preparation : undefined;
-			const ticket = {};
-			if (owner) requests.set(owner, ticket);
-			const notify = () => {
-				if (!owner || requests.get(owner) !== ticket) return;
-				rendered.delete(owner); context?.invalidate?.();
-			};
-			const highlightCode = (value: string, lang: string | undefined, filePath?: string) => {
-				const ready = owner && preparation?.request({ kind: "highlight", text: value, lang, filePath, colors: styleColors() }, owner, notify);
-				return ready?.lines ?? (value.length <= 8_000 ? highlightLines(value, lang, filePath, fallbackHighlight) : undefined);
-			};
+			const visual = layouts.begin(context);
+			const highlightCode = visual.highlight;
 			if (shell && context?.state) {
 				const exitCode = context.isError && !options.isPartial ? /(?:^|\n)Command exited with code (-?\d+)\s*$/.exec(sanitizeToolText(extractResultText(result)))?.[1] : undefined;
 				if (exitCode !== undefined) context.state.grokExitCode = exitCode;
@@ -322,27 +262,17 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			};
 			const palette = activeDiffPalette();
 			const highlight = (value: string) => highlightCode(value, lang, pathArg(context?.args));
-			const fallbacks: Array<[string, string[]]> = [];
-			const fallbackRows = diff ? buildDiffRows(diff, paintDiff, (value) => {
-				const lines = value.length <= 8_000 ? highlightLines(value, lang, pathArg(context?.args), fallbackHighlight) : undefined;
-				if (lines) fallbacks.push([value, lines]);
-				return lines;
-			}, palette, !preparation) : [];
-			const preparedDiff = diff && owner ? preparation?.request({
-				kind: "diff", text: diff, fallbacks, lang, filePath: pathArg(context?.args), colors: styleColors(), palette,
-				paint: { toolDiffAdded: paintDiff.paint("toolDiffAdded", "\0"), toolDiffRemoved: paintDiff.paint("toolDiffRemoved", "\0"), toolDiffContext: paintDiff.paint("toolDiffContext", "\0") },
-			}, owner, notify) : undefined;
+			const diffRows = visual.diff(diff, theme, lang, pathArg(context?.args));
 			const rows: RenderRow[] = [
 				...(summary?.kind === "created" ? createdRows(sanitizeToolText(summary.preview), paintDiff, highlight) : []),
-				...(preparedDiff?.rows ?? fallbackRows),
+				...diffRows,
 			];
 			let prose = paintedText ?? (text ? paint(theme, token, text) : "");
 			if (!prose && rows.length === 0 && context?.isError) prose = paint(theme, "error", "error");
 			if (!prose && rows.length === 0) return emptyComponent();
 			const background = original.name === "read" && !context?.isError ? theme?.bg?.("customMessageBg", "\0") : undefined;
-			const large = rows.length > 200 || prose.length + rows.reduce((sum, row) => sum + row.text.length, 0) > 16_000;
-			const plainRows = large && preparation ? rows.map((row) => ({ ...row, text: sanitizeToolText(row.text) })) : rows;
-			const plainProse = large && preparation ? sanitizeToolText(prose) : prose;
+			const layout = visual.layout(prose, rows, background);
+			const { plainRows, plainProse } = layout;
 			let cachedWidth: number | undefined;
 			let cachedLines: string[] = [];
 			let codeLines: Array<number | undefined> = [];
@@ -362,7 +292,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 			if (selectionGroup.active === previousSelection && selection !== previousSelection) selectionGroup.active = undefined;
 			if (owner) selections.set(owner, selection);
 			return {
-				invalidate() { cachedWidth = undefined; },
+				invalidate() { cachedWidth = undefined; layout.invalidate(); },
 				handleMouse(event: TuiMouseEvent) {
 					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
 					if (opened) { selection.range = undefined; selectionGroup.active = undefined; return opened; }
@@ -448,10 +378,7 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 						if (selectionGroup.active === selection) selectionGroup.active = undefined;
 					}
 					cachedWidth = width;
-					const layout = large && owner ? preparation?.request({
-						kind: "layout", text: prose, rows, width, palette, background, colors: styleColors(),
-					}, owner, notify) : undefined;
-					cachedLines = layout?.lines ?? layoutTool(plainProse, plainRows, width, palette, background);
+					cachedLines = layout.render(width);
 					codeLines = [];
 					if (!fileRow || !path || !hooks?.onCodeLocation) return cachedLines;
 					// Use the same wrapping width as layoutTool, so a click on a continuation
@@ -485,22 +412,12 @@ export function wrapWithDiamondRenderer(original: OriginalTool, hooks?: DiamondH
 		},
 	};
 	return { ...wrapped, renderResult(result, options, theme, context) {
-		const owner = context?.state ?? context;
-		// Pi creates a fresh result wrapper on every call, but preserves its content and details.
-		const keys = [result.content, result.details, context?.args, options.expanded, options.isPartial, context?.isError, context?.state?.grokEdit?.open, context?.state?.grokTool?.open,
-			styleColors(), ...(["toolOutput", "toolDiffAdded", "toolDiffRemoved", "toolDiffContext", "muted", "error"] as const).map((token) => paint(theme, token, "x")), theme?.bg?.("customMessageBg", "x")];
-		const cached = owner && rendered.get(owner);
-		if (cached && keys.every((key, index) => key === cached.keys[index])) return cached.component;
-		const component = wrapped.renderResult(result, options, theme, context);
-		keys[6] = context?.state?.grokEdit?.open;
-		keys[7] = context?.state?.grokTool?.open;
-		if (owner && !options.isPartial) rendered.set(owner, { keys, component });
-		return component;
+		return layouts.cached(result, options, theme, context, () => wrapped.renderResult(result, options, theme, context));
 	} };
 }
 
-export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}, hooks?: DiamondHooks): DiamondTool[] {
+export function createDiamondTools(cwd: string, factories: ToolFactoryMap, options: ToolsOptions = {}, hooks?: DiamondHooks, sections: SectionTable = DEFAULT_SECTIONS): DiamondTool[] {
 	return BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => wrapWithDiamondRenderer(
-		name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name]), hooks,
+		withToolDescriptions(name === "write" ? withWriteSummary(factories.write, cwd, options.write) : factories[name](cwd, options[name])), hooks, sections,
 	));
 }

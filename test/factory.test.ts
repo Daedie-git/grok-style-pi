@@ -248,7 +248,8 @@ test("clearing the composer keeps the draft in prompt history", () => {
 
 test("shell schema accepts optional summaries and renderer shows them", async () => {
 	const { createBashTool } = await import("@earendil-works/pi-coding-agent");
-	const tool = wrapWithDiamondRenderer(createBashTool(process.cwd()));
+	const { withToolDescriptions } = await import("../src/tools/guidance.ts");
+	const tool = wrapWithDiamondRenderer(withToolDescriptions(createBashTool(process.cwd())));
 	const schema = tool.parameters as any;
 	assert.equal(schema.properties.description.type, "string");
 	assert.ok(!schema.required.includes("description"));

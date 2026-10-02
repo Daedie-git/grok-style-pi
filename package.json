@@ -30,6 +30,7 @@
     "test:bat": "GROK_BAT_INTEGRATION=1 node --test test/highlight-bat.test.ts",
     "typecheck:subagents": "tsc -p tsconfig.subagents.json",
     "test:subagents": "node --test test/subagent-contract.test.ts",
+    "test:current-pi": "node scripts/test-current-pi.ts",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json"
   },
   "pi": {

@@ -64,6 +64,8 @@ The first open waits for regeneration, with a progress notification; concurrent 
 
 Write rows report `Creating` or `Replaced`. A new file is an all-insert diff: the header says `Creating <path>`, a collapsed row shows `+N/-0`, and each line has a green gutter, GrokNight's green insert background `#063806`, and syntax-colored source. Tabs expand to four spaces. Alt-click the diamond to collapse it, and click it to reopen it. Replacements expand on demand to show their colored diff. The previous contents are captured inside Pi's per-file write queue. Previews are bounded: new contents show up to 16,000 characters; diffs require both versions to fit within 64 KB and 1,000 lines each. Larger or unreadable originals fall back to a labeled content preview. Older session entries and custom remote write operations use `Wrote` when creation/replacement cannot be established; previous contents are never inferred from the current file. Original tool-result text sent to the model is preserved.
 
+Pi's `codemode` scripts also use a collapsed `◆ codemode` row. Click the diamond or use Ctrl+O to show the JavaScript, live nested-call statuses and timings, model-call costs, and script output. Click again to close it. Script errors retain their partial output. Styling uses Pi's public `createCodemodeExtension` factory and does not enable codemode automatically or change its sandbox, tool discovery, storage, or execution. Older Pi versions without that factory keep their existing tools; disabling tool styling leaves Pi's native codemode renderer in place.
+
 Tool panels reuse their completed layout while their width, content, and colors are unchanged. Syntax highlighting, detailed diff preparation, and large colored layouts run in a lazy background worker. Panels display readable text immediately, then add syntax and character colors without waiting on `bat`. Small previews use Pi's highlighter while preparation is pending; large previews initially use plain text with the diff backgrounds. Oversized replacement blocks keep line-level coloring when detailed character matching exceeds its work budget. Background work is deduplicated and bounded, and reload discards pending results. The `bat` theme cache is reused across sessions when its theme and `bat` version match.
 
 Pi still controls transcript spacing and message layout, so this is an approximation of Grok Build rather than a complete replacement of Pi’s interface.
@@ -96,6 +98,7 @@ The extension refreshes that handler when a session starts. Its `Exec` line is u
 
 To collapse `Agent` launches and `get_subagent_result` behind diamonds, load the optional `integrations/subagents.ts` entrypoint instead of the npm package's direct entrypoint. Outside Herdr it loads the globally installed `npm:@tintinweb/pi-subagents` and decorates only those tools' rendering; execution, waiting, cancellation, and notification consumption remain owned by Pi Subagents. Inside Herdr it loads this package's pane runner instead, described below. It also removes the Agent and SubagentWorkflow system-prompt instructions that invite unsolicited spawns. Those tools stay available, but their descriptions say to call them only when you explicitly ask. In Pi settings, keep its package installed with `{"source":"npm:@tintinweb/pi-subagents","extensions":[]}` and add `/path/to/grok-style-pi/integrations/subagents.ts` to `extensions`. Do not also enable the original entrypoint. Run `/reload`. Collapsed rows read `◆ Explore: <description>` and `◆ Read agent result <id>`; Ctrl+O expands the full output. Disabling `toolStyling` restores the original result display through the same wrapper.
 
+When switching an existing package installation to the subagent entrypoint, also disable **this package's** default extension. For example, replace its string in `packages` with `{"source":"/path/to/grok-style-pi","extensions":[]}` and retain `/path/to/grok-style-pi/integrations/subagents.ts` in `extensions`. The package's themes remain installed. Both entrypoints now include the core chrome and tool styling, so loading both produces tool-registration conflicts. Pi may separately report that its replaceable built-in codemode extension was superseded by this package; the styled tool still uses Pi's public codemode factory.
 
 The activity bar reserves space above the composer when a shell tool or subagent runs. Each active subagent row shows that run's model and thinking level when the session or spawn record reports them; a clamped level or overridden model is marked with what was asked. The same line appears in the viewer and the `/activity` list. The bar does not cover the transcript or register a persistent overlay. Click **View** to follow its live output, **Stop** to cancel that specific run, or **Close** on the right to dismiss any entry. Closing a running entry hides it without stopping it; it remains accessible through `/activity`. Stopping a shell tool preserves the parent turn and other concurrent tools. Separate **Active subagents** and **Active tasks** sections show up to three entries each. Finished, failed, and stopped entries disappear automatically; empty sections take no space. Click a section heading or use `/activity` to inspect retained history.
 
@@ -124,12 +127,13 @@ Subagent integration uses the documented event bus and manager registry from `@t
 
 ## Code organization
 
-`extensions/index.ts` wires Pi's real editor and built-in tool factories into `createGrokStyleExtension`. The factory in `src/extension.ts` coordinates feature settings, tool registration, and session startup/shutdown. Its public exports and injected dependencies stay available from that file.
+Both alternative entrypoints call `extensions/install.ts` once to wire Pi's real editor and built-in tool factories into `createGrokStyleExtension`. The optional subagent entrypoint therefore includes the same core chrome and codemode styling as the direct entrypoint, while still choosing exactly one subagent runner. The factory in `src/extension.ts` coordinates feature settings, tool registration, and session startup/shutdown. Its public exports and injected dependencies stay available from that file.
 
 | Module | Owns |
 |---|---|
 | `src/extension.ts`, `src/extension/` | Factory, session lifecycle, feature settings, communication, and usage tracking |
-| `src/tools/` | Pi tool rendering, diamond summaries, write previews, and tool settings |
+| `src/tools/` | Shared diamond section state/layout, rendering-only section decoration, specialized file/shell rendering, write previews, and tool settings |
+| `src/tools/sections/` | Unstyled summary/body adapters for codemode, subagent rows, and ordinary text tools |
 | `src/rendering/` | Cached layouts, diffs, syntax colors, palette data, and background visual workers |
 | `src/chrome/` | Composer, footer, terminal colors, theme loading, and color settings |
 | `src/navigation/` | File links, edit targets, workspace preparation, and Cursor launching |
@@ -137,6 +141,8 @@ Subagent integration uses the documented event bus and manager registry from `@t
 | `src/subagents/` | In-process Pi Subagents adapter, result styling, and runtime selection |
 | `src/herdr/` | Separate Herdr extension, runner, child sessions, CLI client, and database worker |
 | `src/utils/` | Shared bounded text helpers |
+
+To add a text-oriented tool section, define a `DiamondSection` with `summary(view)` and `body(view)`, then add it to the explicit adapter table in `src/tools/sections/index.ts`. Bodies return text or code blocks; the shell owns sanitization, expansion, clicks, highlighting, caching, and completed-result diff rows. Collapsed bodies are not evaluated. Ordinary adapters hide partial output; codemode returns live progress blocks. Tool execution and upstream metadata remain unchanged. The factory also accepts an injected `sections` table and returns `styleTool` for extension-owned registrations, sharing the session's visual preparation hooks. File navigation, source selection, default-open edit/write behavior, and media lifecycle stay specialized. Shell/write description guidance is applied separately from rendering.
 
 The session modules keep their state and cleanup together; the factory calls their lifecycle methods. Behavior is tested through the factory and the existing rendering, navigation, and runner interfaces in `test/`.
 
@@ -150,6 +156,8 @@ npm run bench:performance
 ```
 
 The performance benchmark reports redraw and resize timings, event-loop delay during cold preparation, replacement-diff costs, and fleet polling counts. Timing results are diagnostic; deterministic cache, queue, lifecycle, and lease assertions run in the test suite.
+
+An optional current-Pi smoke test verifies public-factory integration, replaceable native codemode loading, disabled styling, activation defaults, sandbox execution, and session storage without model requests. Set `GROK_CURRENT_PI` to a current Pi package's public `dist/index.js`, then run `npm run test:current-pi`. This complements the older Pi development dependency used by the main test suite.
 
 Requires Node 22.18+ on the 22.x line, or Node 24+ (type stripping) and `@earendil-works/pi-coding-agent` for the factory/consumer tests (`npm install`).
 

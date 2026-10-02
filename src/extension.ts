@@ -2,17 +2,17 @@ import { VisualPreparation } from "./rendering/visual-preparation.ts";
 import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { defaultFeatures } from "./extension/features.ts";
 import { COMMUNICATION, installCommunication } from "./extension/communication.ts";
-import { BUILTIN_TOOL_NAMES, createDiamondTools, type BuiltinToolName } from "./tools/renderer.ts";
+import { BUILTIN_TOOL_NAMES, createDiamondTools, wrapWithDiamondRenderer, type BuiltinToolName, type OriginalTool } from "./tools/renderer.ts";
 import { createShowImageTool } from "./tools/show-image.ts";
 import { createShowVideoTool } from "./tools/show-video.ts";
 import { createFileNavigation } from "./extension/file-navigation.ts";
 import type { OpenTarget } from "./navigation/open-in-cursor.ts";
 import { createSessionChrome } from "./extension/session-chrome.ts";
-import type { ExtensionApiLike, GrokStyleDeps, SessionContext } from "./extension/types.ts";
+import type { ExtensionApiLike, GrokStyleDeps, GrokStyleRuntime, SessionContext } from "./extension/types.ts";
 
-export type { SessionUi, SessionContext, ExtensionApiLike, CustomEditorCtor, GrokStyleDeps } from "./extension/types.ts";
+export type { SessionUi, SessionContext, ExtensionApiLike, CustomEditorCtor, GrokStyleDeps, GrokStyleRuntime } from "./extension/types.ts";
 
-export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): void {
+export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): GrokStyleRuntime {
 	const features = { ...defaultFeatures, ...deps.features };
 	const preparation = new VisualPreparation();
 	let started = false;
@@ -46,7 +46,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 		},
 	};
 	function registerTools(cwd: string, options?: ToolsOptions) {
-		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, diamondHooks) :
+		const tools = features.toolStyling ? createDiamondTools(cwd, deps.tools, options, diamondHooks, deps.sections) :
 			BUILTIN_TOOL_NAMES.map(<N extends BuiltinToolName>(name: N) => deps.tools[name](cwd, options?.[name]));
 		for (const tool of tools) {
 			const registered = deps.wrapTool ? deps.wrapTool(tool) : tool;
@@ -80,4 +80,9 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 		navigation.dispose();
 		chrome.dispose();
 	});
+	return {
+		styleTool<T extends OriginalTool>(tool: T): T {
+			return features.toolStyling ? wrapWithDiamondRenderer(tool, diamondHooks, deps.sections) : tool;
+		},
+	};
 }

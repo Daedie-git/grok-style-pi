@@ -81,8 +81,15 @@ export function machinesFromList(payload: unknown): HerdrMachine[] {
 	});
 }
 
+export const SAVED_MACHINES_UNSUPPORTED = "Remote subagents need Herdr 0.9.1 or later on both machines (herdr machine and herdr --machine); the local herdr does not support saved machines. Update Herdr, add the machine with herdr machine add <ssh-target>, then /reload. Do not work around this by starting agents over SSH yourself.";
+
 export async function listHerdrMachines(env: NodeJS.ProcessEnv = process.env, timeout = 10_000): Promise<HerdrMachine[]> {
-	return machinesFromList(await call(env.HERDR_BIN_PATH || "herdr", ["machine", "list", "--json"], env, timeout));
+	try { return machinesFromList(await call(env.HERDR_BIN_PATH || "herdr", ["machine", "list", "--json"], env, timeout)); }
+	catch (error) {
+		// Herdr before 0.9 rejects the subcommand outright; say what to do instead of passing that through.
+		if (error instanceof HerdrCliError && /unknown command: machine/.test(error.message)) throw new Error(SAVED_MACHINES_UNSUPPORTED);
+		throw error;
+	}
 }
 
 /** Resolves a saved machine the way `herdr --machine` does: profile ID first, then a unique label. */

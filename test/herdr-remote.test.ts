@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { machinesFromList, tabFromCreate, panesFromList, type HerdrClient } from "../src/herdr/client.ts";
+import { findHerdrMachine, machinesFromList, tabFromCreate, panesFromList, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger } from "../src/herdr/child.ts";
 import { createHerdrSubagents, machineGuidance, remoteWorkerEntry } from "../src/herdr/extension.ts";
 import { HerdrRunner, qualifiedAgentId, splitAgentId } from "../src/herdr/runner.ts";
@@ -147,6 +147,16 @@ test("machine listings and remote placement facts are parsed", () => {
 		{ id: "m3", label: "build", target: "build", enabled: true },
 	]), " Saved machines: m1 (label laptop, aim@lappy), build. Pass the name shown first as machine.");
 	assert.equal(remoteWorkerEntry({ GROK_HERDR_REMOTE_PACKAGE: "/opt/grok-style-pi/" }), "/opt/grok-style-pi/src/herdr/worker-entry.mjs");
+});
+
+test("a Herdr without saved machines explains the upgrade instead of its raw CLI error", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-old-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const bin = join(dir, "herdr");
+	// Herdr 0.8 output for `herdr machine list --json`.
+	writeFileSync(bin, "#!/bin/sh\necho 'unknown command: machine' >&2\necho \"run 'herdr --help' for usage\" >&2\nexit 2\n");
+	chmodSync(bin, 0o755);
+	await assert.rejects(findHerdrMachine("lappy", { HERDR_BIN_PATH: bin }), /need Herdr 0\.9\.1 or later.*Do not work around this/s);
 });
 
 test("a launch owned on another host is never recovered by PID", async (t) => {

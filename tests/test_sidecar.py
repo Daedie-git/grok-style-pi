@@ -15,21 +15,85 @@ HERDR = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 args = sys.argv[1:]
 home = pathlib.Path(os.environ['HOME'])
-state_path = home / 'agent.json'
+# Herdr before 0.9 has no `machine` command.
+machine = None
+if args[0] == '--machine':
+    machine, args = args[1], args[2:]
+if args[:2] == ['machine', 'list']:
+    listing = home / 'machines.json'
+    if not listing.exists():
+        print('error: unknown command machine', file=sys.stderr)
+        sys.exit(2)
+    print(listing.read_text())
+    sys.exit(0)
+# A machine is a separate herdr server: its own panes and agents, and the sidecar's home is the machine's home.
+state_dir, data_home = home, home
+if machine:
+    target = next(m['target'] for m in json.loads((home / 'machines.json').read_text()) if m['id'] == machine)
+    state_dir = home / 'remote-state' / machine
+    state_dir.mkdir(parents=True, exist_ok=True)
+    data_home = home / 'remote' / target
+name = args[2] if args[0] == 'agent' else ''
+state_path = state_dir / ('agent.json' if name == 'sc-pane-1' else name + '.agent.json')
 state = json.loads(state_path.read_text()) if state_path.exists() else None
 with (home / 'calls.jsonl').open('a') as log:
-    log.write(json.dumps(args) + '\n')
+    log.write(json.dumps((['--machine', machine] if machine else []) + args) + '\n')
+panes_path = state_dir / 'panes.json'
+if args[:2] == ['agent', 'start']:
+    time.sleep(float(os.environ.get('HERDR_START_DELAY', '0')))
+# Serialize pane state updates from concurrent launchers.
+if args[0] in ('pane', 'tab') or args[:2] == ['agent', 'start']:
+    import fcntl
+    lock = (state_dir / 'panes.lock').open('w')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+# Panes in list order, which is spatial within a tab as in Herdr's layout output.
+panes = json.loads(panes_path.read_text()) if panes_path.exists() else [] if machine else [
+    {'pane_id': 'PANE:1', 'tab_id': 't1', 'workspace_id': 'workspace-1', 'agent': 'claude', 'width': 324, 'height': 97}]
+def pane_info(p):
+    return {k: p.get(k) for k in ('pane_id', 'tab_id', 'workspace_id', 'agent', 'cwd')}
+def find(pane_id):
+    return next(p for p in panes if p['pane_id'] == pane_id)
 if args[:2] == ['pane', 'layout']:
-    print(json.dumps({'result': {'layout': {'panes': [{'pane_id': 'PANE:1', 'rect': {'width': 200, 'height': 40}}]}}}))
-elif args[:2] == ['pane', 'split']:
-    print(json.dumps({'result': {'pane': {'pane_id': 'review-pane'}}}))
+    tab = find(args[args.index('--pane') + 1])['tab_id']
+    print(json.dumps({'result': {'layout': {'tab_id': tab, 'panes': [
+        {'pane_id': p['pane_id'], 'rect': {'width': p['width'], 'height': p['height']}}
+        for p in panes if p['tab_id'] == tab]}}}))
+elif args[:2] == ['pane', 'list']:
+    print(json.dumps({'result': {'panes': [pane_info(p) for p in panes]}}))
+elif args[:2] == ['pane', 'get']:
+    print(json.dumps({'result': {'pane': pane_info(find(args[2]))}}))
+elif args[:2] in (['pane', 'split'], ['tab', 'create']):
+    # Herdr never reuses a closed pane's ID.
+    counter_path = state_dir / 'pane-counter'
+    number = int(counter_path.read_text()) + 1 if counter_path.exists() else max(len(panes), 1)
+    counter_path.write_text(str(number))
+    pane = {'pane_id': ('remote-pane-' if machine else 'review-pane-') + str(number), 'agent': None}
+    if args[0] == 'tab':
+        pane.update(tab_id='t' + str(len({p['tab_id'] for p in panes}) + 1),
+                    workspace_id=args[args.index('--workspace') + 1] if '--workspace' in args else 'rw-new', width=324, height=97)
+        panes.append(pane)
+    else:
+        target = find(args[args.index('--pane') + 1])
+        key = 'width' if args[args.index('--direction') + 1] == 'right' else 'height'
+        target[key] //= 2
+        pane.update(tab_id=target['tab_id'], workspace_id=target['workspace_id'],
+                    width=target['width'], height=target['height'])
+        panes.insert(panes.index(target) + 1, pane)
+    panes_path.write_text(json.dumps(panes))
+    key = 'root_pane' if args[0] == 'tab' else 'pane'
+    print(json.dumps({'result': {key: {'pane_id': pane['pane_id']}}}))
 elif args[:2] == ['agent', 'get']:
     time.sleep(float(os.environ.get('HERDR_GET_DELAY', '0')))
     if state is None:
         sys.exit(1)
     print(json.dumps({'result': {'agent': state}}))
 elif args[:2] == ['agent', 'start']:
-    time.sleep(float(os.environ.get('HERDR_START_DELAY', '0')))
+    target = find(args[args.index('--pane') + 1])
+    if target['agent'] is not None or target.get('busy'):
+        print('agent_pane_busy', file=sys.stderr)
+        sys.exit(1)
+    target['agent'] = 'pi'
+    panes_path.write_text(json.dumps(panes))
     session = args[args.index('--session-id') + 1]
     with state_path.open('x') as output:
         json.dump({'agent_status': 'idle', 'agent_session': {'value': '/tmp/time_' + session + '.jsonl'}}, output)
@@ -42,7 +106,8 @@ elif args[:2] == ['agent', 'prompt']:
     prompt = args[3]
     if prompt.startswith('[request '):
         request_id = prompt.split(']', 1)[0].split()[1]
-        reports = home / '.cache/claude-sidecar/reports'
+        reports = data_home / '.cache/claude-sidecar/reports'
+        reports.mkdir(parents=True, exist_ok=True)
         time.sleep(float(os.environ.get('HERDR_PROMPT_DELAY', '0')))
         if os.environ.get('FAKE_NO_REPORT'):
             sys.exit(0)
@@ -64,6 +129,30 @@ elif args[:2] == ['agent', 'prompt']:
 '''
 
 
+# Runs the command on a "machine" whose home differs from ours, as a real SSH login would.
+SSH = r'''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+home = pathlib.Path(os.environ['HOME'])
+options = []
+while args and args[0].startswith('-') and args[0] != '--':
+    options.append(args.pop(0))
+    if options[-1] == '-o':
+        options.append(args.pop(0))
+if args[0] == '--':
+    args.pop(0)
+target, command = args[0], args[1]
+with (home / 'ssh-calls.jsonl').open('a') as log:
+    log.write(json.dumps({'options': options, 'target': target, 'command': command}) + '\n')
+if os.environ.get('FAKE_SSH_DOWN'):
+    print('ssh: connect to host ' + target + ' port 22: Connection refused', file=sys.stderr)
+    sys.exit(255)
+remote_home = home / 'remote' / target
+remote_home.mkdir(parents=True, exist_ok=True)
+sys.exit(subprocess.run(['sh', '-c', command], env=dict(os.environ, HOME=str(remote_home))).returncode)
+'''
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -80,9 +169,12 @@ class LauncherTests(unittest.TestCase):
         (bin_dir / 'herdr').chmod(0o755)
         (bin_dir / 'pi').write_text('#!/bin/sh\nexit 0\n')
         (bin_dir / 'pi').chmod(0o755)
+        (bin_dir / 'ssh').write_text(SSH)
+        (bin_dir / 'ssh').chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:/usr/bin:/bin',
-                        HERDR_ENV='1', HERDR_PANE_ID='PANE:1')
-        for key in ('SIDECAR_AGENT', 'SIDECAR_PI_SESSION', 'SIDECAR_MODEL', 'SIDECAR_THINKING', 'CLAUDE_ENV_FILE'):
+                        HERDR_ENV='1', HERDR_PANE_ID='PANE:1', HERDR_WORKSPACE_ID='workspace-1')
+        for key in ('SIDECAR_AGENT', 'SIDECAR_PI_SESSION', 'SIDECAR_MODEL', 'SIDECAR_THINKING', 'CLAUDE_ENV_FILE',
+                    'SIDECAR_MACHINE', 'SIDECAR_REMOTE_HOME'):
             self.env.pop(key, None)
 
     def run_cli(self, *args, input='', env=None, cwd=None, check=True):
@@ -108,21 +200,17 @@ class LauncherTests(unittest.TestCase):
             futures = [pool.submit(self.run_cli, 'start', env=env) for _ in range(2)]
             for future in futures:
                 future.result()
+        self.assertEqual(sum(c[:2] == ['tab', 'create'] for c in self.calls()), 0)
         self.assertEqual(sum(c[:2] == ['pane', 'split'] for c in self.calls()), 1)
         self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 1)
 
-    def test_clear_during_pending_hook_startup(self):
+    def test_clear_before_first_request_keeps_identity(self):
         env_file = self.home / 'claude.env'
         env = dict(self.env, HERDR_START_DELAY='0.2', CLAUDE_ENV_FILE=str(env_file))
         self.run_cli('session-start', input='{"session_id":"first"}', env=env)
         self.run_cli('session-start', input='{"session_id":"after-clear"}', env=env)
-        log = self.home / '.cache/claude-sidecar/sc-pane-1.log'
-        for _ in range(150):
-            if log.exists() and 'already running' in log.read_text():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail('Detached startups did not finish')
+        self.assertEqual(self.calls(), [])
+        self.run_cli('ask', 'First deferred task', env=env)
         self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 1)
         self.assertFalse(any(c[:2] == ['agent', 'rename'] for c in self.calls()))
         self.assertEqual(env_file.read_text().count('SIDECAR_PI_SESSION=cc-first'), 2)
@@ -147,6 +235,143 @@ class LauncherTests(unittest.TestCase):
                                     env=env, capture_output=True, text=True, check=True)
             self.assertEqual(result.stdout, '')
             self.assertEqual(self.calls(), [])
+
+    def test_eight_sidecars_fill_caller_then_overflow_tabs(self):
+        for slot in range(1, 9):
+            self.run_cli('--slot', str(slot), 'ask', 'Independent task')
+        tabs = [c for c in self.calls() if c[:2] == ['tab', 'create']]
+        splits = [c for c in self.calls() if c[:2] == ['pane', 'split']]
+        self.assertEqual(len(tabs), 2)
+        self.assertEqual(len(splits), 6)
+        self.assertEqual([c[c.index('--direction') + 1] for c in splits],
+                         ['right', 'down', 'down'] * 2)
+        self.assertEqual([c[c.index('--pane') + 1] for c in splits],
+                         ['PANE:1', 'PANE:1', 'review-pane-1',
+                          'review-pane-4', 'review-pane-4', 'review-pane-5'])
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(len({c[c.index('--session-id') + 1] for c in starts}), 8)
+        self.run_cli('--slot', '2', 'ask', 'Follow up')
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 8)
+        for call in tabs + splits:
+            self.assertIn('--no-focus', call)
+
+    def test_concurrent_slots_share_topology(self):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(self.run_cli, '--slot', str(i), 'start') for i in range(1, 9)]
+            for future in futures:
+                future.result()
+        self.assertEqual(sum(c[:2] == ['tab', 'create'] for c in self.calls()), 2)
+        self.assertEqual(sum(c[:2] == ['pane', 'split'] for c in self.calls()), 6)
+
+    def test_slot_question_is_independent(self):
+        self.run_cli('--slot', '2', 'ask', 'Task', env=dict(self.env, FAKE_QUESTION='Proceed?'), check=False)
+        self.assertNotEqual(self.run_cli('answer', 'Yes', check=False).returncode, 0)
+        self.assertIn('ship', self.run_cli('--slot', '2', 'answer', 'Yes').stdout)
+
+    def panes(self):
+        path = self.home / 'panes.json'
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def set_panes(self, panes):
+        (self.home / 'panes.json').write_text(json.dumps(panes))
+
+    def add_pane(self, pane_id, agent=None, width=162, height=97):
+        panes = self.panes()
+        panes.append({'pane_id': pane_id, 'tab_id': 't1', 'workspace_id': 'workspace-1',
+                      'agent': agent, 'width': width, 'height': height})
+        self.set_panes(panes)
+
+    def topology(self):
+        return [c[:2] for c in self.calls() if c[:2] in (['pane', 'split'], ['tab', 'create'])]
+
+    def test_closed_pane_frees_room_in_tab(self):
+        self.run_cli('start')
+        self.run_cli('--slot', '2', 'start')
+        self.set_panes([p for p in self.panes() if p['pane_id'] != 'review-pane-1'])
+        self.run_cli('--slot', '3', 'start')
+        self.assertEqual(self.topology(), [['pane', 'split']] * 3)
+        self.assertEqual([p['pane_id'] for p in self.panes()], ['PANE:1', 'review-pane-3', 'review-pane-2'])
+
+    def test_existing_panes_count_toward_limit(self):
+        self.set_panes([])
+        self.add_pane('PANE:1', agent='claude')
+        self.add_pane('existing-right')
+        for slot in range(1, 4):
+            self.run_cli('--slot', str(slot), 'start')
+        topology = [c for c in self.calls() if c[:2] in (['pane', 'split'], ['tab', 'create'])]
+        self.assertEqual([c[:2] for c in topology], [['pane', 'split'], ['pane', 'split'], ['tab', 'create']])
+        self.assertEqual([c[c.index('--pane') + 1] for c in topology[:2]], ['PANE:1', 'existing-right'])
+        self.assertTrue(all(c[c.index('--direction') + 1] == 'down' for c in topology[:2]))
+
+    def test_pane_opened_later_counts_toward_limit(self):
+        self.run_cli('start')
+        self.add_pane('opened-by-hand')
+        self.run_cli('--slot', '2', 'start')
+        self.run_cli('--slot', '3', 'start')
+        self.assertEqual(self.topology(), [['pane', 'split'], ['pane', 'split'], ['tab', 'create']])
+        self.assertEqual(sum(p['tab_id'] == 't1' for p in self.panes()), 4)
+
+    def test_claude_panes_sharing_a_tab_share_its_limit(self):
+        self.set_panes([])
+        self.add_pane('PANE:1', agent='claude')
+        self.add_pane('PANE:2', agent='claude')
+        other = dict(self.env, HERDR_PANE_ID='PANE:2')
+        self.run_cli('start')
+        self.run_cli('start', env=other)
+        self.run_cli('--slot', '2', 'start')
+        self.run_cli('--slot', '2', 'start', env=other)
+        # Each Claude pane overflows into its own tab.
+        self.assertEqual(self.topology(), [['pane', 'split'], ['pane', 'split'], ['tab', 'create'], ['tab', 'create']])
+        self.assertEqual(sum(p['tab_id'] == 't1' for p in self.panes()), 4)
+
+    def test_cached_pane_taken_by_another_agent_is_left_alone(self):
+        self.run_cli('start')
+        (self.home / 'agent.json').unlink()  # The name is gone; another pi keeps the pane.
+        self.run_cli('start')
+        starts = [c[c.index('--pane') + 1] for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(starts, ['review-pane-1', 'review-pane-2'])
+
+    def test_busy_cached_pane_gets_replacement(self):
+        self.run_cli('start')
+        (self.home / 'agent.json').unlink()
+        panes = self.panes()
+        for pane in panes:
+            if pane['pane_id'] == 'review-pane-1':
+                pane.update(agent=None, busy=True)  # A non-agent program now runs there.
+        self.set_panes(panes)
+        self.run_cli('start')
+        starts = [c[c.index('--pane') + 1] for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(starts, ['review-pane-1', 'review-pane-1', 'review-pane-2'])
+        self.run_cli('start')
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 3)
+
+    def test_idle_cached_pane_is_reused(self):
+        self.run_cli('start')
+        (self.home / 'agent.json').unlink()
+        panes = self.panes()
+        for pane in panes:
+            if pane['pane_id'] == 'review-pane-1':
+                pane['agent'] = None  # pi exited back to the shell.
+        self.set_panes(panes)
+        self.run_cli('start')
+        starts = [c[c.index('--pane') + 1] for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(starts, ['review-pane-1', 'review-pane-1'])
+
+    def test_slot_started_outside_claude_keeps_claude_session(self):
+        env_file = self.home / 'claude.env'
+        self.run_cli('session-start', input='{"session_id":"first"}',
+                     env=dict(self.env, CLAUDE_ENV_FILE=str(env_file)))
+        self.run_cli('--slot', '2', 'start')
+        claude = dict(self.env, SIDECAR_AGENT='sc-pane-1', SIDECAR_PI_SESSION='cc-first')
+        self.run_cli('--slot', '2', 'ask', 'Task', env=claude)
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual([c[c.index('--session-id') + 1] for c in starts], ['cc-first-2'])
+        self.assertFalse(any(c[:2] == ['agent', 'rename'] for c in self.calls()))
+
+    def test_invalid_slot(self):
+        for slot in ('0', '-1', 'abc', '10000'):
+            self.assertNotEqual(self.run_cli('--slot', slot, 'start', check=False).returncode, 0)
+        self.assertEqual(self.calls(), [])
 
     def test_overrides(self):
         env = dict(self.env, SIDECAR_MODEL='test/model', SIDECAR_THINKING='xhigh')
@@ -174,14 +399,7 @@ class LauncherTests(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertIn('claude-sidecar:sidecar-review', output['hookSpecificOutput']['additionalContext'])
         self.assertIn('SIDECAR_PI_SESSION=cc-pane-pane-1', env_file.read_text())
-        # Wait for the detached startup before temporary files disappear.
-        log = self.home / '.cache/claude-sidecar/sc-pane-1.log'
-        for _ in range(100):
-            if log.exists() and 'already running' in log.read_text():
-                break
-            time.sleep(0.02)
-        else:
-            self.fail('Detached startup did not finish')
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 1)
 
     def test_requests_use_unique_reports(self):
         for _ in range(2):
@@ -273,6 +491,275 @@ class LauncherTests(unittest.TestCase):
         diff = diffs[0].read_text()
         for content in ('untracked content', 'unicode content', 'newline content'):
             self.assertIn('+' + content, diff)
+
+    # --- Saved herdr machines (herdr 0.9.1+) ---
+
+    def add_machines(self, machines=None):
+        machines = machines or [
+            {'id': 'm1', 'label': 'laptop', 'target': 'laptop-host', 'session': None, 'enabled': True, 'selected': False},
+            {'id': 'm2', 'label': 'desk', 'target': 'user@desk:2222', 'session': None, 'enabled': True, 'selected': False},
+            {'id': 'm3', 'label': 'off', 'target': 'off-host', 'session': None, 'enabled': False, 'selected': False}]
+        (self.home / 'machines.json').write_text(json.dumps(machines))
+        self.work = self.home / 'work dir'
+        self.work.mkdir(exist_ok=True)
+        self.remote_env = dict(self.env, SIDECAR_MACHINE_TAG='tt01')
+
+    def remote_run(self, *args, env=None, check=True):
+        return self.run_cli(*args, env=env or self.remote_env, cwd=self.work, check=check)
+
+    def remote_calls(self, machine='m1'):
+        return [c[2:] for c in self.calls() if c[:2] == ['--machine', machine]]
+
+    def local_calls(self):
+        # Calls to Claude's own herdr, except the read-only probe for a pre-existing local sidecar of the slot.
+        return [c for c in self.calls() if c[0] != '--machine' and c[:2] != ['agent', 'get']]
+
+    def all_starts(self):
+        return [c for c in self.calls() if 'agent' in c[:3] and 'start' in c[1:4] and c[-1] != '--wait']
+
+    def remote_home(self, target='laptop-host'):
+        return self.home / 'remote' / target
+
+    def remote_panes(self, panes, machine='m1'):
+        path = self.home / 'remote-state' / machine
+        path.mkdir(parents=True, exist_ok=True)
+        (path / 'panes.json').write_text(json.dumps(panes))
+
+    def test_hook_names_saved_machines(self):
+        env = dict(self.env, CLAUDE_ENV_FILE=str(self.home / 'claude.env'))
+        context = lambda: json.loads(self.run_cli('session-start', input='{"session_id":"s"}', env=env).stdout)[
+            'hookSpecificOutput']['additionalContext']
+        self.assertNotIn('machine', context())  # herdr 0.8 has no `machine list`
+        self.add_machines()
+        text = context()
+        self.assertIn('--machine', text)
+        self.assertIn('laptop (laptop-host), desk (user@desk:2222).', text)
+        self.assertNotIn('off', text)
+        self.assertEqual(self.calls(), [])
+
+    def test_machine_routes_every_herdr_call_and_files(self):
+        self.add_machines()
+        result = self.remote_run('--machine', 'laptop', 'ask', 'Task')
+        self.assertIn('ship', result.stdout)
+        self.assertIn('# Sidecar report (laptop:' + str(self.remote_home()), result.stdout)
+        calls = self.calls()
+        self.assertTrue(self.remote_calls())
+        self.assertEqual(self.local_calls(), [])
+        inner = self.remote_calls()
+        tab = next(c for c in inner if c[:2] == ['tab', 'create'])
+        self.assertEqual(tab[tab.index('--cwd') + 1], str(self.work))
+        self.assertEqual(tab[tab.index('--label') + 1], 'Sidecars')
+        self.assertNotIn('--workspace', tab)  # no remote pane sits in that directory; herdr picks
+        start = next(c for c in inner if c[:2] == ['agent', 'start'])
+        self.assertEqual(start[2], 'sc-tt01-pane-1')
+        self.assertEqual(start[start.index('--pane') + 1], 'remote-pane-1')
+        self.assertEqual(start[start.index('-e') + 1], str(self.plugin / 'sidecar/sidecar.ts'))
+        self.assertEqual(start[start.index('--append-system-prompt') + 1], str(self.plugin / 'sidecar/reviewer.md'))
+        # The request is read on the machine, under the machine's own home.
+        requests = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*.md'))
+        self.assertEqual(len(requests), 1)
+        prompt = next(c for c in inner if c[:2] == ['agent', 'prompt'])
+        self.assertIn('Read ' + str(requests[0]) + ' ', prompt[3])
+        text = requests[0].read_text()
+        self.assertIn('Follow-up from Claude', text)
+        self.assertIn("land in this machine's checkout", text)
+        self.assertIn(str(self.work), text)
+        # Panes are never taken from Claude's local tab.
+        self.assertFalse(any(c[:2] == ['--machine', 'm1'] and 'PANE:1' in c for c in calls))
+        ssh = [json.loads(line) for line in (self.home / 'ssh-calls.jsonl').read_text().splitlines()]
+        self.assertTrue(all(c['target'] == 'laptop-host' for c in ssh))
+        self.assertIn('BatchMode=yes', ssh[0]['options'])
+        self.assertTrue(any(o.startswith('ServerAliveInterval=') for o in ssh[0]['options']))
+
+    def test_machine_tag_defaults_to_a_short_hash(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'start', env=self.env)
+        start = next(c for c in self.remote_calls() if c[:2] == ['agent', 'start'])
+        self.assertRegex(start[2], r'^sc-[0-9a-f]{4}-pane-1$')
+
+    def test_machine_panes_use_the_workspace_at_the_directory_and_fill_2x2(self):
+        self.add_machines()
+        self.remote_panes([{'pane_id': 'w1:p1', 'tab_id': 'rt1', 'workspace_id': 'rw-7', 'agent': None,
+                            'width': 324, 'height': 97, 'cwd': str(self.work)},
+                           {'pane_id': 'w2:p1', 'tab_id': 'rt2', 'workspace_id': 'rw-8', 'agent': None,
+                            'width': 324, 'height': 97, 'cwd': '/elsewhere'}])
+        for slot in range(1, 6):
+            self.remote_run('--slot', str(slot), '--machine', 'laptop', 'start')
+        inner = self.remote_calls()
+        tabs = [c for c in inner if c[:2] == ['tab', 'create']]
+        splits = [c for c in inner if c[:2] == ['pane', 'split']]
+        self.assertEqual(len(tabs), 2)
+        self.assertEqual(len(splits), 3)
+        self.assertEqual([c[c.index('--workspace') + 1] for c in tabs], ['rw-7', 'rw-7'])
+        self.assertEqual([c[c.index('--direction') + 1] for c in splits], ['right', 'down', 'down'])
+        for call in tabs + splits:
+            self.assertIn('--no-focus', call)
+        names = [c[2] for c in inner if c[:2] == ['agent', 'start']]
+        self.assertEqual(names, ['sc-tt01-pane-1'] + ['sc-tt01-pane-1-%d' % n for n in range(2, 6)])
+        # Local herdr never saw a pane or tab.
+        self.assertEqual(self.local_calls(), [])
+
+    def test_slot_remembers_its_machine(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'start')
+        self.assertEqual((self.home / '.cache/claude-sidecar/sc-pane-1.machine').read_text(), 'm1\n')
+        self.assertIn('on laptop', self.remote_run('status').stdout)
+        self.remote_run('ask', 'Follow up')
+        self.remote_run('--machine', 'm1', 'note', 'By ID')
+        self.assertEqual(self.local_calls(), [])
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.remote_calls()), 1)
+
+    def test_slot_cannot_switch_machines(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'start')
+        before = len(self.calls())
+        result = self.remote_run('--machine', 'desk', 'start', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bound to machine 'laptop'", result.stderr)
+        self.assertEqual(len(self.calls()), before)
+        self.remote_run('--slot', '2', '--machine', 'desk', 'start')  # another slot may use it
+
+    def test_local_slot_cannot_move_to_a_machine_and_back(self):
+        self.add_machines()
+        self.run_cli('start')
+        result = self.remote_run('--machine', 'laptop', 'start', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('already runs locally', result.stderr)
+        self.remote_run('--slot', '2', '--machine', 'laptop', 'start')
+        result = self.remote_run('--slot', '2', 'start')  # stays on the machine
+        self.assertIn('already running', result.stdout)
+        self.assertEqual(len(self.all_starts()), 2)
+
+    def test_sidecar_machine_sets_the_default_for_new_slots(self):
+        self.add_machines()
+        env = dict(self.remote_env, SIDECAR_MACHINE='laptop')
+        self.remote_run('--slot', '2', 'start', env=self.env)  # local before the default exists
+        self.remote_run('--slot', '2', 'start', env=env)  # a bound slot keeps its machine
+        self.remote_run('--slot', '3', 'start', env=env)
+        starts = self.all_starts()
+        self.assertEqual([c[:2] for c in starts], [['agent', 'start'], ['--machine', 'm1']])
+        self.assertEqual(starts[1][2:4], ['agent', 'start'])
+        self.assertEqual(starts[1][4], 'sc-tt01-pane-1-3')
+
+    def test_machine_errors(self):
+        self.run_cli('start', env=self.env)
+        cases = [(('--machine', 'laptop'), 'cannot list herdr machines')]  # herdr without `machine list`
+        for args, message in cases:
+            result = self.run_cli(*args, '--slot', '2', 'start', check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
+        self.add_machines()
+        for selector, message in (('nope', 'unknown herdr machine'), ('off', 'disabled')):
+            result = self.run_cli('--slot', '2', '--machine', selector, 'start', check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
+        self.add_machines([
+            {'id': 'a', 'label': 'twin', 'target': 'x', 'enabled': True}, {'id': 'b', 'label': 'twin', 'target': 'y', 'enabled': True}])
+        result = self.run_cli('--slot', '2', '--machine', 'twin', 'start', check=False)
+        self.assertIn('ambiguous', result.stderr)
+        self.assertEqual(self.run_cli('--slot', '2', '--machine', 'b', 'status').returncode, 0)
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 1)
+
+    def test_unreachable_machine_fails_before_starting_anything(self):
+        self.add_machines()
+        result = self.remote_run('--machine', 'laptop', 'ask', 'Task', env=dict(self.remote_env, FAKE_SSH_DOWN='1'), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cannot reach laptop', result.stderr)
+        self.assertIn('ssh-agent', result.stderr)
+        self.assertEqual(self.local_calls(), [])
+        self.assertEqual(self.remote_calls(), [])
+        self.assertFalse((self.home / '.cache/claude-sidecar/sc-pane-1.machine').exists())
+
+    def test_remote_plugin_path_and_directory_are_checked_and_overridable(self):
+        self.add_machines()
+        result = self.remote_run('--machine', 'laptop', 'start', env=dict(self.remote_env, SIDECAR_REMOTE_HOME='/nonexistent'), check=False)
+        self.assertIn('plugin is not at /nonexistent on laptop', result.stderr)
+        result = self.remote_run('--machine', 'laptop', '--remote-cwd', '/nonexistent/repo', 'start', check=False)
+        self.assertIn('/nonexistent/repo does not exist on laptop', result.stderr)
+        self.assertEqual(self.local_calls() + self.remote_calls(), [])
+        elsewhere = self.home / 'elsewhere'
+        shutil.copytree(self.plugin / 'sidecar', elsewhere)
+        checkout = self.home / 'laptop-checkout'
+        checkout.mkdir()
+        self.remote_run('--machine', 'laptop', '--remote-cwd', str(checkout) + '/', 'start',
+                        env=dict(self.remote_env, SIDECAR_REMOTE_HOME=str(elsewhere)))
+        inner = self.remote_calls()
+        start = next(c for c in inner if c[:2] == ['agent', 'start'])
+        self.assertEqual(start[start.index('-e') + 1], str(elsewhere / 'sidecar.ts'))
+        self.assertEqual(start[start.index('--append-system-prompt') + 1], str(elsewhere / 'reviewer.md'))
+        tab = next(c for c in inner if c[:2] == ['tab', 'create'])
+        self.assertEqual(tab[tab.index('--cwd') + 1], str(checkout))
+        result = self.run_cli('--slot', '2', '--remote-cwd', str(checkout), 'start', check=False)
+        self.assertIn('--remote-cwd needs --machine', result.stderr)
+
+    def make_repo(self):
+        repo = self.home / 'repo'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+        git('init')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.com')
+        git('commit', '--allow-empty', '-m', 'Initial')
+        (repo / 'new.txt').write_text('untracked content\n')
+        (repo / 'sub').mkdir()
+        return repo, git('rev-parse', 'HEAD')
+
+    def test_remote_diff_copies_the_diff_and_names_the_repo_and_base(self):
+        self.add_machines()
+        repo, sha = self.make_repo()
+        checkout = self.home / 'laptop-checkout'
+        (checkout / 'sub').mkdir(parents=True)
+        result = self.run_cli('--machine', 'laptop', '--remote-cwd', str(checkout / 'sub'), 'diff', 'HEAD', 'Intent',
+                              env=self.remote_env, cwd=repo / 'sub')
+        self.assertIn('ship', result.stdout)
+        requests = self.remote_home() / '.cache/claude-sidecar/requests'
+        diff = next(requests.glob('*.diff'))
+        self.assertIn('+untracked content', diff.read_text())
+        text = next(requests.glob('*diff*.md')).read_text()
+        self.assertIn('`%s`' % diff, text)
+        self.assertIn('repository: `%s`, base `HEAD`' % checkout, text)
+        self.assertIn(sha, text)
+        self.assertIn('git fetch', text)
+        self.assertIn('uncommitted or untracked', text)
+        self.assertIn('Never run git checkout, reset or stash', text)
+        self.assertIn("not in Claude's", text)
+
+    def test_remote_plan_copies_the_plan_file(self):
+        self.add_machines()
+        plan = self.home / 'plan.md'
+        plan.write_text('# My plan\n')
+        self.run_cli('--machine', 'laptop', 'plan', str(plan), 'Context', env=self.remote_env, cwd=self.work)
+        copies = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-plan-plan.md'))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text(), '# My plan\n')
+        text = next(p for p in (self.remote_home() / '.cache/claude-sidecar/requests').glob('*plan-*.md') if p != copies[0]).read_text()
+        self.assertIn('`%s`' % copies[0], text)
+
+    def test_remote_question_and_answer_route_to_the_machine(self):
+        self.add_machines()
+        env = dict(self.remote_env, FAKE_QUESTION='May I?')
+        result = self.remote_run('--machine', 'laptop', 'ask', 'Do it', env=env, check=False)
+        self.assertEqual(result.returncode, 3)
+        self.assertTrue(result.stdout.startswith('NEEDS_ANSWER: May I?'))
+        answered = self.remote_run('answer', 'Yes')
+        self.assertIn('ship', answered.stdout)
+        answers = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-answer-*.md'))
+        self.assertIn('Yes', answers[0].read_text())
+
+    def test_remote_report_is_polled_after_prompt_returns(self):
+        self.add_machines()
+        env = dict(self.remote_env, FAKE_LATE_REPORT='1', SIDECAR_SETTLE_GRACE_S='0')
+        self.remote_run('--machine', 'laptop', 'start')
+        self.assertIn('late ship', self.remote_run('ask', 'Long task', env=env).stdout)
+
+    def test_remote_no_report_points_at_ssh(self):
+        self.add_machines()
+        env = dict(self.remote_env, FAKE_NO_REPORT='1', SIDECAR_SETTLE_GRACE_S='0')
+        result = self.remote_run('--machine', 'laptop', 'ask', 'Task', env=env, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('no report submitted', result.stderr)
+        self.assertIn('ssh laptop-host true', result.stderr)
 
 
 if __name__ == '__main__':

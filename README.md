@@ -1,17 +1,18 @@
 # Claude Sidecar
 
-A Claude Code plugin that runs a persistent [pi](https://github.com/badlogic/pi-mono) review agent beside Claude in a Herdr pane. The reviewer remembers notes and earlier reviews, reviews plans and diffs, and returns Markdown reports to Claude.
+A Claude Code plugin that runs persistent [pi](https://github.com/badlogic/pi-mono) sidecar agents on demand in Herdr panes. The reviewer remembers notes and earlier reviews, reviews plans and diffs, and returns Markdown reports to Claude.
 
 The default model is `openai-codex/gpt-6.1-sol` with `high` thinking. pi needs authentication and access to that model.
 
 ## Requirements
 
-- Linux, Bash, Git, jq, and util-linux (`flock`, `setsid`).
+- Linux, Bash, Git, jq, and util-linux (`flock`).
 - Claude Code with plugin support.
 - Herdr with `pane` and `agent` commands on `PATH`; start interactive Claude inside a Herdr pane.
 - pi (`@earendil-works/pi-coding-agent`) on `PATH`, authenticated with the model provider.
+- To run sidecars on another machine: see [Sidecars on another machine](#sidecars-on-another-machine).
 
-The plugin does not install these dependencies. Session startup skips the sidecar outside Herdr, in headless `claude -p` sessions, or when launcher dependencies are missing.
+The plugin does not install these dependencies. Session startup only publishes identity and usage guidance; the first task starts its sidecar. The hook skips setup outside Herdr, in headless `claude -p` sessions, or when launcher dependencies are missing.
 
 ## Develop locally
 
@@ -60,9 +61,13 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar plan docs/plan.md "Goals and constraints"
 ./scripts/sidecar diff HEAD "Intent of the implementation"
 ./scripts/sidecar ask "Recheck finding 2 after the fix."
+./scripts/sidecar --slot 2 ask "Review the parser independently."
+./scripts/sidecar --slot 3 ask "Review lifecycle handling independently."
+./scripts/sidecar --slot 2 answer "Yes, keep backward compatibility."
+./scripts/sidecar --slot 4 --machine laptop ask "Run the suite on the laptop."
 ```
 
-Commands run against the current working directory. The diff review includes commits since the base, working-tree changes, and untracked files. Reviews serialize per Claude pane. A blocked reviewer needs human attention in its pane.
+Commands run against the current working directory. The diff review includes commits since the base, working-tree changes, and untracked files. Requests serialize per slot, while different slots can work concurrently. Slot 1 is the default; each slot retains its own context and pending questions across follow-ups and `/clear`. Sidecars fill Claude's current tab up to four total panes, counting every pane open in it, including Claude's and other Claude panes' sidecars. Each new sidecar halves the largest pane: first left/right, then top/bottom in each column. A full tab sends further sidecars to overflow tabs of up to four panes each; closing a pane frees its room. Reuse slots for later tasks. A blocked reviewer needs human attention in its pane.
 
 Override the model and thinking level in the environment before starting Claude or the launcher:
 
@@ -70,6 +75,29 @@ Override the model and thinking level in the environment before starting Claude 
 export SIDECAR_MODEL=openai-codex/gpt-6.1-sol
 export SIDECAR_THINKING=high
 ```
+
+## Sidecars on another machine
+
+`--machine NAME` runs a slot's sidecar on a [saved Herdr SSH machine](https://herdr.dev/docs/connecting-machines/), such as your laptop, while Claude stays local. `NAME` is a saved machine's label or profile ID. The sidecar is a pi agent in a Herdr pane on that machine, and your local Herdr window lists the pane under the machine. It is opt-in per slot; without the flag, or `SIDECAR_MACHINE`, nothing changes.
+
+```bash
+./scripts/sidecar --slot 2 --machine laptop ask "Run the integration tests on macOS and report."
+./scripts/sidecar --slot 2 answer "Yes."        # no flag needed: slot 2 remembers its machine
+./scripts/sidecar --machine laptop --remote-cwd /Users/me/src/app diff origin/main "Intent"
+```
+
+- **Slots stay put.** A slot remembers its machine in `~/.cache/claude-sidecar/<agent>.machine`, so later `note`, `ask`, `answer`, `status` and `restart` route there without the flag. Starting a slot on another machine, or moving a local slot to one, is an error: use another slot. `SIDECAR_MACHINE=laptop` makes new slots start on that machine by default; a slot bound earlier keeps its own.
+- **Panes.** Every Herdr call for the slot goes through `herdr --machine`. The panes open in the machine's workspace that already has a pane in the working directory (Herdr picks one when none does), in a "Sidecars" tab that fills 2×2 like the local one. Claude's local tab is never used. Agent names carry a short tag of the local machine, such as `sc-3fa9-pane-1`, so they cannot collide with sidecars that a Claude on that machine starts.
+- **Files.** The sidecar reads requests where it runs. The launcher copies each request, diff and plan file over `ssh <target>` into `~/.cache/claude-sidecar/requests` on the machine, reads the report and the `needs_answer` marker back from the machine's `~/.cache/claude-sidecar/reports`, and polls it like a local one. Paths are resolved on the machine, so its home directory may differ. SSH uses the target saved in `herdr machine list`, with `BatchMode=yes` and keepalives, so it never prompts or hangs.
+- **Code.** The sidecar works in the machine's own checkout, by default at the same absolute path as the current directory; `--remote-cwd DIR` names the directory there instead. Requests tell it that path, and for `diff` and `plan` Claude's commit and that its uncommitted changes exist only in the copied files. The checkout may need `git fetch` to reach that commit. The launcher never runs checkout or reset there, and tells the sidecar not to. **Edits and commits a remote sidecar makes land in the machine's checkout, not in the local one.**
+
+Requirements:
+
+- Herdr 0.9.1 or later on both machines. Add the machine with `herdr machine add <ssh-target>` and check `herdr machine list`. The SessionStart hook names the enabled machines to Claude when that command works, and says nothing about machines otherwise.
+- On the machine: pi, authenticated with the model provider (for example a Codex login); this plugin at the same path (`SIDECAR_REMOTE_HOME` names the plugin's `sidecar/` directory elsewhere); and Git and jq for the repository work. The launcher itself runs only here.
+- SSH keys loaded in your agent: a passphrase-protected key is not prompted for.
+
+Clear errors name an unknown or disabled machine, a missing plugin or directory on the machine, and an unreachable SSH connection.
 
 ## Safety
 

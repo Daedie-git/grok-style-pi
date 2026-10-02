@@ -5,7 +5,30 @@ description: Second-opinion review by a persistent pi agent in a Herdr pane. Use
 
 # Sidecar review
 
-A long-lived pi agent in a herdr split pane reviews your work and remembers the session's history: notes you sent, past reviews, findings you rejected. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative.
+Persistent pi agents in Herdr panes review or implement work and remember their own history: notes you sent, past reviews, findings you rejected. No agent starts at Claude startup; the first `note`, `plan`, `diff`, or `ask` starts the selected sidecar. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative.
+
+## Parallel sidecars
+
+Use `--slot N` before the command to select an independent persistent sidecar (default `1`). Assign a different slot to each concurrent task and keep that slot for its notes, follow-ups, status checks and answers. Each slot has separate context, reports, pending questions and request locks; requests to the same slot serialize. Reuse existing slots after their work finishes.
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 ask "Inspect the parser for edge cases; report without editing."
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 3 ask "Inspect the lifecycle code; report without editing."
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 answer "Yes, preserve backward compatibility."
+```
+
+Run independent requests with `run_in_background: true`. Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. Herdr fills Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus.
+
+## Sidecars on another machine
+
+Use `--machine NAME` only when the user asks to run a sidecar on another machine, for example "on the laptop". `NAME` is a saved Herdr machine label or ID; the session-start context lists the enabled ones when Herdr can name them. Pick a slot, then keep it: the slot stays on that machine, so later `note`, `ask`, `answer` and `status` with that slot need no `--machine`. Using the flag with another machine, or on a slot that runs locally, fails; use a new slot.
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 --machine laptop ask "Run the integration tests there and report."
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 diff <base> "Intent of the change"
+```
+
+The sidecar works in the machine's own checkout of the repository, at the same path unless `--remote-cwd DIR` says where. It does not see your uncommitted changes: `diff` and `plan` send them as copied files, and the checkout may lack your commits (the request tells the sidecar to `git fetch`). **Anything a remote sidecar edits or commits lands in the machine's checkout, not yours**; ask it to push or report the patch, and say so in the request. Reports come back as usual. If the command says the machine is unreachable or lacks the plugin, tell the user; do not retry with another machine.
 
 ## Brief it
 
@@ -37,6 +60,10 @@ After every real implementation, before you report it done, run an **adversarial
 
 `<base>` is the commit the work started from (`HEAD` when all of it is uncommitted). The review covers commits since base, uncommitted changes, and untracked files.
 
+## Reviewing a merge request
+
+When the review targets a GitLab/GitHub merge request, post each confirmed finding as an **inline discussion on the diff line** it concerns. Never post a summary note, and never post without the user's go-ahead. Review a worktree at the MR head so the user's checkout stays untouched, and run the sidecar from inside it.
+
 ## Handle the report
 
 The report prints on completion. Every finding is a claim to verify, not an instruction:
@@ -54,7 +81,7 @@ Done when every finding is confirmed-and-fixed or rejected-with-reason, and the 
 
 ## Questions from the sidecar
 
-When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` first, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"/home/aim/git/claude-sidecar/scripts/sidecar" answer "<decision and constraints>"`; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
+When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` first, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot N answer "<decision and constraints>"` using the requesting sidecar's slot; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
 
 ## When it misbehaves
 

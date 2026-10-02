@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHerdrCli, findHerdrMachine, type HerdrClient } from "./client.ts";
+import { createHerdrCli, findHerdrMachine, listHerdrMachines, type HerdrClient, type HerdrMachine } from "./client.ts";
 import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
 import type { ExecutionEvent, RunRef } from "./state.ts";
 import {
@@ -32,6 +32,15 @@ export interface HerdrSubagentDeps {
 	machineChannel: (machine: string) => Promise<StoreChannelFactory>;
 	/** Distinguishes this machine's panes in a remote store, where pane IDs belong to another server. */
 	hostname: string;
+	/** Saved SSH machines named in the Agent description. Read once per load, so /reload refreshes it. */
+	listMachines: () => Promise<HerdrMachine[]>;
+}
+
+/** Names the enabled saved machines so the model can map "the laptop" to a label without asking. */
+export function machineGuidance(machines: HerdrMachine[]): string {
+	const enabled = machines.filter((machine) => machine.enabled);
+	if (!enabled.length) return "";
+	return ` Saved machines: ${enabled.map((machine) => machine.label === machine.target ? machine.label : `${machine.label} (${machine.target})`).join(", ")}.`;
 }
 
 /** The remote store runs this package's worker entry, by default at the same path as here. */
@@ -58,11 +67,14 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			entry: remoteWorkerEntry(env),
 		})),
 		hostname: overrides.hostname ?? hostname(),
+		// Older Herdr has no saved machines, and an unavailable listing only leaves them unnamed.
+		listMachines: overrides.listMachines ?? (() => listHerdrMachines(env, 2500).catch(() => [])),
 	};
 	const paneId = deps.env.HERDR_PANE_ID ?? "";
 	// Remote stores key notices by this pane; a bare pane ID could name one of that machine's own panes.
 	const parentKey = (machine?: string) => machine && paneId ? `${deps.hostname}/${paneId}` : paneId;
-	return (pi: ExtensionAPI) => {
+	return async (pi: ExtensionAPI) => {
+		const savedMachines = machineGuidance(await deps.listMachines().catch(() => []));
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
 		const getRunner = () => runner ??= new HerdrRunner(deps);
@@ -140,7 +152,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.registerTool(defineTool({
 			name: "Agent",
 			label: "Agent",
-			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>.",
+			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>." + savedMachines,
 			parameters: Type.Object({
 				prompt: Type.String({ description: "The task for the agent to perform." }),
 				description: Type.String({ description: "A short (3-5 word) description of the task (shown in UI)." }),

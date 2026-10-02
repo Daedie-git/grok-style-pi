@@ -1038,7 +1038,7 @@ test("tool names and durable notification receipts survive extension reload", { 
 	await c.finish("finished");
 	const saved: any[] = [];
 	const queued: any[] = [];
-	const create = () => {
+	const create = async () => {
 		const tools: any[] = [];
 		const handlers = new Map<string, (...args: any[]) => any>();
 		const pi = {
@@ -1047,11 +1047,11 @@ test("tool names and durable notification receipts survive extension reload", { 
 			sendMessage(message: any) { queued.push(message); },
 			sendUserMessage() {}, appendEntry() {},
 		} as unknown as ExtensionAPI;
-		createHerdrSubagents({ root: f.root, client: f.client, env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, agentDir: f.root })(pi);
+		await createHerdrSubagents({ root: f.root, client: f.client, env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, agentDir: f.root })(pi);
 		return { tools, handlers };
 	};
 	const ctx = { isIdle: () => true, abort() {}, ui: { notify() {} }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => "/parent/session.jsonl", getSessionId: () => "parent" } };
-	const first = create();
+	const first = await create();
 	assert.deepEqual(first.tools.map((tool) => tool.name), ["Agent", "get_subagent_result", "steer_subagent"]);
 	const agentTool = first.tools[0];
 	assert.match(agentTool.description, /Keep inherit_context false/);
@@ -1061,7 +1061,7 @@ test("tool names and durable notification receipts survive extension reload", { 
 	await eventually(async () => queued.length === 1);
 	assert.equal((await f.runner.store.notices("w1:p1")).length, 1, "queued messages are not delivery receipts");
 	await first.handlers.get("session_shutdown")!({ reason: "reload" });
-	const second = create();
+	const second = await create();
 	await second.handlers.get("session_start")!({}, ctx);
 	await eventually(async () => queued.length === 2);
 	assert.equal(queued[0].details.noticeId, queued[1].details.noticeId);
@@ -1085,7 +1085,7 @@ test("slow Herdr maintenance does not block child cancellation polling", { timeo
 		registerTool() {}, on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
 		sendUserMessage(text: string) { sent.push(text); }, sendMessage() {}, appendEntry() {},
 	} as unknown as ExtensionAPI;
-	createHerdrSubagents({ root: f.root, client: f.client, env: { HERDR_ENV: "1", HERDR_PANE_ID: record.paneId }, agentDir: f.root })(pi);
+	await createHerdrSubagents({ root: f.root, client: f.client, env: { HERDR_ENV: "1", HERDR_PANE_ID: record.paneId }, agentDir: f.root })(pi);
 	const ctx = { isIdle: () => true, abort() { aborts++; }, ui: { notify() {} }, sessionManager: { getEntries: () => [], getBranch: () => [], getSessionFile: () => record.sessionFile, getSessionId: () => sessionId } };
 	await handlers.get("session_start")!({}, ctx);
 	try {

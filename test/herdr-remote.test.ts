@@ -7,7 +7,7 @@ import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { machinesFromList, tabFromCreate, panesFromList, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger } from "../src/herdr/child.ts";
-import { createHerdrSubagents, remoteWorkerEntry } from "../src/herdr/extension.ts";
+import { createHerdrSubagents, machineGuidance, remoteWorkerEntry } from "../src/herdr/extension.ts";
 import { HerdrRunner, qualifiedAgentId, splitAgentId } from "../src/herdr/runner.ts";
 import { HerdrStore, sshChannel, workerChannel, type StoreChannelFactory } from "../src/herdr/store.ts";
 import { spawn } from "node:child_process";
@@ -138,6 +138,8 @@ test("machine listings and remote placement facts are parsed", () => {
 	assert.equal(qualifiedAgentId("review", "laptop"), "review@laptop");
 	assert.deepEqual(splitAgentId("review@Build machine"), { id: "review", machine: "Build machine" });
 	assert.deepEqual(splitAgentId("review"), { id: "review" });
+	assert.equal(machineGuidance([]), "", "no saved machines, or an older Herdr, adds nothing");
+	assert.equal(machineGuidance([{ id: "m1", label: "lappy", target: "lappy", enabled: true }]), " Saved machines: lappy.");
 	assert.equal(remoteWorkerEntry({ GROK_HERDR_REMOTE_PACKAGE: "/opt/grok-style-pi/" }), "/opt/grok-style-pi/src/herdr/worker-entry.mjs");
 });
 
@@ -180,10 +182,14 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		sendUserMessage() {},
 		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
 	} as unknown as ExtensionAPI;
-	createHerdrSubagents({
+	await createHerdrSubagents({
 		root: localRoot, client: local, agentDir: localRoot, hostname: "desk", now: () => clock,
 		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" },
 		machineClient: (machine) => { assert.equal(machine, "laptop"); return remote.client; },
+		listMachines: async () => [
+			{ id: "m1", label: "laptop", target: "aim@lappy.local", enabled: true },
+			{ id: "m2", label: "old", target: "old", enabled: false },
+		],
 		machineChannel: async () => {
 			opens++;
 			if (opens === 1) return sshChannel({ target: "laptop", entry: ENTRY, root: remoteRoot });
@@ -198,6 +204,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	const [agentTool, resultTool] = tools;
 	assert.match(agentTool.parameters.properties.machine.description, /Only when the user asks/);
+	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\.$/, "the model can map a casual name to the saved label");
 	await handlers.get("session_start")!({}, ctx);
 	try {
 		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop", machine_cwd: "/laptop/project" }, undefined, undefined, ctx);
@@ -294,7 +301,7 @@ test("a stalled machine never delays local notices, and a failed first launch st
 		sendUserMessage() {},
 		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
 	} as unknown as ExtensionAPI;
-	createHerdrSubagents({
+	await createHerdrSubagents({
 		root: localRoot, client: local.client, agentDir: localRoot, hostname: "desk",
 		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
 		machineClient: (machine) => machine === "broken" ? broken.client : local.client,
@@ -348,7 +355,7 @@ test("shutdown is not held by a reconnect whose owner retirement stalls", { time
 		sendMessage() {}, sendUserMessage() {},
 		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
 	} as unknown as ExtensionAPI;
-	createHerdrSubagents({
+	await createHerdrSubagents({
 		root: localRoot, client: remote.client, agentDir: localRoot, hostname: "desk", now: () => clock,
 		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
 		machineClient: () => remote.client,

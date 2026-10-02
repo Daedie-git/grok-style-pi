@@ -81,9 +81,13 @@ export function machinesFromList(payload: unknown): HerdrMachine[] {
 	});
 }
 
+export async function listHerdrMachines(env: NodeJS.ProcessEnv = process.env, timeout = 10_000): Promise<HerdrMachine[]> {
+	return machinesFromList(await call(env.HERDR_BIN_PATH || "herdr", ["machine", "list", "--json"], env, timeout));
+}
+
 /** Resolves a saved machine the way `herdr --machine` does: profile ID first, then a unique label. */
 export async function findHerdrMachine(selector: string, env: NodeJS.ProcessEnv = process.env): Promise<HerdrMachine> {
-	const machines = machinesFromList(await call(env.HERDR_BIN_PATH || "herdr", ["machine", "list", "--json"], env, 10_000));
+	const machines = await listHerdrMachines(env);
 	const byId = machines.find((machine) => machine.id === selector);
 	const byLabel = machines.filter((machine) => machine.label === selector);
 	if (!byId && byLabel.length > 1) throw new Error(`Herdr machine label '${selector}' is ambiguous; use its profile ID.`);

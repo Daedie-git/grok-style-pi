@@ -61,7 +61,7 @@ interface Placement {
 }
 
 /** Restores a two-column grid: one column splits right; otherwise the shorter column splits down. */
-function refill(live: LaunchRecord[]): Pick<Placement, "paneId" | "direction" | "column"> | undefined {
+function refill(live: { paneId?: string; column?: "left" | "right" }[]): Pick<Placement, "paneId" | "direction" | "column"> | undefined {
 	const left = live.filter((launch) => launch.column === "left");
 	const right = live.filter((launch) => launch.column === "right");
 	if (!left.length || !right.length) {
@@ -336,7 +336,34 @@ export class HerdrRunner {
 		check(signal);
 		const launches = await this.store.launches();
 		check(signal);
-		// Only fill grid tabs this runner fleet created in the caller's workspace, never the orchestrator's tab.
+		// Fill the caller's tab first, counting all physical panes and unpublished reservations.
+		if (request.tabId && panes.some((pane) => pane.tabId === request.tabId && pane.paneId === request.paneId)) {
+			const physical = panes.filter((pane) => pane.tabId === request.tabId);
+			const pending = launches.filter((launch) => launch.tabId === request.tabId && launch.stage !== "closed");
+			const live: LaunchRecord[] = [];
+			let unknown = false;
+			for (const launch of pending) {
+				if (launch.stage === "published" && launch.paneId && !physical.some((pane) => pane.paneId === launch.paneId)) {
+					const alive = await this.deps.client.isAlive(launch.agentId);
+					check(signal);
+					if (!alive) { await this.store.releasePlacement(launch); continue; }
+				}
+				if (!launch.paneId || !launch.column || launch.stage === "cleanup") unknown = true;
+				live.push(launch);
+			}
+			const untracked = physical.filter((pane) => !live.some((launch) => launch.paneId === pane.paneId));
+			if (!unknown && !needsNewTab(live.length + untracked.length)) {
+				// A single untracked pane is the original root of this tab's grid.
+				const grid = [...live, ...untracked.map((pane) => ({ paneId: pane.paneId, column: "left" as const }))];
+				const target = untracked.length <= 1 ? refill(grid) : undefined;
+				// Existing unrelated panes still count toward the cap, even when their layout is unknown.
+				return { newTab: false, tabId: request.tabId, ...(target ?? {
+					paneId: request.paneId, direction: physical.length === 1 ? "right" : "down",
+					column: live.find((launch) => launch.paneId === request.paneId)?.column ?? "left",
+				}) };
+			}
+		}
+		// After the caller's tab fills, reuse grid tabs this fleet created in the same workspace.
 		const tabs = new Set(launches.filter((launch) => launch.tabId && launch.column && !launch.direction && launch.workspaceId === request.workspaceId).map((launch) => launch.tabId!));
 		for (const tabId of tabs) {
 			const pendingOnTab = launches.filter((launch) => launch.tabId === tabId && launch.stage !== "closed");

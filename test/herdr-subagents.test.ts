@@ -20,7 +20,8 @@ import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
 import { loadSubagentExtension } from "../integrations/subagents.ts";
 
 function request(extra: Partial<SpawnRequest> = {}): SpawnRequest {
-	return { prompt: "Find the launch path", description: "Find launch path", subagentType: "Explore", runInBackground: true, cwd: "/work", paneId: "w1:p1", tabId: "w1:t1", workspaceId: "w1", ...extra };
+	// Default to the dedicated-tab fallback; caller-tab placement tests supply tabId explicitly.
+	return { prompt: "Find the launch path", description: "Find launch path", subagentType: "Explore", runInBackground: true, cwd: "/work", paneId: "w1:p1", tabId: undefined, workspaceId: "w1", ...extra };
 }
 
 function fakeClient(partial: Partial<HerdrClient> = {}) {
@@ -506,7 +507,70 @@ test("concurrent placement counts durable reservations even before Herdr sees Pi
 	assert.equal(f.events.filter((event) => event === "tab").length, 2);
 });
 
-test("eight subagents fill two dedicated tabs with balanced four-pane grids", async (t) => {
+test("the caller's tab fills to four physical panes before opening another tab", async (t) => {
+	const f = fixture(t);
+	for (let index = 0; index < 8; index++) {
+		await f.runner.spawn(request({ tabId: "w1:t1" }));
+		if (index < 3) assert.equal(f.events.filter((event) => event === "tab").length, 0);
+	}
+	const counts = new Map<string, number>([["w1:t1", 1]]);
+	for (const agent of f.live.values()) counts.set(agent.tabId, (counts.get(agent.tabId) ?? 0) + 1);
+	assert.deepEqual([...counts.values()], [4, 4, 1]);
+	const [right, leftDown, rightDown] = f.splits;
+	assert.deepEqual([right.direction, leftDown.direction, rightDown.direction], ["right", "down", "down"]);
+	assert.equal(right.paneId, "w1:p1");
+	assert.equal(leftDown.paneId, "w1:p1");
+	assert.equal(rightDown.paneId, right.createdPaneId);
+});
+
+test("caller-tab capacity includes unrelated physical panes", async (t) => {
+	const f = fixture(t);
+	f.panes.set("w1:unrelated", "w1:t1");
+	for (let index = 0; index < 3; index++) await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.splits.length, 2);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	assert.deepEqual(f.splits.map((split) => split.direction), ["down", "down"]);
+});
+
+test("concurrent caller-tab placement counts reservations not yet visible in Herdr", async (t) => {
+	const f = fixture(t, { listPanes: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }] });
+	await Promise.all(Array.from({ length: 8 }, () => f.runner.spawn(request({ tabId: "w1:t1" }))));
+	assert.equal([...f.live.values()].filter((agent) => agent.tabId === "w1:t1").length, 3);
+	assert.equal(f.events.filter((event) => event === "tab").length, 2);
+});
+
+test("caller-tab shells occupy slots and closed subagent panes can be refilled", async (t) => {
+	const f = fixture(t);
+	for (let index = 0; index < 3; index++) await f.runner.spawn(request({ tabId: "w1:t1" }));
+	const [name, agent] = [...f.live][0];
+	f.live.delete(name);
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	f.panes.delete(agent.paneId);
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.splits.at(-1)!.paneId, f.splits[2].createdPaneId);
+	assert.equal(f.splits.at(-1)!.direction, "down");
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+test("a child launching from its own pane fills that caller tab", async (t) => {
+	const f = fixture(t);
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	const [child] = f.live.values();
+	await f.runner.spawn(request({ tabId: child.tabId, paneId: child.paneId }));
+	await f.runner.spawn(request({ tabId: child.tabId, paneId: child.paneId }));
+	assert.equal(f.events.filter((event) => event === "tab").length, 0);
+	assert.deepEqual(f.splits.map((split) => split.direction), ["right", "down", "down"]);
+});
+
+test("ambiguous caller-tab creation is not followed by another split there", async (t) => {
+	const f = fixture(t, { split: async () => { throw new Error("reply lost"); } });
+	await assert.rejects(f.runner.spawn(request({ tabId: "w1:t1" })), /outcome is unknown/);
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+test("without a caller tab, eight subagents fill two dedicated tabs with balanced four-pane grids", async (t) => {
 	const f = fixture(t);
 	for (let index = 0; index < 8; index++) await f.runner.spawn(request());
 	assert.equal(f.events.filter((event) => event === "tab").length, 2);

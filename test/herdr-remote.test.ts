@@ -7,7 +7,7 @@ import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { findHerdrMachine, machinesFromList, tabFromCreate, panesFromList, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger } from "../src/herdr/child.ts";
-import { createHerdrSubagents, machineGuidance, remoteWorkerEntry } from "../src/herdr/extension.ts";
+import { createHerdrSubagents, machineGuidance, remoteWorkerEntry, samePath } from "../src/herdr/extension.ts";
 import { HerdrRunner, qualifiedAgentId, splitAgentId } from "../src/herdr/runner.ts";
 import { HerdrStore, sshChannel, workerChannel, type StoreChannelFactory } from "../src/herdr/store.ts";
 import { spawn } from "node:child_process";
@@ -178,6 +178,16 @@ test("a launch owned on another host is never recovered by PID", async (t) => {
 	assert.equal((await runner.read(ref)).phase, "queued");
 });
 
+test("machine_cwd matches a Windows pane by either separator and case, and POSIX paths exactly", () => {
+	assert.ok(samePath("C:\\Git\\Project\\", "c:/git/project"));
+	assert.ok(samePath("\\\\HOST\\Share\\Project", "//host/share/project"));
+	assert.ok(samePath("//HOST/Share/Project", "\\\\host\\share\\project"));
+	assert.ok(samePath("/home/aim/project/", "/home/aim/project"));
+	assert.ok(samePath("/", "/"));
+	assert.ok(!samePath("/project/foo\\bar", "/project/foo/bar"), "a POSIX backslash is part of the name");
+	assert.ok(!samePath("/home/aim/Project", "/home/aim/project"));
+});
+
 test("Agent with machine runs in that machine's panes and store, and routes results by qualified ID", { timeout: 20_000 }, async (t) => {
 	fakeSsh(t);
 	const localRoot = mkdtempSync(join(tmpdir(), "herdr-local-"));
@@ -276,6 +286,11 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		await assert.rejects(
 			agentTool.execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine: "laptop", machine_cwd: "/home/aim/git/missing" }, undefined, undefined, ctx),
 			(error: Error) => error.message.includes("/home/aim/git/missing does not exist on laptop") && error.message.includes(`open in: ${PROJECT}`),
+		);
+		// A relative path would be checked against the worker's directory, not the pane's.
+		await assert.rejects(
+			agentTool.execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine: "laptop", machine_cwd: "." }, undefined, undefined, ctx),
+			/machine_cwd \. is not an absolute path on laptop/,
 		);
 		assert.equal(remote.events.length, before);
 		await assert.rejects(agentTool.execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine: "laptop", inherit_context: true }, undefined, undefined, ctx), /inherit_context/);

@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { parentPort, threadId, workerData } from "node:worker_threads";
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
 import { herdrSubagentRoot } from "./store.ts";
@@ -169,10 +169,12 @@ const operations = {
 			}
 		}
 	},
-	/** Answered where the store runs, so a remote launch can check a directory on its own machine. */
-	isDirectory(path: string): boolean {
-		try { return statSync(path).isDirectory(); }
-		catch { return false; }
+	/** Answered where the store runs, so a remote launch checks a directory by that machine's path rules. */
+	directoryStatus(path: string): "directory" | "missing" | "relative" {
+		// A relative path would resolve against this worker's directory, not the pane's.
+		if (!fullyQualified(path)) return "relative";
+		try { return statSync(path).isDirectory() ? "directory" : "missing"; }
+		catch { return "missing"; }
 	},
 	/** Session files live beside the store, so a remote store creates them on its own machine. */
 	createSession(header: Record<string, unknown>, copyFrom?: string): string {
@@ -392,6 +394,12 @@ const operations = {
 		placementOwner = undefined;
 	},
 };
+
+/** On Windows, a path without a drive or UNC share resolves against each process's current drive, which may differ. */
+function fullyQualified(path: string): boolean {
+	if (process.platform !== "win32") return isAbsolute(path);
+	return /^[A-Za-z]:[\\/]/.test(path) || /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(path);
+}
 
 export type StoreOperations = typeof operations;
 

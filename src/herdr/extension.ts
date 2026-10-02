@@ -136,11 +136,12 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			try { panes = await deps.machineClient(machine).listPanes(); }
 			catch {}
 			// Pi stops at a startup prompt when its session directory is missing, so check on the machine itself.
-			const exists = await source.store.isDirectory(cwd).catch((error: Error) => {
+			const status = await source.store.directoryStatus(cwd).catch((error: Error) => {
 				if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older grok-style-pi. Update the package there, then retry.`);
 				throw error;
 			});
-			if (!exists) {
+			if (status === "relative") throw new Error(`machine_cwd ${cwd} is not an absolute path on ${machine}.`);
+			if (status === "missing") {
 				const open = [...new Set(panes.flatMap((pane) => pane.cwd ? [pane.cwd] : []))].slice(0, 8);
 				throw new Error(`Directory ${cwd} does not exist on ${machine}. Pass machine_cwd with the project's absolute path there.${open.length ? ` Herdr panes on ${machine} are open in: ${open.join(", ")}.` : ""}`);
 			}
@@ -387,9 +388,13 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 	};
 }
 
-/** Herdr reports Windows directories with backslashes; machine_cwd may use either separator. */
-function samePath(a: string, b: string): boolean {
-	const normal = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/, "");
+/** Herdr reports Windows directories with backslashes; machine_cwd may use either separator. POSIX paths compare exactly. */
+export function samePath(a: string, b: string): boolean {
+	const windows = (path: string) => /^(?:[A-Za-z]:[\\/]|\\\\)/.test(path);
+	// Either side naming a drive or share means the machine is Windows, so both compare by Windows rules.
+	const normal = windows(a) || windows(b)
+		? (path: string) => path.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase()
+		: (path: string) => path.replace(/(.)\/+$/, "$1");
 	return normal(a) === normal(b);
 }
 

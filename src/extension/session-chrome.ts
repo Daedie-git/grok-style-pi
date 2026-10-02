@@ -1,9 +1,9 @@
-import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { CustomEditor, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { applyComposerBorderColor, frameEditorLines } from "../chrome/composer.ts";
-import { footerLinesFromContext } from "../chrome/footer.ts";
+import { modelDisplayName, renderFooter } from "../chrome/footer.ts";
 import { startGrokFooterPolling } from "./grok-usage.ts";
+import { startAccountPolling } from "./account.ts";
 import { formatCodexQuota, parseCodexQuota, startCodexUsagePolling, type QuotaWindow } from "./subscription.ts";
 import {
 	applyGrokTerminalChrome,
@@ -24,6 +24,19 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 	const { features } = deps;
 	let suspendChrome: ReturnType<typeof suspendTerminalChrome> | undefined;
 	let restoreTerminal: (() => void) | undefined;
+	let account: string | undefined;
+	let accountPolling: ReturnType<typeof startAccountPolling> | undefined;
+	function refreshAccountSource(ctx: SessionContext) {
+		accountPolling?.dispose(); accountPolling = undefined;
+		account = undefined;
+		const provider = ctx.model?.provider;
+		const registry = ctx.modelRegistry;
+		if (!features.footer || !registry || !provider || !["openai-codex", "xai"].includes(provider) || (ctx.mode && ctx.mode !== "tui")) return;
+		accountPolling = startAccountPolling(provider, () => registry.getApiKeyForProvider(provider), (next) => {
+			account = next;
+			requestRender?.();
+		});
+	}
 	let quota: QuotaWindow[] = [];
 	let quotaError: string | undefined;
 	let quotaPolling: ReturnType<typeof startCodexUsagePolling> | undefined;
@@ -69,6 +82,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		quota = [];
 		refreshQuotaSource(ctx);
 		refreshGrokSource(ctx);
+		refreshAccountSource(ctx);
 		requestRender?.();
 	});
 
@@ -100,12 +114,19 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 						const subscription = ctx.model?.provider === "openai-codex"
 							? quotaError && formattedQuota === "Weekly ?% left" ? `Weekly ${quotaError}` : formattedQuota
 							: undefined;
-						return footerLinesFromContext(ctx, width, pi.getThinkingLevel?.(), subscription, footerData?.getGitBranch?.(), {
-							contextPercent: grokContext,
-							weekly: grokWeekly,
-						}).map((line) =>
-							truncateToWidth(theme?.fg ? theme.fg("muted", line) : line, Math.max(0, width)),
-						);
+						const branch = footerData?.getGitBranch?.();
+						return renderFooter({
+							cwd: ctx.cwd,
+							model: modelDisplayName(ctx.model),
+							percent: ctx.getContextUsage?.()?.percent,
+							thinkingLevel: pi.getThinkingLevel?.() ?? ctx.thinkingLevel,
+							branch: branch === undefined ? ctx.branch : branch,
+							provider: ctx.model?.provider,
+							subscription,
+							account,
+							grokPercent: grokContext,
+							grokWeekly,
+						}, { width, paint: theme?.fg ? (token, text) => theme.fg!(token, text) : undefined });
 					},
 				};
 			});
@@ -182,9 +203,12 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		}
 		refreshQuotaSource(ctx);
 		refreshGrokSource(ctx);
+		refreshAccountSource(ctx);
 	}
 
 	function dispose() {
+		accountPolling?.dispose(); accountPolling = undefined;
+		account = undefined;
 		quotaPolling?.dispose(); quotaPolling = undefined;
 		quotaError = undefined;
 		quota = [];

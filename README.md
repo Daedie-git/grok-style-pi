@@ -45,7 +45,7 @@ Install either the local clone or the GitHub package, not both. When working fro
 | Surface | Behavior |
 |---|---|
 | Theme | Neutral near-black gray + blue highlights `#7aa2f7` / `#7dcfff` (GrokNight) |
-| Footer | One row: full working path (`~` for home) with the active Git branch, model, thinking level, and context and subscription usage for the active model only |
+| Footer | One row: full working path (`~` for home) with the active Git branch, model, thinking level, and context and subscription usage for the active model only, followed by its logged-in account when available |
 | Composer | Rounded frame and `❯` prompt; muted idle border, brighter focused border. Clearing a draft with Ctrl+C adds it to prompt history, so Up brings it back |
 | Tools | Dim diamond summaries for shell commands (using their description when supplied), with readable file-tool labels; edit diffs open by default with green additions, red removals, and stronger character highlights on changed text; other output expands on demand. The dedicated `show_image` and `show_video` tools display media in open, closable diamonds; other images use Pi’s normal inline display |
 | Activity | Live Bash/PowerShell commands and top-level subagents above the composer, with clickable View, Stop, and Close controls. Subagent rows show the run's model and thinking level |
@@ -79,6 +79,8 @@ The footer shows context and allowance only for the selected model. Other provid
 For `openai-codex`, that is this session's context (`Context N% used`) and weekly quota remaining (for example, `Weekly 46% left`). Quota refreshes in the background at startup and once per minute using the existing Pi ChatGPT login and Codex's usage endpoint. Response headers also update the display when available. This works with WebSocket transport and makes no model requests. Refresh stops when the footer is disabled, the model changes away from Codex, or the session closes. Unavailable or expired data is not shown as a known percentage; authentication failures display `login required`. The usage endpoint is an internal Codex service and may change.
 
 For `xai`, that is the Grok session for this working directory (`Context N% used`, from that session's saved context-window percent) and allowance remaining (`Weekly N% left`). Weekly allowance refreshes at startup and once per minute with the existing Pi xAI login and Grok's credits endpoint. Context is re-read locally every few seconds. A missing Grok session or a non-weekly allowance shows `?`. Authentication failures display `login required`. The credits endpoint is an internal Grok service and may change.
+
+For Codex and xAI logins, the footer appends `Account <email or name>` after usage. If the login token provides neither, it shows the account ID instead. Identity refreshes at startup, on model changes, and once per minute using the existing Pi login, without extra account endpoint requests. API keys and logins without a readable identity omit this item. On narrow terminals, the account is shortened first and dropped when fewer than 12 columns remain, so the path and model stay visible.
 
 Any other model shows this Pi session's context (`Context N% used`) and no subscription line.
 

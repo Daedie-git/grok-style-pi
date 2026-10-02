@@ -77,11 +77,16 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				pending = deps.machineChannel(machine).then(async (channel) => {
+				pending = deps.machineChannel(machine).then((channel) => {
 					const opened = new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine });
-					for (const owner of lostOwners.get(machine) ?? []) await opened.store.retireOwner(owner);
-					lostOwners.delete(machine);
 					if (machines.get(machine) === pending) machineRunners.set(machine, opened);
+					// Retire in the background: a stalled call must not hold the open, which shutdown awaits.
+					// An owner that could not be retired is kept for the next reconnect.
+					const lost = lostOwners.get(machine) ?? [];
+					lostOwners.delete(machine);
+					for (const owner of lost) {
+						opened.store.retireOwner(owner).catch(() => lostOwners.set(machine, [...lostOwners.get(machine) ?? [], owner]));
+					}
 					return opened;
 				});
 				machines.set(machine, pending);

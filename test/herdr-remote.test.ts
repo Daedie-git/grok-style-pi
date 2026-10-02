@@ -104,6 +104,22 @@ test("ending the stdio channel retires the launch owners it carried, as after a 
 	finally { await store.close(); }
 });
 
+test("a reply that hits a closed connection still retires the channel's owners", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "herdr-epipe-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", ENTRY, root], { stdio: ["pipe", "pipe", "inherit"] });
+	const closed = once(child, "close");
+	// The reading end goes away while input stays open, so only the failed reply can end the channel.
+	child.stdout.destroy();
+	const owner = "4343:launch:desk-machine";
+	const task = { id: "orphan", herdrName: "orphan", paneId: "", type: "Explore", description: "orphan", prompt: "x", depth: 1, createdAt: new Date().toISOString() };
+	child.stdin.write(JSON.stringify({ id: 1, operation: "reserveAgent", args: [task, join(root, "orphan.jsonl"), owner, Date.now()] }) + "\n");
+	await closed;
+	const store = new HerdrStore(root);
+	try { assert.equal(await store.ownerRetired(owner), true); }
+	finally { await store.close(); }
+});
+
 test("closing a store settles calls stalled on its channel", async () => {
 	const store = new HerdrStore(() => ({ post() {}, hold() {}, close: async () => {} }));
 	const stalled = store.listAgents();
@@ -311,4 +327,46 @@ test("a stalled machine never delays local notices, and a failed first launch st
 	} finally {
 		await handlers.get("session_shutdown")!({ reason: "quit" });
 	}
+});
+
+test("shutdown is not held by a reconnect whose owner retirement stalls", { timeout: 20_000 }, async (t) => {
+	const localRoot = mkdtempSync(join(tmpdir(), "herdr-retire-local-"));
+	const remoteRoot = mkdtempSync(join(tmpdir(), "herdr-retire-remote-"));
+	t.after(() => { rmSync(localRoot, { recursive: true, force: true }); rmSync(remoteRoot, { recursive: true, force: true }); });
+	const remote = remoteClient();
+	let opens = 0;
+	let clock = Date.now();
+	let drop = () => {};
+	let stalledPosts = 0;
+	const tools: any[] = [];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const notices: string[] = [];
+	const saved: any[] = [];
+	const pi = {
+		registerTool(tool: any) { tools.push(tool); },
+		on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
+		sendMessage() {}, sendUserMessage() {},
+		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
+	} as unknown as ExtensionAPI;
+	createHerdrSubagents({
+		root: localRoot, client: remote.client, agentDir: localRoot, hostname: "desk", now: () => clock,
+		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+		machineClient: () => remote.client,
+		machineChannel: async () => {
+			opens++;
+			if (opens === 1) return (events) => { drop = () => events.fail(new Error("connection lost")); return workerChannel(remoteRoot)(events); };
+			// The reconnect's channel never answers, including the retirement of the lost owner.
+			return () => ({ post() { stalledPosts++; }, hold() {}, close: async () => {} });
+		},
+	})(pi);
+	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
+	await handlers.get("session_start")!({}, ctx);
+	await tools[0].execute("call", { prompt: "p", description: "Remote", subagent_type: "Explore", machine: "laptop", machine_cwd: "/laptop/project" }, undefined, undefined, ctx);
+	drop();
+	await eventually(() => notices.some((text) => text.includes("laptop: connection lost")));
+	clock += 10_001;
+	await eventually(() => opens === 2 && stalledPosts > 0, "the reconnect did not start retiring the lost owner");
+	const shutdown = handlers.get("session_shutdown")!({ reason: "quit" });
+	const outcome = await Promise.race([shutdown.then(() => "closed"), new Promise((resolve) => setTimeout(resolve, 8000, "hung"))]);
+	assert.equal(outcome, "closed");
 });

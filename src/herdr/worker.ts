@@ -407,7 +407,10 @@ else {
 	// Ending the channel, including by a parent crash, retires every launch owner seen on it.
 	const owners = new Set<string>();
 	const ownerArgument: Partial<Record<keyof StoreOperations, number>> = { reserveAgent: 2, recordLaunch: 1, claimLaunchRecovery: 2 };
+	let finished = false;
 	const finish = () => {
+		if (finished) return;
+		finished = true;
 		for (const owner of owners) {
 			try { operations.retireOwner(owner); } catch {}
 		}
@@ -424,6 +427,8 @@ else {
 		if (typeof owner === "string") owners.add(owner);
 		process.stdout.write(JSON.stringify(serve(request)) + "\n");
 	}).on("close", finish);
+	// A reply written after the connection closed fails with EPIPE; that is the end of the channel too.
+	process.stdout.on("error", finish);
 	process.on("SIGHUP", finish);
 	process.on("SIGTERM", finish);
 }

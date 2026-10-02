@@ -81,7 +81,9 @@ export class HerdrStore {
 
 	constructor(root: string) {
 		this.worker = new Worker(new URL("./worker-entry.mjs", import.meta.url), {
-			workerData: { root }, execArgv: [],
+			// node:sqlite is required here; its experimental notice otherwise overwrites Pi's UI.
+			// Scope suppression to this database worker, never the parent Pi process.
+			workerData: { root }, execArgv: ["--disable-warning=ExperimentalWarning"],
 		});
 		this.worker.on("message", (reply: { id: number; value?: unknown; error?: string }) => {
 			const pending = this.pending.get(reply.id);

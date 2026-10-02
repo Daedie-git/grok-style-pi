@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHerdrCli, findHerdrMachine, listHerdrMachines, type HerdrClient, type HerdrMachine } from "./client.ts";
+import { createHerdrCli, findHerdrMachine, listHerdrMachines, type HerdrAgentRef, type HerdrClient, type HerdrMachine } from "./client.ts";
 import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
 import type { ExecutionEvent, RunRef } from "./state.ts";
 import {
@@ -131,10 +131,21 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			const { id, machine } = splitAgentId(agentId);
 			return { id, runner: machine ? await machineRunner(machine) : getRunner() };
 		};
-		const remoteWorkspace = async (machine: string, cwd: string) => {
+		const remoteWorkspace = async (machine: string, source: HerdrRunner, cwd: string) => {
+			let panes: HerdrAgentRef[] = [];
+			try { panes = await deps.machineClient(machine).listPanes(); }
+			catch {}
+			// Pi stops at a startup prompt when its session directory is missing, so check on the machine itself.
+			const exists = await source.store.isDirectory(cwd).catch((error: Error) => {
+				if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older grok-style-pi. Update the package there, then retry.`);
+				throw error;
+			});
+			if (!exists) {
+				const open = [...new Set(panes.flatMap((pane) => pane.cwd ? [pane.cwd] : []))].slice(0, 8);
+				throw new Error(`Directory ${cwd} does not exist on ${machine}. Pass machine_cwd with the project's absolute path there.${open.length ? ` Herdr panes on ${machine} are open in: ${open.join(", ")}.` : ""}`);
+			}
 			// Reuse the workspace already open in that directory, so its tabs form the same grid.
-			try { return (await deps.machineClient(machine).listPanes()).find((pane) => pane.cwd === cwd)?.workspaceId; }
-			catch { return undefined; }
+			return panes.find((pane) => pane.cwd && samePath(pane.cwd, cwd))?.workspaceId;
 		};
 		let child: ChildSession | undefined;
 		let stopped = false;
@@ -172,7 +183,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				isolated: Type.Optional(Type.Boolean({ description: "If true, the child may use only built-in tools." })),
 				inherit_context: Type.Optional(Type.Boolean({ description: "Must remain false. The orchestrating agent provides all needed context in the prompt." })),
 				machine: Type.Optional(Type.String({ description: "Saved Herdr SSH machine (label or profile ID) to run on. Only when the user asks. Ignored with resume; the agent ID names its machine." })),
-				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine. Defaults to this session's directory." })),
+				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine. Set it whenever that machine's paths differ from this one's, such as C:/git/project on Windows. Defaults to this session's directory." })),
 			}),
 			execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 				const target = params.resume ? await route(params.resume) : undefined;
@@ -197,7 +208,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					paneId: parentKey(machine),
 					// The caller's tab and workspace are local; remote agents fill grid tabs on that machine.
 					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
-					workspaceId: !machine ? deps.env.HERDR_WORKSPACE_ID : target ? undefined : await remoteWorkspace(machine, cwd),
+					workspaceId: !machine ? deps.env.HERDR_WORKSPACE_ID : target ? undefined : await remoteWorkspace(machine, current, cwd),
 					sessionFile: ctx.sessionManager.getSessionFile(),
 					agentDir: deps.agentDir,
 				};
@@ -374,6 +385,12 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			return { block: true, reason: "This subagent is not allowed to use that tool." };
 		});
 	};
+}
+
+/** Herdr reports Windows directories with backslashes; machine_cwd may use either separator. */
+function samePath(a: string, b: string): boolean {
+	const normal = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/, "");
+	return normal(a) === normal(b);
 }
 
 function toolResult(result: ToolText) {

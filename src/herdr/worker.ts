@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, threadId, workerData } from "node:worker_threads";
-import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -168,6 +168,11 @@ const operations = {
 				throw new Error(`Legacy Herdr agent ${entry.name} is still active. Finish or stop legacy runs before switching to protocol 2.`);
 			}
 		}
+	},
+	/** Answered where the store runs, so a remote launch can check a directory on its own machine. */
+	isDirectory(path: string): boolean {
+		try { return statSync(path).isDirectory(); }
+		catch { return false; }
 	},
 	/** Session files live beside the store, so a remote store creates them on its own machine. */
 	createSession(header: Record<string, unknown>, copyFrom?: string): string {

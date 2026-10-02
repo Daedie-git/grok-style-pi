@@ -200,6 +200,7 @@ export class HerdrStore {
 	get failed(): boolean { return this.failure !== undefined; }
 
 	assertProtocolReady() { return this.call("assertProtocolReady"); }
+	isDirectory(path: string) { return this.call("isDirectory", path); }
 	createSession(header: Record<string, unknown>, copyFrom?: string) { return this.call("createSession", header, copyFrom); }
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }
 	findAgent(id: string) { return this.call("findAgent", id); }

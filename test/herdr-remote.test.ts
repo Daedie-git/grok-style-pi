@@ -15,6 +15,9 @@ import { once } from "node:events";
 import { createInterface } from "node:readline";
 
 const ENTRY = fileURLToPath(new URL("../src/herdr/worker-entry.mjs", import.meta.url));
+// Remote stores check machine_cwd on their own machine, which in these tests is this one.
+const PROJECT = mkdtempSync(join(tmpdir(), "herdr-laptop-project-"));
+process.on("exit", () => rmSync(PROJECT, { recursive: true, force: true }));
 
 /** An `ssh` on PATH that runs the remote command locally, so quoting and stdio match real SSH. */
 function fakeSsh(t: TestContext, script = 'for last; do :; done\nexec sh -c "$last"\n') {
@@ -40,7 +43,7 @@ function remoteClient() {
 		isAlive: async (name) => live.has(name),
 		showLabel: async () => undefined,
 		listAgents: async () => [],
-		listPanes: async () => [{ paneId: "w9:p1", tabId: "w9:t1", workspaceId: "w9", cwd: "/laptop/project" }],
+		listPanes: async () => [{ paneId: "w9:p1", tabId: "w9:t1", workspaceId: "w9", cwd: PROJECT }],
 		createTab: async (options) => { events.push(`tab:${options.workspaceId}:${options.cwd}`); return { tabId: `w9:t${sequence++}`, paneId: `w9:p${sequence++}`, workspaceId: "w9" }; },
 	};
 	return { client, events, live };
@@ -223,12 +226,12 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\. Pass the name shown first as machine\.$/, "the model can map a casual name to the saved label");
 	await handlers.get("session_start")!({}, ctx);
 	try {
-		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop", machine_cwd: "/laptop/project" }, undefined, undefined, ctx);
+		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop", machine_cwd: PROJECT }, undefined, undefined, ctx);
 		const agentId = started.details.agentId as string;
 		assert.match(agentId, /^explore@laptop$/);
 		assert.match(started.content[0].text, /Pane: w9:p\d+ on laptop/);
 		assert.deepEqual(localEvents, []);
-		assert.ok(remote.events.some((event) => event === "tab:w9:/laptop/project"), "the tab opens in the workspace already at that directory");
+		assert.ok(remote.events.some((event) => event === `tab:w9:${PROJECT}`), "the tab opens in the workspace already at that directory");
 		assert.deepEqual(saved.map((entry) => entry.customType), ["herdr-remote-machine"]);
 
 		// The child on the laptop sees an ordinary record in its own store.
@@ -268,13 +271,20 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		// Receipts are acknowledged in the machine's store.
 		saved.push({ type: "custom_message", ...queued[0] });
 		await eventually(async () => (await laptop.notices("desk/w1:p1")).length === 0);
+		// A directory missing on the machine fails before any pane opens, naming where that machine's panes are.
+		const before = remote.events.length;
+		await assert.rejects(
+			agentTool.execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine: "laptop", machine_cwd: "/home/aim/git/missing" }, undefined, undefined, ctx),
+			(error: Error) => error.message.includes("/home/aim/git/missing does not exist on laptop") && error.message.includes(`open in: ${PROJECT}`),
+		);
+		assert.equal(remote.events.length, before);
 		await assert.rejects(agentTool.execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine: "laptop", inherit_context: true }, undefined, undefined, ctx), /inherit_context/);
 
 		// Reload reopens the machine this session used.
 		await handlers.get("session_shutdown")!({ reason: "reload" });
 		await handlers.get("session_start")!({}, ctx);
 		await eventually(() => opens === 2, "the used machine was not reopened after reload");
-		await agentTool.execute("call", { prompt: "y", description: "Second", subagent_type: "Explore", machine: "laptop", machine_cwd: "/laptop/project" }, undefined, undefined, ctx);
+		await agentTool.execute("call", { prompt: "y", description: "Second", subagent_type: "Explore", machine: "laptop", machine_cwd: PROJECT }, undefined, undefined, ctx);
 		const second = (await laptop.launches()).find((launch) => launch.agentId !== "explore")!;
 		// A dropped channel is reported, replaced, and the new channel retires the owner it lost.
 		drop();
@@ -345,7 +355,7 @@ test("a stalled machine never delays local notices, and a failed first launch st
 		await child.noteSettled("completed");
 		await eventually(() => queued.some((message) => message.details.agentId === ref.agentId), "a stalled machine blocked local notices");
 
-		await assert.rejects(tools[0].execute("call", { prompt: "x", description: "Broken", subagent_type: "Explore", machine: "broken", machine_cwd: "/x" }, undefined, undefined, ctx), /pi is not installed/);
+		await assert.rejects(tools[0].execute("call", { prompt: "x", description: "Broken", subagent_type: "Explore", machine: "broken", machine_cwd: PROJECT }, undefined, undefined, ctx), /pi is not installed/);
 		assert.ok(saved.some((entry) => entry.customType === "herdr-remote-machine" && entry.data.machine === "broken"));
 	} finally {
 		await handlers.get("session_shutdown")!({ reason: "quit" });
@@ -384,7 +394,7 @@ test("shutdown is not held by a reconnect whose owner retirement stalls", { time
 	})(pi);
 	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	await handlers.get("session_start")!({}, ctx);
-	await tools[0].execute("call", { prompt: "p", description: "Remote", subagent_type: "Explore", machine: "laptop", machine_cwd: "/laptop/project" }, undefined, undefined, ctx);
+	await tools[0].execute("call", { prompt: "p", description: "Remote", subagent_type: "Explore", machine: "laptop", machine_cwd: PROJECT }, undefined, undefined, ctx);
 	drop();
 	await eventually(() => notices.some((text) => text.includes("laptop: connection lost")));
 	clock += 10_001;

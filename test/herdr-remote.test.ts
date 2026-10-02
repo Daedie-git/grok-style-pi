@@ -152,6 +152,94 @@ test("machine listings and remote placement facts are parsed", () => {
 	assert.equal(remoteWorkerEntry({ GROK_HERDR_REMOTE_PACKAGE: "/opt/grok-style-pi/" }), "/opt/grok-style-pi/src/herdr/worker-entry.mjs");
 });
 
+test("a remote package with another protocol is refused before any launch, with which side to update", async () => {
+	// A channel whose worker answers remoteProtocol as an older or newer package would. A refused store gets no other call.
+	const operations: string[] = [];
+	const remote = (answer: { value?: unknown; error?: string }): StoreChannelFactory => (events) => ({
+		post(request) {
+			operations.push(request.operation);
+			if (request.operation === "remoteProtocol") queueMicrotask(() => events.reply({ id: request.id, ...answer }));
+		},
+		hold() {}, close: async () => {},
+	});
+	const answers: Record<string, { value?: unknown; error?: string }> = {
+		old: { error: "Unknown Herdr control operation" }, behind: { value: 0 }, ahead: { value: 999 },
+	};
+	const tools: any[] = [];
+	const pi = { registerTool(tool: any) { tools.push(tool); }, on() {}, appendEntry() {} } as unknown as ExtensionAPI;
+	await createHerdrSubagents({
+		root: "", client: remoteClient().client, agentDir: "", hostname: "desk", env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+		machineClient: () => remoteClient().client, machineChannel: async (machine) => remote(answers[machine]), listMachines: async () => [],
+	})(pi);
+	const ctx = { cwd: PROJECT, sessionManager: { getSessionFile: () => undefined } };
+	const launch = (machine: string) => tools[0].execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine, machine_cwd: PROJECT }, undefined, undefined, ctx);
+	await assert.rejects(launch("old"), /old runs an older grok-style-pi\. Update grok-style-pi on old/);
+	await assert.rejects(launch("behind"), /behind speaks remote protocol 0; this machine speaks \d+\. Update grok-style-pi on behind/);
+	await assert.rejects(launch("ahead"), /Update grok-style-pi on this machine/);
+	assert.deepEqual(operations, ["remoteProtocol", "remoteProtocol", "remoteProtocol"]);
+});
+
+test("a failed or superseded open never removes or outlives its replacement, and each machine's failure is reported once", async () => {
+	// Channels answer the protocol check only when released, so opens can be raced against shutdown and each other.
+	const channels: Array<{ machine: string; closed: boolean; answer(value: unknown): void }> = [];
+	const channelFor = (machine: string): StoreChannelFactory => (events) => {
+		const entry = { machine, closed: false, answer(_value: unknown) {} };
+		channels.push(entry);
+		return {
+			post(request) {
+				if (request.operation === "remoteProtocol") entry.answer = (value) => events.reply({ id: request.id, value });
+				else queueMicrotask(() => events.reply({ id: request.id, value: request.operation === "notices" ? [] : undefined }));
+			},
+			hold() {}, close: async () => { entry.closed = true; },
+		};
+	};
+	const tools: any[] = [];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const notices: string[] = [];
+	const saved: any[] = [];
+	const pi = {
+		registerTool(tool: any) { tools.push(tool); },
+		on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
+		sendMessage() {}, sendUserMessage() {},
+		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
+	} as unknown as ExtensionAPI;
+	let clock = Date.now();
+	const localRoot = mkdtempSync(join(tmpdir(), "herdr-race-"));
+	await createHerdrSubagents({
+		root: localRoot, client: remoteClient().client, agentDir: localRoot, hostname: "desk", now: () => clock,
+		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, listMachines: async () => [],
+		machineClient: () => remoteClient().client, machineChannel: async (machine) => channelFor(machine),
+	})(pi);
+	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
+	try {
+		// Shutdown closes an open whose check is stalled; a later answer must not leave it running untracked.
+		await handlers.get("session_start")!({}, ctx);
+		const first = tools[0].execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine: "a", machine_cwd: PROJECT }, undefined, undefined, ctx);
+		await eventually(() => channels.length === 1);
+		await handlers.get("session_shutdown")!({ reason: "quit" });
+		await assert.rejects(first);
+		assert.ok(channels[0].closed, "shutdown closed the stalled open");
+		channels[0].answer(1);
+
+		// Two recorded machines with mismatched packages each report once across reconnect cycles.
+		saved.push({ type: "custom", customType: "herdr-remote-machine", data: { machine: "b" } }, { type: "custom", customType: "herdr-remote-machine", data: { machine: "c" } });
+		await handlers.get("session_start")!({}, ctx);
+		for (let cycle = 0; cycle < 3; cycle++) {
+			const opened = channels.length;
+			await eventually(() => channels.length === opened + 2, "both machines reconnect");
+			for (const channel of channels.slice(opened)) channel.answer(0);
+			await eventually(() => channels.slice(opened).every((channel) => channel.closed));
+			clock += 10_001;
+		}
+		assert.equal(notices.filter((text) => /b speaks remote protocol 0/.test(text)).length, 1);
+		assert.equal(notices.filter((text) => /c speaks remote protocol 0/.test(text)).length, 1);
+	} finally {
+		await handlers.get("session_shutdown")!({ reason: "quit" });
+		rmSync(localRoot, { recursive: true, force: true });
+	}
+	assert.ok(channels.every((channel) => channel.closed), "no channel outlives shutdown");
+});
+
 test("a Herdr without saved machines explains the upgrade instead of its raw CLI error", async (t) => {
 	const dir = mkdtempSync(join(tmpdir(), "herdr-old-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));

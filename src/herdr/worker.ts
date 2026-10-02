@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
-import { herdrSubagentRoot } from "./store.ts";
+import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot } from "./store.ts";
 import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 
@@ -172,6 +172,8 @@ const operations = {
 			}
 		}
 	},
+	/** A parent checks this before using a remote store, so a package mismatch fails once, with its fix. */
+	remoteProtocol(): number { return HERDR_REMOTE_PROTOCOL; },
 	/** Answered where the store runs, so a remote launch checks a directory by that machine's path rules. */
 	directoryStatus(path: string): "directory" | "missing" | "relative" {
 		// A relative path would resolve against this worker's directory, not the pane's.

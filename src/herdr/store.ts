@@ -71,6 +71,9 @@ export interface CompletionNotice extends RunRef {
 	run: RunSnapshot;
 }
 
+/** Raised whenever the parent and a remote worker would disagree on store operations; both ends must match. */
+export const HERDR_REMOTE_PROTOCOL = 1;
+
 export function herdrSubagentRoot(env: NodeJS.ProcessEnv = process.env): string {
 	return join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "grok-style-pi", "herdr-subagents");
 }
@@ -202,6 +205,7 @@ export class HerdrStore {
 	get failed(): boolean { return this.failure !== undefined; }
 
 	assertProtocolReady() { return this.call("assertProtocolReady"); }
+	remoteProtocol() { return this.call("remoteProtocol"); }
 	directoryStatus(path: string) { return this.call("directoryStatus", path); }
 	createSession(header: Record<string, unknown>, copyFrom?: string) { return this.call("createSession", header, copyFrom); }
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }

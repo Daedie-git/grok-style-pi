@@ -17,7 +17,7 @@ import {
 	type SpawnRequest,
 	type ToolText,
 } from "./runner.ts";
-import { herdrSubagentRoot, sshChannel, type StoreChannelFactory } from "./store.ts";
+import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
 
 export interface HerdrSubagentDeps {
 	env: NodeJS.ProcessEnv;
@@ -87,6 +87,10 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		/** One runner, and one SSH store channel, per saved machine used by this session. */
 		const machines = new Map<string, Promise<HerdrRunner>>();
 		const machineRunners = new Map<string, HerdrRunner>();
+		/** Each machine's runner once its channel opens, before its protocol check settles. */
+		const connecting = new Map<string, Promise<HerdrRunner>>();
+		/** Runners whose protocol matched. Only these may send store calls, including owner retirement on close. */
+		const verified = new WeakSet<HerdrRunner>();
 		const recordedMachines = new Set<string>();
 		/** Owners whose channel dropped. A reconnect retires them so the machine can recover their launches. */
 		const lostOwners = new Map<string, string[]>();
@@ -95,9 +99,19 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				pending = deps.machineChannel(machine).then((channel) => {
-					const opened = new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine });
-					if (machines.get(machine) === pending) machineRunners.set(machine, opened);
+				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine }));
+				pending = connected.then(async (opened) => {
+					// Refuse a mismatched package before any launch or owner retirement runs on that store.
+					// An unverified store is closed without retiring anything: its operations are not established.
+					try { await assertRemoteProtocol(opened.store, machine); }
+					catch (error) { await opened.store.close().catch(() => undefined); throw error; }
+					verified.add(opened);
+					// Shutdown or a reconnect replaced this open while it was checked; it must not outlive them untracked.
+					if (machines.get(machine) !== pending) {
+						await opened.close().catch(() => undefined);
+						throw new Error(`${machine}: connection closed`);
+					}
+					machineRunners.set(machine, opened);
 					// Retire in the background: a stalled call must not hold the open, which shutdown awaits.
 					// An owner that could not be retired is kept for the next reconnect.
 					const lost = lostOwners.get(machine) ?? [];
@@ -108,18 +122,26 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					return opened;
 				});
 				machines.set(machine, pending);
-				pending.catch(() => machines.delete(machine));
+				connecting.set(machine, connected);
+				// A failed open removes only its own entries, never a replacement opened meanwhile.
+				pending.catch(() => {
+					if (machines.get(machine) === pending) machines.delete(machine);
+					if (connecting.get(machine) === connected) connecting.delete(machine);
+				});
 			}
 			return pending;
 		};
 		const dropMachine = async (machine: string) => {
-			const pending = machines.get(machine);
+			const connected = connecting.get(machine);
 			const stale = machineRunners.get(machine);
 			machines.delete(machine);
+			connecting.delete(machine);
 			machineRunners.delete(machine);
 			if (stale?.store.failed) lostOwners.set(machine, [...lostOwners.get(machine) ?? [], stale.owner]);
 			// A channel still opening is closed once it opens, so shutdown never leaves an SSH process behind.
-			await (await pending?.catch(() => undefined))?.close().catch(() => undefined);
+			// Closing does not wait for the protocol check, which a stalled channel never answers; it rejects it.
+			const opened = await connected?.catch(() => undefined);
+			await (opened && verified.has(opened) ? opened.close() : opened?.store.close())?.catch(() => undefined);
 		};
 		const remember = (machine: string) => {
 			// Reload reopens the machines this session used, so their completion notices still arrive.
@@ -136,10 +158,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			try { panes = await deps.machineClient(machine).listPanes(); }
 			catch {}
 			// Pi stops at a startup prompt when its session directory is missing, so check on the machine itself.
-			const status = await source.store.directoryStatus(cwd).catch((error: Error) => {
-				if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older grok-style-pi. Update the package there, then retry.`);
-				throw error;
-			});
+			const status = await source.store.directoryStatus(cwd);
 			if (status === "relative") throw new Error(`machine_cwd ${cwd} is not an absolute path on ${machine}.`);
 			if (status === "missing") {
 				const open = [...new Set(panes.flatMap((pane) => pane.cwd ? [pane.cwd] : []))].slice(0, 8);
@@ -281,15 +300,16 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				sessionId: ctx.sessionManager.getSessionId(), checkpoint,
 			}, messenger);
 			if (timer) clearInterval(timer);
-			let lastError = "";
+			/** The last error per source ("" for this machine), so failing machines never alternate past deduplication. */
+			const lastErrors = new Map<string, string>();
 			const health = new Map<HerdrRunner, Promise<void>>();
 			// Each machine polls on its own, so a stalled SSH call never delays local coordination or other machines.
 			const machinePolls = new Map<string, Promise<void>>();
 			const reconnectAt = new Map<string, number>();
-			const reportError = (error: unknown) => {
+			const reportError = (error: unknown, source = "") => {
 				const message = error instanceof Error ? error.message : String(error);
-				if (!stopped && message !== lastError) ctx.ui.notify(`Herdr coordination: ${message}`, "error");
-				lastError = message;
+				if (!stopped && message !== lastErrors.get(source)) ctx.ui.notify(`Herdr coordination: ${message}`, "error");
+				lastErrors.set(source, message);
 			};
 			const deliver = async (source: HerdrRunner) => {
 				for (const notice of await source.store.notices(parentKey(source.machine))) {
@@ -308,11 +328,12 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				for (const machine of recordedMachines) {
 					if (machines.has(machine) || (reconnectAt.get(machine) ?? 0) > deps.now()) continue;
 					reconnectAt.set(machine, deps.now() + 10_000);
-					machineRunner(machine).catch(reportError);
+					// A machine that reconnects reports its next failure again.
+					machineRunner(machine).then(() => lastErrors.delete(machine), (error) => reportError(error, machine));
 				}
 				// Slow Herdr calls must not delay the child's command/cancellation polling.
 				for (const source of [current, ...machineRunners.values()]) {
-					if (!health.has(source)) health.set(source, source.maintain().catch(reportError).finally(() => health.delete(source)));
+					if (!health.has(source)) health.set(source, source.maintain().catch((error) => reportError(error, source.machine ?? "")).finally(() => health.delete(source)));
 				}
 				// A sendMessage call may only queue a message. Acknowledge only evidence actually in Pi's session.
 				const saved = ctx.sessionManager.getEntries();
@@ -342,13 +363,13 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					await acknowledge(machine, source);
 					await deliver(source);
 				} catch (error) {
-					reportError(new Error(`${machine}: ${error instanceof Error ? error.message : String(error)}`));
+					reportError(new Error(`${machine}: ${error instanceof Error ? error.message : String(error)}`), machine);
 					if (source.store.failed) await dropMachine(machine);
 				}
 			};
 			timer = setInterval(() => {
 				if (stopped || tick) return;
-				tick = poll().catch(reportError).finally(() => { tick = undefined; });
+				tick = poll().catch((error) => reportError(error)).finally(() => { tick = undefined; });
 			}, POLL_MS);
 			timer.unref();
 		});
@@ -362,7 +383,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			child = undefined;
 			await runner?.close();
 			runner = undefined;
-			for (const machine of [...machines.keys()]) await dropMachine(machine);
+			for (const machine of new Set([...machines.keys(), ...connecting.keys()])) await dropMachine(machine);
 		});
 		pi.on("input", (event) => child?.input(event.text));
 		pi.on("agent_start", async () => {
@@ -389,6 +410,18 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			return { block: true, reason: "This subagent is not allowed to use that tool." };
 		});
 	};
+}
+
+async function assertRemoteProtocol(store: HerdrStore, machine: string): Promise<void> {
+	const update = (side: string) => `Update grok-style-pi on ${side} so both match, then retry.`;
+	const remote = await store.remoteProtocol().catch((error: Error) => {
+		// Packages before the handshake lack the operation, so this is the one error text worth matching.
+		if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older grok-style-pi. ${update(machine)}`);
+		throw error;
+	});
+	if (remote !== HERDR_REMOTE_PROTOCOL) {
+		throw new Error(`${machine} speaks remote protocol ${remote}; this machine speaks ${HERDR_REMOTE_PROTOCOL}. ${update(remote < HERDR_REMOTE_PROTOCOL ? machine : "this machine")}`);
+	}
 }
 
 /** Herdr reports Windows directories with backslashes; machine_cwd may use either separator. POSIX paths compare exactly. */

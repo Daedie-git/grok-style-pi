@@ -88,10 +88,13 @@ find_machine() {
 # error because the slot's context, session and pending questions live on the machine it started on.
 resolve_machine() {
   RESOLVED=1
-  local bound file wanted=${MACHINE_ARG:-} record id
+  local bound file wanted=${MACHINE_ARG:-} record id bound_cwd=
   file=$(machine_binding_file)
   bound=
-  if [[ -s $file ]]; then bound=$(head -n 1 "$file"); fi
+  if [[ -s $file ]]; then
+    bound=$(head -n 1 "$file")
+    bound_cwd=$(sed -n 2p "$file")
+  fi
   if [[ $bound == local ]]; then
     [[ -z $wanted ]] || die "slot $SLOT already runs locally; use another slot for --machine $wanted"
     [[ -z $REMOTE_CWD ]] || die "--remote-cwd needs a slot on a machine"
@@ -103,6 +106,11 @@ resolve_machine() {
       [[ $(jq -r '.id' <<<"$id") == "$bound" ]] ||
         die "slot $SLOT is bound to machine '$(jq -r '.label' <<<"$record")'; use another slot for --machine $wanted"
     fi
+    # The checkout chosen at start belongs to the slot, like its machine: follow-ups reuse it.
+    if [[ -n $REMOTE_CWD && $REMOTE_CWD != "${bound_cwd:-$PWD}" ]]; then
+      die "slot $SLOT works in ${bound_cwd:-$PWD} on that machine; use another slot for --remote-cwd $REMOTE_CWD"
+    fi
+    REMOTE_CWD=$bound_cwd
   else
     wanted=${wanted:-${SIDECAR_MACHINE:-}}
     if [[ -z $wanted ]]; then
@@ -309,12 +317,19 @@ publish_session() {
   mv -f -- "$marker" "$STATE_DIR/$1.session"
 }
 
-# Records where the slot runs ("local" or the machine's profile ID) for later commands.
+# Records where the slot runs ("local" or the machine's profile ID, then the remote checkout if one was chosen) for
+# later commands. Call under the identity lock: resolve_machine ran earlier, so a concurrent start may have bound the
+# slot elsewhere meanwhile, and that must fail rather than hide the other agent.
 bind_machine() {
-  local file marker
+  local file marker want
   file=$(machine_binding_file)
+  want="${MACHINE:-local}
+${REMOTE_CWD}"
+  if [[ -s $file && $(cat "$file") != "${want%$'\n'}" ]]; then
+    die "slot $SLOT is already bound to $(head -n 1 "$file") (checkout: $(sed -n 2p "$file")); use another slot"
+  fi
   marker=$(mktemp "$file.XXXXXX")
-  printf '%s\n' "${MACHINE:-local}" >"$marker"
+  printf '%s\n' "${want%$'\n'}" >"$marker"
   mv -f -- "$marker" "$file"
 }
 
@@ -527,12 +542,14 @@ You run on the machine \`$MACHINE_LABEL\`, not on Claude's. Work in \`$WORK_DIR\
 EOF
 }
 
-# For a remote plan or diff: Claude's commit and uncommitted state need not exist in the machine's checkout.
+# For a remote plan or diff: Claude's commits and uncommitted state need not exist in the machine's checkout. Takes
+# Claude's HEAD and, for a diff, the review base; the surrounding code to read is the code at HEAD, not at the base.
 remote_checkout_note() {
-  local sha=${1:-}
+  local head=${1:-} base=${2:-} lack="that commit"
   [[ -n $MACHINE ]] || return 0
-  if [[ -n $sha ]]; then
-    echo "Claude's checkout is at commit \`$sha\`. The checkout on this machine may not have it; \`git fetch\` there if \`git cat-file -e $sha\` fails. It does not contain Claude's uncommitted or untracked changes, which exist only in the files named above. Never run git checkout, reset or stash in that checkout to reach a state; use \`git show\`, \`git diff $sha\` or a separate \`git worktree\`."
+  if [[ -n $base ]]; then lack="either of them"; fi
+  if [[ -n $head ]]; then
+    echo "Claude's checkout is at commit \`$head\`${base:+ and the review base is commit \`$base\`}. The checkout on this machine may lack $lack; \`git fetch\` there if \`git cat-file -e $head\`${base:+ or \`git cat-file -e $base\`} fails, then inspect \`$head\` read-only (\`git show $head:PATH\`, \`git diff${base:+ $base} $head\`, \`git grep -e PATTERN $head\`) instead of trusting what is checked out, which may be older. It does not contain Claude's uncommitted or untracked changes, which exist only in the files named above. Never run git checkout, reset or stash in that checkout to reach a state; use those read-only commands or a separate \`git worktree\`."
   else
     echo "The checkout on this machine may differ from Claude's and does not contain Claude's uncommitted changes. Never run git checkout, reset or stash in it to reach a state; use a separate \`git worktree\`."
   fi
@@ -605,11 +622,14 @@ $(remote_notice)"
 cmd_plan() {
   require_herdr
   [[ $# -ge 1 && -f "$1" ]] || die "usage: sidecar plan FILE [CONTEXT]"
-  local file sha=
+  local file copy sha=
   file=$(realpath "$1")
   if [[ -n $MACHINE ]]; then
     sha=$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)
-    file=$(publish_file "$file" "$(date +%Y%m%d-%H%M%S)-$(agent_name)-plan-${file##*/}")
+    # Requests of one slot are serialized later, so each upload gets its own unique name.
+    copy=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-planfile-$(agent_name).XXXXXX.md")
+    cp -- "$file" "$copy"
+    file=$(publish_file "$copy")
   fi
   request plan "# Plan review
 
@@ -624,7 +644,7 @@ ${2:-(none)}"
 
 cmd_diff() {
   require_herdr
-  local base=${1:-HEAD} id diff root f diff_path repo sha rel
+  local base=${1:-HEAD} id diff root f diff_path repo sha head rel
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
   root=$(git rev-parse --show-toplevel)
   id="$(date +%Y%m%d-%H%M%S)-$(agent_name)"
@@ -645,6 +665,7 @@ cmd_diff() {
   diff_path=$diff
   repo=$root
   sha=$(git rev-parse "$base^{commit}")
+  head=$(git rev-parse HEAD)
   if [[ -n $MACHINE ]]; then
     diff_path=$(publish_file "$diff")
     # The machine's checkout of the same repository: WORK_DIR is the counterpart of this directory.
@@ -654,7 +675,7 @@ cmd_diff() {
   request diff "# Adversarial implementation review
 
 Find bugs in the change in \`$diff_path\` (repository: \`$repo\`, base \`$base\`).
-$(remote_checkout_note "$sha")
+$(remote_checkout_note "$head" "$sha")
 
 Read the diff, then read the surrounding code it touches and its callers. Hunt for real defects: logic errors, broken invariants, lifecycle and ownership mistakes, races, missed error paths, edge inputs, stale callers, and behaviour that contradicts the intent below or earlier agreed decisions. Give each finding a concrete failure scenario. Skip style.
 

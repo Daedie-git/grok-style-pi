@@ -131,7 +131,7 @@ elif args[:2] == ['agent', 'prompt']:
 
 # Runs the command on a "machine" whose home differs from ours, as a real SSH login would.
 SSH = r'''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, subprocess, sys, time
 args = sys.argv[1:]
 home = pathlib.Path(os.environ['HOME'])
 options = []
@@ -144,6 +144,7 @@ if args[0] == '--':
 target, command = args[0], args[1]
 with (home / 'ssh-calls.jsonl').open('a') as log:
     log.write(json.dumps({'options': options, 'target': target, 'command': command}) + '\n')
+time.sleep(float(os.environ.get('FAKE_SSH_DELAY', '0')))
 if os.environ.get('FAKE_SSH_DOWN'):
     print('ssh: connect to host ' + target + ' port 22: Connection refused', file=sys.stderr)
     sys.exit(255)
@@ -730,11 +731,84 @@ class LauncherTests(unittest.TestCase):
         plan = self.home / 'plan.md'
         plan.write_text('# My plan\n')
         self.run_cli('--machine', 'laptop', 'plan', str(plan), 'Context', env=self.remote_env, cwd=self.work)
-        copies = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-plan-plan.md'))
+        copies = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-planfile-*.md'))
         self.assertEqual(len(copies), 1)
         self.assertEqual(copies[0].read_text(), '# My plan\n')
-        text = next(p for p in (self.remote_home() / '.cache/claude-sidecar/requests').glob('*plan-*.md') if p != copies[0]).read_text()
+        text = next(p for p in (self.remote_home() / '.cache/claude-sidecar/requests').glob('*-plan-*.md') if p != copies[0]).read_text()
         self.assertIn('`%s`' % copies[0], text)
+
+    def test_remote_checkout_is_remembered_with_the_slot(self):
+        self.add_machines()
+        checkout = self.home / 'laptop-checkout'
+        checkout.mkdir()
+        env = dict(self.remote_env, FAKE_QUESTION='May I?')
+        self.remote_run('--machine', 'laptop', '--remote-cwd', str(checkout), 'ask', 'Do it', env=env, check=False)
+        self.assertEqual((self.home / '.cache/claude-sidecar/sc-pane-1.machine').read_text(), 'm1\n%s\n' % checkout)
+        self.remote_run('answer', 'Yes')
+        answer = next((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-answer-*.md')).read_text()
+        self.assertIn('Work in `%s` there' % checkout, answer)
+        self.remote_run('status')  # the flag may be repeated, but only with the same checkout
+        self.remote_run('--remote-cwd', str(checkout), 'status')
+        result = self.remote_run('--remote-cwd', str(self.home), 'status', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('works in %s on that machine' % checkout, result.stderr)
+        # Tabs for later slot members open in the remembered checkout too.
+        tab = next(c for c in self.remote_calls() if c[:2] == ['tab', 'create'])
+        self.assertEqual(tab[tab.index('--cwd') + 1], str(checkout))
+
+    def test_concurrent_starts_cannot_bind_a_slot_to_two_machines(self):
+        self.add_machines()
+        env = dict(self.remote_env, FAKE_SSH_DELAY='0.7')  # both resolve before either binds
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.remote_run, '--machine', machine, 'start', env=env, check=False)
+                       for machine in ('laptop', 'desk')]
+            results = [future.result() for future in futures]
+        self.assertEqual(sorted(r.returncode == 0 for r in results), [False, True])
+        failed = next(r for r in results if r.returncode != 0)
+        self.assertIn('already bound', failed.stderr)
+        self.assertEqual(len(self.all_starts()), 1)
+        bound = (self.home / '.cache/claude-sidecar/sc-pane-1.machine').read_text().strip()
+        self.assertIn(bound, ('m1', 'm2'))
+        self.assertEqual(self.run_cli('status', env=self.remote_env, cwd=self.work).returncode, 0)
+
+    def test_same_second_plans_get_distinct_remote_files(self):
+        self.add_machines()
+        date = self.home / 'bin/date'
+        date.write_text('#!/bin/sh\ncase "$1" in +%Y%m%d-%H%M%S) echo 20260101-000000;; *) exec /usr/bin/date "$@";; esac\n')
+        date.chmod(0o755)
+        for index in (1, 2):
+            folder = self.home / ('plans%d' % index)
+            folder.mkdir()
+            (folder / 'plan.md').write_text('plan number %d\n' % index)
+            self.run_cli('--machine', 'laptop', 'plan', str(folder / 'plan.md'), env=self.remote_env, cwd=self.work)
+        requests = self.remote_home() / '.cache/claude-sidecar/requests'
+        copies = sorted(p.read_text() for p in requests.glob('*-planfile-*.md'))
+        self.assertEqual(copies, ['plan number 1\n', 'plan number 2\n'])
+        mentioned = [p.read_text() for p in requests.glob('*-plan-*.md')]
+        for copy in requests.glob('*-planfile-*.md'):
+            self.assertEqual(sum('`%s`' % copy in text for text in mentioned), 1)
+
+    def test_remote_diff_sends_head_as_well_as_the_base(self):
+        self.add_machines()
+        repo, base = self.make_repo()
+        subprocess.run(['git', '-C', str(repo), 'add', 'new.txt'], check=True)
+        subprocess.run(['git', '-C', str(repo), 'commit', '-m', 'Second'], check=True, capture_output=True)
+        head = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(base, head)
+        (self.home / 'repo/new.txt').write_text('changed\n')
+        self.run_cli('--machine', 'laptop', '--remote-cwd', str(self.work), 'diff', base, env=self.remote_env, cwd=repo)
+        text = next((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-diff-*.md')).read_text()
+        self.assertIn('checkout is at commit `%s`' % head, text)
+        self.assertIn('review base is commit `%s`' % base, text)
+        self.assertIn('git fetch', text)
+        self.assertIn('git show %s:PATH' % head, text)
+        self.assertIn('Never run git checkout, reset or stash', text)
+        # A plan request gets HEAD too.
+        plan = self.home / 'plan.md'
+        plan.write_text('# Plan\n')
+        self.run_cli('--slot', '2', '--machine', 'laptop', '--remote-cwd', str(self.work), 'plan', str(plan), env=self.remote_env, cwd=repo)
+        plans = [p.read_text() for p in (self.remote_home() / '.cache/claude-sidecar/requests').glob('*-plan-*.md')]
+        self.assertTrue(any('checkout is at commit `%s`' % head in t for t in plans))
 
     def test_remote_question_and_answer_route_to_the_machine(self):
         self.add_machines()

@@ -9,6 +9,8 @@ import type { StoreOperations } from "./worker.ts";
 export type { RunRef, RunSnapshot, ExecutionEvent } from "./state.ts";
 
 export interface HerdrTask {
+	/** Missing on existing records means Pi. */
+	runtime?: "pi" | "claude-code";
 	id: string;
 	herdrName: string;
 	paneId: string;
@@ -97,7 +99,7 @@ export function workerChannel(root: string): StoreChannelFactory {
 		const worker = new Worker(new URL("./worker-entry.mjs", import.meta.url), {
 			// node:sqlite is required here; its experimental notice otherwise overwrites Pi's UI.
 			// Scope suppression to this database worker, never the parent Pi process.
-			workerData: { root }, execArgv: ["--disable-warning=ExperimentalWarning"],
+			workerData: { root }, execArgv: ["--disable-warning=ExperimentalWarning", "--disable-warning=UNDICI-EHPA"],
 		});
 		worker.on("message", events.reply);
 		worker.on("error", events.fail);
@@ -118,7 +120,7 @@ export function workerChannel(root: string): StoreChannelFactory {
  */
 export function sshChannel(options: { target: string; node?: string; entry: string; root?: string }): StoreChannelFactory {
 	return (events) => {
-		const remote = [options.node ?? "node", "--disable-warning=ExperimentalWarning", options.entry, ...(options.root ? [options.root] : [])];
+		const remote = [options.node ?? "node", "--disable-warning=ExperimentalWarning", "--disable-warning=UNDICI-EHPA", options.entry, ...(options.root ? [options.root] : [])];
 		const child = spawn("ssh", [
 			"-T", "-o", "BatchMode=yes",
 			// A half-open connection must close the channel, or pending calls and a held placement lock hang.
@@ -217,6 +219,8 @@ export class HerdrStore {
 	expireUnacceptedRun(ref: RunRef, now: number) { return this.call("expireUnacceptedRun", ref, now); }
 	recordPaneClosed(ref: RunRef, now: number) { return this.call("recordPaneClosed", ref, now); }
 	attach(paneId: string, sessionFile: string, sessionId: string) { return this.call("attach", paneId, sessionFile, sessionId); }
+	claudeBinding(agentId: string) { return this.call("claudeBinding", agentId); }
+	claudeHook(agentId: string, input: import("./claude.ts").ClaudeHookInput, now: number) { return this.call("claudeHook", agentId, input, now); }
 	claimNextCommand(agentId: string, token: string, streaming: boolean) { return this.call("claimNextCommand", agentId, token, streaming); }
 	commandDelivered(command: Command, token: string) { return this.call("commandDelivered", command, token); }
 	authorizeInput(ref: RunRef, commandId: string, token: string) { return this.call("authorizeInput", ref, commandId, token); }

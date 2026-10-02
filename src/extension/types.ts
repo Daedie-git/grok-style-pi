@@ -10,6 +10,7 @@ export type SessionUi = {
 	theme?: { fg?(token: string, text: string): string };
 	setFooter?(factory: unknown): void;
 	setStatus?: (id: string, text: string | undefined) => void;
+	notify?(message: string, kind?: "info" | "warning" | "error"): void;
 	setEditorComponent?(factory: unknown): void;
 	getEditorText?(): string;
 	pasteToEditor?(text: string): void;

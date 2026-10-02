@@ -6,6 +6,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
 import { herdrSubagentRoot } from "./store.ts";
+import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 
 // A worker thread receives its root; a remote stdio process takes an optional root argument.
@@ -76,6 +77,8 @@ databaseDiagnostics("initialize control.sqlite schema", () => transaction(() => 
 		CREATE TABLE IF NOT EXISTS launches (run TEXT PRIMARY KEY REFERENCES runs(id), data TEXT NOT NULL);
 		CREATE TABLE IF NOT EXISTS notices (run TEXT PRIMARY KEY REFERENCES runs(id), acknowledged INTEGER NOT NULL DEFAULT 0);
 		CREATE TABLE IF NOT EXISTS retired_owners (id TEXT PRIMARY KEY);
+		CREATE TABLE IF NOT EXISTS claude_turns (agent TEXT PRIMARY KEY REFERENCES agents(id), run TEXT NOT NULL REFERENCES runs(id));
+		CREATE TABLE IF NOT EXISTS claude_approvals (run TEXT NOT NULL REFERENCES runs(id), key TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(run,key));
 		CREATE TABLE IF NOT EXISTS maintenance (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, expires INTEGER NOT NULL, next_at INTEGER NOT NULL);
 		INSERT OR IGNORE INTO maintenance(id,expires,next_at) VALUES(1,0,0);
 		CREATE INDEX IF NOT EXISTS active_runs ON runs(agent) WHERE json_extract(data,'$.phase') IN ('queued','starting','running','blocked');
@@ -290,6 +293,81 @@ const operations = {
 			const value = run({ agentId: record.id, runId: record.currentRunId });
 			const ambiguous = commands(value).some((command) => command.state === "dispatching");
 			return { agent: { ...record, sessionId }, token, run: value, ambiguous };
+		});
+	},
+	claudeBinding(agentId: string): ChildBinding | undefined {
+		const record = agent(agentId);
+		const token = db.prepare("SELECT binding FROM agents WHERE id=?").get(agentId)?.binding;
+		if (record?.runtime !== "claude-code" || !record.sessionId || typeof token !== "string") return undefined;
+		const value = run({ agentId, runId: record.currentRunId });
+		return { agent: record, token, run: value, ambiguous: commands(value).some((command) => command.state === "dispatching") };
+	},
+	claudeHook(agentId: string, input: ClaudeHookInput, now: number): boolean {
+		return transaction(() => {
+			const binding = operations.claudeBinding(agentId);
+			if (!binding || binding.agent.sessionId !== input.session_id) return false;
+			if (input.hook_event_name === "UserPromptSubmit") {
+				const marker = CLAUDE_MARKER.exec(input.prompt ?? "");
+				if (!marker) return false; // Human follow-ups never create or retarget managed runs.
+				const ref = { agentId, runId: marker[1] };
+				if (!operations.authorizeInput(ref, marker[2], binding.token)) return false;
+				db.prepare("INSERT INTO claude_turns(agent,run) VALUES(?,?) ON CONFLICT(agent) DO UPDATE SET run=excluded.run").run(agentId, ref.runId);
+				// Submission hooks run concurrently: another hook may still reject this input.
+				// Execution is confirmed by PreToolUse/PermissionRequest or the final Stop, not receipt.
+				saveRun({ ...run(ref), inputReceived: true, deadline: now + CLAUDE_START_TIMEOUT_MS, updatedAt: now });
+				return true;
+			}
+			const active = db.prepare("SELECT run FROM claude_turns WHERE agent=?").get(agentId)?.run;
+			if (typeof active !== "string") return false;
+			const ref = { agentId, runId: active };
+			if (!current(ref)) return false;
+			let event: ExecutionEvent | undefined;
+			const actor = claudeActorPrefix(input);
+			const key = actor + claudePermissionKey(input);
+			const pendingApprovals = () => !!db.prepare("SELECT 1 FROM claude_approvals WHERE run=? AND count>0").get(ref.runId);
+			// Native children share session_id, but only the main conversation may settle the run.
+			if (input.agent_id && ["Stop", "StopFailure", "SessionEnd"].includes(input.hook_event_name)) return true;
+			const confirmExecution = () => saveRun(transition(run(ref), { type: "live" }, now));
+			const approval = () => {
+				confirmExecution();
+				db.prepare("INSERT INTO claude_approvals(run,key,count) VALUES(?,?,1) ON CONFLICT(run,key) DO UPDATE SET count=count+1").run(ref.runId, key);
+				event = { type: "blocked" };
+			};
+			switch (input.hook_event_name) {
+				case "PreToolUse":
+					if (input.tool_name === "AskUserQuestion") approval();
+					else confirmExecution();
+					break;
+				case "PermissionRequest": approval(); break;
+				case "Notification":
+					if (input.notification_type === "permission_prompt" || input.notification_type === "elicitation_dialog") {
+						// Notifications lack a tool identity. Do not duplicate a known outstanding approval.
+						if (!db.prepare("SELECT 1 FROM claude_approvals WHERE run=? AND key LIKE ? AND count>0").get(ref.runId, `${actor}%`)) {
+							db.prepare("INSERT OR IGNORE INTO claude_approvals(run,key,count) VALUES(?,?,1)").run(ref.runId, `${actor}notification`);
+						}
+						event = { type: "blocked" };
+					}
+					break;
+				case "PostToolUse": case "PostToolUseFailure":
+					db.prepare("UPDATE claude_approvals SET count=count-1 WHERE run=? AND key=? AND count>0").run(ref.runId, key);
+					if (!pendingApprovals()) event = { type: "unblocked" };
+					break;
+				case "PostToolBatch":
+					// Every tool has resolved, including manually denied tools (which emit no
+					// PostToolUseFailure) and identity-free network permission notifications.
+					db.prepare("DELETE FROM claude_approvals WHERE run=? AND key LIKE ?").run(ref.runId, `${actor}%`);
+					confirmExecution();
+					event = { type: pendingApprovals() ? "blocked" : "unblocked" };
+					break;
+				case "Stop":
+					confirmExecution();
+					event = { type: "completed", result: input.last_assistant_message ?? "" };
+					break;
+				case "StopFailure": event = { type: "failed", error: input.error_details || input.error || "Claude Code turn failed" }; break;
+				case "SessionEnd": event = { type: "failed", error: "Claude Code session ended before the task completed" }; break;
+			}
+			if (event) saveRun(transition(run(ref), event, now));
+			return true;
 		});
 	},
 	claimNextCommand(agentId: string, token: string, streaming: boolean): Command | undefined {

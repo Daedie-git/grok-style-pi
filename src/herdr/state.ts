@@ -12,6 +12,8 @@ export interface RunSnapshot extends RunRef {
 	result?: string;
 	error?: string;
 	accepted: boolean;
+	/** Claude input-hook receipt is durable dispatch evidence, not execution acceptance. */
+	inputReceived?: boolean;
 	cancelRequested: boolean;
 	deadline: number;
 	turns: number;
@@ -34,7 +36,7 @@ export function expireUnaccepted(run: RunSnapshot, now: number): RunSnapshot {
 		...run, phase: "failed", updatedAt: now,
 		error: run.cancelRequested
 			? "The child did not acknowledge cancellation. The pane may still be live."
-			: "Pi started, but the pane did not accept the task.",
+			: "The agent started, but the pane did not confirm task execution.",
 	};
 }
 

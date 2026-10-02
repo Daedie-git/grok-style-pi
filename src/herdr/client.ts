@@ -20,6 +20,8 @@ export interface HerdrMachine {
 export interface HerdrClient {
 	split(options: { paneId: string; direction: "right" | "down"; cwd: string }): Promise<{ paneId: string }>;
 	startPi(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
+	startClaude?(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
+	promptAgent?(name: string, text: string, signal?: AbortSignal): Promise<void>;
 	closePane(paneId: string): Promise<void>;
 	isAlive(name: string): Promise<boolean>;
 	showLabel(paneId: string, label: string): Promise<void>;
@@ -114,6 +116,21 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 	// Listings cross SSH when routed to a machine.
 	const listTimeout = machine ? 10_000 : 2500;
 	const routed = (binary: string, args: string[], ...rest: CallOptions) => call(binary, [...prefix, ...args], ...rest);
+	const start = async (kind: "pi" | "claude", options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal) => {
+		const deadline = timing.now() + 60_000;
+		for (;;) {
+			signal?.throwIfAborted();
+			try {
+				await routed(bin, ["agent", "start", options.name, "--kind", kind, "--pane", options.paneId, "--timeout", "60000", "--", ...options.args], env, 70_000, signal);
+				return;
+			} catch (error) {
+				if (!(error instanceof HerdrCliError) || error.message !== `agent target pane ${options.paneId} is not an available shell`) throw error;
+				const remaining = deadline - timing.now();
+				if (remaining <= 0) throw new Error(`Timed out after 60 seconds waiting for shell readiness in ${options.paneId}: ${error.message}`);
+				await timing.sleep(Math.min(250, remaining), signal);
+			}
+		}
+	};
 	return {
 		async split(options) {
 			const payload = await routed(bin, [
@@ -122,25 +139,11 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 			], env);
 			return { paneId: paneIdFromSplit(payload) };
 		},
-		async startPi(options, signal) {
-			const deadline = timing.now() + 60_000;
-			for (;;) {
-				signal?.throwIfAborted();
-				try {
-					await routed(bin, [
-						"agent", "start", options.name, "--kind", "pi", "--pane", options.paneId, "--timeout", "60000",
-						"--", ...options.args,
-					], env, 70_000, signal);
-					return;
-				} catch (error) {
-					// This rejection happens before launch. Never retry ambiguous startup or transport failures.
-					if (!(error instanceof HerdrCliError)
-						|| error.message !== `agent target pane ${options.paneId} is not an available shell`) throw error;
-					const remaining = deadline - timing.now();
-					if (remaining <= 0) throw new Error(`Timed out after 60 seconds waiting for shell readiness in ${options.paneId}: ${error.message}`);
-					await timing.sleep(Math.min(250, remaining), signal);
-				}
-			}
+		startPi: (options, signal) => start("pi", options, signal),
+		startClaude: (options, signal) => start("claude", options, signal),
+		async promptAgent(name, text, signal) {
+			// Submission only; completion comes from run-scoped Claude hooks, not terminal detection.
+			await routed(bin, ["agent", "prompt", name, text], env, 10_000, signal);
 		},
 		async closePane(paneId) {
 			await routed(bin, ["pane", "close", paneId], env);

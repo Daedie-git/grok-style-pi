@@ -7,6 +7,7 @@ import { parseAgentFile } from "./agent-file.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
+import { claudeArgs, claudePrompt, claudeTools } from "./claude.ts";
 
 export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -15,6 +16,7 @@ const POLL_MS = 200;
 const CLOSE_GRACE_MS = 2000;
 
 export interface SpawnRequest {
+	runtime?: "pi" | "claude-code";
 	prompt: string;
 	description: string;
 	name?: string;
@@ -146,7 +148,13 @@ export class HerdrRunner {
 			if (!(await this.deps.client.isAlive(record.herdrName))) throw new Error(`Agent ${agentId} is no longer running in Herdr pane ${record.paneId}.`);
 			check(combined);
 			const ref = await this.store.beginRun(record.id, previous, prompt, notify, this.now());
-			if (combined.aborted) await this.cancel(ref);
+			try {
+				if (combined.aborted) await this.cancel(ref);
+				else if (record.runtime === "claude-code") await this.serviceClaude(record.id, combined);
+			} catch (error) {
+				if (combined.aborted) await this.cancel(ref);
+				throw error;
+			}
 			return ref;
 		})());
 	}
@@ -158,10 +166,15 @@ export class HerdrRunner {
 	}
 
 	read(ref: RunRef): Promise<RunSnapshot> { return this.store.read(ref); }
-	cancel(ref: RunRef): Promise<RunSnapshot> { return this.store.requestCancellation(ref, this.now()); }
+	async cancel(ref: RunRef): Promise<RunSnapshot> {
+		const value = await this.store.requestCancellation(ref, this.now());
+		if (!isTerminal(value.phase) && (await this.resolve(ref.agentId)).runtime === "claude-code") await this.serviceClaude(ref.agentId);
+		return this.read(ref);
+	}
 
 	async steer(ref: RunRef, message: string): Promise<void> {
 		const record = await this.resolve(ref.agentId);
+		if (record.runtime === "claude-code") throw new Error("Live steering is not supported for Claude Code. Wait for the run to finish, then use Agent with resume.");
 		if (!(await this.deps.client.isAlive(record.herdrName))) throw new Error(`Agent ${record.id} is no longer running in Herdr.`);
 		// The transactional check still targets the captured run after the asynchronous liveness check.
 		await this.store.steer(ref, message);
@@ -195,6 +208,7 @@ export class HerdrRunner {
 					{ ref: { agentId: run.agentId, runId: run.runId }, alive: names.has(agent.herdrName) },
 				]);
 				await this.store.finishMaintenance(token, observations, this.now());
+				for (const { agent } of runs) if (agent.runtime === "claude-code") await this.serviceClaude(agent.id, this.stopping.signal);
 				if (await this.store.tryPlacementLock(token)) {
 					try { await this.recoverLaunches(); }
 					finally { await this.store.releasePlacementLock(token); }
@@ -265,6 +279,11 @@ export class HerdrRunner {
 
 	private async launch(request: SpawnRequest, signal: AbortSignal): Promise<RunRef> {
 		check(signal);
+		const claude = request.runtime === "claude-code";
+		if (claude && this.machine) throw new Error("Claude Code subagents currently support local Herdr panes only.");
+		if (claude && process.platform === "win32") throw new Error("Claude Code subagents currently require Linux or macOS.");
+		if (claude && request.inheritContext) throw new Error("Claude Code cannot inherit a Pi session. Provide context in prompt.");
+		if (claude && (!this.deps.client.startClaude || !this.deps.client.promptAgent)) throw new Error("The Herdr client does not support Claude Code launches.");
 		if (!request.paneId) throw new Error("Not inside a Herdr pane, so no subagent pane can be opened.");
 		await this.store.assertProtocolReady();
 		check(signal);
@@ -274,6 +293,14 @@ export class HerdrRunner {
 		if (depth > HERDR_MAX_DEPTH) throw new Error(`Subagent depth ${depth} exceeds the Herdr limit of ${HERDR_MAX_DEPTH}.`);
 		if (request.inheritContext && (!request.sessionFile || !existsSync(request.sessionFile))) throw new Error("inherit_context was set, but this session has no file to clone.");
 		const definition = loadAgent(request);
+		const maxTurns = request.maxTurns ?? definition?.maxTurns;
+		const thinking = request.thinking ?? definition?.thinking;
+		const tools = allowedTools(request.isolated || definition?.isolated, definition?.tools);
+		if (claude && maxTurns != null) throw new Error("max_turns is not supported by interactive Claude Code. Omit it.");
+		if (claude && thinking && !["low", "medium", "high", "xhigh", "max"].includes(thinking)) throw new Error("Claude Code thinking maps to --effort: low, medium, high, xhigh, or max.");
+		if (claude && definition?.tools) claudeTools(definition.tools);
+		if (claude && tools) claudeTools(tools);
+		const sessionId = randomUUID();
 		const base = herdrAgentName(request.name, request.subagentType);
 		let ref: RunRef | undefined;
 		let task: HerdrTask | undefined;
@@ -285,16 +312,16 @@ export class HerdrRunner {
 			if (await this.deps.client.isAlive(id)) continue;
 			check(signal);
 			task = {
-				id, herdrName: id, paneId: "", depth, type: request.subagentType,
+				runtime: request.runtime, id, herdrName: id, paneId: "", depth, type: request.subagentType,
 				description: request.description, prompt: request.prompt, instructions: definition?.body || undefined,
-				allowedTools: allowedTools(request.isolated || definition?.isolated, definition?.tools),
-				maxTurns: request.maxTurns ?? definition?.maxTurns, model: request.model ?? definition?.model,
-				thinking: request.thinking ?? definition?.thinking, parentPaneId: request.paneId,
+				allowedTools: tools,
+				maxTurns, model: request.model ?? definition?.model,
+				thinking, parentPaneId: request.paneId,
 				createdAt: new Date(this.now()).toISOString(),
 			};
 			// The store creates the file on its own machine. A failed reservation leaves only an unused empty session.
 			sessionFile ??= await this.store.createSession(
-				{ type: "session", version: 3, id: randomUUID(), timestamp: task.createdAt, cwd: request.cwd },
+				{ type: "session", version: 3, id: sessionId, timestamp: task.createdAt, cwd: request.cwd },
 				request.inheritContext ? request.sessionFile : undefined,
 			);
 			check(signal);
@@ -328,10 +355,14 @@ export class HerdrRunner {
 			await this.store.recordLaunch(ref, this.owner, "starting-pi", {}, this.now());
 			check(signal);
 			task.paneId = paneId!;
-			await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile!) }, signal);
+			if (claude) {
+				await this.store.attach(paneId!, sessionFile!, sessionId);
+				await this.deps.client.startClaude!({ name: task.id, paneId: paneId!, args: claudeArgs(task, sessionId, this.deps.root) }, signal);
+			} else await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile!) }, signal);
 			check(signal);
 			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now());
 			published = true;
+			if (claude && !signal.aborted) await this.serviceClaude(task.id, signal);
 			if (signal.aborted) { await this.cancel(ref); return ref; }
 			await this.deps.client.showLabel(paneId!, paneLabel(task.id, task.model, task.thinking)).catch(() => undefined);
 			if (signal.aborted) await this.cancel(ref);
@@ -343,6 +374,42 @@ export class HerdrRunner {
 				? await this.withPlacement(() => this.cleanup(ref!, paneId, message(error), signal.aborted, creationIssued), new AbortController().signal)
 				: await this.cleanup(ref, paneId, message(error), signal.aborted, creationIssued);
 			throw new Error(failure);
+		}
+	}
+
+	/** Claims each prompt durably before terminal submission; an uncertain dispatch is never replayed. */
+	private async serviceClaude(agentId: string, signal?: AbortSignal): Promise<void> {
+		const binding = await this.store.claudeBinding(agentId);
+		if (!binding || isTerminal(binding.run.phase)) return;
+		if (binding.run.cancelRequested) {
+			// Closing the owned pane is an explicit, confirmed stop; Esc alone is not execution evidence.
+			await this.withPlacement(async () => {
+				if (isTerminal((await this.read(binding.run)).phase)) return;
+				await this.deps.client.closePane(binding.agent.paneId);
+				await this.store.recordPaneClosed(binding.run, this.now());
+			}, signal ?? this.stopping.signal);
+			return;
+		}
+		const command = await this.store.claimNextCommand(agentId, binding.token, false);
+		if (!command) return;
+		try {
+			await this.deps.client.promptAgent!(binding.agent.herdrName, claudePrompt(command), signal);
+			await this.store.commandDelivered(command, binding.token);
+		} catch (error) {
+			// Cancellation wins even before execution confirmation: close the owned pane
+			// before terminalizing this dispatched run, so no live task escapes cancellation.
+			if (signal?.aborted) {
+				await this.cancel(command);
+				throw error;
+			}
+			const value = await this.read(command);
+			// Durable hook receipt repairs a lost CLI reply without pretending another
+			// submission hook has allowed execution. The execution deadline remains bounded.
+			if (value.accepted || value.inputReceived) return;
+			await this.store.recordExecutionEvent(command, binding.token, {
+				type: "failed", error: `Claude prompt submission was not confirmed; it will not be retried. The pane may still be live: ${message(error)}`,
+			}, this.now());
+			throw error;
 		}
 	}
 
@@ -486,7 +553,7 @@ export async function spawnHerdrAgent(request: SpawnRequest, deps: RunnerDeps): 
 		const shown = { ...ref, agentId: qualifiedAgentId(ref.agentId, runner.machine) };
 		if (deps.signal?.aborted) return text(formatStatus(record, snapshot, runner.machine), { ...shown, paneId: record.paneId, status: snapshot.phase });
 		if (request.runInBackground) return text(
-			`Agent ${request.resume ? "resumed" : "started"} in a Herdr pane.\nAgent ID: ${shown.agentId}\nRun ID: ${ref.runId}\nPane: ${paneText(record.paneId, runner.machine)}\nType: ${record.type}\nDescription: ${record.description}\n\nYou will be notified when this run completes.\nUse get_subagent_result for full results, or steer_subagent to send messages.\nDo not duplicate this agent's work.`,
+			`Agent ${request.resume ? "resumed" : "started"} in a Herdr pane.\nAgent ID: ${shown.agentId}\nRun ID: ${ref.runId}\nPane: ${paneText(record.paneId, runner.machine)}\nRuntime: ${record.runtime ?? "pi"}\nType: ${record.type}\nDescription: ${record.description}\n\nYou will be notified when this run completes.\nUse get_subagent_result for full results.${record.runtime === "claude-code" ? " After completion, use Agent with resume for follow-up work; live steering is unsupported." : " Use steer_subagent to send messages."}\nDo not duplicate this agent's work.`,
 			{ ...shown, status: "background", paneId: record.paneId },
 		);
 		return resultForRun(runner, record, ref, true, deps.signal);
@@ -572,7 +639,7 @@ function loadAgent(request: SpawnRequest) {
 
 function formatStatus(record: AgentRecord, snapshot: RunSnapshot, machine?: string): string {
 	const pane = paneText(record.paneId, machine);
-	const header = `Agent: ${qualifiedAgentId(record.id, machine)}\nRun: ${snapshot.runId}\nType: ${record.type} | Status: ${snapshot.phase}\nDescription: ${record.description}\nPane: ${pane}\n`;
+	const header = `Agent: ${qualifiedAgentId(record.id, machine)}\nRun: ${snapshot.runId}\nRuntime: ${record.runtime ?? "pi"}\nType: ${record.type} | Status: ${snapshot.phase}\nDescription: ${record.description}\nPane: ${pane}\n`;
 	if (snapshot.cancelRequested && !isTerminal(snapshot.phase)) return `${header}\nCancellation requested; waiting for the child to stop.`;
 	if (snapshot.phase === "blocked") return `${header}\nAgent is blocked in Herdr pane ${pane}. Answer the prompt there.`;
 	if (!isTerminal(snapshot.phase)) return `${header}\nAgent is still ${snapshot.phase}. Use wait: true or check back later.`;

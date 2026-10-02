@@ -29,7 +29,9 @@ function workerExecutor(): VisualExecutor {
 		run(request) {
 			return new Promise((resolve, reject) => {
 				if (!worker) {
-					worker = new Worker(new URL("./visual-worker-entry.mjs", import.meta.url), { execArgv: [] });
+					// Node 22's env-proxy notice occurs before worker JS runs and bypasses parent
+					// warning listeners. Silence only that startup notice, not proxying or errors.
+					worker = new Worker(new URL("./visual-worker-entry.mjs", import.meta.url), { execArgv: ["--disable-warning=UNDICI-EHPA"] });
 					worker.on("error", () => {}); // Pending jobs install their own failure handler.
 					const created = worker;
 					created.once("exit", () => { if (worker === created) worker = undefined; });

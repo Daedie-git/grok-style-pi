@@ -900,7 +900,7 @@ test("the worker loads from an installed package path without Node TypeScript st
 	const pkg = join(dir, "node_modules", "grok-style-pi");
 	mkdirSync(join(pkg, "src", "herdr"), { recursive: true });
 	writeFileSync(join(pkg, "package.json"), '{"type":"module"}');
-	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs"]) {
+	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs", "claude.ts"]) {
 		copyFileSync(fileURLToPath(new URL(`../src/herdr/${name}`, import.meta.url)), join(pkg, "src", "herdr", name));
 	}
 	symlinkSync(fileURLToPath(new URL("../node_modules/jiti", import.meta.url)), join(dir, "node_modules", "jiti"), "dir");

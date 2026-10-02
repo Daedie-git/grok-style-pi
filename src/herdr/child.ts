@@ -29,9 +29,10 @@ export interface ChildSession {
 	dispose(): Promise<void>;
 }
 
-export function taskMessage(task: Pick<HerdrTask, "type" | "description" | "prompt" | "instructions">): string {
+export function taskMessage(task: Pick<HerdrTask, "type" | "description" | "prompt" | "instructions" | "runtime">): string {
 	return [
-		"You are a subagent running in your own Pi pane. Finish the task below and reply with the result.",
+		`You are a subagent running in your own ${task.runtime === "claude-code" ? "Claude Code" : "Pi"} pane. Finish the task below and reply with the result.`,
+		"Do not start other subagents unless the task explicitly asks you to.",
 		`Type: ${task.type}`,
 		`Task: ${task.description}`,
 		task.instructions?.trim(),

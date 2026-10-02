@@ -1,5 +1,5 @@
 import type { CustomEditor, ThemeColor } from "@earendil-works/pi-coding-agent";
-import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { applyComposerBorderColor, frameEditorLines } from "../chrome/composer.ts";
 import { modelDisplayName, renderFooter } from "../chrome/footer.ts";
 import { startGrokFooterPolling } from "./grok-usage.ts";
@@ -17,6 +17,10 @@ import type { CustomEditorCtor, ExtensionApiLike, SessionContext, SessionUi } fr
 type SessionChromeDeps = {
 	CustomEditor: CustomEditorCtor;
 	features: Pick<Features, "footer" | "composer" | "terminalColors" | "toolStyling">;
+	warningEvents?: {
+		on(event: "warning", listener: (warning: Error) => void): unknown;
+		off(event: "warning", listener: (warning: Error) => void): unknown;
+	};
 };
 
 /** Owns footer polling, the framed editor, and their shared terminal colors. */
@@ -66,6 +70,26 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		});
 	}
 	let requestRender: (() => void) | undefined;
+	let requestFullRender: (() => void) | undefined;
+	const warningEvents = deps.warningEvents ?? process;
+	let warningListener: ((warning: Error) => void) | undefined;
+	let warningUi: SessionUi | undefined;
+	function trackWarningRepaint(tui: { mode?: string; requestRender?: (force?: boolean) => void }) {
+		if (tui.mode !== "fullscreen") return;
+		requestFullRender = () => tui.requestRender?.(true);
+		if (warningListener) return;
+		warningListener = (warning) => {
+			if (!requestFullRender) return;
+			// Node writes stderr before emitting this event. Its out-of-band write is
+			// absent from the fullscreen screen cache, so unchanged rows need repainting.
+			// Retain diagnostics through Pi instead of suppressing host warnings.
+			try {
+				warningUi?.notify?.(stripTerminalSequences(`${warning.name}: ${warning.message}`).slice(0, 500), "warning");
+			} catch { /* Notification failures must not turn host warnings into crashes. */ }
+			requestFullRender?.();
+		};
+		warningEvents.on("warning", warningListener);
+	}
 	let hasActiveSelection: (() => boolean) | undefined;
 	pi.on("after_provider_response", (event, ctx) => {
 		if (ctx.model?.provider !== "openai-codex") return;
@@ -88,15 +112,20 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 
 	function startSession(ctx: SessionContext) {
 		quota = [];
+		requestFullRender = undefined;
+		warningUi = undefined;
 
 		if (!ctx.hasUI && ctx.mode && ctx.mode !== "tui") {
 			return;
 		}
 
+		warningUi = ctx.ui;
+
 		if (features.footer && typeof ctx.ui.setFooter === "function") {
-			ctx.ui.setFooter((tui: { requestRender?: (force?: boolean) => void; hasActiveSelection?: () => boolean }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
+			ctx.ui.setFooter((tui: { mode?: string; requestRender?: (force?: boolean) => void; hasActiveSelection?: () => boolean }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
 				hasActiveSelection = tui.hasActiveSelection?.bind(tui);
 				requestRender = () => tui.requestRender?.();
+				trackWarningRepaint(tui);
 				const write = tuiWrite(tui);
 				if (features.terminalColors && write && !restoreTerminal) {
 					applyGrokTerminalChrome(write);
@@ -188,6 +217,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 				}
 			}
 			ctx.ui.setEditorComponent((...[tui, theme, keybindings]: ConstructorParameters<typeof CustomEditor>) => {
+				trackWarningRepaint(tui);
 				hasActiveSelection = "hasActiveSelection" in tui && typeof tui.hasActiveSelection === "function"
 					? tui.hasActiveSelection.bind(tui) : undefined;
 				const write = tuiWrite(tui);
@@ -207,6 +237,10 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 	}
 
 	function dispose() {
+		if (warningListener) warningEvents.off("warning", warningListener);
+		warningListener = undefined;
+		warningUi = undefined;
+		requestFullRender = undefined;
 		accountPolling?.dispose(); accountPolling = undefined;
 		account = undefined;
 		quotaPolling?.dispose(); quotaPolling = undefined;

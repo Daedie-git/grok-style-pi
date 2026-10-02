@@ -170,14 +170,15 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.registerTool(defineTool({
 			name: "Agent",
 			label: "Agent",
-			description: "Launch a subagent as its own Pi process in a Herdr pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>." + savedMachines,
+			description: "Launch a subagent as its own Pi (default) or Claude Code process in a Herdr pane. Set runtime to claude-code only when the user requests Claude Code. Claude Code supports local Linux/macOS panes, normal permissions, results, and resume; live steering and max_turns are unsupported, and Stop closes its pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>." + savedMachines,
 			parameters: Type.Object({
+				runtime: Type.Optional(Type.Union([Type.Literal("pi"), Type.Literal("claude-code")], { description: "Default pi. Use claude-code only when the user requests Claude Code. Ignored with resume, which preserves the original runtime." })),
 				prompt: Type.String({ description: "The task for the agent to perform." }),
 				description: Type.String({ description: "A short (3-5 word) description of the task (shown in UI)." }),
 				name: Type.Optional(Type.String({ description: "Optional memorable name, letters, digits, underscores, and hyphens." })),
 				subagent_type: Type.String({ description: "Agent type. A matching .pi/agents or user agent file supplies its prompt and tool list." }),
-				model: Type.Optional(Type.String({ description: "Optional model override. Accepts provider/modelId or a fuzzy name." })),
-				thinking: Type.Optional(Type.String({ description: "Thinking level: off, minimal, low, medium, high, xhigh, max." })),
+				model: Type.Optional(Type.String({ description: "Optional model override. Pi accepts provider/modelId or a fuzzy name; Claude Code uses native names such as sonnet or opus." })),
+				thinking: Type.Optional(Type.String({ description: "Pi thinking: off, minimal, low, medium, high, xhigh, max. Claude Code effort: low, medium, high, xhigh, max (model-dependent)." })),
 				max_turns: Type.Optional(Type.Number({ description: "Maximum turns before stopping. Omit for unlimited.", minimum: 1 })),
 				run_in_background: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false to wait for the result, or for blocked." })),
 				resume: Type.Optional(Type.String({ description: "Agent ID to resume after its current run has finished." })),
@@ -187,12 +188,14 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine. Set it whenever that machine's paths differ from this one's, such as C:/git/project on Windows. Defaults to this session's directory." })),
 			}),
 			execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+				if (!params.resume && params.runtime === "claude-code" && params.machine?.trim()) throw new Error("Claude Code subagents currently support local Herdr panes only.");
 				const target = params.resume ? await route(params.resume) : undefined;
 				const machine = target ? target.runner.machine : params.machine?.trim() || undefined;
 				if (machine && params.inherit_context) throw new Error("inherit_context cannot clone this session onto another machine.");
 				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
 				const cwd = machine ? params.machine_cwd?.trim() || ctx.cwd : ctx.cwd;
 				const request: SpawnRequest = {
+					runtime: params.runtime,
 					prompt: params.prompt,
 					description: params.description,
 					name: params.name,
@@ -241,7 +244,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.registerTool(defineTool({
 			name: "steer_subagent",
 			label: "Steer Agent",
-			description: "Send a steering message to a running Herdr subagent. Use this for follow-up work on the same thread instead of starting another agent. It is delivered after the current tool execution. Only works while that Pi pane is still running.",
+			description: "Send a steering message to a running Herdr subagent. Use this for follow-up work on the same thread instead of starting another agent. It is delivered after the current tool execution. Only works while that Pi pane is still running. Claude Code does not support live steering; wait for completion and use Agent with resume.",
 			promptSnippet: "Send a steering message to redirect a running background agent",
 			parameters: Type.Object({
 				agent_id: Type.String({ description: "The agent ID to steer." }),

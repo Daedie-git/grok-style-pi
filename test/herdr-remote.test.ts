@@ -139,7 +139,13 @@ test("machine listings and remote placement facts are parsed", () => {
 	assert.deepEqual(splitAgentId("review@Build machine"), { id: "review", machine: "Build machine" });
 	assert.deepEqual(splitAgentId("review"), { id: "review" });
 	assert.equal(machineGuidance([]), "", "no saved machines, or an older Herdr, adds nothing");
-	assert.equal(machineGuidance([{ id: "m1", label: "lappy", target: "lappy", enabled: true }]), " Saved machines: lappy.");
+	assert.equal(machineGuidance([{ id: "m1", label: "lappy", target: "lappy", enabled: true }]), " Saved machines: lappy. Pass the name shown first as machine.");
+	// Repeated labels are ambiguous to herdr --machine, even when one profile is disabled.
+	assert.equal(machineGuidance([
+		{ id: "m1", label: "laptop", target: "aim@lappy", enabled: true },
+		{ id: "m2", label: "laptop", target: "aim@old-lappy", enabled: false },
+		{ id: "m3", label: "build", target: "build", enabled: true },
+	]), " Saved machines: m1 (label laptop, aim@lappy), build. Pass the name shown first as machine.");
 	assert.equal(remoteWorkerEntry({ GROK_HERDR_REMOTE_PACKAGE: "/opt/grok-style-pi/" }), "/opt/grok-style-pi/src/herdr/worker-entry.mjs");
 });
 
@@ -204,7 +210,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	const [agentTool, resultTool] = tools;
 	assert.match(agentTool.parameters.properties.machine.description, /Only when the user asks/);
-	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\.$/, "the model can map a casual name to the saved label");
+	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\. Pass the name shown first as machine\.$/, "the model can map a casual name to the saved label");
 	await handlers.get("session_start")!({}, ctx);
 	try {
 		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop", machine_cwd: "/laptop/project" }, undefined, undefined, ctx);

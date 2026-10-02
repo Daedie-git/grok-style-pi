@@ -36,11 +36,17 @@ export interface HerdrSubagentDeps {
 	listMachines: () => Promise<HerdrMachine[]>;
 }
 
-/** Names the enabled saved machines so the model can map "the laptop" to a label without asking. */
+/** Names the enabled saved machines so the model can map "the laptop" to a selector without asking. */
 export function machineGuidance(machines: HerdrMachine[]): string {
 	const enabled = machines.filter((machine) => machine.enabled);
 	if (!enabled.length) return "";
-	return ` Saved machines: ${enabled.map((machine) => machine.label === machine.target ? machine.label : `${machine.label} (${machine.target})`).join(", ")}.`;
+	// A label shared by any two profiles, disabled ones included, is ambiguous; only the profile ID selects then.
+	const repeated = (label: string) => machines.filter((machine) => machine.label === label).length > 1;
+	const describe = (machine: HerdrMachine) => {
+		if (repeated(machine.label)) return `${machine.id} (label ${machine.label}, ${machine.target})`;
+		return machine.label === machine.target ? machine.label : `${machine.label} (${machine.target})`;
+	};
+	return ` Saved machines: ${enabled.map(describe).join(", ")}. Pass the name shown first as machine.`;
 }
 
 /** The remote store runs this package's worker entry, by default at the same path as here. */

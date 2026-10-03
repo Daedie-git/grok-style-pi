@@ -35,6 +35,7 @@ MACHINE=
 MACHINE_LABEL=
 MACHINE_TARGET=
 REMOTE_STATE=
+REMOTE_TRANSPORT='sh'
 # The directory sidecar panes open in: here, or its counterpart on the machine.
 WORK_DIR=$PWD
 RESOLVED=
@@ -64,6 +65,16 @@ remote() {
   cmd="sh -c $(shq "$script") sh"
   for arg in "$@"; do cmd+=" $(shq "$arg")"; done
   ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "$cmd"
+}
+
+# Node is already required by pi. A base64 program inside double quotes works with both cmd.exe and POSIX shells,
+# without changing the SSH server's default shell. Arguments are encoded with the program, never shell-interpolated.
+remote_node() {
+  local script=$1 args encoded
+  shift
+  args=$(jq -cn --args '$ARGS.positional' "$@")
+  encoded=$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script" | base64 -w0)
+  ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "node -e \"eval(Buffer.from('$encoded','base64').toString())\""
 }
 
 # Saved herdr machines as a JSON array; fails on herdr older than 0.9 or when herdr does not answer in time.
@@ -110,7 +121,9 @@ resolve_machine() {
     if [[ -n $REMOTE_CWD && $REMOTE_CWD != "${bound_cwd:-$PWD}" ]]; then
       die "slot $SLOT works in ${bound_cwd:-$PWD} on that machine; use another slot for --remote-cwd $REMOTE_CWD"
     fi
+    # A binding without a saved directory predates mappings: it keeps $PWD and must not acquire one.
     REMOTE_CWD=$bound_cwd
+    [[ -n $bound_cwd ]] || KEEP_PWD=1
   else
     wanted=${wanted:-${SIDECAR_MACHINE:-}}
     if [[ -z $wanted ]]; then
@@ -128,8 +141,33 @@ resolve_machine() {
   MACHINE_TARGET=$(jq -r '.target' <<<"$record")
   [[ -n $MACHINE_TARGET ]] || die "herdr machine '$MACHINE_LABEL' has no SSH target"
   command -v ssh >/dev/null || die "ssh is required for --machine"
-  AGENT_HOME=${SIDECAR_REMOTE_HOME:-$SIDECAR_HOME}
-  WORK_DIR=${REMOTE_CWD:-$PWD}
+  # Per-machine settings avoid repeating checkout paths and support Windows without a POSIX SSH shell.
+  local config='{}' config_file=${SIDECAR_MACHINES_FILE:-$HOME/.config/claude-sidecar/machines.json} mapped=
+  if [[ -f $config_file ]]; then
+    config=$(jq -ce --arg id "$MACHINE" --arg label "$MACHINE_LABEL" '.[$id] // .[$label] // {}' "$config_file") || die "invalid machine configuration: $config_file"
+  fi
+  REMOTE_TRANSPORT=$(jq -r '.transport // "sh"' <<<"$config")
+  [[ $REMOTE_TRANSPORT == sh || $REMOTE_TRANSPORT == node ]] || die "unknown remote transport: $REMOTE_TRANSPORT"
+  [[ -n ${KEEP_PWD:-} ]] || mapped=$(jq -r --arg cwd "$PWD" '[.paths // {} | to_entries | map(.key |= rtrimstr("/")) | .[] | .key as $prefix | select($cwd == $prefix or ($cwd | startswith($prefix + "/")))] | sort_by(.key | length) | last | if . then .value + $cwd[(.key | length):] else empty end' <<<"$config")
+  AGENT_HOME=${SIDECAR_REMOTE_HOME:-$(jq -r --arg fallback "$SIDECAR_HOME" '.home // $fallback' <<<"$config")}
+  WORK_DIR=${REMOTE_CWD:-${mapped:-$PWD}}
+  # Persist the mapped checkout too: changing settings must not silently move an existing slot.
+  if [[ -n $mapped || $REMOTE_TRANSPORT == node ]]; then REMOTE_CWD=$WORK_DIR; fi
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    local info
+    info=$(remote_node 'const home=os.homedir().replace(/\\/g,"/");
+      if(!fs.existsSync(args[0]) || !fs.statSync(args[0]).isDirectory()) process.exit(12);
+      console.log(JSON.stringify({home,agentHome:args[1] || home+"/.cache/claude-sidecar/plugin/sidecar"}));' "$WORK_DIR" "${SIDECAR_REMOTE_HOME:-$(jq -r '.home // ""' <<<"$config")}" </dev/null) || die "cannot access checkout $WORK_DIR on $MACHINE_LABEL; check SSH, Node and the machine path mapping"
+    AGENT_HOME=$(jq -r '.agentHome' <<<"$info")
+    REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
+    # Deploy only the two runtime files, not a checkout or any credentials. Do not rewrite unchanged files.
+    local runtime_file
+    for runtime_file in sidecar.ts reviewer.md; do
+      remote_node 'const dest=args[0],data=fs.readFileSync(0);fs.mkdirSync(path.dirname(dest),{recursive:true});
+        if(!fs.existsSync(dest)||!fs.readFileSync(dest).equals(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
+    done
+    return
+  fi
   # One round trip checks the connection, finds the remote home (it may differ from ours), and confirms what pi needs.
   local home status=0
   home=$(remote 'printf "%s" "$HOME"
@@ -149,18 +187,26 @@ publish_file() {
   local path=$1 name=${2:-} target
   name=${name:-${1##*/}}
   target="$REMOTE_STATE/requests/$name"
-  remote 'mkdir -p "${1%/*}" && cat >"$1.tmp" && mv -f "$1.tmp" "$1"' "$target" <"$path" || die "could not copy $path to $MACHINE_LABEL"
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'fs.mkdirSync(path.dirname(args[0]),{recursive:true});const tmp=args[0]+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,fs.readFileSync(0));fs.renameSync(tmp,args[0]);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}' "$target" <"$path" || die "could not copy $path to $MACHINE_LABEL"
+  else
+    remote 'mkdir -p "${1%/*}" && cat >"$1.tmp" && mv -f "$1.tmp" "$1"' "$target" <"$path" || die "could not copy $path to $MACHINE_LABEL"
+  fi
   echo "$target"
 }
 
 # Reports are written by the sidecar under its own home, which is on the machine for a remote slot.
 report_exists() {
-  if [[ -n $MACHINE ]]; then remote 'test -f "$1"' "$1" </dev/null; else [[ -f $1 ]]; fi
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'process.exit(fs.existsSync(args[0])&&fs.statSync(args[0]).isFile()?0:1);' "$1" </dev/null
+  elif [[ -n $MACHINE ]]; then remote 'test -f "$1"' "$1" </dev/null; else [[ -f $1 ]]; fi
 }
 
 # First line of a non-empty marker file, or nothing.
 marker_line() {
-  if [[ -n $MACHINE ]]; then
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'if(fs.existsSync(args[0])){const text=fs.readFileSync(args[0],"utf8");if(text.length)console.log(text.split(/\r?\n/)[0]);}' "$1" </dev/null
+  elif [[ -n $MACHINE ]]; then
     remote 'if [ -s "$1" ]; then head -n 1 "$1"; fi' "$1" </dev/null
   elif [[ -s $1 ]]; then
     head -n 1 "$1"
@@ -168,7 +214,9 @@ marker_line() {
 }
 
 fetch_file() {
-  if [[ -n $MACHINE ]]; then remote 'cat -- "$1"' "$1" </dev/null; else cat -- "$1"; fi
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'process.stdout.write(fs.readFileSync(args[0]));' "$1" </dev/null
+  elif [[ -n $MACHINE ]]; then remote 'cat -- "$1"' "$1" </dev/null; else cat -- "$1"; fi
 }
 
 # Sidecars belong to the Claude pane; numbered slots keep independent context.
@@ -228,7 +276,19 @@ agent_session_file() {
 # True when the pi in the sidecar's pane runs the session this sidecar was started with. herdr relaunches a bare `pi`
 # (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
 agent_runs_sidecar_session() {
-  [[ $(agent_session_file "$1") == *"_$(pi_session_id).jsonl" ]]
+  local session attempt
+  # Herdr can report a newly launched pi before its session path is published (notably on Windows).
+  # An empty path is not evidence that a different pi owns the pane.
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    session=$(agent_session_file "$1")
+    if [[ -n $session ]]; then
+      [[ $session == *"_$(pi_session_id).jsonl" ]]
+      return
+    fi
+    sleep 0.5
+  done
+  # Still unpublished after the wait: treat as not ours so a bare relaunched pi gets restarted.
+  return 1
 }
 
 # Sidecars fill the active tab, initially Claude's, to four panes, counting
@@ -728,13 +788,16 @@ while [[ ${1:-} == --* ]]; do
       [[ -n ${2:-} ]] || die "--machine requires a saved herdr machine label or ID"
       MACHINE_ARG=$2 ;;
     --remote-cwd)
-      [[ ${2:-} == /* ]] || die "--remote-cwd requires an absolute path on the machine"
+      [[ ${2:-} == /* || ${2:-} =~ ^[A-Za-z]:[/\\] ]] || die "--remote-cwd requires an absolute path on the machine"
       REMOTE_CWD=${2%/} ;;
     *) break ;;
   esac
   shift 2
 done
 mkdir -p "$REQUEST_DIR" "$REPORT_DIR"
+# Parse dispatch and exit together before starting long-running work. Otherwise Bash reads past this command
+# after it returns; an in-place plugin update can move that offset into unrelated text in the new file.
+{
 case "${1:-}" in
   session-start) shift; cmd_session_start "$@" ;;
   start) shift; cmd_start "$@" ;;
@@ -747,3 +810,5 @@ case "${1:-}" in
   answer) shift; cmd_answer "$@" ;;
   *) sed -n '3,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 64 ;;
 esac
+exit $?
+}

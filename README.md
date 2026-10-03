@@ -89,15 +89,36 @@ export SIDECAR_THINKING=high
 - **Slots stay put.** A slot remembers its machine in `~/.cache/claude-sidecar/<agent>.machine`, so later `note`, `ask`, `answer`, `status` and `restart` route there without the flag. Starting a slot on another machine, or moving a local slot to one, is an error: use another slot. `SIDECAR_MACHINE=laptop` makes new slots start on that machine by default; a slot bound earlier keeps its own.
 - **Panes.** Every Herdr call for the slot goes through `herdr --machine`. The panes open in the machine's workspace that already has a pane in the working directory (Herdr picks one when none does), in a "Sidecars" tab that fills 2×2 like the local one. Claude's local tab is never used. Agent names carry a short tag of the local machine, such as `sc-3fa9-pane-1`, so they cannot collide with sidecars that a Claude on that machine starts.
 - **Files.** The sidecar reads requests where it runs. The launcher copies each request, diff and plan file over `ssh <target>` into `~/.cache/claude-sidecar/requests` on the machine, reads the report and the `needs_answer` marker back from the machine's `~/.cache/claude-sidecar/reports`, and polls it like a local one. Paths are resolved on the machine, so its home directory may differ. SSH uses the target saved in `herdr machine list`, with `BatchMode=yes` and keepalives, so it never prompts or hangs.
-- **Code.** The sidecar works in the machine's own checkout, by default at the same absolute path as the current directory; `--remote-cwd DIR` names the directory there instead. Requests tell it that path, and for `diff` and `plan` Claude's commit and that its uncommitted changes exist only in the copied files. The checkout may need `git fetch` to reach that commit. The launcher never runs checkout or reset there, and tells the sidecar not to. **Edits and commits a remote sidecar makes land in the machine's checkout, not in the local one.**
+- **Code.** The sidecar works in the machine's own checkout, by default at the same absolute path as the current directory; machine path mappings or `--remote-cwd DIR` name the directory there instead. Requests tell it that path, and for `diff` and `plan` Claude's commit and that its uncommitted changes exist only in the copied files. The checkout may need `git fetch` to reach that commit. The launcher never runs checkout or reset there, and tells the sidecar not to. **Edits and commits a remote sidecar makes land in the machine's checkout, not in the local one.**
 
 Requirements:
 
 - Herdr 0.9.1 or later on both machines. Add the machine with `herdr machine add <ssh-target>` and check `herdr machine list`. The SessionStart hook names the enabled machines to Claude when that command works, and says nothing about machines otherwise.
-- On the machine: pi, authenticated with the model provider (for example a Codex login); this plugin at the same path (`SIDECAR_REMOTE_HOME` names the plugin's `sidecar/` directory elsewhere); and Git and jq for the repository work. The launcher itself runs only here.
+- On the machine: pi, authenticated with the model provider (for example a Codex login), and Git for repository work. The default `sh` transport also needs a POSIX SSH shell and this plugin at the same path (`SIDECAR_REMOTE_HOME` names the plugin's `sidecar/` directory elsewhere). The Node transport deploys the runtime files automatically. The launcher itself runs only here.
 - SSH keys loaded in your agent: a passphrase-protected key is not prompted for.
 
 Clear errors name an unknown or disabled machine, a missing plugin or directory on the machine, and an unreachable SSH connection.
+
+### Windows and machine path mappings
+
+For a Windows machine whose OpenSSH shell is `cmd.exe`, use the Node transport. It uses the Node already required by pi, without changing OpenSSH's `DefaultShell` or launching pi over SSH: Herdr still owns the agent pane. Put per-machine settings in `~/.config/claude-sidecar/machines.json` (override the file with `SIDECAR_MACHINES_FILE`):
+
+```json
+{
+  "lappy": {
+    "transport": "node",
+    "paths": {
+      "/home/aim/git": "C:/git"
+    }
+  }
+}
+```
+
+Keys are saved machine labels or IDs; IDs take precedence. The longest matching directory prefix maps the local checkout, including subdirectories. `--remote-cwd` overrides the mapping and accepts Windows drive paths; the slot remembers the chosen directory. A matching checkout must already exist on the machine. This does not clone, reset or synchronize repositories.
+
+The Node transport copies only `sidecar.ts` and `reviewer.md` into the remote home's `.cache/claude-sidecar/plugin/sidecar`, updating changed files on each invocation. No plugin checkout or remote launcher dependencies are needed. Optional `home` names a different runtime deployment directory; `SIDECAR_REMOTE_HOME` overrides it. Already-running agents retain their loaded extension. Requests, answers and reports also transfer through Node, so the SSH default shell needs no POSIX commands. Pi's own Bash tool still needs its usual Windows shell setup (such as Git Bash).
+
+From a mapped checkout, start a new slot with `./scripts/sidecar --slot 2 --machine lappy ask "Run the tests there."`; follow-ups need only `--slot 2`. This transport has been smoke-tested with pi in a Windows Herdr pane, including tool execution, report delivery and answering a pending question.
 
 ## Safety
 

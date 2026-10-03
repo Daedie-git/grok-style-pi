@@ -86,6 +86,12 @@ elif args[:2] == ['agent', 'get']:
     time.sleep(float(os.environ.get('HERDR_GET_DELAY', '0')))
     if state is None:
         sys.exit(1)
+    if os.environ.get('FAKE_DELAYED_SESSION'):
+        counter = state_dir / (name + '.session-probes')
+        probes = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(probes + 1))
+        if probes < 2:
+            state = dict(state, agent_session={'value': ''})
     print(json.dumps({'result': {'agent': state}}))
 elif args[:2] == ['agent', 'start']:
     target = find(args[args.index('--pane') + 1])
@@ -185,6 +191,29 @@ class LauncherTests(unittest.TestCase):
     def calls(self):
         path = self.home / 'calls.jsonl'
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_editing_launcher_during_request_preserves_success_exit(self):
+        original = self.launcher.read_bytes()
+        process = subprocess.Popen([str(self.launcher), 'ask', 'Task'], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=dict(self.env, HERDR_PROMPT_DELAY='1'))
+        try:
+            deadline = time.monotonic() + 5
+            while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+                self.assertIsNone(process.poll(), 'launcher exited before submitting request')
+                self.assertLess(time.monotonic(), deadline, 'request was not submitted')
+                time.sleep(0.01)
+            # Simulate an in-place update while Bash executes the already-parsed dispatch.
+            # The new file is valid Bash, but its old EOF offset now falls inside a comment,
+            # on "inst". Re-reading from that offset must not execute a bogus trailing command.
+            self.launcher.write_bytes(b'#' + b' ' * (len(original) - 1) + b'inst\n' + original)
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertIn('ship', stdout, 'the actual work and report should complete')
+            self.assertEqual(process.returncode, 0, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
 
     def test_start_default_and_idempotency(self):
         self.run_cli('start')
@@ -525,6 +554,69 @@ class LauncherTests(unittest.TestCase):
         path = self.home / 'remote-state' / machine
         path.mkdir(parents=True, exist_ok=True)
         (path / 'panes.json').write_text(json.dumps(panes))
+
+    def test_node_transport_deploys_and_maps_checkout(self):
+        self.add_machines()
+        checkout = self.home / "remote checkout 'quoted'"
+        checkout.mkdir()
+        config = self.home / 'sidecar-machines.json'
+        config.write_text(json.dumps({'laptop': {'transport': 'node', 'paths': {str(self.work): str(checkout)}}}))
+        env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+        result = self.remote_run('--machine', 'laptop', 'ask', 'Task', env=env)
+        self.assertIn('ship', result.stdout)
+        runtime = self.remote_home() / '.cache/claude-sidecar/plugin/sidecar'
+        self.assertTrue((runtime / 'sidecar.ts').is_file())
+        self.assertTrue((runtime / 'reviewer.md').is_file())
+        started = self.all_starts()[0]
+        self.assertIn(str(runtime / 'sidecar.ts'), started)
+        tab = next(c for c in self.remote_calls() if c[:2] == ['tab', 'create'])
+        self.assertEqual(tab[tab.index('--cwd') + 1], str(checkout))
+        ssh_calls = [json.loads(line) for line in (self.home / 'ssh-calls.jsonl').read_text().splitlines()]
+        self.assertTrue(all(c['command'].startswith('node -e ') for c in ssh_calls))
+        # The slot retains its original directory even after the configured mapping changes.
+        config.write_text(json.dumps({'laptop': {'transport': 'node', 'paths': {str(self.work): '/missing'}}}))
+        self.assertIn('ship', self.remote_run('ask', 'Follow up', env=env).stdout)
+        self.assertEqual(len(self.all_starts()), 1)
+
+    def test_mapping_added_later_does_not_move_existing_slot(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'ask', 'Task')
+        checkout = self.home / 'other'
+        checkout.mkdir()
+        config = self.home / 'sidecar-machines.json'
+        config.write_text(json.dumps({'laptop': {'paths': {str(self.work) + '/': str(checkout)}}}))
+        env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+        self.remote_run('ask', 'Follow up', env=env)
+        self.assertNotIn(str(checkout), json.dumps(self.remote_calls()))
+
+    def test_concurrent_node_deploys_both_succeed(self):
+        self.add_machines()
+        config = self.home / 'sidecar-machines.json'
+        config.write_text(json.dumps({'laptop': {'transport': 'node'}}))
+        env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+        procs = [subprocess.Popen([str(self.launcher), '--slot', str(n), '--machine', 'laptop', 'start'],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=self.work)
+                 for n in (1, 2)]
+        for p in procs:
+            _, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, err)
+
+    def test_delayed_session_identity_does_not_spawn_duplicate(self):
+        self.add_machines()
+        result = self.remote_run('--machine', 'laptop', 'ask', 'Task',
+                                 env=dict(self.remote_env, FAKE_DELAYED_SESSION='1'))
+        self.assertIn('ship', result.stdout)
+        self.assertEqual(len(self.all_starts()), 1)
+        self.assertFalse(any(c[:2] == ['agent', 'rename'] for c in self.remote_calls()))
+
+    def test_node_transport_rejects_missing_checkout(self):
+        self.add_machines()
+        config = self.home / 'sidecar-machines.json'
+        config.write_text(json.dumps({'m1': {'transport': 'node'}}))
+        result = self.remote_run('--machine', 'laptop', '--remote-cwd', 'C:/missing', 'ask', 'Task',
+                                 env=dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config)), check=False)
+        self.assertIn('cannot access checkout C:/missing', result.stderr)
+        self.assertEqual(self.all_starts(), [])
 
     def test_hook_names_saved_machines(self):
         env = dict(self.env, CLAUDE_ENV_FILE=str(self.home / 'claude.env'))

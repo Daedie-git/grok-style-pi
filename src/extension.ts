@@ -25,7 +25,10 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	pi.on("before_agent_start", (event) => {
 		const options = event.systemPromptOptions as { sections?: Record<string, string> } | undefined;
 		if (options?.sections) {
-			options.sections.workflow = WORKFLOW;
+			const existing = options.sections.workflow;
+			if (!existing?.includes(WORKFLOW)) {
+				options.sections.workflow = existing ? `${existing}\n\n${WORKFLOW}` : WORKFLOW;
+			}
 			installCommunication(options.sections, features.communication);
 			return;
 		}

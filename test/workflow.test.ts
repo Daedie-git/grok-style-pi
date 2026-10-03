@@ -36,7 +36,28 @@ test("workflow loads independently of chrome and communication, preserving other
 		assert.equal(sections.custom, "keep user instructions");
 		assert.equal(Boolean(sections.communication), communication);
 		handler(event, {});
-		assert.equal(sections.workflow, WORKFLOW, "repeated runs replace rather than duplicate guidance");
+		assert.equal(sections.workflow, WORKFLOW, "repeated runs do not duplicate guidance");
+	}
+});
+
+test("existing workflow content survives composition and repeated application", () => {
+	for (const communication of [false, true]) {
+		for (const existing of ["", "Other extension's workflow.", `${WORKFLOW}\n\nLater extension's workflow.`]) {
+			const handler = promptHandler(communication);
+			const sections = { workflow: existing, custom: "keep unrelated instructions" };
+			const event = { systemPrompt: "original", systemPromptOptions: { sections } };
+			const expected = existing.includes(WORKFLOW) ? existing : existing ? `${existing}\n\n${WORKFLOW}` : WORKFLOW;
+			handler(event, {});
+			assert.equal(sections.workflow, expected);
+			handler(event, {});
+			assert.equal(sections.workflow, expected);
+			sections.workflow += "\n\nNew instructions after first application.";
+			const updated = sections.workflow;
+			handler(event, {});
+			assert.equal(sections.workflow, updated);
+			assert.equal(sections.workflow.split(WORKFLOW).length - 1, 1);
+			assert.equal(sections.custom, "keep unrelated instructions");
+		}
 	}
 });
 
@@ -75,10 +96,16 @@ test("normal local package discovery loads workflow outside the checkout without
 				model: getModel("anthropic", "claude-sonnet-4-5"),
 			});
 			try {
-				const sections: Record<string, string> = { custom: "preserved" };
-				await session.extensionRunner.emitBeforeAgentStart("task", undefined, "original", { sections });
-				assert.equal(sections.workflow, WORKFLOW);
-				assert.equal(sections.custom, "preserved");
+				for (const existing of [undefined, "Workflow supplied before package hooks."]) {
+					const sections: Record<string, string> = { custom: "preserved" };
+					if (existing !== undefined) sections.workflow = existing;
+					const expected = existing ? `${existing}\n\n${WORKFLOW}` : WORKFLOW;
+					for (let application = 0; application < 2; application++) {
+						await session.extensionRunner.emitBeforeAgentStart("task", undefined, "original", { sections });
+						assert.equal(sections.workflow, expected);
+						assert.equal(sections.custom, "preserved");
+					}
+				}
 				session.agent.streamFunction = (model) => {
 					const stream = createAssistantMessageEventStream();
 					const message: AssistantMessage = {

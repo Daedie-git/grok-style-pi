@@ -10,29 +10,7 @@ import { join } from "node:path";
 const stateDir = join(homedir(), ".cache", "claude-sidecar");
 const reportDir = join(stateDir, "reports");
 
-// The sidecar may inspect, build, test, edit, push and merge anywhere, including Claude's
-// checkout. A guardrail, not a sandbox.
-const alwaysBlocked: [RegExp, string][] = [
-  [/\bsudo\b/, "sudo"],
-  // Work for a request happens in the sidecar's own turn, where Claude can track it and this guard applies.
-  [/(^|[;&|(`]|\$\()\s*(exec\s+|nohup\s+|setsid\s+(-\S+\s+)*|timeout\s+\S+\s+)*(pi|codex|claude)(\s|$)/m, "spawning agent processes"],
-  [/(^|[;&|(`]|\$\()\s*(setsid|nohup|disown)\b/m, "detaching processes"],
-];
-
-function checkBash(command: string): string | undefined {
-  for (const [pattern, what] of alwaysBlocked) if (pattern.test(command)) return what;
-  return undefined;
-}
-
-const guidance = "Do request work yourself, in this turn; background tasks that end within the turn are fine.";
-
 export default function (pi: ExtensionAPI) {
-  pi.on("tool_call", async (event) => {
-    let reason: string | undefined;
-    if (event.toolName === "bash") reason = checkBash(String(event.input.command ?? ""));
-    return reason ? { block: true, reason: `Sidecar guard blocked ${reason}. ${guidance}` } : undefined;
-  });
-
   pi.registerTool({
     name: "submit_review",
     label: "Submit review to Claude",

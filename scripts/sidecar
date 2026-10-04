@@ -434,7 +434,6 @@ start_unlocked() {
     if err=$(hd agent start "$hname" --kind pi --pane "$pane" --timeout 60000 -- \
       --session-id "$session" -n claude-sidecar \
       --model "$MODEL" --thinking "$THINKING" \
-      --tools read,bash,edit,write,grep,find,ls,submit_review \
       -e "$AGENT_HOME/sidecar.ts" \
       --append-system-prompt "$AGENT_HOME/reviewer.md" 2>&1 >/dev/null); then
       echo "$hname started in $pane (pi session $session)"

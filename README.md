@@ -122,4 +122,4 @@ From a mapped checkout, start a new slot with `./scripts/sidecar --slot 2 --mach
 
 ## Safety
 
-The reviewer inspects by default, but can edit and commit when asked. It may push and write to GitLab/GitHub when asked. Its Bash guard blocks sudo, spawning agent processes, and detaching processes. This is a best-effort guard, not a security boundary: shell wrappers, alternate tools, and other command forms can bypass it. The agent has access to your filesystem and its own model credentials. Claude remains responsible for verifying findings.
+The reviewer inspects by default, but can edit and commit when asked. It may push and write to GitLab/GitHub when asked. It runs with all of pi's tools and no command guard. The agent has access to your filesystem and its own model credentials. Claude remains responsible for verifying findings.

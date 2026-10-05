@@ -26,6 +26,7 @@ export type FooterInput = {
 	provider?: string | null;
 	subscription?: string;
 	account?: string;
+	fastMode?: boolean;
 	grokPercent?: number | null;
 	grokWeekly?: string;
 };
@@ -134,6 +135,9 @@ export function renderFooter(input: FooterInput, options: { width: number; paint
 		{ text: `${input.model.trim() || "unknown"} ${input.thinkingLevel ?? "?"}` },
 	];
 	const usage = usageItems(input);
+	if (input.fastMode !== undefined && (input.provider === "openai" || input.provider === "openai-codex")) {
+		usage.unshift({ text: input.fastMode ? "Fast: on" : "Fast: off", tone: input.fastMode ? "accent" : "muted" });
+	}
 	const available = width - itemsWidth(usage) - SEPARATOR_WIDTH;
 	let items: FooterItem[];
 	if (available <= 0) {

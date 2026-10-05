@@ -122,7 +122,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		warningUi = ctx.ui;
 
 		if (features.footer && typeof ctx.ui.setFooter === "function") {
-			ctx.ui.setFooter((tui: { mode?: string; requestRender?: (force?: boolean) => void; hasActiveSelection?: () => boolean }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void }) => {
+			ctx.ui.setFooter((tui: { mode?: string; requestRender?: (force?: boolean) => void; hasActiveSelection?: () => boolean }, theme: SessionUi["theme"], footerData?: { getGitBranch?: () => string | null; onBranchChange?: (cb: () => void) => () => void; getExtensionStatuses?: () => ReadonlyMap<string, string> }) => {
 				hasActiveSelection = tui.hasActiveSelection?.bind(tui);
 				requestRender = () => tui.requestRender?.();
 				trackWarningRepaint(tui);
@@ -151,6 +151,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 							thinkingLevel: pi.getThinkingLevel?.() ?? ctx.thinkingLevel,
 							branch: branch === undefined ? ctx.branch : branch,
 							provider: ctx.model?.provider,
+							fastMode: /^gpt-/i.test(ctx.model?.id ?? "") ? Boolean(footerData?.getExtensionStatuses?.().get("openai-fast")) : undefined,
 							subscription,
 							account,
 							grokPercent: grokContext,

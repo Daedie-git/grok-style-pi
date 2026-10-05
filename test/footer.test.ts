@@ -21,6 +21,26 @@ test("footer shows only the active model's context and usage", () => {
 	assert.equal(line({ cwd: "/tmp/project", model: "Claude", thinkingLevel: "high", provider: "anthropic", ...usage }), "/tmp/project │ Claude high │ Context 12% used");
 });
 
+test("footer reserves space for fast mode only on OpenAI providers", () => {
+	const input = { cwd: "/tmp/project", model: "GPT-6", provider: "openai-codex", percent: 12, fastMode: true };
+	assert.match(line(input), /│ Fast: on │ Context 12% used/);
+	assert.match(line({ ...input, provider: "openai" }), /Fast: on/);
+	assert.match(line({ ...input, fastMode: false }), /Fast: off/);
+	assert.doesNotMatch(line({ ...input, fastMode: undefined }), /Fast:/);
+	for (const enabled of [true, false]) {
+		const painted = renderFooter({ ...input, fastMode: enabled }, {
+			width: 200, paint: (token, text) => `<${token}>${text}</${token}>`,
+		})[0];
+		assert.ok(painted.includes(enabled ? "<accent>Fast: on</accent>" : "<muted>Fast: off</muted>"));
+	}
+	assert.doesNotMatch(line({ ...input, provider: "xai" }), /Fast:/);
+	assert.doesNotMatch(line({ ...input, provider: "anthropic" }), /Fast:/);
+	assert.match(line(input, 30), /Fast: on/);
+	for (const width of [0, 1, 10, 20, 30, 60, 100]) {
+		assert.ok(visibleWidth(line(input, width)) <= width, `width ${width}`);
+	}
+});
+
 test("footer marks unknown model, thinking level, and context", () => {
 	assert.equal(line({ cwd: "/tmp/x", model: " ", percent: undefined }), "/tmp/x │ unknown ? │ Context ?% used");
 	assert.equal(modelDisplayName({ id: "grok-4.5" }), "grok-4.5");

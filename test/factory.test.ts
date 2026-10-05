@@ -138,7 +138,7 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 		cwd: "/tmp/demo-project",
 		hasUI: true,
 		mode: "tui",
-		model: { name: "Grok 4.6", id: "grok-4.6" },
+		model: { name: "Grok 4.6", id: "grok-4.6", provider: "xai" },
 		getContextUsage: () => ({ percent: 18 }),
 		ui: {
 			theme: { fg: (token: string, text: string) => `<${token}>${text}` },
@@ -168,7 +168,11 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 	}
 
 	assert.ok(footerFactory);
-	const footer = footerFactory!({ requestRender() {} }, ctx.ui.theme, { onBranchChange: () => () => {} });
+	const statuses = new Map<string, string>();
+	const footer = footerFactory!({ requestRender() {} }, ctx.ui.theme, {
+		onBranchChange: () => () => {},
+		getExtensionStatuses: () => statuses,
+	});
 	const footerLine = footer.render(160).join("");
 	assert.ok(footerLine.includes("demo-project"));
 	assert.ok(footerLine.includes("Grok 4.6"));
@@ -179,6 +183,18 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 	assert.ok(footer.render(160).join("").includes("Grok 4.6 low"));
 	assert.ok(footer.render(12).every((line: string) => visibleWidth(line) <= 12));
 	assert.deepEqual(footer.render(0), [""]);
+
+	statuses.set("openai-fast", "Fast: priority requested");
+	assert.ok(!footer.render(160).join("").includes("Fast: on"));
+	ctx.model = { name: "GPT-6", id: "gpt-6", provider: "openai-codex" };
+	assert.ok(footer.render(160).join("").includes("Fast: on"));
+	ctx.model.provider = "openai";
+	assert.ok(footer.render(160).join("").includes("Fast: on"));
+	statuses.delete("openai-fast");
+	assert.ok(footer.render(160).join("").includes("<muted>Fast: off"));
+	statuses.set("openai-fast", "Fast: priority requested");
+	ctx.model.id = "o3";
+	assert.ok(!footer.render(160).join("").includes("Fast:"));
 
 	assert.ok(editorFactory);
 	const editor = editorFactory!({}, {}, {});

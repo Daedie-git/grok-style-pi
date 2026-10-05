@@ -771,7 +771,10 @@ Continue that original task to completion with this answer; do not restart finis
 # The text travels on stdin, so the remote command has a fixed size whatever the text length (cmd.exe caps it at 8191).
 # Before publishing it checks that the inbox's owner (a record the receiving pi writes) runs the targeted agent's pi
 # session file as herdr reports it, so a different pi that reuses the session id is never addressed; unverifiable fails.
-# Exit 0 delivered (queued as a steer, or started as a prompt); 1 refused, unverifiable target or failure;
+# The message names the verified owner instance (its token); a different instance rejects it ("owner changed"). Herdr
+# exposes no pid for an agent, so two pi processes on the very same session file cannot be told apart.
+# Exit 0 delivered, or queued behind the running turn but not yet seen in its conversation (the output says which);
+# 1 refused, unverifiable target or failure;
 # 4 not picked up, and the message was withdrawn (safe to resend); 6 outcome unknown: claimed but not confirmed by pi,
 # so it may still be delivered (do not resend blindly).
 cmd_steer() {
@@ -801,7 +804,7 @@ cmd_steer() {
       if(!live)out({status:"owner",reason:"the inbox receiver (pid "+rec.pid+") is gone; restart or /reload the sidecar pi"},7);
       if(!args[3])out({status:"owner",reason:"cannot tell which session file herdr runs for this sidecar, so the receiver cannot be verified; nothing was sent"},7);
       if(norm(rec.sessionFile)!==norm(args[3]))out({status:"owner",reason:"the inbox is owned by pi pid "+rec.pid+" running "+rec.sessionFile+", not by this sidecar ("+args[3]+"); nothing was sent"},7);
-      const msg=JSON.parse(fs.readFileSync(0,"utf8"));msg.sentAt=Date.now();
+      const msg=JSON.parse(fs.readFileSync(0,"utf8"));msg.sentAt=Date.now();msg.owner=rec.token;
       fs.mkdirSync(dir,{recursive:true});
       fs.writeFileSync(tmp,JSON.stringify(msg));fs.renameSync(tmp,file);
       for(let end=Date.now()+Number(args[1]);Date.now()<end&&!fs.existsSync(ack);)await sleep(100);
@@ -814,7 +817,7 @@ cmd_steer() {
         if(!fs.existsSync(ack))out({status:"unknown"},6);
       }
       const reply=fs.readFileSync(ack,"utf8");fs.unlinkSync(ack);console.log(reply);
-      const st=JSON.parse(reply).status;process.exit(st==="delivered"?0:st==="unconfirmed"?6:3);
+      const st=JSON.parse(reply).status;process.exit(st==="delivered"||st==="queued"?0:st==="unconfirmed"?6:3);
     })().catch(e=>{console.error(String(e));process.exit(5)});'
   # A claimed message may wait up to the receiver's 5s admission window for its acknowledgement.
   if [[ -n $MACHINE ]]; then
@@ -824,7 +827,11 @@ cmd_steer() {
   fi
   case $status in
     0)
-      if [[ $(jq -r '.delivery' <<<"$result") == steer ]]; then echo "steered: queued as a steering message for $hname (applied after its current tool call)"; else echo "delivered to idle $hname as a prompt"; fi ;;
+      case $(jq -r '.status + "/" + (.delivery // "")' <<<"$result") in
+        delivered/steer) echo "steered: delivered into $hname's conversation (applied after its current tool call)" ;;
+        queued/) echo "queued (not yet confirmed in conversation): $hname's pi accepted it behind its running turn; a later input handler could still consume it" ;;
+        *) echo "delivered to idle $hname as a prompt" ;;
+      esac ;;
     7) die "cannot steer $hname: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
     3) die "the sidecar refused the steering message: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
     4)

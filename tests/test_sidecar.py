@@ -971,7 +971,7 @@ class LauncherTests(unittest.TestCase):
         result = self.run_cli('--slot', '3', 'steer', 'Only fix the failing test.')
         self.assertLess(time.monotonic() - started, 2.5)
         self.assertIsNone(busy.poll())
-        self.assertIn('steered: queued as a steering message', result.stdout)
+        self.assertIn('steered: delivered into', result.stdout)
         self.assertEqual([m['text'] for m in seen], ['Only fix the failing test.'])
         self.assertEqual(seen[0]['from'], 'Claude Code')
         session = 'cc-pane-pane-1-3'
@@ -1059,6 +1059,25 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 6)
         self.assertIn('outcome unknown', result.stderr)
 
+    def test_steer_queued_behind_a_running_turn_exits_zero_and_says_it_is_unconfirmed(self):
+        self.run_cli('start')
+        self.steer_inbox(self.home, {'status': 'queued'})
+        result = self.run_cli('steer', 'Hello')
+        self.assertIn('queued (not yet confirmed in conversation)', result.stdout)
+
+    def test_steer_names_the_verified_owner_instance_in_the_message(self):
+        self.run_cli('start')
+        seen = self.steer_inbox(self.home)
+        self.run_cli('steer', 'Hello')
+        self.assertEqual(seen[0]['owner'], 't')
+
+    def test_steer_reports_an_owner_change_after_verification(self):
+        self.run_cli('start')
+        self.steer_inbox(self.home, {'status': 'rejected', 'reason': 'owner changed: the message was addressed to another receiver instance'})
+        result = self.run_cli('steer', 'Hello', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('owner changed', result.stderr)
+
     def test_steer_refuses_an_inbox_without_a_receiver(self):
         self.run_cli('start')
         result = self.run_cli('steer', 'Hello', check=False)
@@ -1119,7 +1138,7 @@ class LauncherTests(unittest.TestCase):
         self.remote_run('--machine', 'laptop', 'start')
         seen = self.steer_inbox(self.remote_home())
         result = self.remote_run('steer', 'Switch to the Windows build.')
-        self.assertIn('steered: queued as a steering message', result.stdout)
+        self.assertIn('steered: delivered into', result.stdout)
         self.assertEqual([m['text'] for m in seen], ['Switch to the Windows build.'])
         self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
         ssh = [json.loads(line) for line in (self.home / 'ssh-calls.jsonl').read_text().splitlines()]

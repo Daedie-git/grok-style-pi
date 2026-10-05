@@ -87,7 +87,7 @@ test("either runner shares the installed core, with one chrome lifecycle and opt
 			};
 			await loadSubagentExtension(h.pi, env, { current: factory("current"), herdr: factory("herdr") }, features.toolStyling, runtime.styleTool);
 			assert.deepEqual(runners, [env.HERDR_ENV ? "herdr" : "current"]);
-			assert.equal(h.handlers.get("session_start")!.length, 1);
+			assert.equal(h.handlers.get("session_start")!.length, 2); // chrome lifecycle + steering inbox
 			assert.equal(h.commands.filter(name => name === "grok-style").length, 1);
 			assert.equal(constructed, enabled ? 1 : 0);
 			assert.equal(executed, enabled ? 1 : 0);

@@ -929,10 +929,22 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('no report submitted', result.stderr)
         self.assertIn('ssh laptop-host true', result.stderr)
 
-    def steer_inbox(self, home, reply=None):
-        """Plays the pi extension: acknowledges every message dropped in the session inbox. Returns the thread and the messages."""
+    def write_owner(self, home, session='cc-pane-pane-1', pid=None, session_file=None):
+        inbox = home / '.local/state/grok-style-pi/steer' / session
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / '.owner').write_text(json.dumps({
+            'pid': os.getpid() if pid is None else pid, 'token': 't', 'startedAt': 'x',
+            'sessionFile': session_file or '/tmp/time_' + session + '.jsonl'}))
+
+    def steer_inbox(self, home, reply=None, session='cc-pane-pane-1', owner=True, session_file=None):
+        """Plays the pi extension: owns the inbox and acknowledges every message dropped in it. Returns the messages seen."""
         root = home / '.local/state/grok-style-pi/steer'
         seen, stop = [], threading.Event()
+        if owner:
+            (root / session).mkdir(parents=True, exist_ok=True)
+            (root / session / '.owner').write_text(json.dumps({
+                'pid': os.getpid(), 'token': 't', 'startedAt': 'x',
+                'sessionFile': session_file or '/tmp/time_' + session + '.jsonl'}))
 
         def watch():
             while not stop.is_set():
@@ -949,7 +961,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_steer_reaches_a_busy_slot_without_waiting_for_its_request(self):
         self.run_cli('--slot', '3', 'start')
-        seen = self.steer_inbox(self.home)
+        seen = self.steer_inbox(self.home, session='cc-pane-pane-1-3')
         busy = subprocess.Popen([str(self.launcher), '--slot', '3', 'ask', 'Long task'], text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=dict(self.env, HERDR_PROMPT_DELAY='3'))
@@ -959,12 +971,11 @@ class LauncherTests(unittest.TestCase):
         result = self.run_cli('--slot', '3', 'steer', 'Only fix the failing test.')
         self.assertLess(time.monotonic() - started, 2.5)
         self.assertIsNone(busy.poll())
-        self.assertIn('steered: delivered mid-turn', result.stdout)
+        self.assertIn('steered: queued as a steering message', result.stdout)
         self.assertEqual([m['text'] for m in seen], ['Only fix the failing test.'])
         self.assertEqual(seen[0]['from'], 'Claude Code')
-        session = next((self.home / '.local/state/grok-style-pi/steer').iterdir()).name
-        self.assertEqual(session, 'cc-pane-pane-1-3')
-        self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer' / session).iterdir()), [])
+        session = 'cc-pane-pane-1-3'
+        self.assertEqual([p.name for p in (self.home / '.local/state/grok-style-pi/steer' / session).iterdir()], ['.owner'])
         busy.communicate()
 
     def test_steer_keeps_text_verbatim_and_reports_an_idle_prompt(self):
@@ -977,13 +988,15 @@ class LauncherTests(unittest.TestCase):
 
     def test_steer_withdraws_an_unacknowledged_message_and_fails(self):
         self.run_cli('start')
+        self.write_owner(self.home)
         result = self.run_cli('steer', 'Hello', env=dict(self.env, SIDECAR_STEER_TIMEOUT_S='1'), check=False)
         self.assertEqual(result.returncode, 4)
         self.assertIn('withdrawn', result.stderr)
-        self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer').glob('*/*')), [])
+        self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer').glob('*/*.json')) + list((self.home / '.local/state/grok-style-pi/steer').glob('*/*.taken')), [])
 
     def test_steer_that_was_claimed_but_not_acknowledged_is_not_called_withdrawn(self):
         self.run_cli('start')
+        self.write_owner(self.home)
         root = self.home / '.local/state/grok-style-pi/steer'
         stop = threading.Event()
 
@@ -1003,6 +1016,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_steer_claimed_late_but_acknowledged_within_the_grace_succeeds(self):
         self.run_cli('start')
+        self.write_owner(self.home)
         root = self.home / '.local/state/grok-style-pi/steer'
 
         def slow_receiver():
@@ -1036,7 +1050,56 @@ class LauncherTests(unittest.TestCase):
         self.remote_run('steer', text)
         self.assertEqual(seen[0]['text'], text)
         ssh = [json.loads(line) for line in (self.home / 'ssh-calls.jsonl').read_text().splitlines()]
-        self.assertLess(max(len(c['command']) for c in ssh), 4000)
+        self.assertLess(max(len(c['command']) for c in ssh), 6000)
+
+    def test_steer_reports_an_unconfirmed_message_as_unknown(self):
+        self.run_cli('start')
+        self.steer_inbox(self.home, {'status': 'unconfirmed', 'reason': 'Pi did not report the message'})
+        result = self.run_cli('steer', 'Hello', check=False)
+        self.assertEqual(result.returncode, 6)
+        self.assertIn('outcome unknown', result.stderr)
+
+    def test_steer_refuses_an_inbox_without_a_receiver(self):
+        self.run_cli('start')
+        result = self.run_cli('steer', 'Hello', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no steering receiver owns this session inbox', result.stderr)
+        self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer').glob('*/*.json')), [])
+
+    def test_steer_refuses_an_inbox_owned_by_another_pi(self):
+        self.run_cli('start')
+        seen = self.steer_inbox(self.home, session_file='/tmp/time_cc-pane-pane-1-other.jsonl')
+        result = self.run_cli('steer', 'Hello', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('not by this sidecar', result.stderr)
+        self.assertEqual(seen, [])
+
+    def test_steer_refuses_a_dead_receiver(self):
+        self.run_cli('start')
+        self.write_owner(self.home, pid=999999)
+        result = self.run_cli('steer', 'Hello', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('is gone', result.stderr)
+
+    def test_steer_says_so_when_the_targets_session_file_is_unknown(self):
+        self.run_cli('start')
+        self.write_owner(self.home)
+        state = next(self.home.glob('agent.json'))
+        data = json.loads(state.read_text())
+        data['agent_session'] = {'value': ''}
+        state.write_text(json.dumps(data))
+        result = self.run_cli('steer', 'Hello', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('cannot tell which session file herdr runs', result.stderr)
+
+    def test_steer_accepts_windows_style_session_paths_from_herdr(self):
+        self.run_cli('start')
+        self.steer_inbox(self.home, session_file='C:\\Users\\AIM\\s\\x.jsonl')
+        state = next(self.home.glob('agent.json'))
+        data = json.loads(state.read_text())
+        data['agent_session'] = {'value': 'c:/users/aim/s/x.jsonl'}
+        state.write_text(json.dumps(data))
+        self.assertIn('steered', self.run_cli('steer', 'Hello').stdout)
 
     def test_steer_reports_a_refusal(self):
         self.run_cli('start')
@@ -1056,7 +1119,7 @@ class LauncherTests(unittest.TestCase):
         self.remote_run('--machine', 'laptop', 'start')
         seen = self.steer_inbox(self.remote_home())
         result = self.remote_run('steer', 'Switch to the Windows build.')
-        self.assertIn('steered: delivered mid-turn', result.stdout)
+        self.assertIn('steered: queued as a steering message', result.stdout)
         self.assertEqual([m['text'] for m in seen], ['Switch to the Windows build.'])
         self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
         ssh = [json.loads(line) for line in (self.home / 'ssh-calls.jsonl').read_text().splitlines()]

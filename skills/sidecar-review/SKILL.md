@@ -42,13 +42,13 @@ Notes return in seconds and cost little; the reviews they inform are sharper for
 
 ## Steer a busy sidecar
 
-`ask`, `diff` and `plan` hold their slot until the report arrives, and a `note` queues behind them. To redirect a sidecar that is mid-task, use `steer`: it reaches the running pi within a second, shows in its transcript as a steering message, and never waits for the in-flight request. The sidecar adjusts its current task; its report for that request still comes back as usual. Use it for a changed decision or a wrong turn, not for routine context (that is a `note`).
+`ask`, `diff` and `plan` hold their slot until the report arrives, and a `note` queues behind them. To redirect a sidecar that is mid-task, use `steer`: it reaches the running pi within a second (after verifying it is the sidecar's own pi), shows in its transcript as a steering message, and never waits for the in-flight request. The sidecar adjusts its current task; its report for that request still comes back as usual. Use it for a changed decision or a wrong turn, not for routine context (that is a `note`).
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 3 steer "Stop refactoring; the user wants only the failing test fixed."
 ```
 
-It exits 0 when delivered (a sidecar that was idle gets it as a normal prompt) and 1 when refused or failed. Exit 4 means it was not picked up and was withdrawn, so it is safe to resend: the sidecar's pi may predate the feature (needs grok-style-pi updated and `/reload`) or be compacting. Exit 6 means the sidecar claimed the message but never acknowledged it, so it may still arrive; check before resending.
+It exits 0 when delivered (a sidecar that was idle gets it as a normal prompt) and 1 when refused or failed. Exit 4 means the sidecar did not pick it up in time and it was withdrawn, so it is safe to resend. A sidecar whose pi predates the feature (needs grok-style-pi updated and `/reload`) or runs under another process fails with exit 1 before anything is sent. Exit 6 means pi never confirmed the message entering the conversation (for example during compaction), so it may still arrive; check before resending. A steer is applied after the sidecar's current tool call finishes, not mid-command.
 
 ## Plan review
 

@@ -769,22 +769,38 @@ Continue that original task to completion with this answer; do not restart finis
 # picks up within a fraction of a second and shows as a user message, mid-turn when it is working. It takes none of
 # the slot's locks, so a long ask never delays it. Runs on the machine for a remote slot (node is already required there).
 # The text travels on stdin, so the remote command has a fixed size whatever the text length (cmd.exe caps it at 8191).
-# Exit 0 delivered; 1 refused or failed; 4 not picked up, and the message was withdrawn (safe to resend);
-# 6 claimed by the session but never acknowledged, so it may still be delivered (do not resend blindly).
+# Before publishing it checks that the inbox's owner (a record the receiving pi writes) runs the targeted agent's pi
+# session file as herdr reports it, so a different pi that reuses the session id is never addressed; unverifiable fails.
+# Exit 0 delivered (queued as a steer, or started as a prompt); 1 refused, unverifiable target or failure;
+# 4 not picked up, and the message was withdrawn (safe to resend); 6 outcome unknown: claimed but not confirmed by pi,
+# so it may still be delivered (do not resend blindly).
 cmd_steer() {
   require_herdr
   [[ $# -ge 1 ]] || die "usage: sidecar steer TEXT"
-  local hname session script payload result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000)) grace_ms=$((${SIDECAR_STEER_CLAIM_GRACE_S:-7} * 1000))
+  local hname session session_file attempt script payload result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000)) grace_ms=$((${SIDECAR_STEER_CLAIM_GRACE_S:-7} * 1000))
   hname=$(herdr_agent)
   [[ $(agent_status "$hname") != missing ]] || die "no running sidecar in slot $SLOT${MACHINE:+ on $MACHINE_LABEL} to steer; use ask to start one"
   session=$(pi_session_id)
+  # Herdr can publish a new pi's session file late (notably on Windows); the owner check needs it.
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    session_file=$(agent_session_file "$hname")
+    [[ -z $session_file ]] || break
+    sleep 0.5
+  done
   payload=$(jq -cn --arg text "$*" --arg from "Claude Code" '{text: $text, from: $from}')
   script='const sleep=ms=>new Promise(r=>setTimeout(r,ms));
     const root=process.env.GROK_STEER_DIR||path.join(process.env.XDG_STATE_HOME||path.join(os.homedir(),".local","state"),"grok-style-pi","steer");
     const dir=path.join(root,args[0]),id=Date.now().toString(36)+"-"+process.pid+"-"+Math.random().toString(36).slice(2,8);
     const file=path.join(dir,id+".json"),ack=path.join(dir,id+".ack"),tmp=path.join(dir,id+".tmp");
     const out=(o,c)=>{console.log(JSON.stringify(o));process.exit(c)};
+    const norm=p=>{p=String(p||"").replace(/\\/g,"/");return /^[A-Za-z]:/.test(p)?p.toLowerCase():p};
     (async()=>{
+      let rec=null;try{rec=JSON.parse(fs.readFileSync(path.join(dir,".owner"),"utf8"))}catch(e){}
+      if(!rec)out({status:"owner",reason:"no steering receiver owns this session inbox: the sidecar pi predates steering (update grok-style-pi, then /reload in its pane) or is not running"},7);
+      let live=true;try{process.kill(rec.pid,0)}catch(e){live=e.code==="EPERM"}
+      if(!live)out({status:"owner",reason:"the inbox receiver (pid "+rec.pid+") is gone; restart or /reload the sidecar pi"},7);
+      if(!args[3])out({status:"owner",reason:"cannot tell which session file herdr runs for this sidecar, so the receiver cannot be verified; nothing was sent"},7);
+      if(norm(rec.sessionFile)!==norm(args[3]))out({status:"owner",reason:"the inbox is owned by pi pid "+rec.pid+" running "+rec.sessionFile+", not by this sidecar ("+args[3]+"); nothing was sent"},7);
       const msg=JSON.parse(fs.readFileSync(0,"utf8"));msg.sentAt=Date.now();
       fs.mkdirSync(dir,{recursive:true});
       fs.writeFileSync(tmp,JSON.stringify(msg));fs.renameSync(tmp,file);
@@ -798,23 +814,24 @@ cmd_steer() {
         if(!fs.existsSync(ack))out({status:"unknown"},6);
       }
       const reply=fs.readFileSync(ack,"utf8");fs.unlinkSync(ack);console.log(reply);
-      process.exit(JSON.parse(reply).status==="delivered"?0:3);
+      const st=JSON.parse(reply).status;process.exit(st==="delivered"?0:st==="unconfirmed"?6:3);
     })().catch(e=>{console.error(String(e));process.exit(5)});'
   # A claimed message may wait up to the receiver's 5s admission window for its acknowledgement.
   if [[ -n $MACHINE ]]; then
-    result=$(remote_node "$script" "$session" "$timeout_ms" "$grace_ms" <<<"$payload") || status=$?
+    result=$(remote_node "$script" "$session" "$timeout_ms" "$grace_ms" "$session_file" <<<"$payload") || status=$?
   else
-    result=$(node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$(jq -cn --args '$ARGS.positional' "$session" "$timeout_ms" "$grace_ms")" "$script")" <<<"$payload") || status=$?
+    result=$(node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$(jq -cn --args '$ARGS.positional' "$session" "$timeout_ms" "$grace_ms" "$session_file")" "$script")" <<<"$payload") || status=$?
   fi
   case $status in
     0)
-      if [[ $(jq -r '.delivery' <<<"$result") == steer ]]; then echo "steered: delivered mid-turn to $hname"; else echo "delivered to idle $hname as a prompt"; fi ;;
+      if [[ $(jq -r '.delivery' <<<"$result") == steer ]]; then echo "steered: queued as a steering message for $hname (applied after its current tool call)"; else echo "delivered to idle $hname as a prompt"; fi ;;
+    7) die "cannot steer $hname: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
     3) die "the sidecar refused the steering message: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
     4)
       echo "sidecar: $hname did not pick the message up within $((timeout_ms / 1000))s and it was withdrawn; it is safe to resend. Its pi may predate steering (update grok-style-pi there and /reload in its pane), or be compacting." >&2
       exit 4 ;;
     6)
-      echo "sidecar: outcome unknown: $hname claimed the message but did not acknowledge it, so it may still be delivered. Check the pane before resending." >&2
+      echo "sidecar: outcome unknown: pi did not confirm that the message entered $hname's conversation (it may be compacting, preparing a prompt, or an input handler took it), so it may still be delivered. Check the pane before resending." >&2
       exit 6 ;;
     255) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH (BatchMode: load its key in ssh-agent). Test: ssh $MACHINE_TARGET true" ;;
     *) die "could not deliver the steering message (exit $status; is node on PATH${MACHINE:+ on $MACHINE_LABEL}?)" ;;

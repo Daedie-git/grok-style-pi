@@ -978,9 +978,65 @@ class LauncherTests(unittest.TestCase):
     def test_steer_withdraws_an_unacknowledged_message_and_fails(self):
         self.run_cli('start')
         result = self.run_cli('steer', 'Hello', env=dict(self.env, SIDECAR_STEER_TIMEOUT_S='1'), check=False)
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 4)
         self.assertIn('withdrawn', result.stderr)
         self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer').glob('*/*')), [])
+
+    def test_steer_that_was_claimed_but_not_acknowledged_is_not_called_withdrawn(self):
+        self.run_cli('start')
+        root = self.home / '.local/state/grok-style-pi/steer'
+        stop = threading.Event()
+
+        def claim():  # the receiver renames the message, then stalls
+            while not stop.is_set():
+                for path in list(root.glob('*/*.json')) if root.exists() else []:
+                    path.rename(path.with_suffix('.taken'))
+                time.sleep(0.02)
+        thread = threading.Thread(target=claim)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(stop.set)
+        result = self.run_cli('steer', 'Hello', env=dict(self.env, SIDECAR_STEER_TIMEOUT_S='1', SIDECAR_STEER_CLAIM_GRACE_S='1'), check=False)
+        self.assertEqual(result.returncode, 6)
+        self.assertIn('outcome unknown', result.stderr)
+        self.assertNotIn('withdrawn', result.stderr)
+
+    def test_steer_claimed_late_but_acknowledged_within_the_grace_succeeds(self):
+        self.run_cli('start')
+        root = self.home / '.local/state/grok-style-pi/steer'
+
+        def slow_receiver():
+            for _ in range(500):
+                for path in list(root.glob('*/*.json')) if root.exists() else []:
+                    taken = path.with_suffix('.taken')
+                    path.rename(taken)
+                    time.sleep(1.5)  # past the sender's 1s timeout
+                    taken.unlink()
+                    path.with_suffix('.ack').write_text(json.dumps({'status': 'delivered', 'delivery': 'prompt'}))
+                    return
+                time.sleep(0.02)
+        thread = threading.Thread(target=slow_receiver)
+        thread.start()
+        self.addCleanup(thread.join)
+        result = self.run_cli('steer', 'Hello', env=dict(self.env, SIDECAR_STEER_TIMEOUT_S='1', SIDECAR_STEER_CLAIM_GRACE_S='3'))
+        self.assertIn('delivered to idle', result.stdout)
+
+    def test_steer_delivers_json_looking_text_verbatim(self):
+        # The text is data: a JSON-looking message is delivered verbatim, never parsed by the launcher.
+        self.run_cli('start')
+        seen = self.steer_inbox(self.home)
+        self.run_cli('steer', 'null')
+        self.assertEqual(seen[0]['text'], 'null')
+
+    def test_remote_steer_command_has_a_fixed_size_for_any_text(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'start')
+        seen = self.steer_inbox(self.remote_home())
+        text = 'x\u00e9 ' * 20000
+        self.remote_run('steer', text)
+        self.assertEqual(seen[0]['text'], text)
+        ssh = [json.loads(line) for line in (self.home / 'ssh-calls.jsonl').read_text().splitlines()]
+        self.assertLess(max(len(c['command']) for c in ssh), 4000)
 
     def test_steer_reports_a_refusal(self):
         self.run_cli('start')

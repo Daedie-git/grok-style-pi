@@ -48,7 +48,7 @@ Notes return in seconds and cost little; the reviews they inform are sharper for
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 3 steer "Stop refactoring; the user wants only the failing test fixed."
 ```
 
-It exits 0 when delivered (a sidecar that was idle gets it as a normal prompt) and non-zero with a reason otherwise. A sidecar whose pi predates the feature does not pick it up: the command says so and withdraws the message.
+It exits 0 when delivered (a sidecar that was idle gets it as a normal prompt) and 1 when refused or failed. Exit 4 means it was not picked up and was withdrawn, so it is safe to resend: the sidecar's pi may predate the feature (needs grok-style-pi updated and `/reload`) or be compacting. Exit 6 means the sidecar claimed the message but never acknowledged it, so it may still arrive; check before resending.
 
 ## Plan review
 

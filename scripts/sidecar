@@ -768,39 +768,54 @@ Continue that original task to completion with this answer; do not restart finis
 # Delivers TEXT through the session's steering inbox (grok-style-pi, src/steering/inbox.ts): a file the running pi
 # picks up within a fraction of a second and shows as a user message, mid-turn when it is working. It takes none of
 # the slot's locks, so a long ask never delays it. Runs on the machine for a remote slot (node is already required there).
-# Exit 0 delivered, 4 not picked up (message withdrawn), 3 refused by the session.
+# The text travels on stdin, so the remote command has a fixed size whatever the text length (cmd.exe caps it at 8191).
+# Exit 0 delivered; 1 refused or failed; 4 not picked up, and the message was withdrawn (safe to resend);
+# 6 claimed by the session but never acknowledged, so it may still be delivered (do not resend blindly).
 cmd_steer() {
   require_herdr
   [[ $# -ge 1 ]] || die "usage: sidecar steer TEXT"
-  local hname session script result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000))
+  local hname session script payload result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000)) grace_ms=$((${SIDECAR_STEER_CLAIM_GRACE_S:-7} * 1000))
   hname=$(herdr_agent)
   [[ $(agent_status "$hname") != missing ]] || die "no running sidecar in slot $SLOT${MACHINE:+ on $MACHINE_LABEL} to steer; use ask to start one"
   session=$(pi_session_id)
+  payload=$(jq -cn --arg text "$*" --arg from "Claude Code" '{text: $text, from: $from}')
   script='const sleep=ms=>new Promise(r=>setTimeout(r,ms));
     const root=process.env.GROK_STEER_DIR||path.join(process.env.XDG_STATE_HOME||path.join(os.homedir(),".local","state"),"grok-style-pi","steer");
     const dir=path.join(root,args[0]),id=Date.now().toString(36)+"-"+process.pid+"-"+Math.random().toString(36).slice(2,8);
     const file=path.join(dir,id+".json"),ack=path.join(dir,id+".ack"),tmp=path.join(dir,id+".tmp");
+    const out=(o,c)=>{console.log(JSON.stringify(o));process.exit(c)};
     (async()=>{
+      const msg=JSON.parse(fs.readFileSync(0,"utf8"));msg.sentAt=Date.now();
       fs.mkdirSync(dir,{recursive:true});
-      fs.writeFileSync(tmp,JSON.stringify({text:args[1],from:args[2],sentAt:Date.now()}));fs.renameSync(tmp,file);
-      for(let end=Date.now()+Number(args[3]);Date.now()<end&&!fs.existsSync(ack);)await sleep(100);
+      fs.writeFileSync(tmp,JSON.stringify(msg));fs.renameSync(tmp,file);
+      for(let end=Date.now()+Number(args[1]);Date.now()<end&&!fs.existsSync(ack);)await sleep(100);
       if(!fs.existsSync(ack)){
-        try{fs.unlinkSync(file)}catch(e){for(let i=0;i<20&&!fs.existsSync(ack);i++)await sleep(100)}
+        let removed=true;
+        try{fs.unlinkSync(file)}catch(e){removed=false}
+        if(removed)out({status:"timeout"},4);
+        // Already claimed: the session may still deliver it. Give its admission window time to finish.
+        for(let end=Date.now()+Number(args[2]);Date.now()<end&&!fs.existsSync(ack);)await sleep(100);
+        if(!fs.existsSync(ack))out({status:"unknown"},6);
       }
-      if(!fs.existsSync(ack)){console.log(JSON.stringify({status:"timeout"}));process.exit(4)}
       const reply=fs.readFileSync(ack,"utf8");fs.unlinkSync(ack);console.log(reply);
       process.exit(JSON.parse(reply).status==="delivered"?0:3);
     })().catch(e=>{console.error(String(e));process.exit(5)});'
+  # A claimed message may wait up to the receiver's 5s admission window for its acknowledgement.
   if [[ -n $MACHINE ]]; then
-    result=$(remote_node "$script" "$session" "$*" "Claude Code" "$timeout_ms" </dev/null) || status=$?
+    result=$(remote_node "$script" "$session" "$timeout_ms" "$grace_ms" <<<"$payload") || status=$?
   else
-    result=$(node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$(jq -cn --args '$ARGS.positional' "$session" "$*" "Claude Code" "$timeout_ms")" "$script")" </dev/null) || status=$?
+    result=$(node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$(jq -cn --args '$ARGS.positional' "$session" "$timeout_ms" "$grace_ms")" "$script")" <<<"$payload") || status=$?
   fi
   case $status in
     0)
       if [[ $(jq -r '.delivery' <<<"$result") == steer ]]; then echo "steered: delivered mid-turn to $hname"; else echo "delivered to idle $hname as a prompt"; fi ;;
     3) die "the sidecar refused the steering message: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
-    4) die "the sidecar did not pick the message up within $((timeout_ms / 1000))s and it was withdrawn; its pi may predate steering (update grok-style-pi there and /reload in its pane)" ;;
+    4)
+      echo "sidecar: $hname did not pick the message up within $((timeout_ms / 1000))s and it was withdrawn; it is safe to resend. Its pi may predate steering (update grok-style-pi there and /reload in its pane), or be compacting." >&2
+      exit 4 ;;
+    6)
+      echo "sidecar: outcome unknown: $hname claimed the message but did not acknowledge it, so it may still be delivered. Check the pane before resending." >&2
+      exit 6 ;;
     255) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH (BatchMode: load its key in ssh-agent). Test: ssh $MACHINE_TARGET true" ;;
     *) die "could not deliver the steering message (exit $status; is node on PATH${MACHINE:+ on $MACHINE_LABEL}?)" ;;
   esac

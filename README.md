@@ -36,6 +36,10 @@ Tests use a fake Herdr and isolated home directories; they never start a real mo
 
 A sidecar that cannot continue without a decision submits its report with `needs_answer`. The launcher then prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. Requests have no deadline; a turn that ends without a report exits 2, and a sidecar blocked in its pane exits 5. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.
 
+## Steering a busy sidecar
+
+`sidecar [--slot N] [--machine NAME] steer TEXT` delivers a message to the running sidecar immediately, even while a long `ask` holds the slot. It writes the message into the pi session's steering inbox (`<state>/grok-style-pi/steer/<pi session id>/`, from the [grok-style-pi](https://github.com/Daedie-git/grok-style-pi) extension, which must be loaded in the sidecar's pi) and waits up to `SIDECAR_STEER_TIMEOUT_S` seconds (default 8) for that extension to acknowledge it. pi shows it as a user message, mid-turn when the sidecar is working or as a normal prompt when idle. Exit 0 means delivered; otherwise the message is withdrawn and the command fails with the reason. It takes no slot locks. For a slot on a machine it runs over the same SSH connection as other commands, using the machine's Node. A pi that started before the extension was updated needs `/reload` in its pane (or a restart).
+
 ## Install from GitHub
 
 This repository includes a single-plugin marketplace. In Claude Code:

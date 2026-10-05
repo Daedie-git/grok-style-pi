@@ -40,6 +40,16 @@ The sidecar only knows what you tell it. Send a `note` at each milestone: the us
 
 Notes return in seconds and cost little; the reviews they inform are sharper for them.
 
+## Steer a busy sidecar
+
+`ask`, `diff` and `plan` hold their slot until the report arrives, and a `note` queues behind them. To redirect a sidecar that is mid-task, use `steer`: it reaches the running pi within a second, shows in its transcript as a steering message, and never waits for the in-flight request. The sidecar adjusts its current task; its report for that request still comes back as usual. Use it for a changed decision or a wrong turn, not for routine context (that is a `note`).
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 3 steer "Stop refactoring; the user wants only the failing test fixed."
+```
+
+It exits 0 when delivered (a sidecar that was idle gets it as a normal prompt) and non-zero with a reason otherwise. A sidecar whose pi predates the feature does not pick it up: the command says so and withdraws the message.
+
 ## Plan review
 
 Send a plan when it is **complex**: it spans subsystems, decides ownership, lifecycle, scheduling, persistence, or concurrency, migrates data or APIs, or would warrant an ADR. A plan that is a local, mechanical change goes straight to implementation.

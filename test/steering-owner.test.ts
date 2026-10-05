@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { acquireOwner, OWNER_FILE, readOwner, releaseOwner } from "../src/steering/owner.ts";
+import { acquireOwner, acquireOwnerWithBackoff, LOCK_FILE, OWNER_FILE, readOwner, releaseOwner } from "../src/steering/owner.ts";
 
 const CHILD = fileURLToPath(new URL("./fixtures/steer-owner.ts", import.meta.url));
 
@@ -90,4 +90,58 @@ test("the owner record names the pi session file senders verify", () => {
 		assert.equal(readOwner(dir)!.sessionFile, "/home/u/.pi/agent/sessions/x_cc-1-3.jsonl");
 		releaseOwner(dir, claim.token);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+/** A live process that stands in for a paused or stalled lock holder. */
+function liveProcess() {
+	const p = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+	return { pid: p.pid!, stop: () => p.kill("SIGKILL") };
+}
+async function deadPid() {
+	const p = spawn(process.execPath, ["-e", "0"], { stdio: "ignore" });
+	await new Promise((r) => p.once("exit", r));
+	return p.pid!;
+}
+
+test("a paused live mutex holder keeps the mutex however old it is; acquisition reports busy", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "owner-"));
+	const holder = liveProcess();
+	t.after(() => { holder.stop(); rmSync(dir, { recursive: true, force: true }); });
+	writeFileSync(join(dir, LOCK_FILE), JSON.stringify({ pid: holder.pid, token: "paused" }));
+	const longAgo = new Date(Date.now() - 3600_000);
+	utimesSync(join(dir, LOCK_FILE), longAgo, longAgo);
+	const claim = acquireOwner(dir, "/s.jsonl");
+	assert.deepEqual([claim.owned, (claim as { busy?: boolean }).busy], [false, true]);
+	assert.equal(readOwner(dir), undefined, "no owner was published behind the holder's back");
+	// It resumes and finishes: the mutex is still its own.
+	assert.equal(JSON.parse(readFileSync(join(dir, LOCK_FILE), "utf8")).token, "paused");
+	// Releasing as another instance neither removes the live holder's mutex nor an owner record that is not ours.
+	releaseOwner(dir, "not-held");
+	assert.equal(existsSync(join(dir, LOCK_FILE)), true);
+});
+
+test("a crashed mutex holder is recovered at once, even if its mutex is brand new", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "owner-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	writeFileSync(join(dir, LOCK_FILE), JSON.stringify({ pid: await deadPid(), token: "crashed" }));
+	const claim = acquireOwner(dir, "/s.jsonl");
+	assert.equal(claim.owned, true);
+	assert.equal(existsSync(join(dir, LOCK_FILE)), false, "own mutex released after acquiring");
+});
+
+test("startup retries a busy mutex with backoff and acquires as soon as it frees, without blocking", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "owner-"));
+	const holder = liveProcess();
+	t.after(() => { holder.stop(); rmSync(dir, { recursive: true, force: true }); });
+	writeFileSync(join(dir, LOCK_FILE), JSON.stringify({ pid: holder.pid, token: "busy" }));
+	let ticks = 0;
+	const interval = setInterval(() => ticks++, 10);
+	setTimeout(() => rmSync(join(dir, LOCK_FILE)), 250);
+	const claim = await acquireOwnerWithBackoff(dir, "/s.jsonl", { withinMs: 5000 });
+	clearInterval(interval);
+	assert.equal(claim.owned, true);
+	assert.ok(ticks > 10, "the event loop kept running while waiting");
+	writeFileSync(join(dir, LOCK_FILE), JSON.stringify({ pid: holder.pid, token: "busy-forever" }));
+	const busy = await acquireOwnerWithBackoff(dir, "/s.jsonl", { withinMs: 300 });
+	assert.deepEqual([busy.owned, (busy as { busy?: boolean }).busy], [false, true]);
 });

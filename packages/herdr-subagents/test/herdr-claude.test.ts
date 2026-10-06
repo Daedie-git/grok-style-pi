@@ -23,6 +23,7 @@ function fixture(t: TestContext, extra: Partial<HerdrClient> = {}) {
 		promptAgent: async (_name, text) => { prompts.push(text); },
 		closePane: async () => { closes++; live.clear(); },
 		isAlive: async (name) => live.has(name),
+		getAgent: async (name) => live.has(name) ? { name, paneId: live.get(name) } : undefined,
 		listAgents: async () => [...live].map(([name, paneId]) => ({ name, paneId })),
 		listPanes: async () => [],
 		showLabel: async () => {},
@@ -81,6 +82,29 @@ test("Claude hook rejects stale commands and other sessions", async (t) => {
 	await f.hook("UserPromptSubmit", { prompt: f.prompts[0] });
 	await f.hook("Stop", { last_assistant_message: "Done" });
 	assert.equal((await f.hook("UserPromptSubmit", { prompt: f.prompts[0] }))?.decision, "block");
+});
+
+test("Claude prompts target the verified pane and refuse a name taken in another pane", async (t) => {
+	const targets: string[] = [];
+	const texts: string[] = [];
+	const f = fixture(t, { promptAgent: async (target, text) => { targets.push(target); texts.push(text); } });
+	const first = await f.runner.spawn(f.request);
+	const record = await f.runner.resolve(first.agentId);
+	assert.deepEqual(targets, [record.paneId], "the prompt is submitted to the pane, not the reusable name");
+	await f.hook("UserPromptSubmit", { prompt: texts[0] });
+	await f.hook("PreToolUse", { tool_name: "Read" });
+	await f.hook("Stop", { last_assistant_message: "done" });
+	// The agent exited without notice and another process took its name elsewhere.
+	f.client.getAgent = async (name) => ({ name, paneId: "w1:p99" });
+	await assert.rejects(f.runner.resume(first.agentId, "Follow up"), /now in pane w1:p99, not w1:p2/);
+	f.client.getAgent = async (name) => ({ name, paneId: "w1:p99", session: "another-session" });
+	await assert.rejects(f.runner.resume(first.agentId, "Follow up"), /no longer running/);
+	assert.equal(targets.length, 1);
+	assert.equal((await f.runner.resolve(first.agentId)).currentRunId, first.runId);
+	// A pane move keeps the name and session; prompts follow the agent to its new pane.
+	f.client.getAgent = async (name) => ({ name, paneId: "w2:p5", session: record.sessionId });
+	await f.runner.resume(first.agentId, "Follow up");
+	assert.deepEqual(targets, [record.paneId, "w2:p5"]);
 });
 
 test("Claude cancellation confirms owned pane closure and refuses resume after exit", async (t) => {

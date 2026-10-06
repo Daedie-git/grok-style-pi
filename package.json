@@ -14,7 +14,13 @@
     "type": "git",
     "url": "git+https://github.com/Daedie-git/grok-style-pi.git"
   },
+  "workspaces": ["packages/herdr-subagents"],
   "files": [
+    "packages/herdr-subagents/extensions",
+    "packages/herdr-subagents/src",
+    "packages/herdr-subagents/package.json",
+    "packages/herdr-subagents/README.md",
+    "packages/herdr-subagents/LICENSE",
     "extensions",
     "integrations",
     "src",
@@ -24,14 +30,15 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "npm run typecheck && node --test test/*.test.ts",
+    "test": "npm run typecheck && node --test test/*.test.ts packages/herdr-subagents/test/*.test.ts",
+    "test:herdr": "npm test --workspace herdr-subagents",
     "bench:performance": "node scripts/benchmark-performance.ts",
     "setup:file-links": "node scripts/install-file-links.mjs",
     "test:bat": "GROK_BAT_INTEGRATION=1 node --test test/highlight-bat.test.ts",
     "typecheck:subagents": "tsc -p tsconfig.subagents.json",
     "test:subagents": "node --test test/subagent-contract.test.ts",
     "test:current-pi": "node scripts/test-current-pi.ts",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json && npm run typecheck --workspace herdr-subagents"
   },
   "pi": {
     "extensions": [

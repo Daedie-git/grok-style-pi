@@ -1,8 +1,7 @@
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { wrapWithDiamondRenderer } from "../tools/renderer.ts";
 import { registerToolExtension, type ToolTransform } from "../tools/register-extension.ts";
-
-const EXPLICIT_SUBAGENT_REQUEST = "Do not call this tool unless the user explicitly asked you to use a subagent, agent, or workflow. Do not launch one on your own for exploration, research, parallelism, or context management.";
+import { EXPLICIT_SUBAGENT_REQUEST } from "../../packages/herdr-subagents/src/herdr/policy.ts";
 
 type InitiativeTool = {
 	name: string;
@@ -18,7 +17,7 @@ export function withoutSubagentInitiative<T extends InitiativeTool>(tool: T): T 
 	const body = (description ?? "")
 		.replace(/^- If an agent's description says it should be used proactively.*\n?/m, "")
 		.trim();
-	return { ...rest, description: body ? `${EXPLICIT_SUBAGENT_REQUEST}\n\n${body}` : EXPLICIT_SUBAGENT_REQUEST } as T;
+	return { ...rest, description: body.startsWith(EXPLICIT_SUBAGENT_REQUEST) ? body : body ? `${EXPLICIT_SUBAGENT_REQUEST}\n\n${body}` : EXPLICIT_SUBAGENT_REQUEST } as T;
 }
 
 /** Decorate registration, preserving the owning extension's execution and metadata. */

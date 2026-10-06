@@ -4,7 +4,6 @@
     "src/subagents/adapter.ts",
     "src/activity/panel.ts",
     "test/subagent-contract.test.ts",
-    "test/herdr-subagents.test.ts",
-    "test/fixtures/herdr-process.ts"
+    "test/herdr-integration.test.ts"
   ]
 }

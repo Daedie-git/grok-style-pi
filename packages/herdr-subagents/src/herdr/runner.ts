@@ -83,6 +83,19 @@ function refill(live: { paneId?: string; column?: "left" | "right" }[]): Pick<Pl
 	return { paneId: shorter[0].paneId, direction: "down", column: shorter[0].column! };
 }
 
+export type Presence = "alive" | "dead" | "unknown";
+
+/**
+ * A Herdr name follows its agent across pane moves, which issue new pane IDs, but another process may take the
+ * name after the agent exits. A name proves this agent only in its recorded pane or with its own session.
+ */
+export function agentPresence(record: Pick<AgentRecord, "herdrName" | "paneId" | "sessionFile" | "sessionId">, named: HerdrAgentRef | undefined): Presence {
+	if (!named) return "dead";
+	if (named.paneId === record.paneId) return "alive";
+	if (named.session === undefined) return "unknown";
+	return named.session === record.sessionFile || named.session === record.sessionId ? "alive" : "dead";
+}
+
 /** Remote agent IDs carry their machine so later tool calls route back to it. Agent names never contain `@`. */
 export function qualifiedAgentId(id: string, machine?: string): string {
 	return machine ? `${id}@${machine}` : id;
@@ -145,7 +158,7 @@ export class HerdrRunner {
 			const record = await this.resolve(agentId);
 			check(combined);
 			const previous = record.currentRunId;
-			if (!(await this.deps.client.isAlive(record.herdrName))) throw new Error(`Agent ${agentId} is no longer running in Herdr pane ${record.paneId}.`);
+			await this.locate(record, combined);
 			check(combined);
 			const ref = await this.store.beginRun(record.id, previous, prompt, notify, this.now());
 			try {
@@ -175,7 +188,7 @@ export class HerdrRunner {
 	async steer(ref: RunRef, message: string): Promise<void> {
 		const record = await this.resolve(ref.agentId);
 		if (record.runtime === "claude-code") throw new Error("Live steering is not supported for Claude Code. Wait for the run to finish, then use Agent with resume.");
-		if (!(await this.deps.client.isAlive(record.herdrName))) throw new Error(`Agent ${record.id} is no longer running in Herdr.`);
+		await this.locate(record);
 		// The transactional check still targets the captured run after the asynchronous liveness check.
 		await this.store.steer(ref, message);
 	}
@@ -201,12 +214,14 @@ export class HerdrRunner {
 				const agents = runs.length ? await this.deps.client.listAgents(this.stopping.signal) : [];
 				check(this.stopping.signal);
 				if (agents.some((agent) => !agent.paneId)) throw new Error("Herdr returned an incomplete agent listing");
-				const names = new Set(agents.flatMap((agent) => agent.name ? [agent.name] : []));
+				const named = new Map(agents.flatMap((agent) => agent.name ? [[agent.name, agent] as const] : []));
 				const unnamedPanes = new Set(agents.filter((agent) => !agent.name).map((agent) => agent.paneId));
-				// An older/incomplete listing at the right pane is unknown, not proof of death.
-				const observations = runs.flatMap(({ agent, run }) => !names.has(agent.herdrName) && unnamedPanes.has(agent.paneId) ? [] : [
-					{ ref: { agentId: run.agentId, runId: run.runId }, alive: names.has(agent.herdrName) },
-				]);
+				const observations = runs.flatMap(({ agent, run }) => {
+					const presence = agentPresence(agent, named.get(agent.herdrName));
+					// An older/incomplete listing at the right pane is unknown, not proof of death.
+					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) return [];
+					return [{ ref: { agentId: run.agentId, runId: run.runId }, alive: presence === "alive" }];
+				});
 				await this.store.finishMaintenance(token, observations, this.now());
 				for (const { agent } of runs) if (agent.runtime === "claude-code") await this.serviceClaude(agent.id, this.stopping.signal);
 				if (await this.store.tryPlacementLock(token)) {
@@ -249,7 +264,7 @@ export class HerdrRunner {
 		if (isTerminal(value.phase) || !value.deadline) return;
 		const record = await this.resolve(ref.agentId);
 		// Unknown liveness is not proof of pane death. The CLI adapter throws for transport errors.
-		if (!(await this.deps.client.isAlive(record.herdrName))) await this.store.recordPaneClosed(ref, this.now());
+		if (agentPresence(record, await this.deps.client.getAgent(record.herdrName)) === "dead") await this.store.recordPaneClosed(ref, this.now());
 		else await this.store.expireUnacceptedRun(ref, this.now());
 	}
 
@@ -393,7 +408,9 @@ export class HerdrRunner {
 		const command = await this.store.claimNextCommand(agentId, binding.token, false);
 		if (!command) return;
 		try {
-			await this.deps.client.promptAgent!(binding.agent.herdrName, claudePrompt(command), signal);
+			// Target the verified pane: the name alone could reach another process that took it.
+			const paneId = await this.locate(binding.agent, signal);
+			await this.deps.client.promptAgent!(paneId, claudePrompt(command), signal);
 			await this.store.commandDelivered(command, binding.token);
 		} catch (error) {
 			// Cancellation wins even before execution confirmation: close the owned pane
@@ -411,6 +428,15 @@ export class HerdrRunner {
 			}, this.now());
 			throw error;
 		}
+	}
+
+	/** The pane currently hosting this agent. Throws unless Herdr proves it is the launched process. */
+	private async locate(record: AgentRecord, signal?: AbortSignal): Promise<string> {
+		const named = await this.deps.client.getAgent(record.herdrName, signal);
+		const presence = agentPresence(record, named);
+		if (presence === "dead") throw new Error(`Agent ${record.id} is no longer running in Herdr pane ${record.paneId}.`);
+		if (presence === "unknown") throw new Error(`Herdr agent ${record.herdrName} is now in pane ${named!.paneId}, not ${record.paneId}, and Herdr reports no session to confirm it is the same agent.`);
+		return named!.paneId!;
 	}
 
 	private async withPlacement<T>(body: () => Promise<T>, signal: AbortSignal): Promise<T> {
@@ -549,7 +575,8 @@ export async function spawnHerdrAgent(request: SpawnRequest, deps: RunnerDeps): 
 			? await runner.resume(request.resume, request.prompt, deps.signal, request.runInBackground)
 			: await runner.spawn(request, deps.signal);
 		const record = await runner.resolve(ref.agentId);
-		const snapshot = await runner.read(ref);
+		// An abort after publication still reaches the run; cancel() is idempotent for one already cancelled.
+		const snapshot = deps.signal?.aborted ? await runner.cancel(ref) : await runner.read(ref);
 		const shown = { ...ref, agentId: qualifiedAgentId(ref.agentId, runner.machine) };
 		if (deps.signal?.aborted) return text(formatStatus(record, snapshot, runner.machine), { ...shown, paneId: record.paneId, status: snapshot.phase });
 		if (request.runInBackground) return text(

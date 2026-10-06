@@ -17,6 +17,7 @@ import {
 	type SpawnRequest,
 	type ToolText,
 } from "./runner.ts";
+import { EXPLICIT_SUBAGENT_REQUEST } from "./policy.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
 
 export interface HerdrSubagentDeps {
@@ -49,9 +50,9 @@ export function machineGuidance(machines: HerdrMachine[]): string {
 	return ` Saved machines: ${enabled.map(describe).join(", ")}. Pass the name shown first as machine.`;
 }
 
-/** The remote store runs this package's worker entry, by default at the same path as here. */
+/** New overrides name the standalone root; legacy overrides name a Grok root with a forwarding entry. */
 export function remoteWorkerEntry(env: NodeJS.ProcessEnv): string {
-	const pkg = env.GROK_HERDR_REMOTE_PACKAGE?.replace(/\/+$/, "");
+	const pkg = (env.HERDR_SUBAGENTS_REMOTE_PACKAGE || env.GROK_HERDR_REMOTE_PACKAGE)?.replace(/\/+$/, "");
 	return pkg ? `${pkg}/src/herdr/worker-entry.mjs` : fileURLToPath(new URL("./worker-entry.mjs", import.meta.url));
 }
 
@@ -69,7 +70,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		machineClient: overrides.machineClient ?? ((machine) => createHerdrCli(env, undefined, machine)),
 		machineChannel: overrides.machineChannel ?? (async (machine) => sshChannel({
 			target: (await findHerdrMachine(machine, env)).target,
-			node: env.GROK_HERDR_REMOTE_NODE,
+			node: env.HERDR_SUBAGENTS_REMOTE_NODE || env.GROK_HERDR_REMOTE_NODE,
 			entry: remoteWorkerEntry(env),
 		})),
 		hostname: overrides.hostname ?? hostname(),
@@ -189,7 +190,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.registerTool(defineTool({
 			name: "Agent",
 			label: "Agent",
-			description: "Launch a subagent as its own Pi (default) or Claude Code process in a Herdr pane. Set runtime to claude-code only when the user requests Claude Code. Claude Code supports local Linux/macOS panes, normal permissions, results, and resume; live steering and max_turns are unsupported, and Stop closes its pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>." + savedMachines,
+			description: EXPLICIT_SUBAGENT_REQUEST + "\n\nLaunch a subagent as its own Pi (default) or Claude Code process in a Herdr pane. Set runtime to claude-code only when the user requests Claude Code. Claude Code supports local Linux/macOS panes, normal permissions, results, and resume; live steering and max_turns are unsupported, and Stop closes its pane. Background by default. Use get_subagent_result for the outcome and steer_subagent to redirect a running agent. Reuse the same subagent for follow-up work on that thread: steer_subagent while it is running, or resume after it has finished. Start a new Agent only for new work. A blocked agent returns immediately and stays open in its pane. Results are limited to 2000 lines or 50KB; full output remains in the pane. Keep inherit_context false; the orchestrating agent must provide all needed context in the prompt. schedule and isolation are not available here. Set machine only when the user asks to run the agent on a saved Herdr SSH machine; its agent ID then ends in @<machine>." + savedMachines,
 			parameters: Type.Object({
 				runtime: Type.Optional(Type.Union([Type.Literal("pi"), Type.Literal("claude-code")], { description: "Default pi. Use claude-code only when the user requests Claude Code. Ignored with resume, which preserves the original runtime." })),
 				prompt: Type.String({ description: "The task for the agent to perform." }),
@@ -413,10 +414,10 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 }
 
 async function assertRemoteProtocol(store: HerdrStore, machine: string): Promise<void> {
-	const update = (side: string) => `Update grok-style-pi on ${side} so both match, then retry.`;
+	const update = (side: string) => `Update herdr-subagents (or the Grok package that includes it) on ${side} so both match, then retry.`;
 	const remote = await store.remoteProtocol().catch((error: Error) => {
 		// Packages before the handshake lack the operation, so this is the one error text worth matching.
-		if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older grok-style-pi. ${update(machine)}`);
+		if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older Herdr subagent runner. ${update(machine)}`);
 		throw error;
 	});
 	if (remote !== HERDR_REMOTE_PROTOCOL) {

@@ -33,14 +33,14 @@ function database(name: string): DatabaseSync {
 	}
 }
 
-// Temporary diagnostics: never include operation arguments, prompts, or stored task data.
+// Diagnostics name the operation and process, never its arguments, prompts, or stored task data.
 function databaseDiagnostics<T>(operation: string, body: () => T): T {
 	try { return body(); }
 	catch (error) {
 		const sqlite = error as { code?: string; errcode?: number } | null;
 		if (sqlite?.code !== "ERR_SQLITE_ERROR" && typeof sqlite?.errcode !== "number") throw error;
 		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`[DEBUG-herdr-db] operation=${operation} code=${sqlite.code ?? "unknown"} errcode=${sqlite.errcode ?? "unknown"} node=${process.version} pid=${process.pid} thread=${threadId}: ${message}`, { cause: error });
+		throw new Error(`[herdr-db] operation=${operation} code=${sqlite.code ?? "unknown"} errcode=${sqlite.errcode ?? "unknown"} node=${process.version} pid=${process.pid} thread=${threadId}: ${message}`, { cause: error });
 	}
 }
 

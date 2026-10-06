@@ -34,15 +34,16 @@ function fakeSsh(t: TestContext, script = 'for last; do :; done\nexec sh -c "$la
 
 function remoteClient() {
 	const events: string[] = [];
-	const live = new Set<string>();
+	const live = new Map<string, string>();
 	let sequence = 2;
 	const client: HerdrClient = {
 		split: async (options) => { events.push(`split:${options.paneId}`); return { paneId: `w9:p${sequence++}` }; },
-		startPi: async (options) => { events.push(`start:${options.name}:${options.paneId}`); live.add(options.name); },
+		startPi: async (options) => { events.push(`start:${options.name}:${options.paneId}`); live.set(options.name, options.paneId); },
 		closePane: async (paneId) => { events.push(`close:${paneId}`); },
 		isAlive: async (name) => live.has(name),
+		getAgent: async (name) => live.has(name) ? { name, paneId: live.get(name) } : undefined,
 		showLabel: async () => undefined,
-		listAgents: async () => [],
+		listAgents: async () => [...live].map(([name, paneId]) => ({ name, paneId })),
 		listPanes: async () => [{ paneId: "w9:p1", tabId: "w9:t1", workspaceId: "w9", cwd: PROJECT }],
 		createTab: async (options) => { events.push(`tab:${options.workspaceId}:${options.cwd}`); return { tabId: `w9:t${sequence++}`, paneId: `w9:p${sequence++}`, workspaceId: "w9" }; },
 	};
@@ -150,6 +151,9 @@ test("machine listings and remote placement facts are parsed", () => {
 		{ id: "m3", label: "build", target: "build", enabled: true },
 	]), " Saved machines: m1 (label laptop, aim@lappy), build. Pass the name shown first as machine.");
 	assert.equal(remoteWorkerEntry({ GROK_HERDR_REMOTE_PACKAGE: "/opt/grok-style-pi/" }), "/opt/grok-style-pi/src/herdr/worker-entry.mjs");
+	assert.equal(remoteWorkerEntry({ HERDR_SUBAGENTS_REMOTE_PACKAGE: "/opt/herdr-subagents/" }), "/opt/herdr-subagents/src/herdr/worker-entry.mjs");
+	assert.equal(remoteWorkerEntry({ HERDR_SUBAGENTS_REMOTE_PACKAGE: "/new", GROK_HERDR_REMOTE_PACKAGE: "/old" }), "/new/src/herdr/worker-entry.mjs");
+	assert.equal(remoteWorkerEntry({}), ENTRY);
 });
 
 test("a remote package with another protocol is refused before any launch, with which side to update", async () => {
@@ -173,9 +177,9 @@ test("a remote package with another protocol is refused before any launch, with 
 	})(pi);
 	const ctx = { cwd: PROJECT, sessionManager: { getSessionFile: () => undefined } };
 	const launch = (machine: string) => tools[0].execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine, machine_cwd: PROJECT }, undefined, undefined, ctx);
-	await assert.rejects(launch("old"), /old runs an older grok-style-pi\. Update grok-style-pi on old/);
-	await assert.rejects(launch("behind"), /behind speaks remote protocol 0; this machine speaks \d+\. Update grok-style-pi on behind/);
-	await assert.rejects(launch("ahead"), /Update grok-style-pi on this machine/);
+	await assert.rejects(launch("old"), /old runs an older Herdr subagent runner\. Update herdr-subagents .* on old/);
+	await assert.rejects(launch("behind"), /behind speaks remote protocol 0; this machine speaks \d+\. Update herdr-subagents .* on behind/);
+	await assert.rejects(launch("ahead"), /Update herdr-subagents .* on this machine/);
 	assert.deepEqual(operations, ["remoteProtocol", "remoteProtocol", "remoteProtocol"]);
 });
 

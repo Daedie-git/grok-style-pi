@@ -8,16 +8,14 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 import test, { type TestContext } from "node:test";
-import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseAgentFile } from "../src/herdr/agent-file.ts";
 import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { HerdrRunner, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
+import { HerdrRunner, agentPresence, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
 import { HerdrStore, type HerdrTask } from "../src/herdr/store.ts";
 import { isTerminal, type RunRef, type ExecutionEvent } from "../src/herdr/state.ts";
-import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
-import { loadSubagentExtension } from "../integrations/subagents.ts";
 
 function request(extra: Partial<SpawnRequest> = {}): SpawnRequest {
 	// Default to the dedicated-tab fallback; caller-tab placement tests supply tabId explicitly.
@@ -49,6 +47,7 @@ function fakeClient(partial: Partial<HerdrClient> = {}) {
 			for (const [name, value] of live) if (value.paneId === paneId) live.delete(name);
 		},
 		isAlive: async (name) => live.has(name),
+		getAgent: async (name) => { const value = live.get(name); return value && { name, ...value }; },
 		showLabel: async (paneId, label) => { events.push(`label:${paneId}:${label}`); },
 		listAgents: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...[...live].map(([name, value]) => ({ name, ...value }))],
 		listPanes: async (options) => [{ paneId: "w1:p1", tabId: "w1:t1" }, ...[...tabs].map(([paneId, tabId]) => ({ paneId, tabId }))]
@@ -129,17 +128,6 @@ async function eventually(predicate: () => Promise<boolean>, message = "conditio
 	}
 	assert.fail(message);
 }
-
-test("Herdr selects the pane runner; other sessions retain Pi Subagents", async () => {
-	assert.equal(selectSubagentRuntime({ HERDR_ENV: "1" }), "herdr");
-	assert.equal(selectSubagentRuntime({}), "pi-subagents");
-	const loaded: string[] = [];
-	const pi = { registerTool() {} } as unknown as ExtensionAPI;
-	const factory = (name: string): ExtensionFactory => () => { loaded.push(name); };
-	await loadSubagentExtension(pi, { HERDR_ENV: "1" }, { herdr: factory("herdr"), current: factory("current") }, false);
-	await loadSubagentExtension(pi, {}, { herdr: factory("herdr"), current: factory("current") }, false);
-	assert.deepEqual(loaded, ["herdr", "current"]);
-});
 
 test("spawn publishes only after Pi starts and returns both identities", async (t) => {
 	const f = fixture(t);
@@ -364,7 +352,7 @@ test("blocked children return promptly; pane death is a lifecycle fact", async (
 test("unknown liveness does not become a false pane-closed result", async (t) => {
 	const f = fixture(t);
 	const ref = await f.runner.spawn(request());
-	f.client.isAlive = async () => { throw new Error("transport unavailable"); };
+	f.client.getAgent = async () => { throw new Error("transport unavailable"); };
 	await assert.rejects(f.runner.reconcile(), /transport unavailable/);
 	assert.equal((await f.runner.read(ref)).phase, "queued");
 });
@@ -374,7 +362,8 @@ test("one unavailable agent does not prevent another run's lifecycle reconciliat
 	const first = await f.runner.spawn(request());
 	const second = await f.runner.spawn(request());
 	f.advance(20_000);
-	f.client.isAlive = async (name) => { if (name === first.agentId) throw new Error("unavailable"); return true; };
+	const getAgent = f.client.getAgent;
+	f.client.getAgent = async (name, signal) => { if (name === first.agentId) throw new Error("unavailable"); return getAgent(name, signal); };
 	await assert.rejects(f.runner.reconcile(), /unavailable/);
 	assert.equal((await f.runner.read(second)).phase, "failed");
 });
@@ -443,6 +432,18 @@ for (const stage of ["isAlive", "listPanes", "split", "createTab", "startPi", "s
 	});
 }
 
+test("cancellation after publication, while the result is prepared, cancels the run", async (t) => {
+	const f = fixture(t);
+	const controller = new AbortController();
+	const resolve = f.runner.resolve.bind(f.runner);
+	f.runner.resolve = async (agentId) => { const record = await resolve(agentId); controller.abort(); return record; };
+	const result = await spawnHerdrAgent(request(), { root: f.root, client: f.client, runner: f.runner, signal: controller.signal });
+	const run = await f.runner.read({ agentId: result.details.agentId as string, runId: result.details.runId as string });
+	assert.equal(run.cancelRequested, true);
+	assert.ok(isTerminal(run.phase));
+	assert.equal(result.details.status, run.phase);
+});
+
 test("cancellation during resume liveness does not create a run", async (t) => {
 	const f = fixture(t);
 	const ref = await f.runner.spawn(request());
@@ -450,7 +451,8 @@ test("cancellation during resume liveness does not create a run", async (t) => {
 	await c.start();
 	await c.finish();
 	const controller = new AbortController();
-	f.client.isAlive = async () => { controller.abort(); return true; };
+	const getAgent = f.client.getAgent;
+	f.client.getAgent = async (name, signal) => { controller.abort(); return getAgent(name, signal); };
 	await assert.rejects(f.runner.resume(ref.agentId, "never publish", controller.signal), /Stopped/);
 	assert.equal((await f.runner.resolve(ref.agentId)).currentRunId, ref.runId);
 });
@@ -897,13 +899,13 @@ test("confirmed departed agents release reservations without closing unrelated p
 
 test("the worker loads from an installed package path without Node TypeScript stripping", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "herdr-package-"));
-	const pkg = join(dir, "node_modules", "grok-style-pi");
+	const pkg = join(dir, "node_modules", "herdr-subagents");
 	mkdirSync(join(pkg, "src", "herdr"), { recursive: true });
 	writeFileSync(join(pkg, "package.json"), '{"type":"module"}');
 	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs", "claude.ts"]) {
 		copyFileSync(fileURLToPath(new URL(`../src/herdr/${name}`, import.meta.url)), join(pkg, "src", "herdr", name));
 	}
-	symlinkSync(fileURLToPath(new URL("../node_modules/jiti", import.meta.url)), join(dir, "node_modules", "jiti"), "dir");
+	symlinkSync(fileURLToPath(new URL(".", import.meta.resolve("jiti/package.json"))), join(dir, "node_modules", "jiti"), "dir");
 	try {
 		const loaded = await createJiti(import.meta.url).import<{ HerdrStore: typeof HerdrStore }>(join(pkg, "src", "herdr", "store.ts"));
 		const store = new loaded.HerdrStore(join(dir, "state"));
@@ -925,6 +927,8 @@ test("the CLI distinguishes missing agents from transport failures on either out
 		}
 		await assert.rejects(cli({}, 0).listAgents(), /agents array/);
 		assert.equal(await cli({ result: { agent: "pi" } }, 0).isAlive("name"), true);
+		assert.equal(await cli({ error: { code: "agent_not_found", message: "missing" } }, 1).getAgent("missing"), undefined);
+		assert.deepEqual(await cli({ result: { agent: { name: "review", pane_id: "w2:p5", agent_session: { kind: "path", value: "/s.jsonl" } } } }, 0).getAgent("review"), { name: "review", tabId: undefined, paneId: "w2:p5", session: "/s.jsonl" });
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1125,6 +1129,31 @@ test("background maintenance batches the fleet and shares its interval across ru
 	assert.equal((await f.runner.read(refs[1])).phase, "queued");
 });
 
+test("agent presence trusts a reused name only in the recorded pane or with the recorded session", () => {
+	const record = { herdrName: "review", paneId: "w1:p2", sessionFile: "/state/sessions/a.jsonl", sessionId: "s-1" };
+	assert.equal(agentPresence(record, undefined), "dead");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p2" }), "alive");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w2:p7", session: "/state/sessions/a.jsonl" }), "alive", "a moved pane keeps its session");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w2:p7", session: "s-1" }), "alive");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p99", session: "/other.jsonl" }), "dead");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p99" }), "unknown");
+});
+
+test("maintenance does not keep a run alive through a name reused in another pane", async (t) => {
+	const f = fixture(t);
+	const [moved, reused, unconfirmed] = await Promise.all([f.runner.spawn(request()), f.runner.spawn(request()), f.runner.spawn(request())]);
+	const records = await Promise.all([moved, reused, unconfirmed].map((ref) => f.runner.resolve(ref.agentId)));
+	f.client.listAgents = async () => [
+		{ name: records[0].herdrName, paneId: "w2:p8", session: records[0].sessionFile },
+		{ name: records[1].herdrName, paneId: "w1:p99", session: "/elsewhere/session.jsonl" },
+		{ name: records[2].herdrName, paneId: "w1:p98" },
+	];
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(moved)).phase, "queued");
+	assert.match((await f.runner.read(reused)).error ?? "", /pane closed/);
+	assert.equal((await f.runner.read(unconfirmed)).phase, "queued", "a name without session evidence is not proof either way");
+});
+
 test("maintenance leases fail over and fence stale replies and resumed runs", async (t) => {
 	const f = fixture(t);
 	const ref = await f.runner.spawn(request());
@@ -1170,7 +1199,7 @@ test("database contention reports operation and SQLite diagnostics without task 
 		starting = new HerdrStore(root);
 		const diagnostic = (operation: string) => (error: unknown) => {
 			assert.ok(error instanceof Error);
-			assert.match(error.message, /\[DEBUG-herdr-db\]/);
+			assert.match(error.message, /\[herdr-db\]/);
 			assert.ok(error.message.includes(`operation=${operation}`));
 			assert.match(error.message, /code=ERR_SQLITE_ERROR errcode=5/);
 			assert.match(error.message, /database is locked/);

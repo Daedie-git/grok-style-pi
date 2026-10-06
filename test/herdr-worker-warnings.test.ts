@@ -6,7 +6,7 @@ import test from "node:test";
 const execute = promisify(execFile);
 
 test("proxy-enabled worker startup does not write Undici notices over Pi's UI", { timeout: 25_000 }, async () => {
-	const storeModule = new URL("../src/herdr/store.ts", import.meta.url).href;
+	const storeModule = new URL("../packages/herdr-subagents/src/herdr/store.ts", import.meta.url).href;
 	const visualModule = new URL("../src/rendering/visual-preparation.ts", import.meta.url).href;
 	const paletteModule = new URL("../src/rendering/style-palette.ts", import.meta.url).href;
 	const node = process.env.GROK_WARNING_NODE || process.execPath;
@@ -40,7 +40,7 @@ test("proxy-enabled worker startup does not write Undici notices over Pi's UI", 
 });
 
 test("Herdr SQLite workers do not write experimental notices over Pi's UI", { timeout: 20_000 }, async () => {
-	const module = new URL("../src/herdr/store.ts", import.meta.url).href;
+	const module = new URL("../packages/herdr-subagents/src/herdr/store.ts", import.meta.url).href;
 	const { stdout, stderr } = await execute(process.execPath, ["--input-type=module", "--eval", `
 		import assert from "node:assert/strict";
 		import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
@@ -58,7 +58,7 @@ test("Herdr SQLite workers do not write experimental notices over Pi's UI", { ti
 			process.emitWarning("host regular warning remains visible");
 			mkdirSync(join(brokenRoot, "control.sqlite"));
 			broken = new HerdrStore(brokenRoot);
-			await assert.rejects(broken.assertProtocolReady(), /\\[DEBUG-herdr-db\\] operation=initialize control\\.sqlite/);
+			await assert.rejects(broken.assertProtocolReady(), /\\[herdr-db\\] operation=initialize control\\.sqlite/);
 			console.log("database operations and initialization diagnostics passed");
 		} finally {
 			await store.close();

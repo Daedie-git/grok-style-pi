@@ -8,10 +8,10 @@ Stay on documented Pi extension APIs: `setFooter`, `setEditorComponent` wrapping
 
 `createGrokStyleExtension` takes injected factories. Wire real Pi objects only in an entrypoint. Load exactly one of `extensions/index.ts` or `integrations/subagents.ts`.
 
-`src/subagents/adapter.ts` owns run identity, subscriptions, and cancellation for in-process Pi Subagents. The activity UI consumes its projections. `integrations/subagents.ts` loads `src/herdr/extension.ts` when `HERDR_ENV=1`, and Pi Subagents otherwise. Do not merge those runners. The Herdr runner does not use the adapter.
+`src/subagents/adapter.ts` owns run identity, subscriptions, and cancellation for in-process Pi Subagents. The activity UI consumes its projections. `integrations/subagents.ts` loads the standalone runner in `packages/herdr-subagents` when `HERDR_ENV=1`, and Pi Subagents otherwise. Keep the Herdr package independent of Grok sources; its README owns runner behavior. The Herdr runner does not use the adapter. Load its standalone entrypoint or the Grok integration, never both.
 
 Match the existing TypeScript style: tabs, and `.ts` import specifiers.
 
 ## Verify
 
-`npm test` is the gate (Node 22+ type stripping): strict typecheck, then `node --test test/*.test.ts`. When you touch subagent manager behavior, also run `npm run test:subagents`. When you touch `bat` highlighting, also run `npm run test:bat`.
+`npm test` is the gate (Node 22+ type stripping): strict typechecks and tests for Grok and the standalone Herdr package. When you touch subagent manager behavior, also run `npm run test:subagents`. When you touch `bat` highlighting, also run `npm run test:bat`.

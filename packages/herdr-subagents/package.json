@@ -1,0 +1,39 @@
+{
+  "name": "herdr-subagents",
+  "version": "1.0.0",
+  "description": "Pi and Claude Code subagents in Herdr panes, with remote machines, durable results, steering, and cancellation.",
+  "type": "module",
+  "engines": {
+    "node": "^22.18.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Daedie-git/grok-style-pi.git",
+    "directory": "packages/herdr-subagents"
+  },
+  "files": ["extensions", "src", "README.md", "LICENSE"],
+  "exports": {
+    ".": "./src/herdr/extension.ts"
+  },
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.52",
+    "jiti": "^2.7.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  }
+}

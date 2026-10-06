@@ -1,4 +1,2 @@
-// Pi loads TypeScript through jiti; workers need their own loader, including in npm installations.
-import { createJiti } from "jiti";
-
-await createJiti(import.meta.url).import("./worker.ts");
+// Retain GROK_HERDR_REMOTE_PACKAGE roots used before the standalone package extraction.
+await import("../../packages/herdr-subagents/src/herdr/worker-entry.mjs");

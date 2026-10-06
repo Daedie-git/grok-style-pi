@@ -7,8 +7,8 @@ import { wrapWithDiamondRenderer, type OriginalTool } from "../src/tools/rendere
 import { buildDiffRows, defaultDiffPalette } from "../src/rendering/diff-render.ts";
 import { defaultStyleColors } from "../src/chrome/style-colors.ts";
 import { VisualPreparation, type VisualRequest, type VisualResult } from "../src/rendering/visual-preparation.ts";
-import { HerdrRunner } from "../src/herdr/runner.ts";
-import type { HerdrClient } from "../src/herdr/client.ts";
+import { HerdrRunner } from "../packages/herdr-subagents/src/herdr/runner.ts";
+import type { HerdrClient } from "../packages/herdr-subagents/src/herdr/client.ts";
 
 function measure(name: string, body: () => void, count = 50) {
 	body();

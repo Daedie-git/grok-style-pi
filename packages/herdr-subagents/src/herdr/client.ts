@@ -7,6 +7,8 @@ export interface HerdrAgentRef {
 	paneId?: string;
 	workspaceId?: string;
 	cwd?: string;
+	/** Herdr's session identity for the agent, such as Pi's session file. */
+	session?: string;
 }
 
 /** A saved SSH machine from `herdr machine list --json`. */
@@ -21,9 +23,12 @@ export interface HerdrClient {
 	split(options: { paneId: string; direction: "right" | "down"; cwd: string }): Promise<{ paneId: string }>;
 	startPi(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
 	startClaude?(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
-	promptAgent?(name: string, text: string, signal?: AbortSignal): Promise<void>;
+	/** Targets a live agent name or the pane ID hosting it. */
+	promptAgent?(target: string, text: string, signal?: AbortSignal): Promise<void>;
 	closePane(paneId: string): Promise<void>;
 	isAlive(name: string): Promise<boolean>;
+	/** The live agent holding this name, or undefined when none does. */
+	getAgent(name: string, signal?: AbortSignal): Promise<HerdrAgentRef | undefined>;
 	showLabel(paneId: string, label: string): Promise<void>;
 	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
 	/** Every physical pane, including shells whose agent has exited. */
@@ -62,16 +67,20 @@ function refsFromList(payload: unknown, key: string, operation: string): HerdrAg
 	const result = object(object(payload)?.result) ?? object(payload);
 	const items = result?.[key];
 	if (!Array.isArray(items)) throw new Error(`Herdr ${operation} did not return a ${key} array`);
-	return items.map((item) => {
-		const record = object(item);
-		return {
-			...(typeof record?.name === "string" ? { name: record.name } : {}),
-			tabId: typeof record?.tab_id === "string" ? record.tab_id : undefined,
-			paneId: typeof record?.pane_id === "string" ? record.pane_id : undefined,
-			...(typeof record?.workspace_id === "string" ? { workspaceId: record.workspace_id } : {}),
-			...(typeof record?.cwd === "string" ? { cwd: record.cwd } : {}),
-		};
-	});
+	return items.map(agentRef);
+}
+
+export function agentRef(item: unknown): HerdrAgentRef {
+	const record = object(item);
+	const session = object(record?.agent_session)?.value;
+	return {
+		...(typeof record?.name === "string" ? { name: record.name } : {}),
+		tabId: typeof record?.tab_id === "string" ? record.tab_id : undefined,
+		paneId: typeof record?.pane_id === "string" ? record.pane_id : undefined,
+		...(typeof record?.workspace_id === "string" ? { workspaceId: record.workspace_id } : {}),
+		...(typeof record?.cwd === "string" ? { cwd: record.cwd } : {}),
+		...(typeof session === "string" ? { session } : {}),
+	};
 }
 
 export function machinesFromList(payload: unknown): HerdrMachine[] {
@@ -141,9 +150,9 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 		},
 		startPi: (options, signal) => start("pi", options, signal),
 		startClaude: (options, signal) => start("claude", options, signal),
-		async promptAgent(name, text, signal) {
+		async promptAgent(target, text, signal) {
 			// Submission only; completion comes from run-scoped Claude hooks, not terminal detection.
-			await routed(bin, ["agent", "prompt", name, text], env, 10_000, signal);
+			await routed(bin, ["agent", "prompt", target, text], env, 10_000, signal);
 		},
 		async closePane(paneId) {
 			await routed(bin, ["pane", "close", paneId], env);
@@ -154,6 +163,16 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 				return true;
 			} catch (error) {
 				if (error instanceof HerdrCliError && error.code === "agent_not_found") return false;
+				throw error;
+			}
+		},
+		async getAgent(name, signal) {
+			try {
+				const payload = await routed(bin, ["agent", "get", name], env, undefined, signal);
+				const result = object(object(payload)?.result) ?? object(payload);
+				return agentRef(result?.agent);
+			} catch (error) {
+				if (error instanceof HerdrCliError && error.code === "agent_not_found") return undefined;
 				throw error;
 			}
 		},

@@ -40,6 +40,10 @@ The sidecar only knows what you tell it. Send a `note` at each milestone: the us
 
 Notes return in seconds and cost little; the reviews they inform are sharper for them.
 
+## Reload safely
+
+After updating sidecar or Pi extension files, run `sidecar [--slot N] reload` in the background. It waits for the active request's report and Pi's idle state, then reloads without changing the session or pending question. The original request still prints its own report. Exit 0 confirms a fresh runtime; exit 1 means refusal or missing confirmation (inspect the pane before retrying). Confirmation has a 30-second default timeout, configurable with `SIDECAR_RELOAD_TIMEOUT_S`; waiting for active work has no deadline. It does not cancel hung work or replace Pi's executable/startup flags.
+
 ## Steer a sidecar
 
 If the running slot is idle and has no request in flight, `steer TEXT` creates an `ask` request and waits for its report. Handle its result like any request: exit 0 report, 2 no report, 3 question, 4 duplicate, 5 approval blocked, or 1 failure. Use a background Bash run for this case. A missing sidecar needs `ask` or `start` first.

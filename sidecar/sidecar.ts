@@ -6,11 +6,13 @@ import { Type } from "typebox";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { installReloadControl } from "./reload.mjs";
 
 const stateDir = join(homedir(), ".cache", "claude-sidecar");
 const reportDir = join(stateDir, "reports");
 
 export default function (pi: ExtensionAPI) {
+  installReloadControl(pi, stateDir);
   pi.registerTool({
     name: "submit_review",
     label: "Submit review to Claude",

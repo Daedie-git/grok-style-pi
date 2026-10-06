@@ -8,6 +8,7 @@
 #   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when the pane holding its name runs another pi session
+#   sidecar reload               wait between requests, then reload pi resources without losing its report channel
 #   sidecar status               print the sidecar's herdr agent state
 #   sidecar note TEXT            share context on ongoing work; no review
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
@@ -76,6 +77,15 @@ remote_node() {
   args=$(jq -cn --args '$ARGS.positional' "$@")
   encoded=$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script" | base64 -w0)
   ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "node -e \"eval(Buffer.from('$encoded','base64').toString())\""
+}
+
+# Execute the same Node program locally or through the existing Windows-safe remote transport.
+run_node() {
+  if [[ -n $MACHINE ]]; then remote_node "$@"; return; fi
+  local script=$1 args
+  shift
+  args=$(jq -cn --args '$ARGS.positional' "$@")
+  node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script")"
 }
 
 # Saved herdr machines as a JSON array; fails on herdr older than 0.9 or when herdr does not answer in time.
@@ -163,7 +173,7 @@ resolve_machine() {
     REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
     # Deploy only the two runtime files, not a checkout or any credentials. Do not rewrite unchanged files.
     local runtime_file
-    for runtime_file in sidecar.ts reviewer.md; do
+    for runtime_file in sidecar.ts reviewer.md reload.mjs; do
       remote_node 'const dest=args[0],data=fs.readFileSync(0);fs.mkdirSync(path.dirname(dest),{recursive:true});
         if(!fs.existsSync(dest)||!fs.readFileSync(dest).equals(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
     done
@@ -402,6 +412,53 @@ cmd_start() {
 cmd_restart() {
   require_herdr
   ( flock 8; restart_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+cmd_reload() {
+  require_herdr
+  [[ $# == 0 ]] || die "usage: sidecar reload"
+  local name hname session session_file dir id mode
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  # Keep the existing ask's launcher and report channel intact: it releases this lock only after reading its report.
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  [[ $(agent_status "$hname") != missing ]] || die "no running sidecar to reload; use start first"
+  agent_runs_sidecar_session "$hname" || die "$hname does not run this sidecar session; use restart first"
+  wait_until_ready "$hname"
+  session=$(pi_session_id)
+  session_file=$(agent_session_file "$hname")
+  [[ -n $session_file ]] || die "cannot verify the sidecar session file for reload"
+  dir="${REMOTE_STATE:-$STATE_DIR}/reload"
+  id="reload-$(date +%s)-$$-$RANDOM"
+  mode=$(run_node 'const norm=s=>{s=String(s||"").replace(/\\/g,"/");return /^[A-Za-z]:/.test(s)?s.toLowerCase():s};
+    if(!/^[A-Za-z0-9._-]+$/.test(args[1]))throw Error("invalid session id");
+    fs.mkdirSync(args[0],{recursive:true});
+    const p=path.join(args[0],args[1]+".pending"),tmp=p+"."+args[2]+".tmp";
+    fs.writeFileSync(tmp,JSON.stringify({id:args[2],sessionFile:args[3]}));fs.renameSync(tmp,p);
+    let ready;try{ready=JSON.parse(fs.readFileSync(path.join(args[0],args[1]+".ready"),"utf8"))}catch(e){}
+    let live=false;if(ready)try{process.kill(ready.pid,0);live=true}catch(e){live=e.code==="EPERM"}
+    console.log(live&&norm(ready.sessionFile)===norm(args[3])?"command":"bootstrap");' "$dir" "$session" "$id" "$session_file" </dev/null)
+  # Built-in /reload bootstraps old runtime versions after the same idle/request guard. New versions additionally
+  # wait through compaction/preparation with documented ExtensionCommandContext.waitForIdle().
+  if [[ $mode == command ]]; then
+    hd agent prompt "$hname" "/sidecar-reload $id" >/dev/null || true
+  else
+    hd agent prompt "$hname" "/reload" >/dev/null || true
+  fi
+  if ! run_node 'const ack=path.join(args[0],args[2]+".ack"),pending=path.join(args[0],args[1]+".pending");
+    (async()=>{
+      for(let end=Date.now()+Number(args[3]);Date.now()<end&&!fs.existsSync(ack);)await new Promise(r=>setTimeout(r,100));
+      if(!fs.existsSync(ack)){
+        try{if(JSON.parse(fs.readFileSync(pending,"utf8")).id===args[2])fs.unlinkSync(pending)}catch(e){}
+        console.error("reload was not confirmed; check the pane before retrying (request/report files are unchanged)");process.exit(1)
+      }
+      const reply=JSON.parse(fs.readFileSync(ack,"utf8"));fs.unlinkSync(ack);
+      if(reply.status!=="reloaded")process.exit(1);
+    })().catch(e=>{console.error(String(e));process.exit(1)});' "$dir" "$session" "$id" "$(("${SIDECAR_RELOAD_TIMEOUT_S:-30}" * 1000))" </dev/null; then
+    die "could not confirm reload of $hname"
+  fi
+  echo "$hname reloaded between requests; session and pending answers preserved"
 }
 
 # These helpers run with the startup lock held; recursive calls keep that lock.
@@ -902,6 +959,7 @@ case "${1:-}" in
   session-start) shift; cmd_session_start "$@" ;;
   start) shift; cmd_start "$@" ;;
   restart) shift; cmd_restart "$@" ;;
+  reload) shift; cmd_reload "$@" ;;
   status) shift; cmd_status "$@" ;;
   note) shift; cmd_note "$@" ;;
   plan) shift; cmd_plan "$@" ;;

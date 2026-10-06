@@ -114,7 +114,15 @@ elif args[:2] == ['agent', 'rename']:
     state_path.unlink()
 elif args[:2] == ['agent', 'prompt']:
     prompt = args[3]
-    if prompt.startswith('[request '):
+    if prompt == '/reload' or prompt.startswith('/sidecar-reload '):
+        if not os.environ.get('FAKE_NO_RELOAD'):
+            session = state['agent_session']['value'].split('time_', 1)[1][:-6]
+            directory = data_home / '.cache/claude-sidecar/reload'
+            marker = directory / (session + '.pending')
+            request = json.loads(marker.read_text())
+            (directory / (request['id'] + '.ack')).write_text(json.dumps({'status': 'reloaded'}))
+            marker.unlink()
+    elif prompt.startswith('[request '):
         request_id = prompt.split(']', 1)[0].split()[1]
         reports = data_home / '.cache/claude-sidecar/reports'
         reports.mkdir(parents=True, exist_ok=True)
@@ -930,6 +938,67 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('no report submitted', result.stderr)
         self.assertIn('ssh laptop-host true', result.stderr)
+
+    def test_reload_extension_lifecycle(self):
+        subprocess.run(['node', '--test', str(ROOT / 'tests/test_reload.mjs')], check=True, capture_output=True)
+
+    def test_reload_waits_for_the_request_and_preserves_its_report(self):
+        self.run_cli('start')
+        busy = subprocess.Popen([str(self.launcher), 'ask', 'Long task'], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=dict(self.env, HERDR_PROMPT_DELAY='1.5'))
+        self.addCleanup(busy.wait)
+        deadline = time.monotonic() + 5
+        while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        result = self.run_cli('reload')
+        stdout, stderr = busy.communicate(timeout=5)
+        self.assertEqual(busy.returncode, 0, stderr)
+        self.assertIn('ship', stdout)
+        self.assertIn('reloaded between requests', result.stdout)
+        prompts = [c[3] for c in self.calls() if c[:2] == ['agent', 'prompt']]
+        self.assertTrue(prompts[0].startswith('[request '))
+        self.assertEqual(prompts[-1], '/reload')
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 1)
+
+    def test_reload_preserves_pending_question_and_uses_the_idle_command(self):
+        self.run_cli('start')
+        state = self.home / '.cache/claude-sidecar'
+        (state / 'sc-pane-1.pending').write_text('existing-request')
+        directory = state / 'reload'
+        directory.mkdir()
+        (directory / 'cc-pane-pane-1.ready').write_text(json.dumps({'pid': os.getpid(), 'sessionFile': '/tmp/time_cc-pane-pane-1.jsonl'}))
+        self.run_cli('reload')
+        self.assertEqual((state / 'sc-pane-1.pending').read_text(), 'existing-request')
+        prompts = [c[3] for c in self.calls() if c[:2] == ['agent', 'prompt']]
+        self.assertTrue(prompts[-1].startswith('/sidecar-reload reload-'))
+        self.assertFalse(list(directory.glob('*.pending')))
+
+    def test_remote_reload_preserves_the_session(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'start')
+        result = self.remote_run('reload')
+        self.assertIn('reloaded between requests', result.stdout)
+        self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.remote_calls()), 1)
+
+    def test_reload_timeout_is_not_reported_as_success(self):
+        self.run_cli('start')
+        result = self.run_cli('reload', env=dict(self.env, FAKE_NO_RELOAD='1', SIDECAR_RELOAD_TIMEOUT_S='1'), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('reload was not confirmed', result.stderr)
+        self.assertFalse(list((self.home / '.cache/claude-sidecar/reload').glob('*.pending')))
+
+    def test_reload_refuses_a_foreign_session(self):
+        self.run_cli('start')
+        path = self.home / 'agent.json'
+        state = json.loads(path.read_text())
+        state['agent_session']['value'] = '/tmp/time_foreign.jsonl'
+        path.write_text(json.dumps(state))
+        result = self.run_cli('reload', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('does not run this sidecar session', result.stderr)
+        self.assertFalse(any(c[:2] == ['agent', 'rename'] for c in self.calls()))
 
     def test_idle_steer_prints_a_request_report_without_an_inbox(self):
         self.run_cli('start')

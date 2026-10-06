@@ -36,6 +36,12 @@ Tests use a fake Herdr and isolated home directories; they never start a real mo
 
 A sidecar that cannot continue without a decision submits its report with `needs_answer`. The launcher then prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. Requests have no deadline; a turn that ends without a report exits 2, and a sidecar blocked in its pane exits 5. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.
 
+## Reload without interrupting work
+
+`sidecar [--slot N] reload` waits for the current request to return its report, then for Pi to become idle. It keeps the same process, session, pending-question marker and request/report files; the original `ask` finishes through its original channel. It uses the documented `/sidecar-reload` extension command (`waitForIdle()`, then `reload()`), with a file receipt written only by the fresh runtime. An older extension is bootstrapped through Pi's built-in `/reload` after the same request/idle guard. No pane keys or model prompt are sent. Node remote slots deploy the reload helper along with the runtime files.
+
+Run it in the background like a request. Exit 0 confirms the fresh runtime; exit 1 means it was refused or not confirmed. `SIDECAR_RELOAD_TIMEOUT_S` (default 30) bounds confirmation **after** the request has finished, not the active task. On timeout, inspect the pane before retrying; reload might have started. A foreign or blocked session is not reloaded. This loads Pi's reloadable resources, not a new Pi executable or changed startup flags. The command never interrupts work to make a hung request finish.
+
 ## Steering a sidecar
 
 If the slot is idle and its request lock is free, `steer TEXT` behaves like `ask TEXT`: it creates a request, waits without a deadline, and prints the submitted report. No steering extension is needed for this path. Its exit codes are the request codes: 0 report, 1 failure, 2 no report, 3 decision needed, 4 duplicate in flight, 5 approval blocked. A missing sidecar still needs `ask` or `start` first. If a request already owns the slot, steering stays on the busy path even during gaps between its turns.
@@ -122,7 +128,7 @@ For a Windows machine whose OpenSSH shell is `cmd.exe`, use the Node transport. 
 
 Keys are saved machine labels or IDs; IDs take precedence. The longest matching directory prefix maps the local checkout, including subdirectories. `--remote-cwd` overrides the mapping and accepts Windows drive paths; the slot remembers the chosen directory. A matching checkout must already exist on the machine. This does not clone, reset or synchronize repositories.
 
-The Node transport copies only `sidecar.ts` and `reviewer.md` into the remote home's `.cache/claude-sidecar/plugin/sidecar`, updating changed files on each invocation. No plugin checkout or remote launcher dependencies are needed. Optional `home` names a different runtime deployment directory; `SIDECAR_REMOTE_HOME` overrides it. Already-running agents retain their loaded extension. Requests, answers and reports also transfer through Node, so the SSH default shell needs no POSIX commands. Pi's own Bash tool still needs its usual Windows shell setup (such as Git Bash).
+The Node transport copies only `sidecar.ts`, `reviewer.md` and `reload.mjs` into the remote home's `.cache/claude-sidecar/plugin/sidecar`, updating changed files on each invocation. No plugin checkout or remote launcher dependencies are needed. Optional `home` names a different runtime deployment directory; `SIDECAR_REMOTE_HOME` overrides it. Already-running agents retain their loaded extension. Requests, answers and reports also transfer through Node, so the SSH default shell needs no POSIX commands. Pi's own Bash tool still needs its usual Windows shell setup (such as Git Bash).
 
 From a mapped checkout, start a new slot with `./scripts/sidecar --slot 2 --machine lappy ask "Run the tests there."`; follow-ups need only `--slot 2`. This transport has been smoke-tested with pi in a Windows Herdr pane, including tool execution, report delivery and answering a pending question.
 

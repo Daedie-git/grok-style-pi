@@ -132,6 +132,28 @@ The Node transport copies only `sidecar.ts`, `reviewer.md` and `reload.mjs` into
 
 From a mapped checkout, start a new slot with `./scripts/sidecar --slot 2 --machine lappy ask "Run the tests there."`; follow-ups need only `--slot 2`. This transport has been smoke-tested with pi in a Windows Herdr pane, including tool execution, report delivery and answering a pending question.
 
+## Sync tooling on a saved machine
+
+`sidecar sync-machine NAME` updates the saved machine's `grok-style-pi` and `claude-sidecar` Git checkouts from `origin`. It is independent of the current slot and never changes its binding, deploys runtime files, or reloads a running Pi. Run `sidecar --slot N reload` afterward to load updated resources on that slot. Unpublished local commits cannot reach the machine through this command.
+
+Discovery prefers local paths in the machine's Pi settings (`PI_CODING_AGENT_DIR`, default `~/.pi/agent/settings.json`, plus a mapped project's `.pi/settings.json`) and the configured runtime `home`, then known `~/git`, `~/git/codex`, `~/src`, `C:/git` and `C:/git/codex` locations. Ambiguous or missing checkouts fail clearly. Override discovery with `tooling` in the existing machine configuration:
+
+```json
+{
+  "lappy": {
+    "transport": "node",
+    "tooling": {
+      "grok-style-pi": "C:/git/codex/grok-style-pi",
+      "claude-sidecar": "C:/git/claude-sidecar"
+    }
+  }
+}
+```
+
+Both checkouts must be clean, on a branch of the same name as its `origin` branch, and have no unpublished or diverged local commits. The command validates both, fetches both origins, then fast-forwards; it prints each path, branch and old/new commit. Dirty files (including untracked files), detached HEADs, divergence, local-only commits, missing origins and unverifiable paths are refused. It never resets, rebases, stashes or switches branches. Fetches can update Git metadata even when validation subsequently refuses the checkout update. A late filesystem/Git failure can leave the first checkout updated and the second unchanged; the output identifies completed updates, and there is no automatic rollback.
+
+Exit 0 means both synchronized; exit 1 means refusal or failure. `SIDECAR_SYNC_TIMEOUT_S` (default 60) bounds each Git operation. Node and Git must be on the remote SSH PATH; the program travels on stdin and Git paths use argument arrays, so Windows `cmd.exe` and shell metacharacters need no special quoting. No credentials, dependencies, Pi executables or system configuration are installed. Avoid editing the tooling checkouts during sync. Node-transport slots still deploy the **local plugin's** runtime files on their next command; updating the remote source checkout does not change that deployment policy.
+
 ## Safety
 
 The reviewer inspects by default, but can edit and commit when asked. It may push and write to GitLab/GitHub when asked. It runs with all of pi's tools and no command guard. The agent has access to your filesystem and its own model credentials. Claude remains responsible for verifying findings.

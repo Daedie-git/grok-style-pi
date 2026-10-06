@@ -9,6 +9,7 @@
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when the pane holding its name runs another pi session
 #   sidecar reload               wait between requests, then reload pi resources without losing its report channel
+#   sidecar sync-machine NAME    fast-forward the machine's tooling checkouts from origin (no slot binding)
 #   sidecar status               print the sidecar's herdr agent state
 #   sidecar note TEXT            share context on ongoing work; no review
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
@@ -922,6 +923,33 @@ $*" held
   esac
 }
 
+# Machine maintenance is independent of the current slot's binding and does not deploy or reload a live sidecar.
+cmd_sync_machine() {
+  [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || die "not running inside a herdr pane"
+  [[ $# == 1 ]] || die "usage: sidecar sync-machine NAME"
+  local record config='{}' config_file=${SIDECAR_MACHINES_FILE:-$HOME/.config/claude-sidecar/machines.json} options status=0
+  record=$(find_machine "$1")
+  MACHINE=$(jq -r '.id' <<<"$record")
+  MACHINE_LABEL=$(jq -r '.label' <<<"$record")
+  MACHINE_TARGET=$(jq -r '.target' <<<"$record")
+  [[ -n $MACHINE_TARGET && $MACHINE_TARGET != null ]] || die "herdr machine '$MACHINE_LABEL' has no SSH target"
+  command -v ssh >/dev/null || die "ssh is required for sync-machine"
+  if [[ -f $config_file ]]; then
+    config=$(jq -ce --arg id "$MACHINE" --arg label "$MACHINE_LABEL" '.[$id] // .[$label] // {}' "$config_file") || die "invalid machine configuration: $config_file"
+  fi
+  [[ ${SIDECAR_SYNC_TIMEOUT_S:-60} =~ ^[1-9][0-9]*$ ]] || die "SIDECAR_SYNC_TIMEOUT_S must be a positive integer"
+  options=$(jq -cn --argjson config "$config" --arg cwd "$PWD" --arg runtime "${SIDECAR_REMOTE_HOME:-}" --argjson timeout "$((${SIDECAR_SYNC_TIMEOUT_S:-60} * 1000))" '
+    ($config.paths // {} | to_entries | map(.key |= rtrimstr("/")) | map(.key as $prefix | select($cwd == $prefix or ($cwd | startswith($prefix + "/")))) | sort_by(.key | length) | last) as $mapping |
+    {tooling: ($config.tooling // {}), runtimeHome: (if $runtime != "" then $runtime else $config.home end),
+     workDir: (if $mapping then $mapping.value + $cwd[($mapping.key | length):] else null end), timeoutMs: $timeout}')
+  remote_node 'eval(fs.readFileSync(0,"utf8"));' "$options" <"$PLUGIN_ROOT/scripts/sync-machine.cjs" || status=$?
+  case $status in
+    0) echo "$MACHINE_LABEL tooling synchronized; use sidecar reload on its slots to load the new resources" ;;
+    255) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH; test: ssh $MACHINE_TARGET true" ;;
+    *) die "tooling sync failed on $MACHINE_LABEL (exit $status); check the checkout/SSH/Git messages above" ;;
+  esac
+}
+
 cmd_status() {
   require_herdr
   local name
@@ -960,6 +988,7 @@ case "${1:-}" in
   start) shift; cmd_start "$@" ;;
   restart) shift; cmd_restart "$@" ;;
   reload) shift; cmd_reload "$@" ;;
+  sync-machine) shift; cmd_sync_machine "$@" ;;
   status) shift; cmd_status "$@" ;;
   note) shift; cmd_note "$@" ;;
   plan) shift; cmd_plan "$@" ;;

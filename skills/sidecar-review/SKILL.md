@@ -40,6 +40,10 @@ The sidecar only knows what you tell it. Send a `note` at each milestone: the us
 
 Notes return in seconds and cost little; the reviews they inform are sharper for them.
 
+## Sync remote tooling
+
+When asked to update a saved machine's sidecar tooling, run `sidecar sync-machine NAME`. This does not select or move a slot. It finds the remote `grok-style-pi` and `claude-sidecar` checkouts through Pi settings/known locations, or the machine configuration's `tooling` paths, and fast-forwards their current branches from `origin`. Both must be clean and have no local-only/diverged commits; a refusal preserves that work. Exit 0 means both synchronized; exit 1 means refusal/failure. Read the old/new commits in the output, then run the affected slot's `reload` between requests. It cannot transfer unpublished commits, install dependencies, or replace a running Pi executable. See README's sync section for path overrides and partial-failure behavior.
+
 ## Reload safely
 
 After updating sidecar or Pi extension files, run `sidecar [--slot N] reload` in the background. It waits for the active request's report and Pi's idle state, then reloads without changing the session or pending question. The original request still prints its own report. Exit 0 confirms a fresh runtime; exit 1 means refusal or missing confirmation (inspect the pane before retrying). Confirmation has a 30-second default timeout, configurable with `SIDECAR_RELOAD_TIMEOUT_S`; waiting for active work has no deadline. It does not cancel hung work or replace Pi's executable/startup flags.

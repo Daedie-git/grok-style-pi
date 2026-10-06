@@ -39,7 +39,7 @@ test("Herdr selects the pane runner; other sessions retain Pi Subagents", async 
 
 test("the extracted runner keeps Grok diamonds optional without changing execution or duplicating policy", async () => {
 	const tools: ToolDefinition[] = [];
-	const pi = { registerTool(tool: ToolDefinition) { tools.push(tool); }, on() {} } as unknown as ExtensionAPI;
+	const pi = { registerTool(tool: ToolDefinition) { tools.push(tool); }, registerMessageRenderer() {}, on() {} } as unknown as ExtensionAPI;
 	const factory = createHerdrSubagents({ env: { HERDR_ENV: "1" }, listMachines: async () => [] });
 	await factory(pi);
 	const native = tools.splice(0);

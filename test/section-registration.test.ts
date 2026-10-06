@@ -19,6 +19,7 @@ function host() {
 	const pi = {
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
 		registerCommand(name: string) { commands.push(name); },
+		registerMessageRenderer() {},
 		on(event: string, handler: Function) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
 	} as unknown as ExtensionAPI;
 	return { pi, tools, handlers, commands };

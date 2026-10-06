@@ -6,6 +6,7 @@ import type { ToolTransform } from "../src/tools/register-extension.ts";
 import { createHerdrSubagents } from "../packages/herdr-subagents/src/herdr/extension.ts";
 import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
 import { registerStyledSubagents } from "../src/subagents/result-style.ts";
+import { createHerdrNotificationRenderer } from "../src/subagents/notification-style.ts";
 
 export async function loadSubagentExtension(
 	pi: ExtensionAPI,
@@ -14,7 +15,9 @@ export async function loadSubagentExtension(
 	styling: boolean,
 	styleTool?: ToolTransform,
 ) {
-	await registerStyledSubagents(pi, selectSubagentRuntime(env) === "herdr" ? load.herdr : load.current, styling, styleTool);
+	const herdr = selectSubagentRuntime(env) === "herdr";
+	if (herdr && styling) pi.registerMessageRenderer("herdr-subagent-notification", createHerdrNotificationRenderer());
+	await registerStyledSubagents(pi, herdr ? load.herdr : load.current, styling, styleTool);
 }
 
 /** Preserve the implicit remote worker path of existing combined installations. */

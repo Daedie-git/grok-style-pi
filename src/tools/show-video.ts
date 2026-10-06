@@ -4,7 +4,7 @@ import { getCapabilities, Image, truncateToWidth, type TuiMouseEvent } from "@ea
 import { Type } from "@sinclair/typebox";
 import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { sanitizeToolText } from "./diamond.ts";
-import { classifyClick } from "./interaction.ts";
+import { classifyClick, claimsPress } from "./interaction.ts";
 import { playVideoFrames } from "./video-frames.ts";
 
 const EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"]);
@@ -37,7 +37,7 @@ export function createShowVideoTool(cwd: string, hooks: { onModifierOpen?: (targ
 	function click(event: TuiMouseEvent, surface: "header" | "body", state: VideoState | undefined, invalidate: (() => void) | undefined, path: string | undefined) {
 		if (disposed) return undefined;
 		const action = classifyClick(event, surface, { open: state?.open ?? false });
-		if (action === "none") return undefined;
+		if (action === "none") return claimsPress(event) ? { handled: true as const } : undefined;
 		if (action === "open-target") {
 			if (path) hooks.onModifierOpen?.({ path: absPath(path, cwd), line: 1, cwd });
 			return { handled: true as const };

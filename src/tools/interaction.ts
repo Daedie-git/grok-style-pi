@@ -15,22 +15,35 @@ export type ClickAction = "toggle" | "close" | "open-target" | "inert" | "none";
 
 // Pi builds a click from the release event, so a modifier let go before the
 // button is missing from it. The press that started the click still has it.
-const PRESS_MEMORY_MS = 5000;
+// The memory is used once, ends with a drag, and outlives a click by no more
+// than one gesture, so a finished or cancelled press never modifies a later click.
+const PRESS_MEMORY_MS = 1000;
 let lastPress: { x: number; y: number; ctrl: boolean; alt: boolean; at: number } | undefined;
 const spot = (event: TuiMouseEvent) => ({ x: event.screenX ?? event.x, y: event.screenY ?? event.y });
 
 /** Records a left press, and gives a click the modifiers held when it began. */
 export function withPressModifiers(event: TuiMouseEvent): TuiMouseEvent {
 	if (event.button !== "left") return event;
+	if (event.type === "drag") { lastPress = undefined; return event; }
 	if (event.type === "press") {
 		lastPress = { ...spot(event), ctrl: Boolean(event.ctrl), alt: Boolean(event.alt), at: Date.now() };
 		return event;
 	}
 	if (event.type !== "click" || !lastPress) return event;
 	const press = lastPress;
+	lastPress = undefined;
 	const here = spot(event);
 	if (press.x !== here.x || press.y !== here.y || Date.now() - press.at > PRESS_MEMORY_MS) return event;
 	return { ...event, ctrl: event.ctrl || press.ctrl, alt: event.alt || press.alt };
+}
+
+/**
+ * A modified press is claimed so Pi routes its release back as a click. An
+ * unclaimed press would start native word selection, and a second press on a
+ * word within the double-click interval never produces a click at all.
+ */
+export function claimsPress(event: TuiMouseEvent): boolean {
+	return event.type === "press" && event.button === "left" && Boolean(event.ctrl);
 }
 
 export function classifyClick(
@@ -57,7 +70,7 @@ export function handleDiamondClick(event: TuiMouseEvent, surface: ClickSurface, 
 }): { handled: true } | undefined {
 	const display = options.display;
 	const action = classifyClick(event, surface, { open: display?.open ?? false, closeNeedsAlt: options.closeNeedsAlt });
-	if (action === "none") return undefined;
+	if (action === "none") return claimsPress(event) ? { handled: true } : undefined;
 	if (action === "open-target") {
 		// Ctrl-click always wins over a plain click, even where there is nothing to open.
 		options.openTarget?.();

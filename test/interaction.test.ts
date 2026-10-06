@@ -175,3 +175,68 @@ test("Ctrl released before the button still opens a read body's clicked line", (
 	assert.deepEqual(body.handleMouse(ev({ ...at })), { handled: true });
 	assert.deepEqual(opened, [{ path: "src/a.ts", line: 2, cwd: "/repo" }]);
 });
+
+// Drives Pi's real tool component and fullscreen mouse routing with raw press/release events.
+async function native(name: string, definition: any, args: any, details: unknown, text: string) {
+	const { TuiAltScreen } = await import("@earendil-works/pi-tui");
+	const { ToolExecutionComponent, initTheme } = await import("@earendil-works/pi-coding-agent");
+	initTheme("dark");
+	const terminal = { columns: 80, rows: 24, write() {} } as any;
+	const tui = new TuiAltScreen(terminal, false) as any;
+	tui.requestRender = () => {};
+	tui.altScreenActive = true;
+	tui.stopped = false;
+	const component = new ToolExecutionComponent(name, "id", args, { showImages: false }, definition, tui, "/repo");
+	component.setExpanded(true);
+	component.updateResult({ content: [{ type: "text", text }], details, isError: false }, false);
+	tui.addChild(component);
+	tui.doRender();
+	return {
+		lines: () => component.render(80).map(stripTerminalSequences),
+		click(x: number, y: number, press: number, release = press) {
+			tui.handleMouseEvent({ button: press, x, y, release: false });
+			tui.handleMouseEvent({ button: release, x, y, release: true });
+		},
+	};
+}
+const CTRL = 16;
+
+test("native flow: Ctrl released before the button still opens, and never collapses, a video", async () => {
+	const opened: OpenTarget[] = [];
+	const tool = createShowVideoTool("/repo", { onModifierOpen: (target) => opened.push(target) });
+	const view = await native("show_video", tool, { path: "/repo/a.mp4" }, { path: "/repo/a.mp4" }, "shown");
+	const before = view.lines().length;
+	view.click(10, 1, CTRL, 0);
+	view.click(10, 2, CTRL, 0);
+	assert.equal(opened.length, 2);
+	assert.equal(view.lines().length, before);
+	tool.dispose();
+});
+
+test("native flow: Ctrl-click on a word just after a plain click on it is not swallowed by word selection", async () => {
+	const opened: OpenTarget[] = [];
+	const read = wrapWithDiamondRenderer(original("read"), { onModifierOpen: (target) => opened.push(target), onCodeLocation() {} });
+	const view = await native("read", read, { path: "src/a.ts" }, undefined, "const word = 1;");
+	const row = view.lines().findIndex((line) => line.includes("word"));
+	const x = view.lines()[row].indexOf("word") + 1;
+	view.click(x, row, 0);
+	view.click(x, row, CTRL);
+	assert.deepEqual(opened.map((target) => target.line), [1]);
+});
+
+test("a finished Ctrl-click does not lend Ctrl to a later click at the same spot", () => {
+	const tool = wrapWithDiamondRenderer(original("bash"), {});
+	const args = { command: "ls" };
+	const context = { args, state: {} as any, expanded: true, invalidate() {} };
+	const header = tool.renderCall(args, theme, context) as any;
+	const at = { screenX: 7, screenY: 3 };
+	header.handleMouse(ev({ ...at, type: "press", ctrl: true }));
+	header.handleMouse(ev({ ...at, ctrl: false }));
+	assert.equal(context.state.grokTool.open, true);
+	header.handleMouse(ev({ ...at, ctrl: false }));
+	assert.equal(context.state.grokTool.open, false, "the second click is a plain toggle");
+	header.handleMouse(ev({ ...at, type: "press", ctrl: true }));
+	header.handleMouse(ev({ ...at, type: "drag" }));
+	header.handleMouse(ev({ ...at, ctrl: false }));
+	assert.equal(context.state.grokTool.open, true, "a dragged press lends nothing");
+});

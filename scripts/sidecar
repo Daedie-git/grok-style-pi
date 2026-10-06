@@ -14,7 +14,7 @@
 #   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
 #   sidecar ask TEXT             follow-up request; prints the report
 #   sidecar answer TEXT          answer the sidecar's pending question (exit 3 from a request); resumes that task
-#   sidecar steer TEXT           deliver TEXT to the running sidecar now, mid-turn, without waiting behind a request
+#   sidecar steer TEXT           redirect busy work now; when idle, run a request and print its report
 set -euo pipefail
 
 STATE_DIR="$HOME/.cache/claude-sidecar"
@@ -619,18 +619,21 @@ remote_checkout_note() {
 # 3 the sidecar is blocked on a question (first line `NEEDS_ANSWER: ...`; reply with `sidecar answer`),
 # 4 an identical request is already in flight, 5 the sidecar is blocked in its pane.
 request() {
-  local kind=$1 body=$2 name hname id req report status hash question prompt_path
+  local kind=$1 body=$2 lock_mode=${3:-acquire} name hname id req report status hash question prompt_path
   name=$(agent_name)
   hname=$(herdr_agent)
   hash=$(sha256sum <<<"$body" | cut -d' ' -f1)
-  exec 9>"$STATE_DIR/$name.lock"
-  if ! flock -n 9; then
-    if [[ -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
-      echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
-      exit 4
+  # The idle-steer caller already holds descriptor 9 so its idle decision and request are serialized together.
+  if [[ $lock_mode == acquire ]]; then
+    exec 9>"$STATE_DIR/$name.lock"
+    if ! flock -n 9; then
+      if [[ -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
+        echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
+        exit 4
+      fi
+      echo "sidecar: another request is in flight; waiting for it" >&2
+      flock 9
     fi
-    echo "sidecar: another request is in flight; waiting for it" >&2
-    flock 9
   fi
   INFLIGHT="$STATE_DIR/$name.inflight"
   printf '%s\n' "$hash" >"$INFLIGHT"
@@ -782,7 +785,24 @@ cmd_steer() {
   [[ $# -ge 1 ]] || die "usage: sidecar steer TEXT"
   local hname session session_file attempt script payload result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000)) grace_ms=$((${SIDECAR_STEER_CLAIM_GRACE_S:-7} * 1000))
   hname=$(herdr_agent)
-  [[ $(agent_status "$hname") != missing ]] || die "no running sidecar in slot $SLOT${MACHINE:+ on $MACHINE_LABEL} to steer; use ask to start one"
+  local agent_state name
+  agent_state=$(agent_status "$hname")
+  [[ $agent_state != missing ]] || die "no running sidecar in slot $SLOT${MACHINE:+ on $MACHINE_LABEL} to steer; use ask to start one"
+  if [[ $agent_state == idle || $agent_state == 'done' ]]; then
+    name=$(agent_name)
+    exec 9>"$STATE_DIR/$name.lock"
+    if flock -n 9; then
+      agent_state=$(agent_status "$hname")
+      if [[ $agent_state == idle || $agent_state == 'done' ]]; then
+        request ask "# Follow-up from Claude
+
+$*" held
+        return
+      fi
+    fi
+    # An in-flight request owns the channel, even if Pi has not started its prompt yet. Steer it without waiting.
+    exec 9>&-
+  fi
   session=$(pi_session_id)
   # Herdr can publish a new pi's session file late (notably on Windows); the owner check needs it.
   for ((attempt = 0; attempt < 10; attempt++)); do

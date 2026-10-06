@@ -94,6 +94,8 @@ elif args[:2] == ['agent', 'get']:
         counter.write_text(str(probes + 1))
         if probes < 2:
             state = dict(state, agent_session={'value': ''})
+    if os.environ.get('FAKE_AGENT_WORKING'):
+        state = dict(state, agent_status='working')
     print(json.dumps({'result': {'agent': state}}))
 elif args[:2] == ['agent', 'start']:
     target = find(args[args.index('--pane') + 1])
@@ -929,6 +931,30 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('no report submitted', result.stderr)
         self.assertIn('ssh laptop-host true', result.stderr)
 
+    def test_idle_steer_prints_a_request_report_without_an_inbox(self):
+        self.run_cli('start')
+        text = 'quote "double" and é\nsecond line'
+        result = self.run_cli('steer', text)
+        self.assertIn('Sidecar report', result.stdout)
+        self.assertIn('ship', result.stdout)
+        request = next((self.home / '.cache/claude-sidecar/requests').glob('*.md'))
+        self.assertIn(text, request.read_text())
+        self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
+
+    def test_idle_steer_preserves_request_question_exit(self):
+        self.run_cli('start')
+        result = self.run_cli('steer', 'Need a decision', env=dict(self.env, FAKE_QUESTION='Which?'), check=False)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('NEEDS_ANSWER: Which?', result.stdout)
+
+    def test_idle_remote_steer_returns_the_remote_report(self):
+        self.add_machines()
+        self.remote_run('--machine', 'laptop', 'start')
+        result = self.remote_run('steer', 'Review remotely')
+        self.assertIn('ship', result.stdout)
+        self.assertEqual(len(list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*.md'))), 1)
+        self.assertFalse((self.remote_home() / '.local/state/grok-style-pi/steer').exists())
+
     def write_owner(self, home, session='cc-pane-pane-1', pid=None, session_file=None):
         inbox = home / '.local/state/grok-style-pi/steer' / session
         inbox.mkdir(parents=True, exist_ok=True)
@@ -979,6 +1005,7 @@ class LauncherTests(unittest.TestCase):
         busy.communicate()
 
     def test_steer_keeps_text_verbatim_and_reports_an_idle_prompt(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         seen = self.steer_inbox(self.home, {'status': 'delivered', 'delivery': 'prompt'})
         text = 'quote \' and "double" $HOME `x` \\ \u00e9 \n second line'
@@ -987,6 +1014,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(seen[0]['text'], text)
 
     def test_steer_withdraws_an_unacknowledged_message_and_fails(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.write_owner(self.home)
         result = self.run_cli('steer', 'Hello', env=dict(self.env, SIDECAR_STEER_TIMEOUT_S='1'), check=False)
@@ -995,6 +1023,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer').glob('*/*.json')) + list((self.home / '.local/state/grok-style-pi/steer').glob('*/*.taken')), [])
 
     def test_steer_that_was_claimed_but_not_acknowledged_is_not_called_withdrawn(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.write_owner(self.home)
         root = self.home / '.local/state/grok-style-pi/steer'
@@ -1015,6 +1044,7 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('withdrawn', result.stderr)
 
     def test_steer_claimed_late_but_acknowledged_within_the_grace_succeeds(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.write_owner(self.home)
         root = self.home / '.local/state/grok-style-pi/steer'
@@ -1036,6 +1066,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('delivered to idle', result.stdout)
 
     def test_steer_delivers_json_looking_text_verbatim(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         # The text is data: a JSON-looking message is delivered verbatim, never parsed by the launcher.
         self.run_cli('start')
         seen = self.steer_inbox(self.home)
@@ -1043,6 +1074,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(seen[0]['text'], 'null')
 
     def test_remote_steer_command_has_a_fixed_size_for_any_text(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.add_machines()
         self.remote_run('--machine', 'laptop', 'start')
         seen = self.steer_inbox(self.remote_home())
@@ -1053,6 +1085,7 @@ class LauncherTests(unittest.TestCase):
         self.assertLess(max(len(c['command']) for c in ssh), 6000)
 
     def test_steer_reports_an_unconfirmed_message_as_unknown(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.steer_inbox(self.home, {'status': 'unconfirmed', 'reason': 'Pi did not report the message'})
         result = self.run_cli('steer', 'Hello', check=False)
@@ -1060,18 +1093,21 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('outcome unknown', result.stderr)
 
     def test_steer_queued_behind_a_running_turn_exits_zero_and_says_it_is_unconfirmed(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.steer_inbox(self.home, {'status': 'queued'})
         result = self.run_cli('steer', 'Hello')
         self.assertIn('queued (not yet confirmed in conversation)', result.stdout)
 
     def test_steer_names_the_verified_owner_instance_in_the_message(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         seen = self.steer_inbox(self.home)
         self.run_cli('steer', 'Hello')
         self.assertEqual(seen[0]['owner'], 't')
 
     def test_steer_reports_an_owner_change_after_verification(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.steer_inbox(self.home, {'status': 'rejected', 'reason': 'owner changed: the message was addressed to another receiver instance'})
         result = self.run_cli('steer', 'Hello', check=False)
@@ -1079,6 +1115,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('owner changed', result.stderr)
 
     def test_steer_refuses_an_inbox_without_a_receiver(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         result = self.run_cli('steer', 'Hello', check=False)
         self.assertEqual(result.returncode, 1)
@@ -1086,6 +1123,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(list((self.home / '.local/state/grok-style-pi/steer').glob('*/*.json')), [])
 
     def test_steer_refuses_an_inbox_owned_by_another_pi(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         seen = self.steer_inbox(self.home, session_file='/tmp/time_cc-pane-pane-1-other.jsonl')
         result = self.run_cli('steer', 'Hello', check=False)
@@ -1094,6 +1132,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(seen, [])
 
     def test_steer_refuses_a_dead_receiver(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.write_owner(self.home, pid=999999)
         result = self.run_cli('steer', 'Hello', check=False)
@@ -1101,6 +1140,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('is gone', result.stderr)
 
     def test_steer_says_so_when_the_targets_session_file_is_unknown(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.write_owner(self.home)
         state = next(self.home.glob('agent.json'))
@@ -1112,6 +1152,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('cannot tell which session file herdr runs', result.stderr)
 
     def test_steer_accepts_windows_style_session_paths_from_herdr(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.steer_inbox(self.home, session_file='C:\\Users\\AIM\\s\\x.jsonl')
         state = next(self.home.glob('agent.json'))
@@ -1121,6 +1162,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('steered', self.run_cli('steer', 'Hello').stdout)
 
     def test_steer_reports_a_refusal(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.run_cli('start')
         self.steer_inbox(self.home, {'status': 'rejected', 'reason': 'expired before this session read it'})
         result = self.run_cli('steer', 'Hello', check=False)
@@ -1128,12 +1170,14 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('expired before this session read it', result.stderr)
 
     def test_steer_needs_a_running_sidecar(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         result = self.run_cli('--slot', '4', 'steer', 'Hello', check=False)
         self.assertEqual(result.returncode, 1)
         self.assertIn('no running sidecar in slot 4', result.stderr)
         self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
 
     def test_remote_steer_routes_over_ssh_to_the_machines_inbox(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.add_machines()
         self.remote_run('--machine', 'laptop', 'start')
         seen = self.steer_inbox(self.remote_home())
@@ -1145,6 +1189,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('BatchMode=yes', ssh[-1]['options'])
 
     def test_remote_steer_reports_an_unreachable_machine(self):
+        self.env['FAKE_AGENT_WORKING'] = '1'
         self.add_machines()
         self.remote_run('--machine', 'laptop', 'start')
         result = self.remote_run('steer', 'Hello', env=dict(self.remote_env, FAKE_SSH_DOWN='1'), check=False)

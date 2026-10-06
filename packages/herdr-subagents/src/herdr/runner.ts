@@ -87,13 +87,18 @@ export type Presence = "alive" | "dead" | "unknown";
 
 /**
  * A Herdr name follows its agent across pane moves, which issue new pane IDs, but another process may take the
- * name after the agent exits. A name proves this agent only in its recorded pane or with its own session.
+ * name, or the pane, after the agent exits. A reported session decides; without one, only the recorded pane does.
  */
 export function agentPresence(record: Pick<AgentRecord, "herdrName" | "paneId" | "sessionFile" | "sessionId">, named: HerdrAgentRef | undefined): Presence {
 	if (!named) return "dead";
-	if (named.paneId === record.paneId) return "alive";
-	if (named.session === undefined) return "unknown";
-	return named.session === record.sessionFile || named.session === record.sessionId ? "alive" : "dead";
+	if (named.session !== undefined) return sameSession(named.session, record) ? "alive" : "dead";
+	return named.paneId === record.paneId ? "alive" : "unknown";
+}
+
+/** Session files have unique names, and Claude reports its session ID or a transcript named after it. */
+function sameSession(reported: string, record: Pick<AgentRecord, "sessionFile" | "sessionId">): boolean {
+	const file = (path: string) => path.split(/[\\/]/).pop();
+	return file(reported) === file(record.sessionFile) || (!!record.sessionId && reported.includes(record.sessionId));
 }
 
 /** Remote agent IDs carry their machine so later tool calls route back to it. Agent names never contain `@`. */
@@ -400,7 +405,11 @@ export class HerdrRunner {
 			// Closing the owned pane is an explicit, confirmed stop; Esc alone is not execution evidence.
 			await this.withPlacement(async () => {
 				if (isTerminal((await this.read(binding.run)).phase)) return;
-				await this.deps.client.closePane(binding.agent.paneId);
+				// Close the agent where it is now. An exited agent has nothing to stop, and its old pane may host another process.
+				const named = await this.deps.client.getAgent(binding.agent.herdrName, signal);
+				const presence = agentPresence(binding.agent, named);
+				if (presence === "unknown") throw new Error(`Cannot cancel ${agentId}: Herdr agent ${binding.agent.herdrName} is in pane ${named!.paneId}, not ${binding.agent.paneId}, and reports no session to confirm it.`);
+				if (presence === "alive") await this.deps.client.closePane(named!.paneId!);
 				await this.store.recordPaneClosed(binding.run, this.now());
 			}, signal ?? this.stopping.signal);
 			return;
@@ -575,8 +584,9 @@ export async function spawnHerdrAgent(request: SpawnRequest, deps: RunnerDeps): 
 			? await runner.resume(request.resume, request.prompt, deps.signal, request.runInBackground)
 			: await runner.spawn(request, deps.signal);
 		const record = await runner.resolve(ref.agentId);
+		let snapshot = await runner.read(ref);
 		// An abort after publication still reaches the run; cancel() is idempotent for one already cancelled.
-		const snapshot = deps.signal?.aborted ? await runner.cancel(ref) : await runner.read(ref);
+		if (deps.signal?.aborted) snapshot = await runner.cancel(ref);
 		const shown = { ...ref, agentId: qualifiedAgentId(ref.agentId, runner.machine) };
 		if (deps.signal?.aborted) return text(formatStatus(record, snapshot, runner.machine), { ...shown, paneId: record.paneId, status: snapshot.phase });
 		if (request.runInBackground) return text(

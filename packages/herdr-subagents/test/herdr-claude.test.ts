@@ -107,6 +107,28 @@ test("Claude prompts target the verified pane and refuse a name taken in another
 	assert.deepEqual(targets, [record.paneId, "w2:p5"]);
 });
 
+test("cancelling a moved Claude agent closes its current pane, never the old one", async (t) => {
+	const targets: string[] = [];
+	const texts: string[] = [];
+	const closed: string[] = [];
+	const f = fixture(t, {
+		promptAgent: async (target, text) => { targets.push(target); texts.push(text); },
+		closePane: async (paneId) => { closed.push(paneId); },
+	});
+	const first = await f.runner.spawn(f.request);
+	const record = await f.runner.resolve(first.agentId);
+	await f.hook("UserPromptSubmit", { prompt: texts[0] });
+	await f.hook("PreToolUse", { tool_name: "Read" });
+	await f.hook("Stop", { last_assistant_message: "done" });
+	f.client.getAgent = async (name) => ({ name, paneId: "w2:p5", session: record.sessionId });
+	const second = await f.runner.resume(first.agentId, "Follow up");
+	await f.hook("UserPromptSubmit", { prompt: texts[1] });
+	await f.hook("PreToolUse", { tool_name: "Read" });
+	assert.equal((await f.runner.cancel(second)).phase, "stopped");
+	assert.deepEqual(closed, ["w2:p5"]);
+	assert.deepEqual(targets, [record.paneId, "w2:p5"]);
+});
+
 test("Claude cancellation confirms owned pane closure and refuses resume after exit", async (t) => {
 	const f = fixture(t);
 	const ref = await f.runner.spawn(f.request);

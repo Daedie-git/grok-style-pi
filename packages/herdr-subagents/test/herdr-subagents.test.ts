@@ -444,6 +444,20 @@ test("cancellation after publication, while the result is prepared, cancels the 
 	assert.equal(result.details.status, run.phase);
 });
 
+for (const runInBackground of [true, false]) {
+	test(`cancellation during the post-publication read cancels the ${runInBackground ? "background" : "foreground"} run`, async (t) => {
+		const f = fixture(t);
+		const controller = new AbortController();
+		const read = f.runner.read.bind(f.runner);
+		let reads = 0;
+		f.runner.read = async (ref) => { const value = await read(ref); if (++reads === 1) controller.abort(); return value; };
+		const result = await spawnHerdrAgent(request({ runInBackground }), { root: f.root, client: f.client, runner: f.runner, signal: controller.signal });
+		const run = await read({ agentId: result.details.agentId as string, runId: result.details.runId as string });
+		assert.equal(run.cancelRequested, true);
+		assert.ok(isTerminal(run.phase));
+	});
+}
+
 test("cancellation during resume liveness does not create a run", async (t) => {
 	const f = fixture(t);
 	const ref = await f.runner.spawn(request());
@@ -1137,6 +1151,9 @@ test("agent presence trusts a reused name only in the recorded pane or with the 
 	assert.equal(agentPresence(record, { name: "review", paneId: "w2:p7", session: "s-1" }), "alive");
 	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p99", session: "/other.jsonl" }), "dead");
 	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p99" }), "unknown");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p2", session: "/state/sessions/b.jsonl" }), "dead", "a replacement in the same pane reports its own session");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w2:p7", session: "/home/me/.claude/projects/x/s-1.jsonl" }), "alive", "a Claude transcript is named after its session ID");
+	assert.equal(agentPresence(record, { name: "review", paneId: "w1:p2", session: "/real/state/sessions/a.jsonl" }), "alive", "a symlinked state directory keeps the file name");
 });
 
 test("maintenance does not keep a run alive through a name reused in another pane", async (t) => {

@@ -36,7 +36,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 	const diamondHooks = {
 		preparation,
-		onModifierOpen(target: OpenTarget) { void navigation.openTarget(target); },
+		onModifierOpen(target: OpenTarget) { void navigation.openLinkedTarget(target); },
 		hasActiveSelection: () => chrome.hasActiveSelection(),
 		onCodeLocation(path: string, line: number, endLine?: number) {
 			const ui = activeContext?.ui;
@@ -55,7 +55,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 			pi.registerTool({ ...registered, label: registered.label ?? registered.name });
 		}
 		if (features.toolStyling) {
-			pi.registerTool(createShowImageTool(cwd));
+			pi.registerTool(createShowImageTool(cwd, { onModifierOpen(target) { void navigation.openLinkedTarget(target); } }));
 			if (videoTool) pi.registerTool(videoTool);
 		}
 	}

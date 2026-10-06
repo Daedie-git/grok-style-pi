@@ -1,5 +1,6 @@
 import { activeDiffPalette, createSectionLayouts, paint } from "./section-layout.ts";
-import { editDisplay, toolDisplay, togglesOpen } from "./section-state.ts";
+import { editDisplay, toolDisplay } from "./section-state.ts";
+import { defaultModifierOpen, fileTarget, handleDiamondClick, withPressModifiers } from "./interaction.ts";
 import { withDiamondSection, type SectionTable } from "./section.ts";
 import { DEFAULT_SECTIONS } from "./sections/index.ts";
 import { withToolDescriptions } from "./guidance.ts";
@@ -92,30 +93,9 @@ function callComponent(
 ) {
 	return {
 		invalidate() {},
-		handleMouse(event: TuiMouseEvent) {
-			if (event.type !== "click" || event.button !== "left") return undefined;
-			return onRowClick?.(event);
-		},
+		handleMouse(event: TuiMouseEvent) { return onRowClick?.(event); },
 		render(width: number) { return width > 0 ? [truncateToWidth(typeof label === "function" ? label() : label, width)] : []; },
 	};
-}
-
-function defaultModifierOpen(target: OpenTarget): void {
-	// Standalone renderers have no notification UI. Never leak a launcher rejection.
-	void openInCursor(target).catch(() => {});
-}
-
-function ctrlOpen(
-	event: TuiMouseEvent,
-	args: ToolArgs,
-	line: number,
-	cwd: string | undefined,
-	onModifierOpen: (target: OpenTarget) => void,
-): { handled: true } | undefined {
-	if (event.type !== "click" || event.button !== "left" || !event.ctrl) return undefined;
-	const path = typeof args?.path === "string" ? args.path : undefined;
-	if (path) onModifierOpen({ path, line: Math.max(1, line), cwd: cwd ?? process.cwd() });
-	return { handled: true };
 }
 
 function changedLine(details: unknown): number {
@@ -170,15 +150,12 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 					const detail = created ? stat : paint(theme, "muted", `${count === undefined ? "" : ` · ${count} ${count === 1 ? "line" : "lines"}`}${purpose ? ` · ${purpose}` : ""}`);
 					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) + detail;
 				}, (event) => {
-					const opened = ctrlOpen(event, args, 1, context?.cwd, onModifierOpen);
-					if (opened) return opened;
-					if (!context?.state || !context.invalidate) return undefined;
-					const created = context.state.grokWrite?.kind === "created";
-					const display = created ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false);
-					if (!togglesOpen(event, display.open, created)) return undefined;
-					display.open = !display.open;
-					context.invalidate();
-					return { handled: true };
+					const created = context?.state?.grokWrite?.kind === "created";
+					const display = context?.state && context.invalidate ? created ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false) : undefined;
+					return handleDiamondClick(event, "header", {
+						display, closeNeedsAlt: created, invalidate: context?.invalidate,
+						openTarget: fileTarget(args, 1, context?.cwd, onModifierOpen),
+					});
 				});
 			}
 			const title = `◆ ${failed ? "Failed: " : ""}${shell ? commandSummary(args) : original.name === "Agent" ? agentSummary(args) : toolVerb(original.name)}`;
@@ -187,16 +164,12 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 				(target ? " " + paint(theme, failed ? "error" : "text", target) : "");
 			const display = context?.state && context.invalidate ? edit ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false) : undefined;
 			return callComponent(() => label + (shell && failed && context?.state?.grokExitCode !== undefined ? paint(theme, "error", ` · exit ${context.state.grokExitCode}`) : ""), (event) => {
-				if (fileRow) {
-					// Pi calls renderCall before renderResult populates the shared change line.
-					const line = original.name === "read" && typeof args?.offset === "number" ? args.offset : context?.state?.grokEdit?.line ?? 1;
-					const opened = ctrlOpen(event, args, line, context?.cwd, onModifierOpen);
-					if (opened) return opened;
-				}
-				if (!display || !togglesOpen(event, display.open, edit)) return undefined;
-				display.open = !display.open;
-				context?.invalidate?.();
-				return { handled: true };
+				// Pi calls renderCall before renderResult populates the shared change line.
+				const line = original.name === "read" && typeof args?.offset === "number" ? args.offset : context?.state?.grokEdit?.line ?? 1;
+				return handleDiamondClick(event, "header", {
+					display, closeNeedsAlt: edit, invalidate: context?.invalidate,
+					openTarget: fileRow ? fileTarget(args, line, context?.cwd, onModifierOpen) : undefined,
+				});
 			});
 		},
 		renderResult(result, options, theme, context) {
@@ -291,11 +264,18 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 				? previousSelection : { content: result.content, details: result.details, args: context?.args } as CodeSelection;
 			if (selectionGroup.active === previousSelection && selection !== previousSelection) selectionGroup.active = undefined;
 			if (owner) selections.set(owner, selection);
+			const clickedLine = (event: TuiMouseEvent) => Number.isInteger(event.y) && event.y >= 0 && Number.isInteger(event.x) && event.x >= 0 && event.x < (cachedWidth ?? 0)
+				? codeLines[event.y] : undefined;
 			return {
 				invalidate() { cachedWidth = undefined; layout.invalidate(); },
-				handleMouse(event: TuiMouseEvent) {
-					const opened = fileRow ? ctrlOpen(event, context?.args, line, context?.cwd, onModifierOpen) : undefined;
-					if (opened) { selection.range = undefined; selectionGroup.active = undefined; return opened; }
+				handleMouse(raw: TuiMouseEvent) {
+					const event = withPressModifiers(raw);
+					if (fileRow && event.type === "click" && event.button === "left" && event.ctrl) {
+						const open = fileTarget(context?.args, clickedLine(event) ?? line, context?.cwd, onModifierOpen);
+						selection.range = undefined;
+						selectionGroup.active = undefined;
+						if (open) { open(); return { handled: true }; }
+					}
 					const location = event.button === "left" && !event.alt && !event.ctrl &&
 						Number.isInteger(event.y) && event.y >= 0 && Number.isInteger(event.x) && event.x >= 0 && event.x < (cachedWidth ?? 0)
 						? codeLines[event.y] : undefined;
@@ -365,10 +345,9 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 						return { handled: true };
 					}
 					if (event.type === "click") { selection.range = undefined; selectionGroup.active = undefined; }
-					if (!context?.state || !context.invalidate || !togglesOpen(event, display.open, defaultOpen)) return undefined;
-					display.open = !display.open;
-					context.invalidate();
-					return { handled: true };
+					return handleDiamondClick(event, "body", {
+						display: context?.state && context.invalidate ? display : undefined, invalidate: context?.invalidate,
+					});
 				},
 				render(width: number) {
 					if (width === cachedWidth) return cachedLines;
@@ -380,7 +359,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 					cachedWidth = width;
 					cachedLines = layout.render(width);
 					codeLines = [];
-					if (!fileRow || !path || !hooks?.onCodeLocation) return cachedLines;
+					if (!fileRow || !path) return cachedLines;
 					// Use the same wrapping width as layoutTool, so a click on a continuation
 					// row still refers to the logical source line rather than the next one.
 					const inner = Math.max(0, width - (width > 2 ? 2 : 0));

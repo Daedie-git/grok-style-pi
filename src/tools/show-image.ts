@@ -3,7 +3,8 @@ import { convertToPng } from "@earendil-works/pi-coding-agent";
 import { extname } from "node:path";
 import { Image, truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { absPath } from "../navigation/open-in-cursor.ts";
+import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
+import { fileTarget, handleDiamondClick } from "./interaction.ts";
 import { sanitizeToolText } from "./diamond.ts";
 
 const MIME: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
@@ -13,7 +14,8 @@ type ImageDetails = { data: string; mimeType: string; path: string };
 type ImageState = { open: boolean; expanded: boolean };
 
 /** A text-only tool result keeps Pi from appending an uncollapsible native image. */
-export function createShowImageTool(cwd: string) {
+export function createShowImageTool(cwd: string, hooks: { onModifierOpen?: (target: OpenTarget) => void } = {}) {
+	const openTarget = (path: string) => hooks.onModifierOpen && fileTarget({ path }, 1, cwd, hooks.onModifierOpen);
 	return {
 		name: "show_image",
 		label: "Show Image",
@@ -35,17 +37,16 @@ export function createShowImageTool(cwd: string) {
 		renderCall(args: { path: string }, theme: { fg: (token: "toolTitle" | "text", text: string) => string }, context?: {
 			state?: { grokImage?: ImageState }; expanded?: boolean; invalidate?: () => void;
 		}) {
+			if (context?.state) context.state.grokImage ??= { open: true, expanded: context.expanded ?? false };
 			const label = theme.fg("toolTitle", "◆ Show image") + " " + theme.fg("text", sanitizeToolText(args.path));
 			return {
 				invalidate() {},
 				render(width: number) { return width > 0 ? [truncateToWidth(label, width)] : []; },
 				handleMouse(event: TuiMouseEvent) {
-				if (event.type !== "click" || event.button !== "left" || event.ctrl || !context?.state || !context.invalidate) return undefined;
-				const display = context.state.grokImage;
-				if (!display) return undefined;
-				display.open = !display.open;
-				context.invalidate();
-				return { handled: true as const };
+					return handleDiamondClick(event, "header", {
+						display: context?.invalidate ? context.state?.grokImage : undefined, invalidate: context?.invalidate,
+						openTarget: openTarget(absPath(args.path, cwd)),
+					});
 				},
 			};
 		},
@@ -72,10 +73,10 @@ export function createShowImageTool(cwd: string) {
 					return width > 0 ? [truncateToWidth(theme.fg(context?.isError ? "error" : "toolOutput", sanitizeToolText(result.content?.[0]?.text ?? "Image preview unavailable")), width)] : [];
 				},
 				handleMouse(event: TuiMouseEvent) {
-					if (event.type !== "click" || event.button !== "left" || event.ctrl || !state?.grokImage || !context?.invalidate) return undefined;
-					state.grokImage.open = !state.grokImage.open;
-					context.invalidate();
-					return { handled: true as const };
+					return handleDiamondClick(event, "body", {
+						display: context?.invalidate ? state?.grokImage : undefined, invalidate: context?.invalidate,
+						openTarget: result.details?.path ? openTarget(result.details.path) : undefined,
+					});
 				},
 			};
 		},

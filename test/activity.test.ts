@@ -71,8 +71,11 @@ test("panel buttons retain correct hit targets at narrow and wide widths", () =>
 	panel.handleMouse(click(visibleWidth(row.slice(0, row.indexOf("[Close]"))), 1));
 	assert.equal(dismissed, 1);
 	assert.equal(stopped, 1);
+	// Anywhere else on the row opens the viewer.
 	panel.handleMouse(click(1, 1));
-	assert.equal(viewed, 1);
+	assert.equal(viewed, 2);
+	panel.handleMouse(click(40, 1));
+	assert.equal(viewed, 3);
 	entry.status = "completed";
 	assert.deepEqual(panel.render(80), []);
 });

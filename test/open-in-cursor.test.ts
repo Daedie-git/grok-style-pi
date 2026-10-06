@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -105,8 +105,30 @@ test("ctrl+click opens the file without toggling an edit diamond", () => {
 	assert.equal(invalidated, 0);
 	assert.ok(tool.renderResult(result, { expanded: false }, theme, context).render(80).length > 0);
 	assert.deepEqual(opened, [{ path: "file.ts", line: 42, cwd: process.cwd() }]);
-	assert.equal(header.handleMouse?.({ type: "click", button: "left", ctrl: false } as any), undefined);
+	assert.deepEqual(header.handleMouse?.({ type: "click", button: "left", ctrl: false } as any), { handled: true });
 	assert.deepEqual(header.handleMouse?.({ type: "click", button: "left", ctrl: false, alt: true } as any), { handled: true });
 	assert.equal(invalidated, 1);
 	assert.deepEqual(tool.renderResult(result, { expanded: false }, theme, context).render(80), []);
+});
+
+test("openInCursor opens a directory as a folder without a line", async () => {
+	const launched: string[][] = [];
+	await openInCursor({ path: "/", line: 9, cwd: "/" }, (_command, args) => {
+		launched.push(args);
+		return { once(event, listener) { if (event === "spawn") listener(); }, unref() {} };
+	}, "/no-cursor-mount");
+	assert.deepEqual(launched, [["--classic", "/"]]);
+});
+
+test("openInCursor follows a directory symlink", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "cursor-link-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	await mkdir(join(dir, "real"));
+	await symlink(join(dir, "real"), join(dir, "link"));
+	const launched: string[][] = [];
+	await openInCursor({ path: join(dir, "link"), line: 1, cwd: dir }, (_command, args) => {
+		launched.push(args);
+		return { once(event, listener) { if (event === "spawn") listener(); }, unref() {} };
+	}, "/no-cursor-mount");
+	assert.deepEqual(launched, [["--classic", join(dir, "link")]]);
 });

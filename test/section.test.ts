@@ -49,13 +49,15 @@ test("collapsed bodies are lazy; local/global expansion and concurrent calls sta
 	const result = output("ignored");
 	assert.equal(plain(tool.renderResult(result, { expanded: false }, theme, one)), "");
 	assert.equal(bodies, 0);
-	assert.equal(row.handleMouse({ ...click, ctrl: true }), undefined);
+	assert.deepEqual(row.handleMouse({ ...click, ctrl: true }), { handled: true });
 	row.handleMouse(click);
 	const body = tool.renderResult(result, { expanded: false }, theme, one) as any;
 	assert.match(plain(body), /body/);
 	assert.equal(plain(tool.renderResult(result, { expanded: false }, theme, two)), "");
 	assert.equal(bodies, 1);
-	body.handleMouse(click);
+	assert.deepEqual(body.handleMouse(click), { handled: true });
+	assert.match(plain(tool.renderResult(result, { expanded: false }, theme, one)), /body/);
+	body.handleMouse({ ...click, alt: true });
 	assert.equal(plain(tool.renderResult(result, { expanded: false }, theme, one)), "");
 	assert.match(plain(tool.renderResult(result, { expanded: true }, theme, one)), /body/);
 	assert.equal(plain(tool.renderResult(result, { expanded: false }, theme, one)), "");

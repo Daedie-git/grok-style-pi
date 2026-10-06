@@ -375,7 +375,8 @@ test("numbered edit diff and new-file rows copy their actual lines without colla
 	const context = { args: { path: "a.ts" }, state: {}, expanded: false, invalidate() {} };
 	const result = edit.renderResult({ content: [], details: { firstChangedLine: 80, diff: "@@ -80,2 +80,2 @@\n- 80 old\n+ 80 new\n  81 next" } }, { expanded: false }, theme, context);
 	const lines = result.render(32).map(stripTerminalSequences);
-	assert.deepEqual(result.handleMouse?.(click(lines.findIndex((row) => row.includes("@@")))), undefined);
+	// Consumed, so Pi does not collapse the diff.
+	assert.deepEqual(result.handleMouse?.(click(lines.findIndex((row) => row.includes("@@")))), { handled: true });
 	result.handleMouse?.(click(lines.findIndex((row) => row.includes("old"))));
 	result.handleMouse?.(click(lines.findIndex((row) => row.includes("new"))));
 	result.handleMouse?.(click(lines.findIndex((row) => row.includes("next"))));

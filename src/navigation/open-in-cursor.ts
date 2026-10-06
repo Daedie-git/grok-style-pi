@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 
@@ -171,7 +171,9 @@ export function resolveCursorInvocation(args: string[], tmpDir = "/tmp", options
 export async function openInCursor(target: OpenTarget, spawnImpl: SpawnLike = spawn, tmpDir = "/tmp"): Promise<void> {
 	const remembered = { ...target, path: absPath(target.path, target.cwd) };
 	const workspace = workspaceFor(remembered.path, remembered.cwd);
-	const args = cursorArgs(remembered.path, remembered.line, workspace, remembered.column);
+	// A directory has no line to jump to: open it as a folder.
+	const isDirectory = (() => { try { return statSync(remembered.path).isDirectory(); } catch { return false; } })();
+	const args = isDirectory ? ["--classic", remembered.path] : cursorArgs(remembered.path, remembered.line, workspace, remembered.column);
 	const invocation = resolveCursorInvocation(args, tmpDir);
 	const launch = (invocation: ReturnType<typeof resolveCursorInvocation>) => new Promise<void>((resolveOpen, reject) => {
 		const child = spawnImpl(invocation.command, invocation.args, {

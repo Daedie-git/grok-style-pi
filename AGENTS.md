@@ -12,6 +12,10 @@ Stay on documented Pi extension APIs: `setFooter`, `setEditorComponent` wrapping
 
 Match the existing TypeScript style: tabs, and `.ts` import specifiers.
 
+## Adding a diamond
+
+Route every header and body `handleMouse` through `handleDiamondClick` in `src/tools/interaction.ts`; it owns the gesture table (README, "Diamond interaction"). Do not re-implement toggle, close, or open-target gestures. Give the content a file target with `fileTarget`, and finish with `assertDiamondGestures` from `test/fixtures/diamond-gestures.ts`. `test/interaction.test.ts` fails any tool or subagent module that handles mouse input without importing `interaction.ts`.
+
 ## Verify
 
 `npm test` is the gate (Node 22+ type stripping): strict typechecks and tests for Grok and the standalone Herdr package. When you touch subagent manager behavior, also run `npm run test:subagents`. When you touch `bat` highlighting, also run `npm run test:bat`.

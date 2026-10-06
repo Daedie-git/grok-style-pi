@@ -2,7 +2,8 @@ import { truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { languageForPath } from "../rendering/highlight.ts";
 import { emptyComponent, extractResultDiff, sanitizeToolText, type ToolArgs, type ToolResult } from "./diamond.ts";
 import { createSectionLayouts, paint } from "./section-layout.ts";
-import { toolDisplay, togglesOpen } from "./section-state.ts";
+import { fileTarget, defaultModifierOpen, handleDiamondClick } from "./interaction.ts";
+import { toolDisplay } from "./section-state.ts";
 import type { DiamondHooks, DiamondTool, OriginalTool } from "./renderer.ts";
 
 export type SectionView = { args: ToolArgs; result?: ToolResult; isError: boolean; isPartial: boolean };
@@ -19,6 +20,7 @@ export type SectionTable = Readonly<Record<string, DiamondSection>>;
 /** Render-only decoration: execution, schemas, and upstream metadata stay by identity. */
 export function withDiamondSection<T extends OriginalTool>(tool: T, section: DiamondSection, hooks?: DiamondHooks): T & DiamondTool {
 	const layouts = createSectionLayouts(hooks);
+	const onModifierOpen = hooks?.onModifierOpen ?? defaultModifierOpen;
 	const cleanSummary = (view: SectionView) => {
 		const summary = section.summary(view);
 		const clean = (value: string | undefined) => value === undefined ? undefined : sanitizeToolText(value).replace(/\s+/g, " ").trim();
@@ -47,10 +49,10 @@ export function withDiamondSection<T extends OriginalTool>(tool: T, section: Dia
 					return [truncateToWidth(label, width)];
 				},
 				handleMouse(event: TuiMouseEvent) {
-					if (!context?.state || !context.invalidate || !togglesOpen(event, display.open, false)) return undefined;
-					display.open = !display.open;
-					context.invalidate();
-					return { handled: true as const };
+					return handleDiamondClick(event, "header", {
+						display: context?.state && context.invalidate ? display : undefined, invalidate: context?.invalidate,
+						openTarget: fileTarget(context?.args ?? args, 1, context?.cwd, onModifierOpen),
+					});
 				},
 			};
 		},
@@ -76,10 +78,10 @@ export function withDiamondSection<T extends OriginalTool>(tool: T, section: Dia
 					invalidate: layout.invalidate,
 					render: layout.render,
 					handleMouse(event: TuiMouseEvent) {
-						if (!context?.state || !context.invalidate || !togglesOpen(event, display.open, false)) return undefined;
-						display.open = !display.open;
-						context.invalidate();
-						return { handled: true as const };
+						return handleDiamondClick(event, "body", {
+							display: context?.state && context.invalidate ? display : undefined, invalidate: context?.invalidate,
+							openTarget: fileTarget(view.args, 1, context?.cwd, onModifierOpen),
+						});
 					},
 				};
 			});

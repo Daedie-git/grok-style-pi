@@ -49,9 +49,9 @@ test("completion diamonds preserve click state through rerenders and follow glob
 	assert.ok(render(true).render(100).length > 1);
 	assert.equal(render(false).render(100).length, 1);
 	const collapsed = render();
-	assert.equal(collapsed.handleMouse!({ type: "click", button: "left", y: 1 } as any), undefined);
+	assert.deepEqual(collapsed.handleMouse!({ type: "click", button: "left", y: 1 } as any), { handled: true });
 	assert.equal(collapsed.handleMouse!({ type: "click", button: "right", y: 0 } as any), undefined);
-	assert.equal(collapsed.handleMouse!({ type: "click", button: "left", ctrl: true, y: 0 } as any), undefined);
+	assert.deepEqual(collapsed.handleMouse!({ type: "click", button: "left", ctrl: true, y: 0 } as any), { handled: true });
 	collapsed.handleMouse!({ type: "click", button: "left", y: 0 } as any);
 	assert.ok(collapsed.render(100).length > 1);
 	const other = renderer({ ...h.message, details: { runId: "run-2" } } as any, { expanded: false, outputPad: 1 }, theme)!;

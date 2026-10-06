@@ -1,4 +1,3 @@
-import type { TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { ToolRenderContext } from "./diamond.ts";
 
 export function editDisplay(context: ToolRenderContext | undefined, expanded: boolean) {
@@ -21,9 +20,4 @@ export function toolDisplay(context: ToolRenderContext | undefined, expanded: bo
 		state.grokTool.open = expanded;
 	}
 	return state.grokTool;
-}
-
-/** Diff panels close on Alt-click; ordinary sections toggle on a normal click. */
-export function togglesOpen(event: TuiMouseEvent, open: boolean, requireAltToClose = true): boolean {
-	return event.type === "click" && event.button === "left" && !event.ctrl && (!open || !requireAltToClose || event.alt);
 }

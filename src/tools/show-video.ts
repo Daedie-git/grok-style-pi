@@ -4,6 +4,7 @@ import { getCapabilities, Image, truncateToWidth, type TuiMouseEvent } from "@ea
 import { Type } from "@sinclair/typebox";
 import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { sanitizeToolText } from "./diamond.ts";
+import { classifyClick } from "./interaction.ts";
 import { playVideoFrames } from "./video-frames.ts";
 
 const EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"]);
@@ -33,6 +34,20 @@ export function createShowVideoTool(cwd: string, hooks: { onModifierOpen?: (targ
 		else { state.error = undefined; state.frame = undefined; state.image = undefined; }
 		invalidate();
 	}
+	function click(event: TuiMouseEvent, surface: "header" | "body", state: VideoState | undefined, invalidate: (() => void) | undefined, path: string | undefined) {
+		if (disposed) return undefined;
+		const action = classifyClick(event, surface, { open: state?.open ?? false });
+		if (action === "none") return undefined;
+		if (action === "open-target") {
+			if (path) hooks.onModifierOpen?.({ path: absPath(path, cwd), line: 1, cwd });
+			return { handled: true as const };
+		}
+		if (action === "inert" || action === "close" && state && !state.open) return { handled: true as const };
+		// Without local state, Pi's own expansion toggle is the fallback.
+		if (!state || !invalidate) return undefined;
+		toggle(state, invalidate);
+		return { handled: true as const };
+	}
 	return {
 		name: "show_video",
 		label: "Show Video",
@@ -47,23 +62,14 @@ export function createShowVideoTool(cwd: string, hooks: { onModifierOpen?: (targ
 			return { content: [{ type: "text" as const, text: `Video preview: ${path}. Include this path in your reply for full playback with sound.` }], details: { path } };
 		},
 		renderCall(args: { path: string }, theme: { fg: (token: "toolTitle" | "text", text: string) => string }, context?: {
-			state?: { grokVideo?: VideoState }; invalidate?: () => void;
+			state?: { grokVideo?: VideoState }; expanded?: boolean; invalidate?: () => void;
 		}) {
+			if (context?.state) context.state.grokVideo ??= { open: true, expanded: context.expanded ?? false };
 			const label = theme.fg("toolTitle", "◆ Play video") + " " + theme.fg("text", sanitizeToolText(args.path));
 			return {
 				invalidate() {},
 				render(width: number) { return width > 0 ? [truncateToWidth(label, width)] : []; },
-				handleMouse(event: TuiMouseEvent) {
-					if (disposed || event.type !== "click" || event.button !== "left") return undefined;
-					if (event.ctrl) {
-						if (!hooks.onModifierOpen) return undefined;
-						hooks.onModifierOpen({ path: absPath(args.path, cwd), line: 1, cwd });
-						return { handled: true as const };
-					}
-					if (!context?.state?.grokVideo || !context.invalidate) return undefined;
-					toggle(context.state.grokVideo, context.invalidate);
-				return { handled: true as const };
-				},
+				handleMouse(event: TuiMouseEvent) { return click(event, "header", context?.state?.grokVideo, context?.invalidate, args.path); },
 			};
 		},
 		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: { path: string } }, options: { expanded: boolean; isPartial?: boolean }, theme: { fg: (token: "toolOutput" | "error", text: string) => string }, context?: {
@@ -122,17 +128,7 @@ export function createShowVideoTool(cwd: string, hooks: { onModifierOpen?: (targ
 					if (state?.image) return state.image.render(width);
 					return [truncateToWidth(theme.fg("toolOutput", sanitizeToolText(!imagesEnabled ? "Terminal image playback unavailable; open the file in your video player." : path ? "Loading video preview…" : typeof text === "string" ? text : "Video unavailable")), width)];
 				},
-				handleMouse(event: TuiMouseEvent) {
-					if (disposed || event.type !== "click" || event.button !== "left") return undefined;
-					if (event.ctrl) {
-						if (!path || context?.isError || !hooks.onModifierOpen) return undefined;
-						hooks.onModifierOpen({ path: absPath(path, cwd), line: 1, cwd });
-						return { handled: true as const };
-					}
-					if (!state || !context?.invalidate) return undefined;
-					toggle(state, context.invalidate);
-					return { handled: true as const };
-				},
+				handleMouse(event: TuiMouseEvent) { return click(event, "body", state, context?.invalidate, context?.isError ? undefined : path); },
 			};
 		},
 		startSession(nextCwd = cwd) { cwd = nextCwd; disposed = false; },

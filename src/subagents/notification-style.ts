@@ -1,7 +1,7 @@
 import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { sanitizeToolText, textComponent } from "../tools/diamond.ts";
-import { togglesOpen } from "../tools/section-state.ts";
+import { handleDiamondClick } from "../tools/interaction.ts";
 
 /** Keep display-only expansion per message, without changing the runner's stored notice. */
 export function createHerdrNotificationRenderer(): MessageRenderer {
@@ -32,9 +32,7 @@ export function createHerdrNotificationRenderer(): MessageRenderer {
 					truncateToWidth(padding + theme.fg("toolOutput", line), width, ""))];
 			},
 			handleMouse(event) {
-				if (event.y !== 0 || !togglesOpen(event, state.open, false)) return undefined;
-				state.open = !state.open;
-				return { handled: true };
+				return handleDiamondClick(event, event.y === 0 ? "header" : "body", { display: state });
 			},
 			invalidate() { body.invalidate(); },
 		};

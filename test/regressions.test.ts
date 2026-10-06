@@ -101,7 +101,7 @@ test("edits start open, collapse by clicking their diamond, and follow global ex
 	const body = () => tool.renderResult(result, { expanded: context.expanded }, theme, context).render(80);
 	const click = (alt = false) => (tool.renderCall({ path: "file" }, theme, context) as any).handleMouse({ type: "click", button: "left", alt });
 	assert.ok(body().length > 0);
-	assert.equal(click(), undefined);
+	assert.deepEqual(click(), { handled: true });
 	assert.ok(body().length > 0);
 	assert.deepEqual(click(true), { handled: true });
 	assert.deepEqual(body(), []);

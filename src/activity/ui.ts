@@ -70,6 +70,8 @@ export class ActivityPanel {
 					if (x + button.label.length <= width) this.hits.push({ y, x, end: x + button.label.length, action: button.action });
 					x += button.label.length + 1;
 				}
+				// Registered after the buttons: the first matching hit wins, so the rest of the row opens the viewer.
+				this.hits.push({ y, x: 0, end: width, action: () => this.view(entry) });
 				if (entry.kind === "agent" && entry.model) {
 					lines.push(truncateToWidth(this.theme.fg("muted", `  ${oneLine(entry.model)}`), width));
 				}

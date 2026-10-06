@@ -87,6 +87,19 @@ class SyncMachineTests(unittest.TestCase):
         for repo in self.repos.values():
             self.assertEqual(self.head(repo['checkout']), repo['old'])
 
+    def test_untracked_files_are_refused_even_when_git_config_hides_them(self):
+        for name in self.repos:
+            self.advance(name)
+        root = self.repos['claude-sidecar']['checkout']
+        self.git(root, 'config', 'status.showUntrackedFiles', 'no')
+        (root / 'untracked.txt').write_text('local work')
+        self.assertEqual(self.git(root, 'status', '--porcelain=v1'), '')
+        result = self.sync(check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('has local changes', result.stderr)
+        for repo in self.repos.values():
+            self.assertEqual(self.head(repo['checkout']), repo['old'])
+
     def test_divergence_refuses_before_updating_either(self):
         for name in self.repos:
             self.advance(name)
@@ -130,6 +143,55 @@ class SyncMachineTests(unittest.TestCase):
         result = self.sync()
         self.assertEqual(self.head(custom), new)
         self.assertIn(str(custom), result.stdout)
+
+    def test_glob_resources_select_active_custom_checkout_not_stale_known_copy(self):
+        repo = self.repos['grok-style-pi']
+        extensions = repo['seed'] / 'extensions'
+        extensions.mkdir()
+        (extensions / 'active.ts').write_text('export default function () {}\n')
+        self.commit(repo['seed'], 'Add extension')
+        self.git(repo['seed'], 'push', 'origin', 'main')
+        custom = self.remote / 'custom' / 'grok-style-pi'
+        custom.parent.mkdir()
+        self.git(self.remote, 'clone', str(repo['origin']), str(custom))
+        active_old = self.head(custom)
+        settings = self.remote / '.pi/agent/settings.json'
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({'extensions': [str(custom / 'extensions' / '*.ts')]}))
+        new = self.advance('grok-style-pi')
+        result = self.sync()
+        self.assertEqual(self.head(custom), new)
+        self.assertIn(active_old + ' -> ' + new, result.stdout)
+        self.assertIn(str(custom), result.stdout)
+        self.assertEqual(self.head(repo['checkout']), repo['old'])
+
+    def test_unresolved_active_glob_refuses_instead_of_updating_known_copy(self):
+        custom = self.remote / 'custom active tooling'
+        custom.mkdir()
+        (custom / 'extensions').mkdir()
+        (custom / 'extensions' / 'active.ts').write_text('export default function () {}\n')
+        settings = self.remote / '.pi/agent/settings.json'
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({'extensions': [str(custom / 'extensions' / '*.ts')]}))
+        for name in self.repos:
+            self.advance(name)
+        result = self.sync(check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Cannot resolve configured Pi resources', result.stderr)
+        self.assertIn(str(custom), result.stderr)
+        for repo in self.repos.values():
+            self.assertEqual(self.head(repo['checkout']), repo['old'])
+
+    def test_missing_configured_tooling_path_refuses_known_location_fallback(self):
+        settings = self.remote / '.pi/agent/settings.json'
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({'extensions': [str(self.remote / 'custom' / 'grok-style-pi' / 'extensions' / 'active.ts')]}))
+        self.advance('grok-style-pi')
+        result = self.sync(check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Cannot resolve configured grok-style-pi paths', result.stderr)
+        repo = self.repos['grok-style-pi']
+        self.assertEqual(self.head(repo['checkout']), repo['old'])
 
     def test_explicit_paths_with_quotes_metacharacters_and_unicode_are_not_shell_code(self):
         paths = {}

@@ -21,6 +21,21 @@ function expand(value, base = home) {
   if (value.startsWith('~/') || value.startsWith('~\\')) return path.resolve(home, value.slice(2));
   return path.resolve(base, value);
 }
+// Pi resource globs need not exist literally. Their existing literal ancestor
+// still identifies the checkout without choosing one of several wildcard matches.
+function resourceAncestor(candidate) {
+  if (fs.existsSync(candidate)) return candidate;
+  const parts = candidate.split(path.sep);
+  const wildcard = parts.findIndex(part => /[*?\[\]{}]/.test(part));
+  if (wildcard < 0) return undefined;
+  let ancestor = parts.slice(0, wildcard).join(path.sep) || path.parse(candidate).root;
+  while (!fs.existsSync(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return undefined;
+    ancestor = parent;
+  }
+  return ancestor;
+}
 function checkout(candidate) {
   let dir = candidate;
   if (!fs.existsSync(dir)) return undefined;
@@ -65,9 +80,19 @@ function discover(name, configured) {
     if (!root) throw Error(`tooling.${name} is not a Git checkout: ${configured}`);
     return root;
   }
-  const fromSettings = [...new Set(settingsCandidates().map(checkout).filter(root => root && identifies(root, name)))];
-  if (fromSettings.length === 1) return fromSettings[0];
+  const resources = settingsCandidates().map(candidate => {
+    const ancestor = resourceAncestor(candidate);
+    return { candidate, ancestor, root: ancestor && checkout(ancestor) };
+  });
+  const unresolved = resources.filter(resource => !resource.root && resource.ancestor);
+  const namedMissing = resources.filter(resource => !resource.root && resource.candidate.split(path.sep).some(part => part.toLowerCase() === name));
+  if (namedMissing.length) throw Error(`Cannot resolve configured ${name} paths: ${namedMissing.map(resource => resource.candidate).join(', ')}; set tooling.${name}`);
+  const fromSettings = [...new Set(resources.map(resource => resource.root).filter(root => root && identifies(root, name)))];
   if (fromSettings.length > 1) throw Error(`Ambiguous ${name} checkouts in Pi settings: ${fromSettings.join(', ')}; set tooling.${name}`);
+  if (fromSettings.length === 1) return fromSettings[0];
+  // An unresolved active resource may belong to this tool. Refuse rather than
+  // silently updating an unrelated known-location copy; explicit tooling wins.
+  if (unresolved.length) throw Error(`Cannot resolve configured Pi resources while discovering ${name}: ${unresolved.map(resource => resource.candidate).join(', ')}; set tooling.${name}`);
   const candidates = [path.join(home, 'git', name), path.join(home, 'git', 'codex', name), path.join(home, 'src', name)];
   if (process.platform === 'win32') {
     const drive = `${process.env.SystemDrive || 'C:'}/`;
@@ -79,7 +104,7 @@ function discover(name, configured) {
   throw Error(`Cannot find ${name}; configure tooling.${name} in the machine settings`);
 }
 function preflight(name, root) {
-  if (git(root, 'status', '--porcelain=v1')) throw Error(`${name} has local changes (including untracked files): ${root}; nothing was updated`);
+  if (git(root, 'status', '--porcelain=v1', '--untracked-files=all')) throw Error(`${name} has local changes (including untracked files): ${root}; nothing was updated`);
   let branch;
   try { branch = git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD'); }
   catch (_) { throw Error(`${name} has detached HEAD: ${root}; check out the intended branch first`); }

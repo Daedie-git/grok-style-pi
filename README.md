@@ -136,7 +136,7 @@ From a mapped checkout, start a new slot with `./scripts/sidecar --slot 2 --mach
 
 `sidecar sync-machine NAME` updates the saved machine's `grok-style-pi` and `claude-sidecar` Git checkouts from `origin`. It is independent of the current slot and never changes its binding, deploys runtime files, or reloads a running Pi. Run `sidecar --slot N reload` afterward to load updated resources on that slot. Unpublished local commits cannot reach the machine through this command.
 
-Discovery prefers local paths in the machine's Pi settings (`PI_CODING_AGENT_DIR`, default `~/.pi/agent/settings.json`, plus a mapped project's `.pi/settings.json`) and the configured runtime `home`, then known `~/git`, `~/git/codex`, `~/src`, `C:/git` and `C:/git/codex` locations. Ambiguous or missing checkouts fail clearly. Override discovery with `tooling` in the existing machine configuration:
+Discovery prefers local paths in the machine's Pi settings (`PI_CODING_AGENT_DIR`, default `~/.pi/agent/settings.json`, plus a mapped project's `.pi/settings.json`) and the configured runtime `home`, then known `~/git`, `~/git/codex`, `~/src`, `C:/git` and `C:/git/codex` locations. Resource globs use their existing literal ancestor to identify a checkout; patterns spanning different checkouts require explicit `tooling` paths. An unresolved existing configured resource refuses known-location fallback rather than updating a potentially stale copy. Ambiguous or missing checkouts fail clearly. Override discovery with `tooling` in the existing machine configuration:
 
 ```json
 {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import fs, { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -58,6 +59,52 @@ test('a withdrawn reload is not run, and invalid command ids are rejected', asyn
   f.ctx.reload = () => { throw Error('must not reload'); };
   await f.commands.get('sidecar-reload').handler('reload-withdrawn', f.ctx);
   await assert.rejects(f.commands.get('sidecar-reload').handler('../escape', f.ctx), /Invalid reload/);
+});
+
+test('consecutive reloads preserve the next marker written as the first acknowledgement becomes visible', async t => {
+  const f = await fixture(t);
+  await f.pending('reload-first');
+  const rename = fs.rename;
+  const intercepted = t.mock.method(fs, 'rename', async (from, to) => {
+    await rename(from, to);
+    if (to === join(f.dir, 'reload-first.ack')) {
+      // The launcher can now release its lock and start the next reload.
+      await assert.rejects(readFile(join(f.dir, 'cc-test.pending')), { code: 'ENOENT' });
+      await f.pending('reload-second');
+    }
+  });
+  syncBuiltinESMExports();
+  t.after(() => { intercepted.mock.restore(); syncBuiltinESMExports(); });
+  await f.handlers.get('session_start')({ reason: 'reload' }, f.ctx);
+  assert.equal(JSON.parse(await readFile(join(f.dir, 'cc-test.pending'))).id, 'reload-second');
+  const fresh = new Map();
+  installReloadControl({ on: (name, handler) => fresh.set(name, handler), registerCommand: () => {} }, f.root);
+  await fresh.get('session_start')({ reason: 'reload' }, f.ctx);
+  for (const id of ['reload-first', 'reload-second']) {
+    assert.equal(JSON.parse(await readFile(join(f.dir, `${id}.ack`))).status, 'reloaded');
+  }
+  await assert.rejects(readFile(join(f.dir, 'cc-test.pending')), { code: 'ENOENT' });
+});
+
+test('a superseded marker is neither consumed nor acknowledged by the earlier runtime', async t => {
+  const f = await fixture(t);
+  await f.pending('reload-first');
+  const originalRead = fs.readFile;
+  let replaced = false;
+  const intercepted = t.mock.method(fs, 'readFile', async (...args) => {
+    const content = await originalRead(...args);
+    if (args[0] === join(f.dir, 'cc-test.pending') && !replaced) {
+      replaced = true;
+      await f.pending('reload-second');
+    }
+    return content;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { intercepted.mock.restore(); syncBuiltinESMExports(); });
+  await f.handlers.get('session_start')({ reason: 'reload' }, f.ctx);
+  assert.equal(replaced, true);
+  assert.equal(JSON.parse(await readFile(join(f.dir, 'cc-test.pending'))).id, 'reload-second');
+  await assert.rejects(readFile(join(f.dir, 'reload-first.ack')), { code: 'ENOENT' });
 });
 
 test('Windows session file case and slash spelling match', async t => {

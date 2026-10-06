@@ -29,8 +29,12 @@ export function installReloadControl(pi, stateDir) {
     const path = join(dir, `${session}.pending`);
     const request = await readJson(path);
     if (!request || typeof request.id !== 'string' || !safeId.test(request.id) || normalize(request.sessionFile) !== normalize(sessionFile)) return;
-    await publish(join(dir, `${request.id}.ack`), { status: 'reloaded', sessionFile });
+    const current = await readJson(path);
+    if (current?.id !== request.id || normalize(current.sessionFile) !== normalize(sessionFile)) return;
+    // The acknowledgement releases the launcher's request lock. Finish consuming
+    // our marker first so cleanup cannot delete the next reload's marker.
     await rm(path, { force: true });
+    await publish(join(dir, `${request.id}.ack`), { status: 'reloaded', sessionFile });
   });
   pi.registerCommand('sidecar-reload', {
     description: 'Reload sidecar resources once the current operation is idle',

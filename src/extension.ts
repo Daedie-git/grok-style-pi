@@ -2,6 +2,7 @@ import { VisualPreparation } from "./rendering/visual-preparation.ts";
 import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { defaultFeatures } from "./extension/features.ts";
 import { COMMUNICATION, installCommunication } from "./extension/communication.ts";
+import { WORKFLOW } from "./extension/workflow.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, wrapWithDiamondRenderer, type BuiltinToolName, type OriginalTool } from "./tools/renderer.ts";
 import { createShowImageTool } from "./tools/show-image.ts";
 import { createShowVideoTool } from "./tools/show-video.ts";
@@ -22,14 +23,18 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	const chrome = createSessionChrome(pi, { CustomEditor: deps.CustomEditor, features });
 
 	pi.on("before_agent_start", (event) => {
-		if (!features.communication) return;
-		const options = event.systemPromptOptions as { sections?: Record<string, string> };
-		if (options.sections) {
-			installCommunication(options.sections, true);
+		const options = event.systemPromptOptions as { sections?: Record<string, string> } | undefined;
+		if (options?.sections) {
+			const existing = options.sections.workflow;
+			if (!existing?.includes(WORKFLOW)) {
+				options.sections.workflow = existing ? `${existing}\n\n${WORKFLOW}` : WORKFLOW;
+			}
+			installCommunication(options.sections, features.communication);
 			return;
 		}
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n<communication>\n${COMMUNICATION}\n</communication>`,
+			systemPrompt: `${event.systemPrompt}\n\n<workflow>\n${WORKFLOW}\n</workflow>` +
+				(features.communication ? `\n\n<communication>\n${COMMUNICATION}\n</communication>` : ""),
 		};
 	});
 	const diamondHooks = {

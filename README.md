@@ -9,7 +9,7 @@ This package uses only documented Pi extension APIs (`setFooter`, `setEditorComp
 From a clone:
 
 ```bash
-pi install /home/aim/git/grok-style-pi
+pi install /path/to/grok-style-pi
 ```
 
 From GitHub:
@@ -83,6 +83,14 @@ For `xai`, that is the Grok session for this working directory (`Context N% used
 For Codex and xAI logins, the footer appends `Account <email or name>` after usage. If the login token provides neither, it shows the account ID instead. Identity refreshes at startup, on model changes, and once per minute using the existing Pi login, without extra account endpoint requests. API keys and logins without a readable identity omit this item. On narrow terminals, the account is shortened first and dropped when fewer than 12 columns remain, so the path and model stay visible.
 
 Any other model shows this Pi session's context (`Context N% used`) and no subscription line.
+
+## Shared workflow guidance
+
+Both entrypoints load `src/extension/workflow.ts` into Pi's system prompt on every agent run through the existing `before_agent_start` instruction hook. This applies in normal package use, including outside this repository, independently of the communication or chrome toggles. It keeps one accountable Pi/Claude lead per branch/topic, preserves authorized isolated work and explicit reasoning choices, and covers task briefs, responsive delegation, concrete blockers, validation, and measurement discipline. It is workflow guidance, not additional permission to publish, destroy, or communicate externally.
+
+MEDIUM is an explicit launch preference in the guidance, not a runtime override: this package does not change an existing session's thinking level, launch arguments, user settings, tools, skills, extensions, or theme.
+
+To pick this up on another Linux or Windows device, update its local clone to the reviewed revision, or update its configured Git package with `pi update --extensions`, then run `/reload` or restart Pi. A Git source pinned to a branch/tag/commit follows that configured ref; change the pin deliberately when adopting a different revision. Load exactly one entrypoint, as before. A device with this extension disabled does not receive the guidance. Confirm the `workflow` section in that device's next saved system prompt before claiming rollout; a PR or one updated clone does not synchronize devices automatically.
 
 ## Feature settings
 

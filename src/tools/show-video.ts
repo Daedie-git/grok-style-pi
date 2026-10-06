@@ -2,7 +2,7 @@ import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { getCapabilities, Image, truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { absPath } from "../navigation/open-in-cursor.ts";
+import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { sanitizeToolText } from "./diamond.ts";
 import { playVideoFrames } from "./video-frames.ts";
 
@@ -19,7 +19,7 @@ type VideoState = {
 };
 
 /** A tool result stores the path, never the video or its decoded frames. */
-export function createShowVideoTool(cwd: string) {
+export function createShowVideoTool(cwd: string, hooks: { onModifierOpen?: (target: OpenTarget) => void } = {}) {
 	const active = new Set<VideoState>();
 	let disposed = false;
 	function stop(state: VideoState) {
@@ -54,8 +54,14 @@ export function createShowVideoTool(cwd: string) {
 				invalidate() {},
 				render(width: number) { return width > 0 ? [truncateToWidth(label, width)] : []; },
 				handleMouse(event: TuiMouseEvent) {
-				if (disposed || event.type !== "click" || event.button !== "left" || event.ctrl || !context?.state?.grokVideo || !context.invalidate) return undefined;
-				toggle(context.state.grokVideo, context.invalidate);
+					if (disposed || event.type !== "click" || event.button !== "left") return undefined;
+					if (event.ctrl) {
+						if (!hooks.onModifierOpen) return undefined;
+						hooks.onModifierOpen({ path: absPath(args.path, cwd), line: 1, cwd });
+						return { handled: true as const };
+					}
+					if (!context?.state?.grokVideo || !context.invalidate) return undefined;
+					toggle(context.state.grokVideo, context.invalidate);
 				return { handled: true as const };
 				},
 			};
@@ -117,13 +123,19 @@ export function createShowVideoTool(cwd: string) {
 					return [truncateToWidth(theme.fg("toolOutput", sanitizeToolText(!imagesEnabled ? "Terminal image playback unavailable; open the file in your video player." : path ? "Loading video preview…" : typeof text === "string" ? text : "Video unavailable")), width)];
 				},
 				handleMouse(event: TuiMouseEvent) {
-					if (disposed || event.type !== "click" || event.button !== "left" || event.ctrl || !state || !context?.invalidate) return undefined;
+					if (disposed || event.type !== "click" || event.button !== "left") return undefined;
+					if (event.ctrl) {
+						if (!path || context?.isError || !hooks.onModifierOpen) return undefined;
+						hooks.onModifierOpen({ path: absPath(path, cwd), line: 1, cwd });
+						return { handled: true as const };
+					}
+					if (!state || !context?.invalidate) return undefined;
 					toggle(state, context.invalidate);
 					return { handled: true as const };
 				},
 			};
 		},
-		startSession() { disposed = false; },
+		startSession(nextCwd = cwd) { cwd = nextCwd; disposed = false; },
 		pauseAll() {
 			for (const state of active) {
 				state.open = false;

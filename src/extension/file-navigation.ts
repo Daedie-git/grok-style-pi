@@ -117,5 +117,5 @@ export function createFileNavigation(pi: ExtensionApiLike, deps: FileNavigationD
 		sessionGeneration++;
 	}
 
-	return { openTarget, startSession, dispose };
+	return { openTarget, openLinkedTarget, startSession, dispose };
 }

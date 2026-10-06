@@ -14,6 +14,25 @@ import { createPngStream, playVideoFrames } from "../src/tools/video-frames.ts";
 const theme = { fg: (_token: string, text: string) => text };
 const click = { type: "click", button: "left", x: 0, y: 0 } as const;
 
+test("Ctrl-click opens the video externally without toggling its preview", () => {
+	const opened: unknown[] = [];
+	const video = createShowVideoTool("/workspace", { onModifierOpen: target => opened.push(target) });
+	const state: { grokVideo?: { open: boolean; expanded: boolean } } = {};
+	const context = { state, invalidate() {} };
+	const header = video.renderCall({ path: "clip.mp4" }, theme, context);
+	const result = video.renderResult({ content: [], details: { path: "/workspace/clip.mp4" } }, { expanded: false }, theme, context);
+	for (const component of [header, result]) {
+		assert.deepEqual(component.handleMouse({ ...click, ctrl: true }), { handled: true });
+		assert.equal(state.grokVideo?.open, true);
+	}
+	assert.deepEqual(opened, [
+		{ path: "/workspace/clip.mp4", line: 1, cwd: "/workspace" },
+		{ path: "/workspace/clip.mp4", line: 1, cwd: "/workspace" },
+	]);
+	video.dispose();
+	assert.equal(header.handleMouse({ ...click, ctrl: true }), undefined);
+});
+
 test("PNG frame parser handles split and joined ffmpeg chunks", () => {
 	const frame = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXcAAAAASUVORK5CYII=", "base64");
 	const found: string[] = [];

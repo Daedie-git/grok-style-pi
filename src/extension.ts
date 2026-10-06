@@ -17,8 +17,10 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	const preparation = new VisualPreparation();
 	let started = false;
 	let activeContext: SessionContext | undefined;
-	const videoTool = features.toolStyling ? createShowVideoTool(process.cwd()) : undefined;
 	const navigation = createFileNavigation(pi, { ...deps, communication: features.communication });
+	const videoTool = features.toolStyling ? createShowVideoTool(process.cwd(), {
+		onModifierOpen(target) { void navigation.openLinkedTarget(target); },
+	}) : undefined;
 	const chrome = createSessionChrome(pi, { CustomEditor: deps.CustomEditor, features });
 
 	pi.on("before_agent_start", (event) => {
@@ -63,7 +65,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 
 	pi.on("session_start", (_event, ctx) => {
 		activeContext = ctx;
-		videoTool?.startSession();
+		videoTool?.startSession(ctx.cwd);
 		if (started) preparation.reset();
 		started = true;
 		// Paint terminal colors before filesystem setup and tool settings can block.

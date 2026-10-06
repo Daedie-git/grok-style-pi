@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -110,6 +111,8 @@ elif args[:2] == ['agent', 'start']:
 elif args[:2] == ['agent', 'wait']:
     while state_path.exists() and json.loads(state_path.read_text())['agent_status'] == 'working':
         time.sleep(0.05)
+elif args[:2] == ['agent', 'read']:
+    print('earlier line\nreading src/foo.ts')
 elif args[:2] == ['agent', 'rename']:
     state_path.unlink()
 elif args[:2] == ['agent', 'prompt']:
@@ -533,6 +536,192 @@ class LauncherTests(unittest.TestCase):
         diff = diffs[0].read_text()
         for content in ('untracked content', 'unicode content', 'newline content'):
             self.assertIn('+' + content, diff)
+
+    def repo_with_change(self):
+        repo = self.home / 'repo'
+        repo.mkdir()
+        def git(*args):
+            subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True)
+        git('init')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.com')
+        (repo / 'a.txt').write_text('one\n')
+        git('add', '.')
+        git('commit', '-m', 'Initial')
+        (repo / 'a.txt').write_text('two\n')
+        return repo, git
+
+    def test_diff_request_requires_reproduced_findings(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('diff', cwd=repo)
+        request = next((self.home / '.cache/claude-sidecar/requests').glob('*-diff-*.md')).read_text()
+        self.assertIn('Reproduce each finding before you report it', request)
+        self.assertIn('unverified', request)
+
+    def test_unreviewed_tracks_changes_since_the_last_diff_review(self):
+        repo, git = self.repo_with_change()
+        before = self.run_cli('unreviewed', cwd=repo, check=False)
+        self.assertEqual(before.returncode, 1)
+        self.assertIn('no diff review recorded', before.stdout)
+        self.run_cli('diff', cwd=repo)
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
+        (repo / 'a.txt').write_text('three\n')
+        (repo / 'b.txt').write_text('new\n')
+        changed = self.run_cli('unreviewed', cwd=repo, check=False)
+        self.assertEqual(changed.returncode, 1)
+        self.assertIn('a.txt', changed.stdout)
+        self.assertIn('b.txt', changed.stdout)
+        (repo / 'a.txt').write_text('two\n')
+        (repo / 'b.txt').unlink()
+        # Committing reviewed content is not a change.
+        git('commit', '-am', 'Reviewed work')
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
+
+    def reviewed_repo(self):
+        repo, git = self.repo_with_change()
+        self.run_cli('diff', cwd=repo)
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
+        return repo, git
+
+    def assert_unreviewed(self, repo, name):
+        result = self.run_cli('unreviewed', cwd=repo, check=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(name, result.stdout)
+
+    def test_unreviewed_sees_symlink_retargets_and_mode_changes(self):
+        repo, git = self.repo_with_change()
+        (repo / 'one').write_text('same\n')
+        (repo / 'two').write_text('same\n')
+        (repo / 'link').symlink_to('one')
+        self.run_cli('diff', cwd=repo)
+        (repo / 'link').unlink()
+        (repo / 'link').symlink_to('two')
+        self.assert_unreviewed(repo, 'link')
+        (repo / 'link').unlink()
+        (repo / 'link').symlink_to('one')
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
+        (repo / 'a.txt').chmod(0o755)
+        self.assert_unreviewed(repo, 'a.txt')
+
+    def test_unreviewed_sees_a_submodule_move(self):
+        repo, git = self.repo_with_change()
+        sub = self.home / 'sub'
+        sub.mkdir()
+        def sgit(*args):
+            subprocess.run(['git', '-C', str(sub), *args], check=True, capture_output=True)
+        sgit('init')
+        sgit('config', 'user.name', 'Test')
+        sgit('config', 'user.email', 'test@example.com')
+        (sub / 'f').write_text('1\n')
+        sgit('add', '.')
+        sgit('commit', '-m', 'one')
+        subprocess.run(['git', '-c', 'protocol.file.allow=always', '-C', str(repo), 'submodule', 'add', str(sub), 'sub'],
+                       check=True, capture_output=True)
+        git('commit', '-m', 'Add submodule')
+        base = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        (repo / 'sub/f').write_text('2\n')
+        subprocess.run(['git', '-C', str(repo / 'sub'), 'config', 'user.name', 'Test'], check=True)
+        subprocess.run(['git', '-C', str(repo / 'sub'), 'config', 'user.email', 'test@example.com'], check=True)
+        subprocess.run(['git', '-C', str(repo / 'sub'), 'commit', '-am', 'two'], check=True, capture_output=True)
+        self.run_cli('diff', base, cwd=repo)
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
+        (repo / 'sub/f').write_text('3\n')
+        subprocess.run(['git', '-C', str(repo / 'sub'), 'commit', '-am', 'three'], check=True, capture_output=True)
+        self.assert_unreviewed(repo, 'sub')
+
+    def test_unreviewed_ignores_diff_relative_and_locale(self):
+        repo, git = self.repo_with_change()
+        git('config', 'diff.relative', 'true')
+        (repo / 'sub').mkdir()
+        (repo / 'sub/x.txt').write_text('x\n')
+        (repo / 'café.txt').write_text('unicode\n')
+        self.run_cli('diff', cwd=repo / 'sub')
+        delivered = next((self.home / '.cache/claude-sidecar/requests').glob('*.diff')).read_text()
+        self.assertIn('a.txt', delivered, 'the delivered diff covers the whole repository')
+        c_locale = dict(self.env, LC_ALL='C')
+        result = self.run_cli('unreviewed', cwd=repo, env=c_locale)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_interrupt_releases_the_slot_and_stops_the_prompt(self):
+        process = subprocess.Popen([str(self.launcher), 'ask', 'Task'], text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=dict(self.env, HERDR_PROMPT_DELAY='20'),
+                                   start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+                self.assertLess(time.monotonic(), deadline, 'request was not submitted')
+                time.sleep(0.02)
+            os.killpg(process.pid, signal.SIGINT)
+            process.communicate(timeout=10)
+            lock = next((self.home / '.cache/claude-sidecar').glob('*.lock'))
+            held = subprocess.run(['flock', '-n', str(lock), 'true'])
+            self.assertEqual(held.returncode, 0, 'the slot lock must be free after Ctrl-C')
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+
+    def test_interrupt_stops_a_prompt_client_started_by_a_wrapper(self):
+        bin_dir = self.home / 'bin'
+        (bin_dir / 'herdr-real').write_text((bin_dir / 'herdr').read_text())
+        (bin_dir / 'herdr-real').chmod(0o755)
+        # A delegating wrapper that does not exec, so the client is a grandchild.
+        (bin_dir / 'herdr').write_text('#!/bin/sh\nherdr-real "$@"\n')
+        process = subprocess.Popen([str(self.launcher), 'ask', 'Task'], text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=dict(self.env, HERDR_PROMPT_DELAY='20'),
+                                   start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+                self.assertLess(time.monotonic(), deadline, 'request was not submitted')
+                time.sleep(0.02)
+            os.killpg(process.pid, signal.SIGINT)
+            process.communicate(timeout=10)  # hangs while a grandchild holds the output pipes
+            leftovers = subprocess.run(['pgrep', '-f', f'agent prompt.*{self.home}'], capture_output=True, text=True).stdout
+            self.assertEqual(leftovers.strip(), '', 'no prompt client may survive Ctrl-C')
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+
+    def test_a_failing_filter_never_counts_as_coverage(self):
+        repo, git = self.repo_with_change()
+        (repo / '.gitattributes').write_text('*.bin filter=broken\n')
+        git('add', '.gitattributes')
+        git('commit', '-m', 'Attributes')
+        git('config', 'filter.broken.clean', 'false')
+        git('config', 'filter.broken.required', 'true')
+        (repo / 'bad.bin').write_text('x\n')
+        failed = self.run_cli('unreviewed', cwd=repo, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertNotIn('no changes', failed.stdout)
+        result = self.run_cli('diff', cwd=repo)
+        self.assertIn('not recorded as covering', result.stderr)
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo, check=False).returncode, 1)
+
+    def test_unreviewed_sees_tracked_changes_outside_a_sparse_cone(self):
+        repo, git = self.repo_with_change()
+        for name in ('in', 'out'):
+            (repo / name).mkdir()
+            (repo / name / 'x').write_text('one\n')
+        git('add', '.')
+        git('commit', '-m', 'Dirs')
+        git('sparse-checkout', 'init', '--cone')
+        git('sparse-checkout', 'set', 'in')
+        self.assertFalse((repo / 'out').exists())
+        self.run_cli('diff', cwd=repo)
+        self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
+        (repo / 'out').mkdir()
+        (repo / 'out' / 'x').write_text('unreviewed\n')
+        self.assert_unreviewed(repo, 'out/x')
+
+    def test_long_requests_report_progress(self):
+        env = dict(self.env, HERDR_PROMPT_DELAY='2.5', SIDECAR_PROGRESS_S='1')
+        result = self.run_cli('ask', 'Task', env=env)
+        self.assertIn('ship', result.stdout)
+        self.assertRegex(result.stderr, r'still working \(0m[12]s\); last output: reading src/foo.ts')
+        quiet = self.run_cli('ask', 'Task two', env=dict(env, SIDECAR_PROGRESS_S='0'))
+        self.assertNotIn('still working', quiet.stderr)
 
     # --- Saved herdr machines (herdr 0.9.1+) ---
 

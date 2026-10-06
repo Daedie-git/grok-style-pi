@@ -14,6 +14,7 @@
 #   sidecar note TEXT            share context on ongoing work; no review
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
 #   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
+#   sidecar unreviewed           list files changed since the last diff review (exit 1 when there are any)
 #   sidecar ask TEXT             follow-up request; prints the report
 #   sidecar answer TEXT          answer the sidecar's pending question (exit 3 from a request); resumes that task
 #   sidecar steer TEXT           redirect busy work now; when idle, run a request and print its report
@@ -31,6 +32,8 @@ NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
 # After the sidecar settles without a report, recheck for this long before declaring the request abandoned.
 SETTLE_GRACE_S="${SIDECAR_SETTLE_GRACE_S:-15}"
+# While a request runs, print a status line to stderr this often (seconds); 0 disables it.
+PROGRESS_S="${SIDECAR_PROGRESS_S:-60}"
 # Where pi finds its extension and prompt. A remote machine needs this plugin checked out there, by default at the same path.
 AGENT_HOME="$SIDECAR_HOME"
 # Set by resolve_machine for a slot on a saved herdr machine; empty for the local one.
@@ -651,6 +654,36 @@ await_report() {
   done
 }
 
+PROMPT_PID=
+# Like hd, but replaces the (background) subshell with herdr in a new session: its pid is then the group to signal.
+hd_detached() {
+  if [[ -n $MACHINE ]]; then exec setsid herdr --machine "$MACHINE" "$@"; else exec setsid herdr "$@"; fi
+}
+
+# shellcheck disable=SC2329  # run from the EXIT trap
+stop_prompt() {
+  [[ -n $PROMPT_PID ]] || return 0
+  # The prompt runs as the leader of its own session, so one signal reaches the whole client tree.
+  kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true
+  kill "$PROMPT_PID" 2>/dev/null || true
+}
+
+# Waits for the background prompt PID. A request can run for hours, so every PROGRESS_S seconds it prints how long
+# the sidecar has been working and the last line of its pane.
+wait_with_progress() {
+  local pid=$1 name=$2 id=$3 start=$SECONDS elapsed last next=$PROGRESS_S
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.2
+    elapsed=$((SECONDS - start))
+    if (( PROGRESS_S > 0 && elapsed >= next )); then
+      last=$(hd agent read "$name" --source recent-unwrapped --lines 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
+      echo "sidecar: $id still working ($((elapsed / 60))m$((elapsed % 60))s)${last:+; last output: $last}" >&2
+      next=$((elapsed + PROGRESS_S))
+    fi
+  done
+  wait "$pid" || true
+}
+
 # Appended to every request of a remote slot: the sidecar cannot see Claude's machine.
 remote_notice() {
   cat <<EOF
@@ -695,7 +728,10 @@ request() {
   fi
   INFLIGHT="$STATE_DIR/$name.inflight"
   printf '%s\n' "$hash" >"$INFLIGHT"
-  trap 'rm -f -- "$INFLIGHT"' EXIT
+  # The background prompt must not outlive the launcher (Ctrl-C leaves it running otherwise).
+  trap 'rm -f -- "$INFLIGHT"; stop_prompt' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   req=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-$kind-$name.XXXXXX.md")
   id=${req##*/}
   id=${id%.md}
@@ -711,7 +747,10 @@ $(remote_notice)"
   if [[ -n $MACHINE ]]; then prompt_path=$(publish_file "$req"); fi
   wait_until_ready "$hname"
   # Requests may run for hours: wait without a deadline until a report arrives or the sidecar settles without one.
-  hd agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. Finish by calling submit_review with request_id $id." --wait >/dev/null || true
+  hd_detached agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. Finish by calling submit_review with request_id $id." --wait >/dev/null 9>&- &
+  PROMPT_PID=$!
+  wait_with_progress "$PROMPT_PID" "$hname" "$id"
+  PROMPT_PID=
   await_report "$hname" "$report"
   if report_exists "$report"; then
     question=$(marker_line "${report%.md}.needs-answer")
@@ -763,9 +802,60 @@ Look for: wrong assumptions about the existing code, missing steps or cases, own
 ${2:-(none)}"
 }
 
+# One line per path that differs from BASE: its escaped name, mode, object id and status. Everything is staged into a
+# throwaway index first, so untracked files, deletions, symlinks (by link text), executable bits and submodule commits
+# are compared as Git sees them, whatever the real index or diff.relative says. LC_ALL=C keeps names and order stable.
+change_manifest() {
+  local base=$1 root index raw status=0 meta path
+  root=$(git rev-parse --show-toplevel) || return 1
+  index=$(mktemp "$STATE_DIR/index.XXXXXX") || return 1
+  raw=$(mktemp "$STATE_DIR/raw.XXXXXX") || { rm -f -- "$index"; return 1; }
+  rm -f -- "$index"
+  # -p keeps the index timestamp, which Git needs to notice same-size edits made right after a commit.
+  cp -p -- "$(git -C "$root" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || true
+  # --sparse: a tracked path outside the sparse cone can reappear and change; a failing step must fail the whole manifest.
+  GIT_INDEX_FILE=$index git -C "$root" add -A --sparse >/dev/null || status=1
+  if (( status == 0 )); then
+    GIT_INDEX_FILE=$index git -C "$root" -c diff.relative=false diff --cached --raw -z --no-renames --no-ext-diff --no-abbrev "$base" >"$raw" || status=1
+  fi
+  if (( status == 0 )); then
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+      LC_ALL=C printf '%q\t%s\n' "$path" "${meta#:* }"
+    done <"$raw"
+  fi
+  rm -f -- "$index" "$raw"
+  return "$status"
+}
+
+# Remembers what the last diff review covered, per slot and repository.
+reviewed_file() {
+  echo "$STATE_DIR/$(agent_name).reviewed.$(git rev-parse --show-toplevel | sha256sum | cut -c1-12)"
+}
+
+cmd_unreviewed() {
+  local file base now changed
+  file=$(reviewed_file)
+  if [[ ! -s $file ]]; then
+    now=$(change_manifest HEAD) || die "could not fingerprint the working tree"
+    [[ -z $now ]] && { echo "no changes, and no diff review recorded"; return 0; }
+    echo "no diff review recorded for this repository; changed: $(cut -f1 <<<"$now" | paste -sd' ')"
+    return 1
+  fi
+  base=$(sed -n '1s/^base=//p' "$file")
+  git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "reviewed base $base no longer exists"
+  now=$(change_manifest "$base") || die "could not fingerprint the working tree"
+  changed=$(LC_ALL=C comm -3 <(tail -n +2 "$file" | LC_ALL=C sort) <(LC_ALL=C sort <<<"$now") | sed 's/^\t//' | cut -f1 | sort -u)
+  if [[ -z $changed ]]; then
+    echo "nothing changed since the last diff review"
+    return 0
+  fi
+  echo "changed since the last diff review: $(paste -sd' ' <<<"$changed")"
+  return 1
+}
+
 cmd_diff() {
   require_herdr
-  local base=${1:-HEAD} id diff root f diff_path repo sha head rel
+  local base=${1:-HEAD} id diff root f diff_path repo sha head rel manifest
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
   root=$(git rev-parse --show-toplevel)
   id="$(date +%Y%m%d-%H%M%S)-$(agent_name)"
@@ -775,7 +865,7 @@ cmd_diff() {
     git log --oneline "$base..HEAD"
     echo
     echo "# Diff: $base..working tree"
-    git diff "$base"
+    git -c diff.relative=false diff "$base"
     echo
     echo "# Untracked files"
     while IFS= read -r -d '' f; do
@@ -783,6 +873,8 @@ cmd_diff() {
     done < <(git -C "$root" ls-files --others --exclude-standard -z)
   } >"$diff"
   [[ -s "$diff" ]] || die "no changes since $base"
+  # An unfingerprintable tree is still reviewed, but never recorded as covered.
+  manifest=$(change_manifest "$base") || manifest=
   diff_path=$diff
   repo=$root
   sha=$(git rev-parse "$base^{commit}")
@@ -800,8 +892,17 @@ $(remote_checkout_note "$head" "$sha")
 
 Read the diff, then read the surrounding code it touches and its callers. Hunt for real defects: logic errors, broken invariants, lifecycle and ownership mistakes, races, missed error paths, edge inputs, stale callers, and behaviour that contradicts the intent below or earlier agreed decisions. Give each finding a concrete failure scenario. Skip style.
 
+Reproduce each finding before you report it: run the existing tests or a short script that triggers it, and quote the command and its output in the finding. Mark a finding you could not reproduce \`unverified\` and say why.
+
 ## Intent and context from Claude
 ${2:-(none)}"
+  # Reached only when a report was delivered; the review covered exactly the files hashed above.
+  if [[ -n $manifest ]]; then
+    printf 'base=%s\n%s\n' "$sha" "$manifest" >"$(reviewed_file)"
+  else
+    rm -f -- "$(reviewed_file)"
+    echo "sidecar: could not fingerprint the working tree; this review is not recorded as covering it" >&2
+  fi
 }
 
 cmd_ask() {
@@ -993,6 +1094,7 @@ case "${1:-}" in
   note) shift; cmd_note "$@" ;;
   plan) shift; cmd_plan "$@" ;;
   diff) shift; cmd_diff "$@" ;;
+  unreviewed) shift; cmd_unreviewed "$@" ;;
   ask) shift; cmd_ask "$@" ;;
   answer) shift; cmd_answer "$@" ;;
   steer) shift; cmd_steer "$@" ;;

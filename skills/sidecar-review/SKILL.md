@@ -78,7 +78,9 @@ After every real implementation, before you report it done, run an **adversarial
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" diff <base> "Intent of the change and anything non-obvious"
 ```
 
-`<base>` is the commit the work started from (`HEAD` when all of it is uncommitted). The review covers commits since base, uncommitted changes, and untracked files.
+`<base>` is the commit the work started from (`HEAD` when all of it is uncommitted). The review covers commits since base, uncommitted changes, and untracked files. After committing or pushing, pass the pre-work commit as `<base>`; use `diff`, not `ask`, so the sidecar receives the diff.
+
+The sidecar reproduces each finding and quotes the command and output; it marks the rest `unverified`. A long request prints a status line to stderr every minute (`SIDECAR_PROGRESS_S`, `0` disables it). Before you report done or push, run `sidecar unreviewed`: it lists files changed since the last diff review and exits 1 if there are any. Send those back through `diff`.
 
 ## Reviewing a merge request
 

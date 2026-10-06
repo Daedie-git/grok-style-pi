@@ -72,6 +72,7 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar note "The user approved the plan in docs/plan.md."
 ./scripts/sidecar plan docs/plan.md "Goals and constraints"
 ./scripts/sidecar diff HEAD "Intent of the implementation"
+./scripts/sidecar unreviewed
 ./scripts/sidecar ask "Recheck finding 2 after the fix."
 ./scripts/sidecar --slot 2 ask "Review the parser independently."
 ./scripts/sidecar --slot 3 ask "Review lifecycle handling independently."
@@ -157,3 +158,9 @@ Exit 0 means both synchronized; exit 1 means refusal or failure. `SIDECAR_SYNC_T
 ## Safety
 
 The reviewer inspects by default, but can edit and commit when asked. It may push and write to GitLab/GitHub when asked. It runs with all of pi's tools and no command guard. The agent has access to your filesystem and its own model credentials. Claude remains responsible for verifying findings.
+
+## Review progress and coverage
+
+A request prints `sidecar: <id> still working (3m00s); last output: ...` to stderr every `SIDECAR_PROGRESS_S` seconds (default 60; `0` turns it off), taken from the last line of the sidecar's pane. A `diff` request asks the sidecar to reproduce each finding with a command and quote its output, and to mark the rest `unverified`.
+
+After a `diff` report is delivered, the launcher records the mode and object id of every path that differs from the base (the working tree as Git would stage it: untracked files included, ignored files excluded, symlinks by link text, submodules by commit), per slot and repository, together with the base commit. A dirty submodule's uncommitted content is not compared. `sidecar unreviewed` compares the working tree with that record against the same base, prints the files whose content differs, and exits 1 if there are any (or if no review is recorded and files have changed). Committing reviewed content does not count as a change.

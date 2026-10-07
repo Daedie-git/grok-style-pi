@@ -148,7 +148,7 @@ The centered viewer has a full border and a top-right **Close** button. In the v
 
 ### Standalone Herdr plugin
 
-Inside Herdr (`HERDR_ENV=1`), the optional entrypoint loads the independently usable [herdr-subagents package](packages/herdr-subagents/README.md) instead of Pi Subagents. The runner owns Pi and Claude Code panes, balanced placement, remote SSH machines, results, resume, steering, cancellation, completion notices, and SQLite coordination. Grok decorates tool rendering and completion notices. Notices appear in expanded diamonds by default; click the diamond to collapse or reopen them, or use Ctrl+O to control expansion globally. Disabling `toolStyling` leaves notices in Pi's native display. The notice content and delivery remain unchanged. Existing combined installations keep working without settings changes.
+Inside Herdr (`HERDR_ENV=1`), the optional entrypoint loads the independently usable [herdr-subagents package](packages/herdr-subagents/README.md) instead of Pi Subagents. The runner owns Pi and Claude Code panes, balanced placement, remote SSH machines, results, resume, steering, cancellation, completion notices, and SQLite coordination. Grok decorates tool rendering and completion notices. Notices appear in collapsed diamonds by default; click the diamond to expand or collapse them, or use Ctrl+O to control expansion globally. Disabling `toolStyling` leaves notices in Pi's native display. The notice content and delivery remain unchanged. Existing combined installations keep working without settings changes.
 
 To use the runner without Grok styling:
 

@@ -9,7 +9,7 @@ export function createHerdrNotificationRenderer(): MessageRenderer {
 	return (message, { expanded }, theme) => {
 		let display = states.get(message);
 		if (!display) {
-			display = { open: true, expanded };
+			display = { open: expanded, expanded };
 			states.set(message, display);
 		} else if (display.expanded !== expanded) {
 			display.expanded = expanded;

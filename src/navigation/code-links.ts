@@ -73,12 +73,13 @@ export function linkifyCodeReferences(
 	markdown: string,
 	cwd: string,
 	exists: (path: string) => boolean = existsSync,
-	urlFor: (reference: FileReference) => string = reference => cursorFileUrl(reference.path, reference.line, reference.column),
+	urlFor: (reference: FileReference) => string | undefined = reference => cursorFileUrl(reference.path, reference.line, reference.column),
 ): string {
 	const replacements = inlineCodeSpans(markdown).flatMap((span) => {
 		const reference = parseFileReference(span.text);
 		const absolute = reference && resolveReference(reference, cwd, exists);
-		return absolute ? [{ ...span, replacement: markdownLink(markdown.slice(span.start, span.end), urlFor({ ...reference, path: absolute })) }] : [];
+		const url = absolute && urlFor({ ...reference, path: absolute });
+		return url ? [{ ...span, replacement: markdownLink(markdown.slice(span.start, span.end), url) }] : [];
 	});
 	let result = markdown;
 	for (const span of replacements.sort((left, right) => right.start - left.start)) {

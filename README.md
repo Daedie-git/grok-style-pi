@@ -40,6 +40,31 @@ Restart Pi after changing `tuiMode`.
 
 Install either the local clone or the GitHub package, not both. When working from the local clone, `/reload` loads your latest changes.
 
+## Standalone media
+
+To use only `show_image` and `show_video`, load the media-only entrypoint instead of either Grok entrypoint:
+
+```bash
+pi -e /path/to/grok-style-pi/integrations/media.ts
+```
+
+For persistent use, add that file to the `extensions` list in Pi's settings. If the Grok package is also installed, disable its default extension (and optionally its theme resources); for example:
+
+```json
+{
+  "packages": [
+    { "source": "/path/to/grok-style-pi", "extensions": [], "themes": [] }
+  ],
+  "extensions": ["/path/to/grok-style-pi/integrations/media.ts"]
+}
+```
+
+The standalone extension retains the same initially open image and video diamonds, [diamond gestures](#diamond-interaction), Ctrl+O expansion, Ctrl+click opening in the desktop's default application, image transcript storage, bounded silent video playback, and playback cleanup on branch navigation, compaction, session replacement, shutdown, and reload. It works independently of `/grok-style` settings and leaves the theme, footer, composer, terminal colors, built-in tools, activity panel, and communication style unchanged.
+
+Standalone inline-code media paths in assistant replies become clickable; code references, existing Markdown links, code blocks, and thinking messages stay unchanged. On Linux it uses the same private, session-owned file-link handler as Grok and installs that handler at interactive session startup. Other platforms use file URLs for reply links. Mouse gestures require Pi's fullscreen mode. Inline video still requires `ffmpeg` and Kitty image support, including Herdr's graphics setting described below; the preview is silent and never sends frames to the model.
+
+Other extensions can import `createMediaExtension` from `integrations/media.ts` to install the full media behavior, or `installMediaTools` to register just the tools and their playback lifecycle with an injected `onModifierOpen` handler. Both register renderers before transcript restoration and preserve the video owner across startup. Use one installer per Pi extension runtime. Do not also load `extensions/index.ts` or `integrations/subagents.ts`: both already include these media tools when tool styling is enabled.
+
 ## What you get
 
 | Surface | Behavior |
@@ -154,7 +179,7 @@ One live process owns an inbox. `<root>/<session id>/.owner` holds `{pid, token,
 
 ## Code organization
 
-Both alternative entrypoints call `extensions/install.ts` once to wire Pi's real editor and built-in tool factories into `createGrokStyleExtension`. The optional subagent entrypoint therefore includes the same core chrome and codemode styling as the direct entrypoint, while still choosing exactly one subagent runner. The factory in `src/extension.ts` coordinates feature settings, tool registration, and session startup/shutdown. Its public exports and injected dependencies stay available from that file.
+Both full Grok entrypoints call `extensions/install.ts` once to wire Pi's real editor and built-in tool factories into `createGrokStyleExtension`. The independent `integrations/media.ts` entrypoint installs only the reusable media extension in `src/media/`; full Grok uses the same media-tool installer and shared session-link transport. The optional subagent entrypoint therefore includes the same core chrome and codemode styling as the direct entrypoint, while still choosing exactly one subagent runner. The factory in `src/extension.ts` coordinates feature settings, tool registration, and session startup/shutdown. Its public exports and injected dependencies stay available from that file.
 
 | Module | Owns |
 |---|---|
@@ -163,7 +188,8 @@ Both alternative entrypoints call `extensions/install.ts` once to wire Pi's real
 | `src/tools/sections/` | Unstyled summary/body adapters for codemode, subagent rows, and ordinary text tools |
 | `src/rendering/` | Cached layouts, diffs, syntax colors, palette data, and background visual workers |
 | `src/chrome/` | Composer, footer, terminal colors, theme loading, and color settings |
-| `src/navigation/` | File links, edit targets, workspace preparation, and Cursor launching |
+| `src/navigation/` | Shared session links, desktop media opening, edit targets, workspace preparation, and Cursor launching |
+| `src/media/` | Reusable media registration and playback lifetime, plus the standalone media extension |
 | `src/activity/` | Activity panel state and presentation |
 | `src/subagents/` | In-process Pi Subagents adapter, result styling, and runtime selection |
 | `packages/herdr-subagents/` | Standalone Herdr package: extension, runner, child sessions, CLI client, database worker, and runner tests |

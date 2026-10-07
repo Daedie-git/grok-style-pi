@@ -21,6 +21,7 @@ export function createShowImageTool(cwd: string, hooks: { onModifierOpen?: (targ
 		label: "Show Image",
 		description: "Show a local PNG, JPEG, GIF, or WebP image to the user in an expanded, closable diamond. Use this when sharing a screenshot. The tool displays the image to the user; it does not provide image pixels to the model. The path must point to an existing image file.",
 		promptSnippet: "Share a local screenshot with the user in a closable image panel",
+		promptGuidelines: ["When referencing a shared image in your reply, use a standalone inline-code file path so the user can open it in their default image viewer."],
 		parameters: Type.Object({ path: Type.String({ description: "Path to the image file to show." }) }),
 		renderShell: "self" as const,
 		async execute(_id: string, args: { path: string }, _signal: AbortSignal | undefined, _update: unknown, ctx: { cwd: string }) {

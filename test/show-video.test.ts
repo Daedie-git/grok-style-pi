@@ -7,6 +7,7 @@ import test from "node:test";
 import { getCapabilities, setCapabilities } from "@earendil-works/pi-tui";
 import { createShowVideoTool } from "../src/tools/show-video.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
+import { createMediaExtension } from "../src/media/extension.ts";
 import { BUILTIN_TOOL_NAMES } from "../src/tools/renderer.ts";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { createPngStream, playVideoFrames } from "../src/tools/video-frames.ts";
@@ -105,7 +106,7 @@ test("video diamond plays real frames, closes its process, and keeps media out o
 	} finally { video.dispose(); setCapabilities(capabilities); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("restored transcript renderers stay owned through startup and cannot restart after shutdown", { skip: spawnSync("ffmpeg", ["-version"], { stdio: "ignore" }).status !== 0 }, async () => {
+for (const mode of ["grok", "standalone"] as const) test(`${mode}: restored transcript renderers stay owned through startup and cannot restart after shutdown`, { skip: spawnSync("ffmpeg", ["-version"], { stdio: "ignore" }).status !== 0 }, async () => {
 	const dir = mkdtempSync(join(tmpdir(), "grok-video-lifetime-"));
 	const handlers = new Map<string, Function>();
 	const tools = new Map<string, any>();
@@ -115,7 +116,15 @@ test("restored transcript renderers stay owned through startup and cannot restar
 	try {
 		const file = join(dir, "clip.mp4");
 		assert.equal(spawnSync("ffmpeg", ["-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=8", "-t", "1", "-pix_fmt", "yuv420p", "-y", file], { timeout: 10_000 }).status, 0);
-		createGrokStyleExtension({ on(name, handler) { handlers.set(name, handler); }, registerTool(tool) { tools.set(tool.name, tool); } }, {
+		const pi = {
+			on(name: string, handler: Function) {
+				const previous = handlers.get(name);
+				handlers.set(name, (...args: unknown[]) => { previous?.(...args); return handler(...args); });
+			},
+			registerTool(tool: any) { tools.set(tool.name, tool); },
+		};
+		if (mode === "standalone") createMediaExtension(pi);
+		else createGrokStyleExtension(pi, {
 			CustomEditor,
 			tools: Object.fromEntries(BUILTIN_TOOL_NAMES.map(name => [name, () => ({ name, description: name, parameters: {}, execute() {} })])) as any,
 		});
@@ -143,10 +152,18 @@ test("restored transcript renderers stay owned through startup and cannot restar
 			{ state: finalState, showImages: true, invalidate() {} });
 		finalResult.render(80);
 		assert.equal(typeof finalState.grokVideo?.stop, "function");
+		handlers.get("session_start")!({ reason: "resume" }, { cwd: dir, hasUI: false, mode: "print", ui: {} });
+		assert.equal(finalState.grokVideo?.stop, undefined, "session replacement stops the previous decoder even without shutdown");
+		assert.deepEqual(finalResult.render(80), [], "previous-session rows cannot restart playback");
+		const shutdownState: typeof state = {};
+		const shutdownResult = restored.renderResult({ content: [], details: { path: file } }, { expanded: false }, theme,
+			{ state: shutdownState, showImages: true, invalidate() {} });
+		shutdownResult.render(80);
+		assert.equal(typeof shutdownState.grokVideo?.stop, "function");
 		handlers.get("session_shutdown")!();
-		assert.equal(finalState.grokVideo?.stop, undefined);
-		finalResult.render(80);
-		assert.equal(finalState.grokVideo?.stop, undefined, "stale rows cannot restart playback after shutdown");
+		assert.equal(shutdownState.grokVideo?.stop, undefined);
+		shutdownResult.render(80);
+		assert.equal(shutdownState.grokVideo?.stop, undefined, "stale rows cannot restart playback after shutdown");
 	} finally { handlers.get("session_shutdown")?.(); restored?.dispose(); setCapabilities(previous); rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -1,9 +1,6 @@
-import { getCapabilities } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { linkifyCodeReferences } from "../navigation/code-links.ts";
-import { createFileLinkBridge } from "../navigation/file-link-bridge.ts";
+import { createSessionLinks } from "../navigation/session-links.ts";
 import { isMediaPath, openMedia } from "../navigation/open-media.ts";
-import { installFileLinkHandler } from "../navigation/file-link-handler.ts";
 import { createOpenHistory, absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { createCursorWorkspaceOpener, type CursorOpenContext } from "../navigation/cursor-workspace.ts";
 import type { ExtensionApiLike, GrokStyleDeps } from "./types.ts";
@@ -18,16 +15,8 @@ export function createFileNavigation(pi: ExtensionApiLike, deps: FileNavigationD
 	const cursor = createCursorWorkspaceOpener({ open: deps.openCursor, refresh: deps.refreshCompileCommands });
 	let openContext: CursorOpenContext | undefined;
 	let sessionGeneration = 0;
-	let linkCwd = process.cwd();
-	const fileLinks = createFileLinkBridge(target => openLinkedTarget(target));
-	const linksEnabled = deps.hyperlinks ?? (() => {
-		try { return getCapabilities().hyperlinks; } catch { return false; }
-	});
-	pi.registerMarkdownTransformer?.((markdown, context) => {
-		if (!deps.communication || context.messageType === "assistant-thinking" || !linksEnabled()) return markdown;
-		return linkifyCodeReferences(markdown, linkCwd, undefined, process.platform === "linux"
-			? reference => fileLinks.urlFor({ ...reference, cwd: linkCwd })
-			: undefined);
+	const links = createSessionLinks(pi, {
+		enabled: deps.communication, hyperlinks: deps.hyperlinks, open: openLinkedTarget,
 	});
 	async function openLinkedTarget(target: OpenTarget): Promise<boolean> {
 		if (!isMediaPath(target.path)) return openTarget(target);
@@ -91,26 +80,15 @@ export function createFileNavigation(pi: ExtensionApiLike, deps: FileNavigationD
 	});
 
 	function startSession(ctx: ExtensionContext) {
-		linkCwd = ctx.cwd;
 		cursor.reset();
 		openContext = ctx;
 		clear();
 		sessionGeneration++;
-		if (process.platform === "linux" && ctx.mode === "tui" && deps.communication && linksEnabled()) {
-			const generation = sessionGeneration;
-			const notify = ctx.ui.notify?.bind(ctx.ui);
-			const onError = (error: Error) => {
-				if (generation === sessionGeneration) notify?.(`Could not start file links: ${error.message}`, "error");
-			};
-			try {
-				installFileLinkHandler();
-				fileLinks.start(onError);
-			} catch (error) { onError(error instanceof Error ? error : new Error(String(error))); }
-		}
+		links.startSession(ctx);
 	}
 
 	function dispose() {
-		fileLinks.stop();
+		links.dispose();
 		cursor.reset();
 		openContext = undefined;
 		clear();

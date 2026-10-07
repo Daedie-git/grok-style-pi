@@ -4,7 +4,7 @@ import { getCapabilities, Image, truncateToWidth, type TuiMouseEvent } from "@ea
 import { Type } from "@sinclair/typebox";
 import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { sanitizeToolText } from "./diamond.ts";
-import { classifyClick, claimsPress } from "./interaction.ts";
+import { fileTarget, handleDiamondClick } from "./interaction.ts";
 import { playVideoFrames } from "./video-frames.ts";
 
 const EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"]);
@@ -28,31 +28,25 @@ export function createShowVideoTool(cwd: string, hooks: { onModifierOpen?: (targ
 		state.stop = undefined;
 		active.delete(state);
 	}
-	function toggle(state: VideoState, invalidate: () => void) {
-		state.open = !state.open;
-		if (!state.open) stop(state);
-		else { state.error = undefined; state.frame = undefined; state.image = undefined; }
-		invalidate();
-	}
 	function click(event: TuiMouseEvent, surface: "header" | "body", state: VideoState | undefined, invalidate: (() => void) | undefined, path: string | undefined) {
 		if (disposed) return undefined;
-		const action = classifyClick(event, surface, { open: state?.open ?? false });
-		if (action === "none") return claimsPress(event) ? { handled: true as const } : undefined;
-		if (action === "open-target") {
-			if (path) hooks.onModifierOpen?.({ path: absPath(path, cwd), line: 1, cwd });
-			return { handled: true as const };
-		}
-		if (action === "inert" || action === "close" && state && !state.open) return { handled: true as const };
-		// Without local state, Pi's own expansion toggle is the fallback.
-		if (!state || !invalidate) return undefined;
-		toggle(state, invalidate);
-		return { handled: true as const };
+		return handleDiamondClick(event, surface, {
+			display: invalidate ? state : undefined,
+			openTarget: path && hooks.onModifierOpen ? fileTarget({ path: absPath(path, cwd) }, 1, cwd, hooks.onModifierOpen) : undefined,
+			invalidate() {
+				if (!state) return;
+				if (!state.open) stop(state);
+				else { state.error = undefined; state.frame = undefined; state.image = undefined; }
+				invalidate?.();
+			},
+		});
 	}
 	return {
 		name: "show_video",
 		label: "Show Video",
 		description: "Play a local video to the user in a closable diamond. Use this to share a video clip. Playback is a silent, low-frame-rate terminal preview; provide the video file path in your reply so the user can open it in their default video player for full playback with sound. Supports MP4, M4V, MOV, MKV, WebM, and AVI. The tool does not provide video frames to the model.",
 		promptSnippet: "Share a local video as a silent animated preview",
+		promptGuidelines: ["After sharing a video, include its path as a standalone inline-code reference in your reply so the user can open full playback with sound."],
 		parameters: Type.Object({ path: Type.String({ description: "Path to an existing local video file." }) }),
 		renderShell: "self" as const,
 		async execute(_id: string, args: { path: string }, _signal: AbortSignal | undefined, _update: unknown, ctx: { cwd: string }) {

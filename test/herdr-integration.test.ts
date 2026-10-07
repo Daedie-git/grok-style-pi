@@ -52,7 +52,7 @@ test("the extracted runner keeps Grok diamonds optional without changing executi
 			assert.equal(tool.execute, captured[i].execute);
 			assert.equal(tool.parameters, captured[i].parameters);
 			assert.equal(tool.description, native[i].description);
-			assert.equal(tool.renderShell, enabled && i < 2 ? "self" : undefined);
+			assert.equal(tool.renderShell, enabled ? "self" : undefined);
 		}
 		assert.equal(tools[0].description.match(/Do not call this tool unless/g)?.length, 1);
 		tools.length = 0;

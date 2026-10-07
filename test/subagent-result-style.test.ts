@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { registerStyledSubagents } from "../src/subagents/result-style.ts";
+import { assertDiamondGestures } from "./fixtures/diamond-gestures.ts";
 
 test("subagent result styling preserves execution and metadata, collapsing only its display", async () => {
 	const result = { content: [{ type: "text" as const, text: "Agent: abc\nType: Explore | Status: completed\nDescription: Find launch procedure\n\n" + "Complete output\n".repeat(80) }] };
@@ -10,7 +11,7 @@ test("subagent result styling preserves execution and metadata, collapsing only 
 		parameters: {}, promptSnippet: "Result guidance", promptGuidelines: ["Keep the original guidance"],
 		execute: async () => result,
 	} as ToolDefinition;
-	const other = { ...original, name: "steer_subagent" };
+	const other = { ...original, name: "unrelated_tool" };
 	const registered: ToolDefinition[] = [];
 	const pi = { registerTool: (tool: ToolDefinition) => registered.push(tool) } as unknown as ExtensionAPI;
 	for (const enabled of [true, false]) {
@@ -31,6 +32,41 @@ test("subagent result styling preserves execution and metadata, collapsing only 
 		const expanded = styled.renderResult!(result, { expanded: true }, theme, {} as any).render(80).join("\n");
 		assert.equal(expanded.match(/Complete output/g)?.length, 80);
 		assert.match(expanded, /Status: completed/);
+	}
+});
+
+test("steering uses a collapsible diamond while preserving the owning tool", async () => {
+	const result = { content: [{ type: "text" as const, text: "Steering message sent to agent qa-fixture-fixes.\nPane: w4T:p2" }], details: undefined };
+	const original = {
+		name: "steer_subagent", label: "Steer Agent", description: "Redirect an agent", parameters: {},
+		promptSnippet: "Steering guidance", promptGuidelines: ["Keep steering guidance"],
+		execute: async () => result,
+		renderCall: () => ({ render: () => ["native call"], invalidate() {} }),
+		renderResult: () => ({ render: () => ["native result"], invalidate() {} }),
+	} as ToolDefinition;
+	let registered: ToolDefinition;
+	const pi = { registerTool: (tool: ToolDefinition) => { registered = tool; } } as unknown as ExtensionAPI;
+	for (const enabled of [true, false]) {
+		await registerStyledSubagents(pi, (api) => { api.registerTool(original); }, enabled);
+		for (const key of ["execute", "parameters", "description", "promptSnippet", "promptGuidelines"] as const) {
+			assert.equal(registered![key], original[key]);
+		}
+		const args = { agent_id: "qa-fixture-fixes", message: "Final proof audit " + "long message ".repeat(80) };
+		assert.equal(await registered!.execute("call", args, undefined, undefined, {} as any), result);
+		if (!enabled) { assert.equal(registered!, original); continue; }
+		const theme = { fg: (_: string, value: string) => value } as any;
+		const context = { args, state: {}, invalidate() {} };
+		const header = registered!.renderCall!(args, theme, context as any) as any;
+		assert.equal(registered!.renderShell, "self");
+		assert.deepEqual(header.render(80), ["◆ Steer agent qa-fixture-fixes"]);
+		assert.deepEqual(registered!.renderResult!(result, { expanded: false }, theme, context as any).render(80), []);
+		const body = registered!.renderResult!(result, { expanded: true }, theme, context as any) as any;
+		assert.equal(body.render(80).map((line: string) => line.trimStart()).join("\n"), result.content[0].text);
+		assertDiamondGestures("steer_subagent", {
+			header: header.handleMouse, body: body.handleMouse,
+			isOpen: () => registered!.renderResult!(result, { expanded: true }, theme, context as any).render(80).length > 0,
+		});
+		assert.deepEqual(registered!.renderResult!(result, { expanded: false }, theme, context as any).render(80), []);
 	}
 });
 

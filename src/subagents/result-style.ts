@@ -24,6 +24,6 @@ export function withoutSubagentInitiative<T extends InitiativeTool>(tool: T): T 
 export async function registerStyledSubagents(pi: ExtensionAPI, factory: ExtensionFactory, enabled: boolean, styleTool: ToolTransform = wrapWithDiamondRenderer) {
 	await registerToolExtension(pi, factory, (tool) => {
 		const gated = withoutSubagentInitiative(tool);
-		return enabled && ["Agent", "get_subagent_result"].includes(gated.name) ? styleTool(gated) : gated;
+		return enabled && ["Agent", "get_subagent_result", "steer_subagent"].includes(gated.name) ? styleTool(gated) : gated;
 	});
 }

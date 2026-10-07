@@ -14,6 +14,7 @@ export const DEFAULT_SECTIONS: SectionTable = Object.freeze({
 	codemode: codemodeSection,
 	Agent: { ...agent, summary: (view) => ({ title: agentSummary(view.args) }) },
 	get_subagent_result: textSection("Read agent result"),
+	steer_subagent: textSection("Steer agent"),
 	grep: textSection("Searched"),
 	find: textSection("Found"),
 	ls: textSection("Listed"),

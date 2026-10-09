@@ -57,7 +57,7 @@ test("Pi's real resource loader loads the media entrypoint without overriding bu
 		session = result.session;
 		assert.deepEqual(result.extensionsResult.errors, []);
 		await session.bindExtensions({ mode: "json" });
-		for (const name of ["show_image", "show_video"]) {
+		for (const name of ["show_image", "show_html", "show_video"]) {
 			assert.equal(session.getToolDefinition(name)?.renderShell, "self");
 			assert.ok(session.getActiveToolNames().includes(name));
 		}
@@ -79,7 +79,7 @@ test("standalone entrypoint installs only media, independently of Grok settings 
 	const h = harness();
 	media(h.pi as any);
 	try {
-		assert.deepEqual([...h.tools.keys()], ["show_image", "show_video"]);
+		assert.deepEqual([...h.tools.keys()], ["show_image", "show_html", "show_video"]);
 		assert.equal(h.handlers.has("before_agent_start"), false, "no communication-style prompt replacement");
 		assert.equal(h.handlers.has("tool_result"), false, "no edited-file history");
 		h.emit("session_start");
@@ -98,9 +98,9 @@ test("standalone media retain diamond gestures and global expansion", () => {
 	createMediaExtension(h.pi as any, { openMedia: async target => { opened.push(target); }, hyperlinks: () => false });
 	h.emit("session_start");
 	try {
-		for (const name of ["show_image", "show_video"]) {
+		for (const name of ["show_image", "show_html", "show_video"]) {
 			const tool = h.tools.get(name);
-			const path = name === "show_image" ? "/repo/screen.png" : "/repo/clip.mp4";
+			const path = name === "show_image" ? "/repo/screen.png" : name === "show_html" ? "/repo/page.html" : "/repo/clip.mp4";
 			const context = { state: {} as any, expanded: false, showImages: false, invalidate() {} };
 			const header = tool.renderCall({ path }, theme, context);
 			const result = { content: [{ type: "text", text: "shown" }], details: { path } };
@@ -115,7 +115,7 @@ test("standalone media retain diamond gestures and global expansion", () => {
 			tool.renderResult(result, { expanded: false }, theme, context);
 			assert.equal(state().open, false, "Ctrl+O collapses");
 		}
-		assert.deepEqual(opened.map(target => target.path), ["/repo/screen.png", "/repo/screen.png", "/repo/clip.mp4", "/repo/clip.mp4"]);
+		assert.deepEqual(opened.map(target => target.path), ["/repo/screen.png", "/repo/screen.png", "/repo/page.html", "/repo/page.html", "/repo/clip.mp4", "/repo/clip.mp4"]);
 	} finally { h.emit("session_shutdown"); }
 });
 
@@ -151,6 +151,34 @@ test("standalone startup refreshes relative paths without replacing the restored
 		await flush();
 		assert.equal(opened.at(-1)?.path, "/next/screen.png");
 	} finally { h.emit("session_shutdown"); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("restored HTML and image headers follow the session cwd without replacing their renderer owners", async () => {
+	const h = harness();
+	const opened: OpenTarget[] = [];
+	createMediaExtension(h.pi as any, { openMedia: async target => { opened.push(target); }, hyperlinks: () => false });
+	const restored = ["show_html", "show_image"].map(name => {
+		const tool = h.tools.get(name);
+		const path = name === "show_html" ? "page.html" : "screen.png";
+		const context = { state: {}, invalidate() {}, showImages: false };
+		return { name, tool, path, header: tool.renderCall({ path }, theme, context), context };
+	});
+	try {
+		h.ctx.cwd = "/restored-project";
+		h.emit("session_start");
+		for (const { name, tool, path, header, context } of restored) {
+			assert.strictEqual(h.tools.get(name), tool, "restored rows retain their renderer owner");
+			header.handleMouse(ctrl);
+			tool.renderResult({ content: [], details: { path: join(h.ctx.cwd, path) } }, { expanded: false }, theme, context).handleMouse(ctrl);
+		}
+		await flush();
+		assert.deepEqual(opened.map(target => target.path), ["/restored-project/page.html", "/restored-project/page.html", "/restored-project/screen.png", "/restored-project/screen.png"]);
+		h.ctx.cwd = "/next-project";
+		h.emit("session_start");
+		restored[0].header.handleMouse(ctrl);
+		await flush();
+		assert.equal(opened.at(-1)?.path, "/next-project/page.html");
+	} finally { h.emit("session_shutdown"); }
 });
 
 test("desktop-opening failures notify only the session that requested them", async () => {

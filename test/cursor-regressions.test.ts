@@ -117,6 +117,26 @@ test("picker retains selected target while newer edits arrive; reads do not repl
 	assert.equal(opened.at(-1).path, "/repo/b");
 });
 
+test("HTML read, edit, and write diamonds keep Cursor source-line navigation", async () => {
+	const opened: any[] = [];
+	const h = harness(async target => { opened.push(target); });
+	h.handlers.session_start({}, h.ctx);
+	for (const name of ["read", "edit", "write"]) {
+		const args = { path: `${name}.html`, offset: 23 };
+		const context = { cwd: h.ctx.cwd, state: {}, args, expanded: true, invalidate() {} };
+		const header = h.tools[name].renderCall(args, theme, context);
+		const result = { content: [{ type: "text", text: "<h1>Hello</h1>" }], details: name === "edit" ? { diff: "- 42 old\n+ 42 new", firstChangedLine: 42 } : undefined };
+		const body = h.tools[name].renderResult(result, { expanded: true }, theme, context);
+		body.render(80);
+		header.handleMouse(click);
+		body.handleMouse(click);
+	}
+	await new Promise(resolve => setTimeout(resolve, 100));
+	assert.deepEqual(opened.map(target => [target.path, target.line]), [
+		["read.html", 23], ["read.html", 23], ["edit.html", 42], ["edit.html", 42], ["write.html", 1], ["write.html", 1],
+	]);
+});
+
 test("cached factory instances reset on every session start and shutdown and isolate instances", async () => {
 	const h = harness();
 	for (const reason of ["startup", "new", "resume", "fork", "reload"]) {

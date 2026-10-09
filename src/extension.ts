@@ -32,7 +32,7 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 	const diamondHooks = {
 		preparation,
-		onModifierOpen(target: OpenTarget) { void navigation.openLinkedTarget(target); },
+		onModifierOpen(target: OpenTarget) { void navigation.openTarget(target); },
 		hasActiveSelection: () => chrome.hasActiveSelection(),
 		onCodeLocation(path: string, line: number, endLine?: number) {
 			const ui = activeContext?.ui;

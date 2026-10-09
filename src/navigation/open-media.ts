@@ -4,7 +4,7 @@ import { extname } from "node:path";
 import { absPath, type OpenTarget } from "./open-in-cursor.ts";
 
 const MEDIA_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif", ".tif", ".tiff",
-	".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi"]);
+	".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".html", ".htm"]);
 
 export function isMediaPath(path: string): boolean {
 	return MEDIA_EXTENSIONS.has(extname(path).toLowerCase());
@@ -25,7 +25,7 @@ export function defaultOpenCommand(path: string, platform = process.platform): {
 	return { command: "xdg-open", args: [path] };
 }
 
-/** Open a rendered image or video reference with the desktop's default application. */
+/** Open a rendered image, video, or HTML reference with the desktop's default application. */
 export async function openMedia(target: OpenTarget, launch = spawn, platform = process.platform): Promise<void> {
 	const path = absPath(target.path, target.cwd);
 	if (!isMediaPath(path) || !(await stat(path)).isFile()) throw new Error("Media file is no longer available.");

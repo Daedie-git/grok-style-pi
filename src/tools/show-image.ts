@@ -14,7 +14,7 @@ type ImageDetails = { data: string; mimeType: string; path: string };
 type ImageState = { open: boolean; expanded: boolean };
 
 /** A text-only tool result keeps Pi from appending an uncollapsible native image. */
-export function createShowImageTool(cwd: string, hooks: { onModifierOpen?: (target: OpenTarget) => void } = {}) {
+export function createShowImageTool(cwd: string, hooks: { onModifierOpen?: (target: OpenTarget) => void } = {}, title = "Show image") {
 	const openTarget = (path: string) => hooks.onModifierOpen && fileTarget({ path }, 1, cwd, hooks.onModifierOpen);
 	return {
 		name: "show_image",
@@ -39,7 +39,7 @@ export function createShowImageTool(cwd: string, hooks: { onModifierOpen?: (targ
 			state?: { grokImage?: ImageState }; expanded?: boolean; invalidate?: () => void;
 		}) {
 			if (context?.state) context.state.grokImage ??= { open: true, expanded: context.expanded ?? false };
-			const label = theme.fg("toolTitle", "◆ Show image") + " " + theme.fg("text", sanitizeToolText(args.path));
+			const label = theme.fg("toolTitle", `◆ ${title}`) + " " + theme.fg("text", sanitizeToolText(args.path));
 			return {
 				invalidate() {},
 				render(width: number) { return width > 0 ? [truncateToWidth(label, width)] : []; },
@@ -81,5 +81,6 @@ export function createShowImageTool(cwd: string, hooks: { onModifierOpen?: (targ
 				},
 			};
 		},
+		startSession(nextCwd = cwd) { cwd = nextCwd; },
 	};
 }

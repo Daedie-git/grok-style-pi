@@ -103,11 +103,12 @@ elif args[:2] == ['agent', 'start']:
     if target['agent'] is not None or target.get('busy'):
         print('agent_pane_busy', file=sys.stderr)
         sys.exit(1)
-    target['agent'] = 'pi'
+    kind = args[args.index('--kind') + 1] if '--kind' in args else 'pi'
+    target['agent'] = kind
     panes_path.write_text(json.dumps(panes))
-    session = args[args.index('--session-id') + 1]
+    session = args[args.index('--session-id' if '--session-id' in args else '--resume') + 1]
     with state_path.open('x') as output:
-        json.dump({'agent_status': 'idle', 'agent_session': {'value': '/tmp/time_' + session + '.jsonl'}}, output)
+        json.dump({'agent': kind, 'agent_status': 'idle', 'agent_session': {'value': '/tmp/time_' + session + '.jsonl'}}, output)
 elif args[:2] == ['agent', 'wait']:
     while state_path.exists() and json.loads(state_path.read_text())['agent_status'] == 'working':
         time.sleep(0.05)
@@ -238,6 +239,105 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(starts[0][starts[0].index('--model') + 1], 'openai-codex/gpt-6.1-sol')
         self.assertEqual(starts[0][starts[0].index('--thinking') + 1], 'high')
         self.assertEqual(starts[0][starts[0].index('-e') + 1], str(self.plugin / 'sidecar/sidecar.ts'))
+
+    def test_implementer_defaults_to_medium_and_remembers_role(self):
+        self.run_cli('--slot', '2', '--role', 'implementer', 'start')
+        self.run_cli('--slot', '2', 'ask', 'Continue implementing')
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index('--thinking') + 1], 'medium')
+        self.assertEqual((self.home / '.cache/claude-sidecar/sc-pane-1-2.role').read_text().strip(),
+                         'implementer')
+        result = self.run_cli('--slot', '2', '--role', 'reviewer', 'start', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('use a new slot', result.stderr)
+
+    def test_claude_agent_starts_claude_and_resumes_its_session(self):
+        self.run_cli('--agent', 'claude', 'start')
+        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
+        self.assertEqual(start[start.index('--kind') + 1], 'claude')
+        self.assertEqual(start[start.index('--model') + 1], 'opus')
+        self.assertEqual(start[start.index('--effort') + 1], 'high')
+        self.assertEqual(start[start.index('-n') + 1], 'claude-sidecar')
+        self.assertNotIn('--thinking', start)
+        self.assertRegex(start[start.index('--session-id') + 1],
+                         r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$')
+        prompt = Path(start[start.index('--append-system-prompt-file') + 1])
+        self.assertIn('Delivery (Claude Code agent)', prompt.read_text())
+        # The remembered agent keeps later commands on claude without the flag; a stale pane resumes the session.
+        self.run_cli('start')
+        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
+
+    def test_claude_implementer_defaults_to_sonnet_medium(self):
+        self.run_cli('--slot', '2', '--agent', 'claude', '--role', 'implementer', 'start')
+        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
+        self.assertEqual(start[start.index('--model') + 1], 'sonnet')
+        self.assertEqual(start[start.index('--effort') + 1], 'medium')
+
+    def test_claude_request_asks_for_a_written_report(self):
+        result = self.run_cli('--agent', 'claude', 'ask', 'Look at x')
+        self.assertIn('## Verdict', result.stdout)
+        prompt = next(c for c in self.calls() if c[:2] == ['agent', 'prompt'])[3]
+        self.assertIn('with the Write tool', prompt)
+        self.assertNotIn('submit_review', prompt)
+
+    def test_slot_cannot_switch_agent(self):
+        self.run_cli('--agent', 'claude', 'start')
+        result = self.run_cli('--agent', 'pi', 'start', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('use a new slot', result.stderr)
+        self.assertEqual(self.run_cli('--agent', 'gpt', 'start', check=False).returncode, 1)
+
+    def test_claude_slot_rejects_a_foreign_agent_in_its_pane(self):
+        self.run_cli('--agent', 'claude', 'start')
+        state = self.home / 'agent.json'
+        data = json.loads(state.read_text())
+        data['agent'] = 'pi'
+        state.write_text(json.dumps(data))
+        result = self.run_cli('start', check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('already running', result.stdout)
+        self.assertTrue(any(c[:2] == ['agent', 'rename'] for c in self.calls()))
+
+    def test_waiting_request_rechecks_the_slot_agent(self):
+        self.run_cli('--agent', 'pi', 'start')
+        result = self.run_cli('--agent', 'claude', 'ask', 'x', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('use a new slot', result.stderr)
+
+    def test_claude_slot_has_no_reload(self):
+        self.run_cli('--agent', 'claude', 'start')
+        result = self.run_cli('reload', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('pi sidecars only', result.stderr)
+
+    def test_claude_sidecar_session_gets_no_sidecars(self):
+        entry = self.home / 'claude'
+        entry.write_text('"$LAUNCHER" session-start <<<\'{"session_id":"child"}\'\n')
+        result = subprocess.run(['bash', '-c', 'exec -a claude bash "$1" -n claude-sidecar', 'x', str(entry)],
+                                env=dict(self.env, LAUNCHER=str(self.launcher)), capture_output=True, text=True,
+                                check=True)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(self.calls(), [])
+
+    def test_thinking_override_applies_to_implementer(self):
+        self.run_cli('--role', 'implementer', 'start',
+                     env=dict(self.env, SIDECAR_THINKING='low'))
+        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
+        self.assertEqual(start[start.index('--thinking') + 1], 'low')
+
+    def test_invalid_role_is_rejected(self):
+        result = self.run_cli('--role', 'writer', 'start', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('--role requires reviewer or implementer', result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_legacy_live_reviewer_cannot_become_implementer(self):
+        self.run_cli('start')
+        (self.home / '.cache/claude-sidecar/sc-pane-1.role').unlink()
+        result = self.run_cli('--role', 'implementer', 'start', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('running reviewer', result.stderr)
 
     def test_concurrent_start_splits_once(self):
         env = dict(self.env, HERDR_GET_DELAY='0.1')
@@ -830,6 +930,14 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('laptop (laptop-host), desk (user@desk:2222).', text)
         self.assertNotIn('off', text)
         self.assertEqual(self.calls(), [])
+
+    def test_remote_implementer_defaults_to_medium(self):
+        self.add_machines()
+        self.remote_run('--slot', '2', '--role', 'implementer', '--machine', 'laptop', 'start')
+        self.remote_run('--slot', '2', 'ask', 'Continue implementing')
+        starts = [c for c in self.remote_calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index('--thinking') + 1], 'medium')
 
     def test_machine_routes_every_herdr_call_and_files(self):
         self.add_machines()

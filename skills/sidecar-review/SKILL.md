@@ -17,6 +17,10 @@ Use `--slot N` before the command to select an independent persistent sidecar (d
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 answer "Yes, preserve backward compatibility."
 ```
 
+For implementation tasks, select a fresh slot with `--role implementer` before `ask`; it defaults to medium reasoning. Review slots default to `reviewer` with high reasoning. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides either default at startup.
+
+`--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for implementers, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). It returns reports by writing a file, and the slot keeps its agent. It runs locally only, cannot be reloaded, and a busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
+
 Run independent requests with `run_in_background: true`. Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. Herdr fills Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus.
 
 ## Sidecars on another machine

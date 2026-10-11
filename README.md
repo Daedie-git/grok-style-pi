@@ -32,6 +32,10 @@ claude plugin validate .claude-plugin/marketplace.json
 
 Tests use a fake Herdr and isolated home directories; they never start a real model session.
 
+## Claude Code agents
+
+`sidecar --slot N --agent claude ask ...` starts a persistent Claude Code agent in a Herdr pane instead of pi. It uses `--session-id` on first start and `--resume` afterwards, `--effort` from the slot's role, and `SIDECAR_CLAUDE_MODEL` (default `opus` for reviewers, `sonnet` for implementers). The agent has no `submit_review` tool: requests tell it to write the report (and `.needs-answer` question) under `~/.cache/claude-sidecar/reports`, so exit codes 0 to 5 behave as for pi. Limits: local machines only; `reload` and busy-path `steer` are pi-only; the agent's permission mode comes from your Claude settings, so an approval prompt shows as exit 5. The `SessionStart` hook skips sessions named `claude-sidecar`, so these agents never start sidecars.
+
 ## Blocked questions
 
 A sidecar that cannot continue without a decision submits its report with `needs_answer`. The launcher then prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. Requests have no deadline; a turn that ends without a report exits 2, and a sidecar blocked in its pane exits 5. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.
@@ -82,7 +86,15 @@ The plugin source sets the new model default. An already-running sidecar retains
 
 Commands run against the current working directory. The diff review includes commits since the base, working-tree changes, and untracked files. Requests serialize per slot, while different slots can work concurrently. Slot 1 is the default; each slot retains its own context and pending questions across follow-ups and `/clear`. Sidecars fill Claude's current tab up to four total panes, counting every pane open in it, including Claude's and other Claude panes' sidecars. Each new sidecar halves the largest pane: first left/right, then top/bottom in each column. A full tab sends further sidecars to overflow tabs of up to four panes each; closing a pane frees its room. Reuse slots for later tasks. A blocked reviewer needs human attention in its pane.
 
-Override the model and thinking level in the environment before starting Claude or the launcher:
+Reviewers default to high reasoning. For implementation work, select `--role implementer` on a fresh slot to default to medium reasoning:
+
+```bash
+./scripts/sidecar --slot 3 --role implementer ask "Implement the parser fix in this checkout."
+```
+
+The slot remembers its role for follow-ups, including on remote machines. Omitted roles default to `reviewer`; changing a bound role requires a new slot. Already-running sidecars retain their startup reasoning level.
+
+Override the model and thinking level for either role in the environment before starting Claude or the launcher:
 
 ```bash
 export SIDECAR_MODEL=openai-codex/gpt-6.1-sol

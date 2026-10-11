@@ -2,9 +2,10 @@
 # shellcheck disable=SC2016  # remote scripts are single-quoted on purpose: the machine expands them
 # Claude's pi review sidecar, hosted in a herdr pane beside the Claude pane.
 #
-#   sidecar [--slot N] [--machine NAME [--remote-cwd DIR]] COMMAND
+#   sidecar [--slot N] [--role reviewer|implementer] [--agent pi|claude] [--machine NAME [--remote-cwd DIR]] COMMAND
 #                                select an independent persistent sidecar (default 1), optionally on a saved herdr
 #                                machine (herdr 0.9.1+); a slot stays on the machine it started on
+#                                --agent claude runs a Claude Code agent (local only; no reload, no busy steer) instead of pi
 #   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when the pane holding its name runs another pi session
@@ -26,7 +27,9 @@ REPORT_DIR="$STATE_DIR/reports"
 PLUGIN_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SIDECAR_HOME="$PLUGIN_ROOT/sidecar"
 MODEL="${SIDECAR_MODEL:-openai-codex/gpt-6.1-sol}"
-THINKING="${SIDECAR_THINKING:-high}"
+THINKING=
+ROLE=reviewer
+BACKEND=pi
 INFLIGHT=
 NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
@@ -53,6 +56,48 @@ die() { echo "sidecar: $*" >&2; exit 1; }
 require_herdr() {
   [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || die "not running inside a herdr pane"
   [[ -n $RESOLVED ]] || resolve_machine
+  resolve_role
+  resolve_backend
+}
+
+# Slots retain their role; do not silently reuse an implementer's context as a reviewer (or vice versa).
+resolve_role() {
+  local file="$STATE_DIR/$(agent_name).role" saved=
+  if [[ -f $file ]]; then saved=$(<"$file"); fi
+  [[ -z $saved || $saved == reviewer || $saved == implementer ]] || die "invalid slot role in $file"
+  if [[ -n $saved && -n $ROLE_ARG && $saved != "$ROLE_ARG" ]]; then
+    die "slot is already a $saved; use a new slot for $ROLE_ARG"
+  fi
+  ROLE=${saved:-${ROLE_ARG:-reviewer}}
+  if [[ -z $saved && $ROLE == implementer && $(agent_status "$(herdr_agent)") != missing ]]; then
+    die "slot already has a running reviewer; use a new slot for implementer"
+  fi
+  local default=high
+  [[ $ROLE != implementer ]] || default=medium
+  THINKING=${SIDECAR_THINKING:-$default}
+}
+
+# A slot keeps the agent it started with (pi or Claude Code), so its context is never swapped.
+resolve_backend() {
+  local file saved=
+  file="$STATE_DIR/$(agent_name).agent"
+  if [[ -f $file ]]; then saved=$(<"$file"); fi
+  [[ -z $saved || $saved == pi || $saved == claude ]] || die "invalid slot agent in $file"
+  if [[ -n $saved && -n $AGENT_ARG && $saved != "$AGENT_ARG" ]]; then
+    die "slot already runs $saved; use a new slot for $AGENT_ARG"
+  fi
+  BACKEND=${saved:-${AGENT_ARG:-pi}}
+  if [[ $BACKEND == claude && -n $MACHINE ]]; then die "--agent claude runs locally only"; fi
+  if [[ -z $saved && $BACKEND == claude && $(agent_status "$(herdr_agent)") != missing ]]; then
+    die "slot already has a running pi; use a new slot for claude"
+  fi
+}
+
+# Claude needs a UUID session id; derive it from the slot's session id so restarts resume the same conversation.
+claude_session_uuid() {
+  local h
+  h=$(sha256sum <<<"$(pi_session_id)")
+  echo "${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
 }
 
 # The one place herdr is invoked: a remote slot routes every call to its machine's herdr server over SSH. Pane, tab and
@@ -292,6 +337,11 @@ agent_session_file() {
 # (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
 agent_runs_sidecar_session() {
   local session attempt
+  # Herdr publishes no session file for Claude Code agents; the name and the agent kind are the identity.
+  if [[ $BACKEND == claude ]]; then
+    [[ $(hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent // empty' 2>/dev/null) == claude ]]
+    return
+  fi
   # Herdr can report a newly launched pi before its session path is published (notably on Windows).
   # An empty path is not evidence that a different pi owns the pane.
   for ((attempt = 0; attempt < 20; attempt++)); do
@@ -421,6 +471,7 @@ cmd_restart() {
 cmd_reload() {
   require_herdr
   [[ $# == 0 ]] || die "usage: sidecar reload"
+  [[ $BACKEND != claude ]] || die "reload applies to pi sidecars only; use restart"
   local name hname session session_file dir id mode
   name=$(agent_name)
   hname=$(herdr_agent)
@@ -476,6 +527,13 @@ start_unlocked() {
     session=$(pi_session_id)
     publish_session "$name" "$session"
     bind_machine
+    resolve_role
+    if [[ ! -f "$STATE_DIR/$name.role" ]]; then
+      printf '%s\n' "$ROLE" >"$STATE_DIR/$name.role"
+    fi
+    if [[ ! -f "$STATE_DIR/$name.agent" ]]; then
+      printf '%s\n' "$BACKEND" >"$STATE_DIR/$name.agent"
+    fi
   } 7>"$STATE_DIR/$name.identity.lock"
   if [[ $(agent_status "$hname") != missing ]]; then
     if agent_runs_sidecar_session "$hname"; then
@@ -493,7 +551,10 @@ start_unlocked() {
   fi
   # A fresh pane is busy until its shell reaches the prompt.
   for ((attempt = 0; attempt < 20; attempt++)); do
-    if err=$(hd agent start "$hname" --kind pi --pane "$pane" --timeout 60000 -- \
+    if [[ $BACKEND == claude ]]; then
+      start_claude "$hname" "$pane" "$name" && return
+      err=$CLAUDE_START_ERR
+    elif err=$(hd agent start "$hname" --kind pi --pane "$pane" --timeout 60000 -- \
       --session-id "$session" -n claude-sidecar \
       --model "$MODEL" --thinking "$THINKING" \
       -e "$AGENT_HOME/sidecar.ts" \
@@ -511,6 +572,27 @@ start_unlocked() {
     sleep 0.5
   done
   die "$err"
+}
+
+CLAUDE_START_ERR=
+# Starts a Claude Code agent in PANE. The first start creates the session; later ones resume it.
+start_claude() {
+  local hname=$1 pane=$2 name=$3 uuid model session_flag=--session-id started="$STATE_DIR/$3.claude-started" prompt
+  uuid=$(claude_session_uuid)
+  model=${SIDECAR_CLAUDE_MODEL:-opus}
+  [[ $ROLE != implementer ]] || model=${SIDECAR_CLAUDE_MODEL:-sonnet}
+  if [[ -f $started ]]; then session_flag=--resume; fi
+  # Herdr refuses multi-line agent arguments, so the prompt travels as a file.
+  prompt="$STATE_DIR/$name.claude-prompt.md"
+  cat "$AGENT_HOME/reviewer.md" "$AGENT_HOME/claude-delivery.md" >"$prompt"
+  if CLAUDE_START_ERR=$(hd agent start "$hname" --kind claude --pane "$pane" --timeout 60000 -- \
+    "$session_flag" "$uuid" -n claude-sidecar --model "$model" --effort "$THINKING" \
+    --append-system-prompt-file "$prompt" 2>&1 >/dev/null); then
+    : >"$started"
+    echo "$hname started in $pane (claude session $uuid)"
+    return 0
+  fi
+  return 1
 }
 
 # The sidecar's name is taken by a pi that does not run the sidecar session (a bare pi that herdr restored after a
@@ -536,7 +618,7 @@ restart_unlocked() {
 # SessionStart hook: publish the sidecar identity to this Claude session's
 # Bash environment. Panes and agents are created only by the first request.
 cmd_session_start() {
-  local input sid pid argv
+  local input sid pid argv i
   input=$(cat)
   [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || exit 0
   local dependency
@@ -556,8 +638,10 @@ cmd_session_start() {
       [[ ${argv[0]##*/} == node && ${#argv[@]} -gt 1 &&
          ( ${argv[1]##*/} == claude || ${argv[1]} == */claude-code/cli.js ) ]];
     }; then
-      for arg in "${argv[@]:1}"; do
-        [[ $arg == -p || $arg == --print ]] && exit 0
+      for ((i = 1; i < ${#argv[@]}; i++)); do
+        [[ ${argv[i]} == -p || ${argv[i]} == --print ]] && exit 0
+        # A Claude sidecar (see start_claude) must not start sidecars of its own.
+        [[ ${argv[i]} == -n && ${argv[i + 1]:-} == claude-sidecar ]] && exit 0
       done
       break
     fi
@@ -726,6 +810,8 @@ request() {
       flock 9
     fi
   fi
+  # A slot may have been bound to another agent while this request waited for the lock.
+  resolve_backend
   INFLIGHT="$STATE_DIR/$name.inflight"
   printf '%s\n' "$hash" >"$INFLIGHT"
   # The background prompt must not outlive the launcher (Ctrl-C leaves it running otherwise).
@@ -747,7 +833,11 @@ $(remote_notice)"
   if [[ -n $MACHINE ]]; then prompt_path=$(publish_file "$req"); fi
   wait_until_ready "$hname"
   # Requests may run for hours: wait without a deadline until a report arrives or the sidecar settles without one.
-  hd_detached agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. Finish by calling submit_review with request_id $id." --wait >/dev/null 9>&- &
+  local finish="Finish by calling submit_review with request_id $id."
+  if [[ $BACKEND == claude ]]; then
+    finish="Finish by writing your report to $report with the Write tool; for a blocking question, first write it to ${report%.md}.needs-answer."
+  fi
+  hd_detached agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" --wait >/dev/null 9>&- &
   PROMPT_PID=$!
   wait_with_progress "$PROMPT_PID" "$hname" "$id"
   PROMPT_PID=
@@ -962,6 +1052,7 @@ $*" held
     # An in-flight request owns the channel, even if Pi has not started its prompt yet. Steer it without waiting.
     exec 9>&-
   fi
+  [[ $BACKEND != claude ]] || die "a busy claude sidecar cannot be steered; wait for its report, then ask"
   session=$(pi_session_id)
   # Herdr can publish a new pi's session file late (notably on Windows); the owner check needs it.
   for ((attempt = 0; attempt < 10; attempt++)); do
@@ -1063,6 +1154,8 @@ cmd_status() {
 }
 
 SLOT=1
+ROLE_ARG=
+AGENT_ARG=
 MACHINE_ARG=
 REMOTE_CWD=
 while [[ ${1:-} == --* ]]; do
@@ -1070,6 +1163,12 @@ while [[ ${1:-} == --* ]]; do
     --slot)
       [[ ${2:-} =~ ^[1-9][0-9]{0,3}$ ]] || die "--slot requires an integer from 1 to 9999"
       SLOT=$2 ;;
+    --role)
+      [[ ${2:-} == reviewer || ${2:-} == implementer ]] || die "--role requires reviewer or implementer"
+      ROLE_ARG=$2 ;;
+    --agent)
+      [[ ${2:-} == pi || ${2:-} == claude ]] || die "--agent requires pi or claude"
+      AGENT_ARG=$2 ;;
     --machine)
       [[ -n ${2:-} ]] || die "--machine requires a saved herdr machine label or ID"
       MACHINE_ARG=$2 ;;

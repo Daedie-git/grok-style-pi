@@ -14,7 +14,9 @@
     "type": "git",
     "url": "git+https://github.com/Daedie-git/grok-style-pi.git"
   },
-  "workspaces": ["packages/herdr-subagents"],
+  "workspaces": [
+    "packages/herdr-subagents"
+  ],
   "files": [
     "packages/herdr-subagents/extensions",
     "packages/herdr-subagents/src",
@@ -53,9 +55,9 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "^0.85.1",
-    "@tintinweb/pi-subagents": "0.19.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@tintinweb/pi-subagents": "0.22.0",
     "@types/node": "22.20.4",
     "typescript": "5.9.3"
   },

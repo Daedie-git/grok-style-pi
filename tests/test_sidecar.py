@@ -260,6 +260,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(start[start.index('--effort') + 1], 'high')
         self.assertEqual(start[start.index('-n') + 1], 'claude-sidecar')
         self.assertNotIn('--thinking', start)
+        self.assertNotIn('--permission-mode', start)
         self.assertRegex(start[start.index('--session-id') + 1],
                          r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$')
         prompt = Path(start[start.index('--append-system-prompt-file') + 1])
@@ -938,6 +939,37 @@ class LauncherTests(unittest.TestCase):
         starts = [c for c in self.remote_calls() if c[:2] == ['agent', 'start']]
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0][starts[0].index('--thinking') + 1], 'medium')
+
+    def test_remote_claude_agent_reads_its_prompt_and_writes_its_report_on_the_machine(self):
+        self.add_machines()
+        env = dict(self.remote_env, SIDECAR_CLAUDE_PERMISSION_MODE='bypassPermissions')
+        result = self.remote_run('--agent', 'claude', '--role', 'implementer', '--machine', 'laptop', 'ask', 'Task', env=env)
+        self.assertIn('ship', result.stdout)
+        self.assertIn('# Sidecar report (laptop:' + str(self.remote_home()), result.stdout)
+        self.assertEqual(self.local_calls(), [])
+        inner = self.remote_calls()
+        start = next(c for c in inner if c[:2] == ['agent', 'start'])
+        self.assertEqual(start[start.index('--kind') + 1], 'claude')
+        self.assertEqual(start[start.index('--model') + 1], 'sonnet')
+        self.assertEqual(start[start.index('--permission-mode') + 1], 'bypassPermissions')
+        prompt = Path(start[start.index('--append-system-prompt-file') + 1])
+        self.assertTrue(prompt.is_relative_to(self.remote_home()))
+        self.assertIn('Delivery (Claude Code agent)', prompt.read_text())
+        request = next(c for c in inner if c[:2] == ['agent', 'prompt'])[3]
+        self.assertIn('with the Write tool', request)
+        self.assertIn(str(self.remote_home() / '.cache/claude-sidecar/reports'), request)
+
+    def test_remote_claude_prompt_copy_failure_starts_nothing(self):
+        self.add_machines()
+        ssh = self.home / 'bin/ssh'
+        original = ssh.read_text()
+        ssh.write_text(original.replace("if os.environ.get('FAKE_SSH_DOWN'):",
+                                        "if os.environ.get('FAKE_SSH_DOWN') or 'claude-prompt' in command:", 1))
+        result = self.remote_run('--agent', 'claude', '--machine', 'laptop', 'start', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('could not copy the Claude prompt to laptop', result.stderr)
+        self.assertFalse([c for c in self.remote_calls() if c[:2] == ['agent', 'start']])
+        self.assertFalse(list((self.home / '.cache/claude-sidecar').glob('*.claude-started')))
 
     def test_machine_routes_every_herdr_call_and_files(self):
         self.add_machines()

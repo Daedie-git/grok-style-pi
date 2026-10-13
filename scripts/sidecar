@@ -87,7 +87,6 @@ resolve_backend() {
     die "slot already runs $saved; use a new slot for $AGENT_ARG"
   fi
   BACKEND=${saved:-${AGENT_ARG:-pi}}
-  if [[ $BACKEND == claude && -n $MACHINE ]]; then die "--agent claude runs locally only"; fi
   if [[ -z $saved && $BACKEND == claude && $(agent_status "$(herdr_agent)") != missing ]]; then
     die "slot already has a running pi; use a new slot for claude"
   fi
@@ -582,11 +581,18 @@ start_claude() {
   model=${SIDECAR_CLAUDE_MODEL:-opus}
   [[ $ROLE != implementer ]] || model=${SIDECAR_CLAUDE_MODEL:-sonnet}
   if [[ -f $started ]]; then session_flag=--resume; fi
-  # Herdr refuses multi-line agent arguments, so the prompt travels as a file.
+  # Herdr refuses multi-line agent arguments, so the prompt travels as a file, read where the agent runs.
   prompt="$STATE_DIR/$name.claude-prompt.md"
-  cat "$AGENT_HOME/reviewer.md" "$AGENT_HOME/claude-delivery.md" >"$prompt"
+  cat "$SIDECAR_HOME/reviewer.md" "$SIDECAR_HOME/claude-delivery.md" >"$prompt"
+  # Called under &&, so errexit is off here: a failed copy must stop the start explicitly.
+  if [[ -n $MACHINE ]] && ! prompt=$(publish_file "$prompt"); then
+    CLAUDE_START_ERR="could not copy the Claude prompt to $MACHINE_LABEL"
+    return 1
+  fi
+  local permission=()
+  if [[ -n ${SIDECAR_CLAUDE_PERMISSION_MODE:-} ]]; then permission=(--permission-mode "$SIDECAR_CLAUDE_PERMISSION_MODE"); fi
   if CLAUDE_START_ERR=$(hd agent start "$hname" --kind claude --pane "$pane" --timeout 60000 -- \
-    "$session_flag" "$uuid" -n claude-sidecar --model "$model" --effort "$THINKING" \
+    "$session_flag" "$uuid" -n claude-sidecar --model "$model" --effort "$THINKING" "${permission[@]}" \
     --append-system-prompt-file "$prompt" 2>&1 >/dev/null); then
     : >"$started"
     echo "$hname started in $pane (claude session $uuid)"

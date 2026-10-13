@@ -4,7 +4,16 @@ export interface ParsedAgentFile {
 	maxTurns?: number;
 	thinking?: string;
 	model?: string;
-	isolated: boolean;
+	isolated?: boolean;
+	isolation?: string;
+}
+
+/** Role defaults apply only when neither the request nor agent file sets thinking. */
+export function defaultThinking(subagentType: string): "medium" | "high" | undefined {
+	const words = subagentType.toLowerCase().split(/[^a-z]+/);
+	if (words.some((word) => ["review", "reviewer", "reviewing"].includes(word))) return "high";
+	if (words.some((word) => ["explore", "explorer", "exploration", "exploring", "implement", "implementer", "implementation", "implementing"].includes(word))) return "medium";
+	return undefined;
 }
 
 function scalar(front: string, key: string): string | undefined {
@@ -46,6 +55,9 @@ export function parseAgentFile(text: string): ParsedAgentFile {
 		maxTurns,
 		thinking: scalar(front, "thinking"),
 		model: scalar(front, "model"),
-		isolated: scalar(front, "extensions") === "false",
+		isolation: scalar(front, "isolation"),
+		isolated: scalar(front, "extensions") === "false" ? true
+			: scalar(front, "isolated") === "true" ? true
+			: scalar(front, "isolated") === "false" ? false : undefined,
 	};
 }

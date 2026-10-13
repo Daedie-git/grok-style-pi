@@ -152,7 +152,7 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 						onUpdate?.(partial);
 					}, context);
 					entry.output = extractResultTail(result as ToolResult);
-					entry.status = controller.signal.aborted ? "stopped" : "completed";
+					entry.status = controller.signal.aborted || signal?.aborted ? "stopped" : (result as ToolResult).isError ? "error" : "completed";
 					return result;
 				} catch (error) {
 					entry.status = controller.signal.aborted || signal?.aborted ? "stopped" : "error";

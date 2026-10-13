@@ -41,7 +41,7 @@ test("footer refreshes from Codex response headers and clears quota on model cha
 		tools: Object.fromEntries(BUILTIN_TOOL_NAMES.map((name) => [name, () => ({ name, description: name, parameters: {}, execute() {} })])) as any,
 	});
 	handlers.session_start({}, ctx);
-	assert.match(footer!.render(160)[0], /Context \?% used/);
+	assert.match(footer!.render(160)[0], /Context \?\/\? used/);
 	assert.match(footer!.render(160)[0], /Weekly \?% left/);
 	assert.doesNotMatch(footer!.render(160)[0], /Grok|Codex Context|Codex weekly/);
 	const redrawsAfterStart = redraws;
@@ -55,7 +55,7 @@ test("footer refreshes from Codex response headers and clears quota on model cha
 	handlers.model_select({}, ctx);
 	handlers.after_provider_response({ headers }, ctx);
 	assert.doesNotMatch(footer!.render(160)[0], /Weekly/);
-	assert.match(footer!.render(160)[0], /Context \?% used/);
+	assert.match(footer!.render(160)[0], /Context \?\/\? used/);
 	ctx.model.provider = "openai-codex";
 	assert.match(footer!.render(160)[0], /Weekly \?% left/);
 	assert.doesNotMatch(footer!.render(160)[0], /Grok/);

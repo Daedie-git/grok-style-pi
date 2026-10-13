@@ -2,7 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { convertToPng } from "@earendil-works/pi-coding-agent";
 import { extname } from "node:path";
 import { Image, truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { fileTarget, handleDiamondClick } from "./interaction.ts";
 import { sanitizeToolText } from "./diamond.ts";

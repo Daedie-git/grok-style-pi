@@ -44,18 +44,16 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 	let quota: QuotaWindow[] = [];
 	let quotaError: string | undefined;
 	let quotaPolling: ReturnType<typeof startCodexUsagePolling> | undefined;
-	let grokContext: number | null = null;
 	let grokWeekly = "Weekly ?% left";
 	let grokPolling: ReturnType<typeof startGrokFooterPolling> | undefined;
 	function refreshGrokSource(ctx: SessionContext) {
 		grokPolling?.dispose(); grokPolling = undefined;
-		grokContext = null;
 		grokWeekly = "Weekly ?% left";
 		if (!features.footer || ctx.model?.provider !== "xai" || (ctx.mode && ctx.mode !== "tui")) return;
 		grokPolling = startGrokFooterPolling(
 			() => ctx.cwd,
 			() => ctx.modelRegistry ? ctx.modelRegistry.getApiKeyForProvider("xai") : Promise.resolve(undefined),
-			(stats) => { grokContext = stats.contextPercent; grokWeekly = stats.weekly; requestRender?.(); },
+			(stats) => { grokWeekly = stats.weekly; requestRender?.(); },
 		);
 	}
 	function refreshQuotaSource(ctx: SessionContext) {
@@ -144,17 +142,18 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 							? quotaError && formattedQuota === "Weekly ?% left" ? `Weekly ${quotaError}` : formattedQuota
 							: undefined;
 						const branch = footerData?.getGitBranch?.();
+						const context = ctx.getContextUsage?.();
 						return renderFooter({
 							cwd: ctx.cwd,
 							model: modelDisplayName(ctx.model),
-							percent: ctx.getContextUsage?.()?.percent,
+							tokens: context?.tokens,
+							contextWindow: context?.contextWindow ?? ctx.model?.contextWindow,
 							thinkingLevel: pi.getThinkingLevel?.() ?? ctx.thinkingLevel,
 							branch: branch === undefined ? ctx.branch : branch,
 							provider: ctx.model?.provider,
 							fastMode: /^gpt-/i.test(ctx.model?.id ?? "") ? Boolean(footerData?.getExtensionStatuses?.().get("openai-fast")) : undefined,
 							subscription,
 							account,
-							grokPercent: grokContext,
 							grokWeekly,
 						}, { width, paint: theme?.fg ? (token, text) => theme.fg!(token, text) : undefined });
 					},
@@ -248,7 +247,6 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 		quotaError = undefined;
 		quota = [];
 		grokPolling?.dispose(); grokPolling = undefined;
-		grokContext = null;
 		grokWeekly = "Weekly ?% left";
 		requestRender = undefined;
 		hasActiveSelection = undefined;

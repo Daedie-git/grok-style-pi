@@ -1,5 +1,5 @@
 import { defineTool, getAgentDir, truncateHead, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import {
 	type ToolText,
 } from "./runner.ts";
 import { EXPLICIT_SUBAGENT_REQUEST } from "./policy.ts";
+import { machineDefaultCwd, readMachineSettings } from "./config.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
 
 export interface HerdrSubagentDeps {
@@ -81,7 +82,9 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 	// Remote stores key notices by this pane; a bare pane ID could name one of that machine's own panes.
 	const parentKey = (machine?: string) => machine && paneId ? `${deps.hostname}/${paneId}` : paneId;
 	return async (pi: ExtensionAPI) => {
-		const savedMachines = machineGuidance(await deps.listMachines().catch(() => []));
+		const profiles = await deps.listMachines().catch(() => []);
+		const settings = readMachineSettings(deps.agentDir);
+		const savedMachines = machineGuidance(profiles);
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
 		const getRunner = () => runner ??= new HerdrRunner(deps);
@@ -160,7 +163,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			catch {}
 			// Pi stops at a startup prompt when its session directory is missing, so check on the machine itself.
 			const status = await source.store.directoryStatus(cwd);
-			if (status === "relative") throw new Error(`machine_cwd ${cwd} is not an absolute path on ${machine}.`);
+			if (status === "relative") throw new Error(`machine_cwd ${cwd} is not an absolute path on ${machine}. Pass machine_cwd or configure machines.${machine}.cwd in ${join(deps.agentDir, "herdr-subagents.json")}.`);
 			if (status === "missing") {
 				const open = [...new Set(panes.flatMap((pane) => pane.cwd ? [pane.cwd] : []))].slice(0, 8);
 				throw new Error(`Directory ${cwd} does not exist on ${machine}. Pass machine_cwd with the project's absolute path there.${open.length ? ` Herdr panes on ${machine} are open in: ${open.join(", ")}.` : ""}`);
@@ -205,7 +208,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				isolated: Type.Optional(Type.Boolean({ description: "If true, the child may use only built-in tools." })),
 				inherit_context: Type.Optional(Type.Boolean({ description: "Must remain false. The orchestrating agent provides all needed context in the prompt." })),
 				machine: Type.Optional(Type.String({ description: "Saved Herdr SSH machine (label or profile ID) to run on. Only when the user asks. Ignored with resume; the agent ID names its machine." })),
-				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine. Set it whenever that machine's paths differ from this one's, such as C:/git/project on Windows. Defaults to this session's directory." })),
+				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine, such as C:/git/project on Windows. Overrides the per-machine cwd in the user agent directory's herdr-subagents.json; otherwise defaults to this session's directory." })),
 			}),
 			execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 				if (!params.resume && params.runtime === "claude-code" && params.machine?.trim()) throw new Error("Claude Code subagents currently support local Herdr panes only.");
@@ -213,7 +216,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				const machine = target ? target.runner.machine : params.machine?.trim() || undefined;
 				if (machine && params.inherit_context) throw new Error("inherit_context cannot clone this session onto another machine.");
 				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
-				const cwd = machine ? params.machine_cwd?.trim() || ctx.cwd : ctx.cwd;
+				const cwd = machine ? params.machine_cwd?.trim() || machineDefaultCwd(machine, profiles, settings) || ctx.cwd : ctx.cwd;
 				const request: SpawnRequest = {
 					runtime: params.runtime,
 					prompt: params.prompt,
@@ -226,6 +229,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					runInBackground: params.run_in_background !== false,
 					resume: target?.id,
 					isolated: params.isolated,
+					projectTrusted: ctx.isProjectTrusted(),
 					inheritContext: params.inherit_context,
 					cwd,
 					definitionsCwd: ctx.cwd,
@@ -318,7 +322,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 					pi.sendMessage({
 						customType: "herdr-subagent-notification", content: completionNotice(notice, source.machine), display: true,
 						details: { noticeId: notice.id, agentId: qualifiedAgentId(notice.agentId, source.machine), runId: notice.runId, machine: source.machine },
-					}, { deliverAs: "followUp", triggerTurn: true });
+					}, { deliverAs: "steer", triggerTurn: true });
 					queuedNotices.add(notice.id);
 				}
 			};
@@ -405,6 +409,10 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 		pi.on("message_end", (event) => {
 			const text = assistantText(event.message);
 			if (text) assistant = text;
+		});
+		// Filter only the current declarations: never activate deferred/codemode tools just because they are allowed.
+		pi.on("before_agent_start", () => {
+			if (child) pi.setActiveTools(pi.getActiveTools().filter((name) => child!.allows(name)));
 		});
 		pi.on("tool_call", (event) => {
 			if (!child || child.allows(event.toolName)) return;

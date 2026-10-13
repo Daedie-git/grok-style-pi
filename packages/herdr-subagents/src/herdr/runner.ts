@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { HerdrClient, HerdrAgentRef } from "./client.ts";
-import { parseAgentFile } from "./agent-file.ts";
+import { defaultThinking, parseAgentFile } from "./agent-file.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
@@ -27,6 +27,8 @@ export interface SpawnRequest {
 	runInBackground: boolean;
 	resume?: string;
 	isolated?: boolean;
+	/** Parent decision; remote projects still resolve their own trust when the parent is trusted. */
+	projectTrusted?: boolean;
 	inheritContext?: boolean;
 	cwd: string;
 	/** Where agent definitions are read, when `cwd` is on another machine. */
@@ -313,9 +315,10 @@ export class HerdrRunner {
 		if (depth > HERDR_MAX_DEPTH) throw new Error(`Subagent depth ${depth} exceeds the Herdr limit of ${HERDR_MAX_DEPTH}.`);
 		if (request.inheritContext && (!request.sessionFile || !existsSync(request.sessionFile))) throw new Error("inherit_context was set, but this session has no file to clone.");
 		const definition = loadAgent(request);
+		if (definition?.isolation && definition.isolation !== "off") throw new Error(`Agent-file isolation: ${definition.isolation} is not supported by Herdr subagents. No pane was opened.`);
 		const maxTurns = request.maxTurns ?? definition?.maxTurns;
-		const thinking = request.thinking ?? definition?.thinking;
-		const tools = allowedTools(request.isolated || definition?.isolated, definition?.tools);
+		const thinking = request.thinking ?? definition?.thinking ?? defaultThinking(request.subagentType);
+		const tools = allowedTools(definition?.isolated ?? request.isolated, definition?.tools);
 		if (claude && maxTurns != null) throw new Error("max_turns is not supported by interactive Claude Code. Omit it.");
 		if (claude && thinking && !["low", "medium", "high", "xhigh", "max"].includes(thinking)) throw new Error("Claude Code thinking maps to --effort: low, medium, high, xhigh, or max.");
 		if (claude && definition?.tools) claudeTools(definition.tools);
@@ -335,6 +338,7 @@ export class HerdrRunner {
 				runtime: request.runtime, id, herdrName: id, paneId: "", depth, type: request.subagentType,
 				description: request.description, prompt: request.prompt, instructions: definition?.body || undefined,
 				allowedTools: tools,
+				projectTrusted: request.projectTrusted === false ? false : this.machine ? undefined : request.projectTrusted,
 				maxTurns, model: request.model ?? definition?.model,
 				thinking, parentPaneId: request.paneId,
 				createdAt: new Date(this.now()).toISOString(),
@@ -661,13 +665,14 @@ function allowedTools(restrict: boolean | undefined, listed: string[] | undefine
 
 function piArgs(task: HerdrTask, sessionFile: string): string[] {
 	const args = ["--session", sessionFile];
+	if (task.projectTrusted !== undefined) args.push(task.projectTrusted ? "--approve" : "--no-approve");
 	if (task.model) args.push("--model", task.model);
 	if (task.thinking) args.push("--thinking", task.thinking);
 	return args;
 }
 
 function loadAgent(request: SpawnRequest) {
-	for (const dir of [join(request.definitionsCwd ?? request.cwd, ".pi", "agents"), request.agentDir ? join(request.agentDir, "agents") : ""].filter(Boolean)) {
+	for (const dir of [request.projectTrusted === false ? "" : join(request.definitionsCwd ?? request.cwd, ".pi", "agents"), request.agentDir ? join(request.agentDir, "agents") : ""].filter(Boolean)) {
 		const path = join(dir, `${request.subagentType}.md`);
 		if (existsSync(path)) return parseAgentFile(readFileSync(path, "utf8"));
 	}

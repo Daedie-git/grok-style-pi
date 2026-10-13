@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 import { extname } from "node:path";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { captureHtmlPreview } from "../media/html-preview.ts";
 import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { createShowImageTool } from "./show-image.ts";

@@ -303,6 +303,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		sendUserMessage() {},
 		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
 	} as unknown as ExtensionAPI;
+	writeFileSync(join(localRoot, "herdr-subagents.json"), JSON.stringify({ machines: { m1: { cwd: PROJECT } } }));
 	await createHerdrSubagents({
 		root: localRoot, client: local, agentDir: localRoot, hostname: "desk", now: () => clock,
 		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" },
@@ -322,13 +323,13 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 	// Agent definitions come from this session's directory, not the remote one.
 	mkdirSync(join(localRoot, ".pi", "agents"), { recursive: true });
 	writeFileSync(join(localRoot, ".pi", "agents", "Explore.md"), "---\ntools: read\n---\nOnly read the build log.");
-	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
+	const ctx = { cwd: localRoot, isProjectTrusted: () => true, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	const [agentTool, resultTool] = tools;
 	assert.match(agentTool.parameters.properties.machine.description, /Only when the user asks/);
 	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\. Pass the name shown first as machine\.$/, "the model can map a casual name to the saved label");
 	await handlers.get("session_start")!({}, ctx);
 	try {
-		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop", machine_cwd: PROJECT }, undefined, undefined, ctx);
+		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop" }, undefined, undefined, ctx);
 		const agentId = started.details.agentId as string;
 		assert.match(agentId, /^explore@laptop$/);
 		assert.match(started.content[0].text, /Pane: w9:p\d+ on laptop/);
@@ -391,8 +392,9 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		await handlers.get("session_shutdown")!({ reason: "reload" });
 		await handlers.get("session_start")!({}, ctx);
 		await eventually(() => opens === 2, "the used machine was not reopened after reload");
-		await agentTool.execute("call", { prompt: "y", description: "Second", subagent_type: "Explore", machine: "laptop", machine_cwd: PROJECT }, undefined, undefined, ctx);
+		await agentTool.execute("call", { prompt: "y", description: "Second", subagent_type: "Explore", machine: "laptop", machine_cwd: localRoot }, undefined, undefined, ctx);
 		const second = (await laptop.launches()).find((launch) => launch.agentId !== "explore")!;
+		assert.ok(remote.events.some((event) => event.endsWith(`:${localRoot}`)), "explicit machine_cwd overrides the configured default");
 		// A dropped channel is reported, replaced, and the new channel retires the owner it lost.
 		drop();
 		await eventually(() => notices.some((text) => text.includes("laptop: connection lost")), "the lost channel was not reported");
@@ -440,7 +442,7 @@ test("a stalled machine never delays local notices, and a failed first launch st
 		machineClient: (machine) => machine === "broken" ? broken.client : local.client,
 		machineChannel: async (machine) => machine === "broken" ? workerChannel(brokenRoot) : stalled,
 	})(pi);
-	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify() {} }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
+	const ctx = { cwd: localRoot, isProjectTrusted: () => true, isIdle: () => true, abort() {}, ui: { notify() {} }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	await handlers.get("session_start")!({}, ctx);
 	try {
 		await eventually(() => stalledPosts > 0, "the saved machine was not reopened");
@@ -499,7 +501,7 @@ test("shutdown is not held by a reconnect whose owner retirement stalls", { time
 			return () => ({ post() { stalledPosts++; }, hold() {}, close: async () => {} });
 		},
 	})(pi);
-	const ctx = { cwd: localRoot, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
+	const ctx = { cwd: localRoot, isProjectTrusted: () => true, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	await handlers.get("session_start")!({}, ctx);
 	await tools[0].execute("call", { prompt: "p", description: "Remote", subagent_type: "Explore", machine: "laptop", machine_cwd: PROJECT }, undefined, undefined, ctx);
 	drop();

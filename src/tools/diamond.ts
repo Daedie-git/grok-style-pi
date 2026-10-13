@@ -22,6 +22,7 @@ export type ToolArgs = Record<string, unknown> | undefined | null;
 export type ToolContentBlock = { type?: string; text?: string; data?: string; mimeType?: string };
 
 export type ToolResult = {
+	isError?: boolean;
 	content?: ToolContentBlock[];
 	details?: unknown;
 };

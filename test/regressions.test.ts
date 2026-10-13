@@ -252,8 +252,9 @@ test("disabled styling retains native command details and edit diffs", () => {
 test("failed shell diamonds summarize exit status and expand the exact command", async () => {
 	const tool = wrapWithDiamondRenderer(agent.createBashToolDefinition(process.cwd()));
 	const args = { command: "exit 1", description: "Capture consecutive play-mode GUI frames" };
-	let failure = "";
-	try { await tool.execute("fail", args); } catch (error) { failure = (error as Error).message; }
+	const failed = await tool.execute("fail", args);
+	assert.equal(failed.isError, true);
+	const failure = failed.content.map((block: any) => block.text ?? "").join("\n");
 	assert.match(failure, /Command exited with code 1/);
 	const context = { args, isError: true, state: {} };
 	const header = tool.renderCall(args, theme, context);

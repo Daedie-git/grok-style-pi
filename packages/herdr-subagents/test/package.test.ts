@@ -79,7 +79,7 @@ test("the packed standalone package loads and runs its worker with only its own 
 	const manifest = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
 	assert.equal(manifest.dependencies["grok-style-pi"], undefined);
 	assert.deepEqual(manifest.pi.extensions, ["./extensions/index.ts"]);
-	for (const dependency of [...Object.keys(manifest.dependencies), "@earendil-works/pi-coding-agent"]) {
+	for (const dependency of [...Object.keys(manifest.dependencies), ...Object.keys(manifest.peerDependencies)]) {
 		const destination = join(modules, dependency);
 		mkdirSync(dirname(destination), { recursive: true });
 		let origin = dirname(fileURLToPath(import.meta.resolve(dependency)));

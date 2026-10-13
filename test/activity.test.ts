@@ -260,7 +260,9 @@ test("real failed shell output is retained once with its exit status", async (t)
 	const { createBashTool } = await import("@earendil-works/pi-coding-agent");
 	const h = harness(); t.after(() => h.emit("session_shutdown"));
 	const tool = h.controller.wrapTool(wrapWithDiamondRenderer(createBashTool(process.cwd())));
-	await assert.rejects(tool.execute("failed", { command: 'printf "UNIQUE_OUTPUT\\n"; exit 1' }, new AbortController().signal) as Promise<unknown>, /Command exited with code 1/);
+	const result = await tool.execute("failed", { command: 'printf "UNIQUE_OUTPUT\\n"; exit 1' }, new AbortController().signal);
+	assert.equal(result.isError, true);
+	assert.equal(h.controller.list()[0].status, "error");
 	const output = h.controller.list()[0].output;
 	assert.equal(output.split("UNIQUE_OUTPUT").length - 1, 1);
 	assert.match(output, /Command exited with code 1/);

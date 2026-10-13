@@ -20,21 +20,21 @@ function displaySeparator(...paths: string[]): string {
 export type FooterInput = {
 	cwd: string;
 	model: string;
-	percent: number | null | undefined;
+	tokens?: number | null;
+	contextWindow?: number | null;
 	thinkingLevel?: string;
 	branch?: string | null;
 	provider?: string | null;
 	subscription?: string;
 	account?: string;
 	fastMode?: boolean;
-	grokPercent?: number | null;
 	grokWeekly?: string;
 };
 
 export type FooterContext = {
 	cwd: string;
-	model?: { name?: string; id?: string; provider?: string } | null;
-	getContextUsage?: () => { percent: number | null } | undefined;
+	model?: { name?: string; id?: string; provider?: string; contextWindow?: number } | null;
+	getContextUsage?: () => { tokens?: number | null; contextWindow?: number; percent: number | null } | undefined;
 	thinkingLevel?: string;
 	branch?: string | null;
 };
@@ -75,6 +75,11 @@ export function formatPercent(percent: number | null | undefined): string {
 	return String(Math.round(Number(percent)));
 }
 
+export function formatTokens(tokens: number | null | undefined): string {
+	if (tokens == null || !Number.isFinite(tokens) || tokens < 0) return "?";
+	return Math.round(tokens).toLocaleString("en-US");
+}
+
 export type UsageSource = "codex" | "grok" | "session";
 
 /** Context and allowance belong to the selected model, not every signed-in provider. */
@@ -86,7 +91,7 @@ export function usageSource(provider?: string | null): UsageSource {
 
 function usageItems(input: FooterInput): FooterItem[] {
 	const source = usageSource(input.provider);
-	const context = `Context ${formatPercent(source === "grok" ? input.grokPercent : input.percent)}% used`;
+	const context = `Context ${formatTokens(input.tokens)}/${formatTokens(input.contextWindow)} used`;
 	if (source === "grok") return [{ text: context }, { text: input.grokWeekly ?? "Weekly ?% left" }];
 	if (source === "codex" && input.subscription) return [{ text: context }, { text: input.subscription }];
 	return [{ text: context }];

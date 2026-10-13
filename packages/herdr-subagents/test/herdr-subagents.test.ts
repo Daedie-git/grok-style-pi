@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { parseAgentFile } from "../src/herdr/agent-file.ts";
+import { defaultThinking, parseAgentFile } from "../src/herdr/agent-file.ts";
 import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
@@ -129,6 +129,43 @@ async function eventually(predicate: () => Promise<boolean>, message = "conditio
 	assert.fail(message);
 }
 
+test("thinking defaults recognize role words without changing unrelated types", () => {
+	for (const type of ["Explore", "exploration", "explorer", "exploring", "Implement", "implementer", "implementation", "implementing"]) {
+		assert.equal(defaultThinking(type), "medium", type);
+	}
+	for (const type of ["Review", "reviewer", "reviewing", "code-review", "standards_reviewer"]) {
+		assert.equal(defaultThinking(type), "high", type);
+	}
+	for (const type of ["general", "research", "preview"]) assert.equal(defaultThinking(type), undefined, type);
+});
+
+test("spawn passes role thinking defaults to Pi and honors explicit overrides", async (t) => {
+	const f = fixture(t);
+	const original = f.client.startPi;
+	const launches: string[][] = [];
+	f.client.startPi = async (options) => {
+		launches.push(options.args);
+		await original(options);
+	};
+	for (const [subagentType, thinking, expected] of [
+		["Explore", undefined, "medium"],
+		["implementing", undefined, "medium"],
+		["code-review", undefined, "high"],
+		["reviewer", "low", "low"],
+	] as const) {
+		const ref = await f.runner.spawn(request({ subagentType, thinking }));
+		assert.equal((await f.runner.resolve(ref.agentId)).thinking, expected);
+		const args = launches.at(-1)!;
+		assert.equal(args[args.indexOf("--thinking") + 1], expected);
+	}
+	mkdirSync(join(f.root, "agents"));
+	writeFileSync(join(f.root, "agents", "Explore.md"), "---\nthinking: high\n---\nExplore.\n");
+	for (const [thinking, expected] of [[undefined, "high"], ["low", "low"]] as const) {
+		const ref = await f.runner.spawn(request({ agentDir: f.root, thinking }));
+		assert.equal((await f.runner.resolve(ref.agentId)).thinking, expected);
+	}
+});
+
 test("spawn publishes only after Pi starts and returns both identities", async (t) => {
 	const f = fixture(t);
 	const original = f.client.startPi;
@@ -143,7 +180,7 @@ test("spawn publishes only after Pi starts and returns both identities", async (
 	const result = await spawnHerdrAgent(request(), { ...f, runner: f.runner });
 	assert.match(result.text, /Agent ID: explore/);
 	assert.match(result.text, /Run ID:/);
-	assert.deepEqual(f.events, ["tab", "start:explore", "label:w1:p2:explore"]);
+	assert.deepEqual(f.events, ["tab", "start:explore", "label:w1:p2:explore · medium"]);
 	const ref = { agentId: String(result.details.agentId), runId: String(result.details.runId) };
 	assert.equal((await f.runner.read(ref)).phase, "queued");
 	assert.equal((await f.runner.store.launches())[0].stage, "published");
@@ -1029,11 +1066,73 @@ console.log(JSON.stringify({ result: results[operation] ?? {} }));
 	} finally { await runner.close(); }
 });
 
+test("agent-file isolation overrides the caller and retains the legacy restriction", async (t) => {
+	const f = fixture(t);
+	mkdirSync(join(f.root, ".pi", "agents"), { recursive: true });
+	for (const [front, requested, expected] of [
+		["isolated: true", false, ["read"]],
+		["isolated: false", true, ["read", "Agent"]],
+		["extensions: false", false, ["read"]],
+		["", true, ["read"]],
+	] as const) {
+		writeFileSync(join(f.root, ".pi", "agents", "Explore.md"), `---\n${front}\ntools: read,Agent\n---\nTask`);
+		const ref = await f.runner.spawn(request({ cwd: f.root, isolated: requested }));
+		assert.deepEqual((await f.runner.resolve(ref.agentId)).allowedTools, expected);
+	}
+});
+
+test("unsupported agent-file worktree isolation fails before opening a pane", async (t) => {
+	const f = fixture(t);
+	mkdirSync(join(f.root, ".pi", "agents"), { recursive: true });
+	writeFileSync(join(f.root, ".pi", "agents", "Explore.md"), "---\nisolation: worktree\n---\nTask");
+	await assert.rejects(f.runner.spawn(request({ cwd: f.root })), /isolation: worktree is not supported/);
+	assert.deepEqual(f.events, []);
+	assert.deepEqual(await f.runner.store.listAgents(), []);
+});
+
+test("remote Pi children inherit a trust refusal but never a local approval", async (t) => {
+	const f = fixture(t);
+	const original = f.client.startPi;
+	const launches: string[][] = [];
+	f.client.startPi = async (options) => { launches.push(options.args); await original(options); };
+	const runner = new HerdrRunner({ root: f.root, client: f.client, machine: "laptop" });
+	t.after(() => runner.close());
+	for (const projectTrusted of [false, true]) {
+		const ref = await runner.spawn(request({ projectTrusted }));
+		assert.equal((await runner.resolve(ref.agentId)).projectTrusted, projectTrusted ? undefined : false);
+		assert.equal(launches.at(-1)!.includes("--approve"), false);
+		assert.equal(launches.at(-1)!.includes("--no-approve"), !projectTrusted);
+	}
+});
+
+test("Pi children inherit trust and untrusted agent files cannot supply instructions or tools", async (t) => {
+	const f = fixture(t);
+	mkdirSync(join(f.root, ".pi", "agents"), { recursive: true });
+	mkdirSync(join(f.root, "agents"));
+	writeFileSync(join(f.root, ".pi", "agents", "Explore.md"), "---\ntools: bash\n---\nProject instructions");
+	writeFileSync(join(f.root, "agents", "Explore.md"), "---\ntools: read\n---\nUser instructions");
+	const original = f.client.startPi;
+	const launches: string[][] = [];
+	f.client.startPi = async (options) => { launches.push(options.args); await original(options); };
+	for (const projectTrusted of [false, true]) {
+		const ref = await f.runner.spawn(request({ cwd: f.root, agentDir: f.root, projectTrusted }));
+		const record = await f.runner.resolve(ref.agentId);
+		assert.equal(record.projectTrusted, projectTrusted);
+		assert.equal(record.instructions, projectTrusted ? "Project instructions" : "User instructions");
+		assert.deepEqual(record.allowedTools, projectTrusted ? ["bash"] : ["read"]);
+		assert.ok(launches.at(-1)!.includes(projectTrusted ? "--approve" : "--no-approve"));
+	}
+});
+
 test("agent files, naming, capacity, and Herdr payload contracts remain intact", () => {
 	const parsed = parseAgentFile("---\ntools:\n  - read\n  - grep\nmax_turns: 4\nextensions: false\n---\nQuote the files.\n");
 	assert.deepEqual(parsed.tools, ["read", "grep"]);
 	assert.equal(parsed.maxTurns, 4);
 	assert.equal(parsed.isolated, true);
+	assert.equal(parseAgentFile("---\nisolated: true\n---\nTask").isolated, true);
+	assert.equal(parseAgentFile("---\nisolated: false\n---\nTask").isolated, false);
+	assert.equal(parseAgentFile("---\nisolated: false\nextensions: false\n---\nTask").isolated, true);
+	assert.equal(parseAgentFile("Task").isolated, undefined);
 	assert.deepEqual(parseAgentFile("---\ntools: []\n---\nNo tools.").tools, []);
 	assert.equal(herdrAgentName("Auth Audit!!!", "Explore"), "auth-audit");
 	assert.equal(herdrAgentName("a".repeat(40), "Explore").length, 31);
@@ -1056,13 +1155,14 @@ test("tool names and durable notification receipts survive extension reload", { 
 	await c.finish("finished");
 	const saved: any[] = [];
 	const queued: any[] = [];
+	const deliveries: any[] = [];
 	const create = async () => {
 		const tools: any[] = [];
 		const handlers = new Map<string, (...args: any[]) => any>();
 		const pi = {
 			registerTool(tool: any) { tools.push(tool); },
 			on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
-			sendMessage(message: any) { queued.push(message); },
+			sendMessage(message: any, options: any) { queued.push(message); deliveries.push(options); },
 			sendUserMessage() {}, appendEntry() {},
 		} as unknown as ExtensionAPI;
 		await createHerdrSubagents({ root: f.root, client: f.client, env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, agentDir: f.root })(pi);
@@ -1083,6 +1183,7 @@ test("tool names and durable notification receipts survive extension reload", { 
 	await second.handlers.get("session_start")!({}, ctx);
 	await eventually(async () => queued.length === 2);
 	assert.equal(queued[0].details.noticeId, queued[1].details.noticeId);
+	assert.deepEqual(deliveries, [{ deliverAs: "steer", triggerTurn: true }, { deliverAs: "steer", triggerTurn: true }]);
 	saved.push({ type: "custom_message", ...queued[1] });
 	await eventually(async () => (await f.runner.store.notices("w1:p1")).length === 0);
 	await second.handlers.get("session_shutdown")!({ reason: "quit" });

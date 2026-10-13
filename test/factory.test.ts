@@ -139,7 +139,7 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 		hasUI: true,
 		mode: "tui",
 		model: { name: "Grok 4.6", id: "grok-4.6", provider: "xai" },
-		getContextUsage: () => ({ percent: 18 }),
+		getContextUsage: () => ({ tokens: 36_000, contextWindow: 200_000, percent: 18 }),
 		ui: {
 			theme: { fg: (token: string, text: string) => `<${token}>${text}` },
 			setFooter(factory: typeof footerFactory) {
@@ -176,7 +176,7 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 	const footerLine = footer.render(160).join("");
 	assert.ok(footerLine.includes("demo-project"));
 	assert.ok(footerLine.includes("Grok 4.6"));
-	assert.ok(footerLine.includes("%"));
+	assert.ok(footerLine.includes("Context 36,000/200,000 used"));
 	assert.ok(footerLine.includes("│"));
 	assert.ok(footerLine.includes("Grok 4.6 high"));
 	thinkingLevel = "low";

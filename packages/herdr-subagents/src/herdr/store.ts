@@ -19,6 +19,8 @@ export interface HerdrTask {
 	prompt: string;
 	instructions?: string;
 	allowedTools?: string[];
+	/** Explicit CLI trust override for Pi children; absent on older records. */
+	projectTrusted?: boolean;
 	maxTurns?: number;
 	depth: number;
 	model?: string;

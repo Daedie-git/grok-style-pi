@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { getCapabilities, Image, truncateToWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { absPath, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import { sanitizeToolText } from "./diamond.ts";
 import { fileTarget, handleDiamondClick } from "./interaction.ts";

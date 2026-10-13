@@ -14,7 +14,7 @@ Install it in Pi's user settings on every machine where children run, so new Pi 
 
 The directory is a complete Pi package with its own manifest, dependencies, entrypoint, and license. It can be copied out of this repository, installed with `pi install /path/to/herdr-subagents`, or packed with `npm pack` from this directory. It is not yet published to npm.
 
-Requirements: Herdr, Pi with model credentials, and Node **22.18+ on the 22.x line, or Node 24+**. Local clone users run `npm install` before loading the package.
+Requirements: Herdr, Pi **1.1.0+** with model credentials, and Node **22.18+ on the 22.x line, or Node 24+**. Local clone users run `npm install` before loading the package.
 
 ### With Grok styling
 
@@ -32,7 +32,7 @@ The Grok activity panel continues tracking shell commands and in-process Pi Suba
 
 The tools retain their existing names and parameter schemas. Agent instructions require an explicit user request before spawning. Reuse the same agent for follow-up work: steer while running, or pass its ID as `Agent.resume` after completion. A resume creates a distinct run with its own result and completion notice. Reading an earlier run cannot suppress a later notice.
 
-A `.pi/agents/<subagent_type>.md` file, or the same file under Pi's user agent directory, supplies the child prompt and tool allow-list. Model and thinking overrides remain supported. `isolated: true` restricts the child to built-in tools; `max_turns` bounds a Pi child's turns. Keep `inherit_context` false and provide context in the task prompt. Scheduling and worktree isolation are not offered.
+A `.pi/agents/<subagent_type>.md` file, or the same file under Pi's user agent directory, supplies the child prompt and tool allow-list. Thinking defaults to `medium` for exploration and implementation roles, and `high` for review roles, based on words in `subagent_type` (for example, `Explore`, `implementer`, or `code-review`). Other types keep the runtime's default. An explicit `thinking` parameter takes precedence over agent-file `thinking`, which takes precedence over the role default. Model overrides remain supported. These defaults apply to both Pi and Claude Code; resumed agents retain their original settings. `isolated: true` restricts the child to built-in tools; agent-file `isolated: true` or `false` overrides the caller, and legacy `extensions: false` still enforces the restriction. This limits tool access, not extension loading or operating-system access. Disallowed tools are removed from the model's active declarations before each prompt and blocked on execution, including nested calls from other tools; allowed deferred tools are not automatically activated. `max_turns` bounds a Pi child's turns. Keep `inherit_context` false and provide context in the task prompt. Scheduling and worktree isolation are not offered. An agent file requesting `isolation: worktree` (or another non-`off` value) fails before opening a pane rather than running in the main checkout.
 
 Results include stable agent IDs and immutable run IDs. Tool output is limited to 2,000 lines or 50 KB; the full conversation remains in the pane. Blocked children return immediately and leave their panes open for you to answer. Finished panes also stay open. Cancelling a tool requests cancellation of its captured run and reports pending cancellation until the child acknowledges it.
 
@@ -64,7 +64,17 @@ The bridge uses documented [Claude command hooks](https://code.claude.com/docs/e
 
 `Agent.machine` selects a [saved Herdr SSH machine](https://herdr.dev/docs/connecting-machines/) label or profile ID, only when the user asks. Enabled machines and SSH targets appear in the tool description; repeated labels use profile IDs. Run `/reload` after adding a machine. Remote IDs end in `@<machine>`, such as `explore@laptop`, and subsequent result, steering, and cancellation calls route by that suffix.
 
-`machine_cwd` sets an absolute directory on that machine. It defaults to the parent's path, so set it when layouts differ; Windows accepts paths such as `C:/git/project`. The directory is checked before opening a pane. Missing-directory errors list directories open in that machine's Herdr panes. The runner reuses a remote workspace already open in the directory, if one exists, and uses the same grid placement there. The local caller tab is never used.
+`machine_cwd` sets an absolute directory on that machine. It overrides the per-machine default in `~/.pi/agent/herdr-subagents.json` (or your `PI_CODING_AGENT_DIR`); without either, the parent's path is used. Configure Windows machines to avoid inheriting a Linux path:
+
+```json
+{
+  "machines": {
+    "lappy": { "cwd": "C:/git" }
+  }
+}
+```
+
+Keys are saved Herdr profile IDs or unique labels. Profile-ID settings take precedence over label settings; duplicate labels require IDs. Run `/reload` after editing the file. Local launches and resumed agents keep their existing directories. The directory is checked on the target machine before opening a pane. Missing-directory errors list directories open in that machine's Herdr panes. The runner reuses a remote workspace already open in the directory, if one exists, and uses the same grid placement there. The local caller tab is never used.
 
 Agent definitions are read locally and sent with the task. Remote context inheritance is rejected. A remote child may start its own children there; their depth starts at 1 again.
 
@@ -95,9 +105,11 @@ Commands and notices poll every 200 ms. Batched Herdr liveness listings run roug
 
 Launch intent is saved before opening a pane. Pre-launch shell-readiness rejections are retried for up to 60 seconds, with cancellation support; other startup failures are not automatically retried. Cancellation before publication closes the owned pane. Uncertain pane creation and failed cleanup retain reservations and diagnostics rather than claiming success. Another runner reconciles abandoned known panes; uncertain creation requires inspecting Herdr.
 
+New Pi children inherit the parent's project-trust decision on the same machine. An untrusted parent skips project agent definitions and starts children with `--no-approve`, including on remote machines; user agent definitions remain available. A trusted parent does not approve a remote project: that machine resolves its own trust. Claude Code keeps its native project-trust and permission flow. Existing child processes retain their startup trust decision.
+
 Children attach using both pane and Pi session identity. A new conversation in the same pane does not inherit another child's restrictions. Reload reconstructs queued commands and execution. An uncertain dispatch is interrupted, never blindly replayed; saved execution checkpoints may repair interrupted database writes.
 
-Completion notices have stable run-scoped IDs. Queueing is not delivery: a receipt is stored only after Pi saves the message. Reload retries unacknowledged delivery. SQLite and Pi session files do not form one atomic transaction, so a crash may produce a duplicate with the same notice ID.
+Completion notices use Pi's steering queue: a busy parent receives them after its current tool batch, before its next model call, without interrupting tools; an idle parent starts a new turn. Completion notices have stable run-scoped IDs. Queueing is not delivery: a receipt is stored only after Pi saves the message. Reload retries unacknowledged delivery. SQLite and Pi session files do not form one atomic transaction, so a crash may produce a duplicate with the same notice ID.
 
 Protocol 2 remains incompatible with the older per-agent-file coordinator. Finish or stop legacy runs and close or reload every legacy Pi process before using this runner. Do not run old and new coordinators together. Legacy results remain untouched, but those agents cannot resume. Close a crashed legacy process before archiving its per-agent state directory and obsolete `panes/` index; never delete control files used by a live runner.
 

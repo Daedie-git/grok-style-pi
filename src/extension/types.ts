@@ -21,8 +21,6 @@ export type SessionContext = FooterContext & {
 	modelRegistry?: Pick<ModelRegistry, "getApiKeyForProvider">;
 	hasUI?: boolean;
 	mode?: string;
-	model?: { name?: string; id?: string; provider?: string } | null;
-	getContextUsage?: () => { percent: number | null } | undefined;
 	isProjectTrusted?: () => boolean;
 	ui: SessionUi;
 };

@@ -123,7 +123,8 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 		assert.equal(tool.promptSnippet, native.promptSnippet);
 		assert.deepEqual((tool.promptGuidelines as string[]).slice(0, native.promptGuidelines?.length), native.promptGuidelines);
 	}
-	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length + 3);
+	assert.equal(registered.length, BUILTIN_TOOL_NAMES.length + 4);
+	assert.ok(registered.some((tool) => tool.name === "codemode" && tool.renderShell === "self"));
 	assert.ok(registered.some((tool) => tool.name === "show_image" && tool.renderShell === "self"));
 	assert.ok(registered.some((tool) => tool.name === "show_video" && tool.renderShell === "self"));
 	assert.ok(registered.some((tool) => tool.name === "show_html" && tool.renderShell === "self"));

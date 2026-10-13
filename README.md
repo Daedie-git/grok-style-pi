@@ -1,6 +1,6 @@
 # grok-style-pi
 
-Grok Build-inspired chrome for [Pi](https://pi.dev): a GrokNight color theme, a `cwd │ model │ Context N% used │ usage` footer, a rounded composer with a `❯` prompt, and diamond (`◆`) tool rows.
+Grok Build-inspired chrome for [Pi](https://pi.dev): a GrokNight color theme, a `cwd │ model │ Context used/max used │ usage` footer, a rounded composer with a `❯` prompt, and diamond (`◆`) tool rows.
 
 This package uses only documented Pi extension APIs (`setFooter`, `setEditorComponent` wrapping `CustomEditor`, and same-name `registerTool` overrides with `renderShell: "self"`). It does not patch Pi internals.
 
@@ -103,13 +103,15 @@ Our blue accent overrides remain a customization: Grok Build's source also uses 
 
 The footer shows context and allowance only for the selected model. Other providers are omitted, and their refresh stops on model change. With the `/fast` extension installed, GPT models on `openai` or `openai-codex` also show an accent-colored `Fast: on` while priority processing is requested, or `Fast: off` in the footer's default color otherwise. The indicator disappears when a non-GPT model is selected; it does not confirm that the server granted priority processing.
 
-For `openai-codex`, that is this session's context (`Context N% used`) and weekly quota remaining (for example, `Weekly 46% left`). Quota refreshes in the background at startup and once per minute using the existing Pi ChatGPT login and Codex's usage endpoint. Response headers also update the display when available. This works with WebSocket transport and makes no model requests. Refresh stops when the footer is disabled, the model changes away from Codex, or the session closes. Unavailable or expired data is not shown as a known percentage; authentication failures display `login required`. The usage endpoint is an internal Codex service and may change.
+Context uses this Pi session's estimated token count and the selected model's context-window limit (for example, `Context 24,800/200,000 used`). Unknown counts show `?`, including after compaction until usage becomes available again.
 
-For `xai`, that is the Grok session for this working directory (`Context N% used`, from that session's saved context-window percent) and allowance remaining (`Weekly N% left`). Weekly allowance refreshes at startup and once per minute with the existing Pi xAI login and Grok's credits endpoint. Context is re-read locally every few seconds. A missing Grok session or a non-weekly allowance shows `?`. Authentication failures display `login required`. The credits endpoint is an internal Grok service and may change.
+For `openai-codex`, that is this session's context and weekly quota remaining (for example, `Weekly 46% left`). Quota refreshes in the background at startup and once per minute using the existing Pi ChatGPT login and Codex's usage endpoint. Response headers also update the display when available. This works with WebSocket transport and makes no model requests. Refresh stops when the footer is disabled, the model changes away from Codex, or the session closes. Unavailable or expired data is not shown as a known percentage; authentication failures display `login required`. The usage endpoint is an internal Codex service and may change.
+
+For `xai`, that is this Pi session's context and allowance remaining (`Weekly N% left`). Weekly allowance refreshes at startup and once per minute with the existing Pi xAI login and Grok's credits endpoint. A non-weekly allowance shows `?`. Authentication failures display `login required`. The credits endpoint is an internal Grok service and may change.
 
 For Codex and xAI logins, the footer appends `Account <email or name>` after usage. If the login token provides neither, it shows the account ID instead. Identity refreshes at startup, on model changes, and once per minute using the existing Pi login, without extra account endpoint requests. API keys and logins without a readable identity omit this item. On narrow terminals, the account is shortened first and dropped when fewer than 12 columns remain, so the path and model stay visible.
 
-Any other model shows this Pi session's context (`Context N% used`) and no subscription line.
+Any other model shows this Pi session's context token counts and no subscription line.
 
 ## Diamond interaction
 

@@ -15,7 +15,7 @@ class SyncMachineTests(unittest.TestCase):
         self.fixture.add_machines()
         self.home = self.fixture.home
         self.remote = self.fixture.remote_home()
-        self.remote.mkdir(parents=True)
+        self.remote.mkdir(parents=True, exist_ok=True)
         self.repos = {}
         for name in ('grok-style-pi', 'claude-sidecar'):
             origin = self.home / 'origins' / (name + '.git')

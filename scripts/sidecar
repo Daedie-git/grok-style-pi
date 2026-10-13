@@ -37,7 +37,8 @@ REVIEW_TIMEOUT_MS=3600000
 SETTLE_GRACE_S="${SIDECAR_SETTLE_GRACE_S:-15}"
 # While a request runs, print a status line to stderr this often (seconds); 0 disables it.
 PROGRESS_S="${SIDECAR_PROGRESS_S:-60}"
-# Where pi finds its extension and prompt. A remote machine needs this plugin checked out there, by default at the same path.
+# Where pi finds its extension and prompt. Remote defaults preserve the path relative to our home,
+# rooted at the remote home on Linux or C:/ on Windows.
 AGENT_HOME="$SIDECAR_HOME"
 # Set by resolve_machine for a slot on a saved herdr machine; empty for the local one.
 MACHINE=
@@ -208,7 +209,10 @@ resolve_machine() {
   REMOTE_TRANSPORT=$(jq -r '.transport // "sh"' <<<"$config")
   [[ $REMOTE_TRANSPORT == sh || $REMOTE_TRANSPORT == node ]] || die "unknown remote transport: $REMOTE_TRANSPORT"
   [[ -n ${KEEP_PWD:-} ]] || mapped=$(jq -r --arg cwd "$PWD" '[.paths // {} | to_entries | map(.key |= rtrimstr("/")) | .[] | .key as $prefix | select($cwd == $prefix or ($cwd | startswith($prefix + "/")))] | sort_by(.key | length) | last | if . then .value + $cwd[(.key | length):] else empty end' <<<"$config")
-  AGENT_HOME=${SIDECAR_REMOTE_HOME:-$(jq -r --arg fallback "$SIDECAR_HOME" '.home // $fallback' <<<"$config")}
+  AGENT_HOME=${SIDECAR_REMOTE_HOME:-$(jq -r '.home // ""' <<<"$config")}
+  local runtime_relative=${SIDECAR_HOME#"$HOME/"}
+  # Checkouts outside our home have no home-relative counterpart; use the conventional checkout layout.
+  [[ $SIDECAR_HOME == "$HOME/"* ]] || runtime_relative=git/claude-sidecar/sidecar
   WORK_DIR=${REMOTE_CWD:-${mapped:-$PWD}}
   # Persist the mapped checkout too: changing settings must not silently move an existing slot.
   if [[ -n $mapped || $REMOTE_TRANSPORT == node ]]; then REMOTE_CWD=$WORK_DIR; fi
@@ -216,7 +220,8 @@ resolve_machine() {
     local info
     info=$(remote_node 'const home=os.homedir().replace(/\\/g,"/");
       if(!fs.existsSync(args[0]) || !fs.statSync(args[0]).isDirectory()) process.exit(12);
-      console.log(JSON.stringify({home,agentHome:args[1] || home+"/.cache/claude-sidecar/plugin/sidecar"}));' "$WORK_DIR" "${SIDECAR_REMOTE_HOME:-$(jq -r '.home // ""' <<<"$config")}" </dev/null) || die "cannot access checkout $WORK_DIR on $MACHINE_LABEL; check SSH, Node and the machine path mapping"
+      const root=os.platform()==="win32" ? "C:/" : home+"/";
+      console.log(JSON.stringify({home,agentHome:args[1] || root+args[2]}));' "$WORK_DIR" "$AGENT_HOME" "$runtime_relative" </dev/null) || die "cannot access checkout $WORK_DIR on $MACHINE_LABEL; check SSH, Node and the machine path mapping"
     AGENT_HOME=$(jq -r '.agentHome' <<<"$info")
     REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
     # Deploy only the two runtime files, not a checkout or any credentials. Do not rewrite unchanged files.
@@ -228,13 +233,16 @@ resolve_machine() {
     return
   fi
   # One round trip checks the connection, finds the remote home (it may differ from ours), and confirms what pi needs.
-  local home status=0
-  home=$(remote 'printf "%s" "$HOME"
-    test -f "$1/sidecar.ts" && test -f "$1/reviewer.md" || exit 11
-    test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" </dev/null) || status=$?
+  local home info status=0
+  info=$(remote 'agent_home=${1:-"$HOME/$3"}
+    printf "%s\n%s\n" "$HOME" "$agent_home"
+    test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" || exit 11
+    test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" "$runtime_relative" </dev/null) || status=$?
+  home=${info%%$'\n'*}
+  AGENT_HOME=${info#*$'\n'}
   case $status in
     0) ;;
-    11) die "the claude-sidecar plugin is not at $AGENT_HOME on $MACHINE_LABEL; install it there or set SIDECAR_REMOTE_HOME" ;;
+    11) die "the claude-sidecar plugin is not at $AGENT_HOME on $MACHINE_LABEL; install it there or set SIDECAR_REMOTE_HOME to the directory containing sidecar.ts and reviewer.md (not the user home or plugin root)" ;;
     12) die "$WORK_DIR does not exist on $MACHINE_LABEL; check out the repository there or pass --remote-cwd DIR" ;;
     *) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH (BatchMode: load its key in ssh-agent). Test: ssh $MACHINE_TARGET true" ;;
   esac

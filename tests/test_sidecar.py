@@ -153,7 +153,7 @@ elif args[:2] == ['agent', 'prompt']:
 
 # Runs the command on a "machine" whose home differs from ours, as a real SSH login would.
 SSH = r'''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import base64, json, os, pathlib, subprocess, sys, time
 args = sys.argv[1:]
 home = pathlib.Path(os.environ['HOME'])
 options = []
@@ -172,7 +172,11 @@ if os.environ.get('FAKE_SSH_DOWN'):
     sys.exit(255)
 remote_home = home / 'remote' / target
 remote_home.mkdir(parents=True, exist_ok=True)
-sys.exit(subprocess.run(['sh', '-c', command], env=dict(os.environ, HOME=str(remote_home))).returncode)
+if os.environ.get('FAKE_REMOTE_WINDOWS') and command.startswith('node -e '):
+    encoded = command.split("Buffer.from('", 1)[1].split("'", 1)[0]
+    script = base64.b64decode(encoded).decode().replace('os.platform()', '"win32"')
+    command = command.replace(encoded, base64.b64encode(script.encode()).decode())
+sys.exit(subprocess.run(['sh', '-c', command], env=dict(os.environ, HOME=str(remote_home)), cwd=remote_home).returncode)
 '''
 
 
@@ -835,6 +839,9 @@ class LauncherTests(unittest.TestCase):
         self.work = self.home / 'work dir'
         self.work.mkdir(exist_ok=True)
         self.remote_env = dict(self.env, SIDECAR_MACHINE_TAG='tt01')
+        for machine in machines:
+            runtime = self.remote_home(machine['target']) / self.plugin.relative_to(self.home) / 'sidecar'
+            shutil.copytree(self.plugin / 'sidecar', runtime, dirs_exist_ok=True)
 
     def remote_run(self, *args, env=None, check=True):
         return self.run_cli(*args, env=env or self.remote_env, cwd=self.work, check=check)
@@ -864,9 +871,10 @@ class LauncherTests(unittest.TestCase):
         config = self.home / 'sidecar-machines.json'
         config.write_text(json.dumps({'laptop': {'transport': 'node', 'paths': {str(self.work): str(checkout)}}}))
         env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+        runtime = self.remote_home() / self.plugin.relative_to(self.home) / 'sidecar'
+        shutil.rmtree(runtime)
         result = self.remote_run('--machine', 'laptop', 'ask', 'Task', env=env)
         self.assertIn('ship', result.stdout)
-        runtime = self.remote_home() / '.cache/claude-sidecar/plugin/sidecar'
         self.assertTrue((runtime / 'sidecar.ts').is_file())
         self.assertTrue((runtime / 'reviewer.md').is_file())
         started = self.all_starts()[0]
@@ -987,8 +995,9 @@ class LauncherTests(unittest.TestCase):
         start = next(c for c in inner if c[:2] == ['agent', 'start'])
         self.assertEqual(start[2], 'sc-tt01-pane-1')
         self.assertEqual(start[start.index('--pane') + 1], 'remote-pane-1')
-        self.assertEqual(start[start.index('-e') + 1], str(self.plugin / 'sidecar/sidecar.ts'))
-        self.assertEqual(start[start.index('--append-system-prompt') + 1], str(self.plugin / 'sidecar/reviewer.md'))
+        runtime = self.remote_home() / self.plugin.relative_to(self.home) / 'sidecar'
+        self.assertEqual(start[start.index('-e') + 1], str(runtime / 'sidecar.ts'))
+        self.assertEqual(start[start.index('--append-system-prompt') + 1], str(runtime / 'reviewer.md'))
         # The request is read on the machine, under the machine's own home.
         requests = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*.md'))
         self.assertEqual(len(requests), 1)
@@ -1103,6 +1112,26 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.local_calls(), [])
         self.assertEqual(self.remote_calls(), [])
         self.assertFalse((self.home / '.cache/claude-sidecar/sc-pane-1.machine').exists())
+
+    def test_windows_plugin_default_is_rooted_at_c_drive(self):
+        self.add_machines()
+        config = self.home / 'sidecar-machines.json'
+        config.write_text(json.dumps({'laptop': {'transport': 'node'}}))
+        self.remote_run('--machine', 'laptop', 'start', env=dict(
+            self.remote_env, SIDECAR_MACHINES_FILE=str(config), FAKE_REMOTE_WINDOWS='1'))
+        runtime = 'C:/' + str(self.plugin.relative_to(self.home)) + '/sidecar'
+        start = self.all_starts()[0]
+        self.assertEqual(start[start.index('-e') + 1], runtime + '/sidecar.ts')
+        self.assertEqual(start[start.index('--append-system-prompt') + 1], runtime + '/reviewer.md')
+        self.assertTrue((self.remote_home() / runtime / 'sidecar.ts').is_file())
+
+    def test_remote_plugin_default_uses_remote_home(self):
+        self.add_machines()
+        runtime = self.remote_home() / self.plugin.relative_to(self.home) / 'sidecar'
+        self.remote_run('--machine', 'laptop', 'start')
+        start = self.all_starts()[0]
+        self.assertEqual(start[start.index('-e') + 1], str(runtime / 'sidecar.ts'))
+        self.assertEqual(start[start.index('--append-system-prompt') + 1], str(runtime / 'reviewer.md'))
 
     def test_remote_plugin_path_and_directory_are_checked_and_overridable(self):
         self.add_machines()

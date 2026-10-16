@@ -363,6 +363,11 @@ agent_runs_sidecar_session() {
     fi
     sleep 0.5
   done
+  # Herdr builds that never publish pi session files (0.9.5 on Windows) leave the field out entirely: the agent
+  # name the launcher gave the pane is then the only identity available.
+  if ! hd agent get "$1" 2>/dev/null | jq -e '.result.agent | has("agent_session")' >/dev/null 2>&1; then
+    return 0
+  fi
   # Still unpublished after the wait: treat as not ours so a bare relaunched pi gets restarted.
   return 1
 }
@@ -759,7 +764,10 @@ await_report() {
 PROMPT_PID=
 # Like hd, but replaces the (background) subshell with herdr in a new session: its pid is then the group to signal.
 hd_detached() {
-  if [[ -n $MACHINE ]]; then exec setsid herdr --machine "$MACHINE" "$@"; else exec setsid herdr "$@"; fi
+  # Git Bash on Windows has no setsid; herdr then stays in this subshell's group and stop_prompt signals its pid.
+  local detach=(setsid)
+  command -v setsid >/dev/null 2>&1 || detach=()
+  if [[ -n $MACHINE ]]; then exec "${detach[@]}" herdr --machine "$MACHINE" "$@"; else exec "${detach[@]}" herdr "$@"; fi
 }
 
 # shellcheck disable=SC2329  # run from the EXIT trap

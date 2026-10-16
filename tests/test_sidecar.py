@@ -145,7 +145,7 @@ elif args[:2] == ['agent', 'prompt']:
                 'pathlib.Path(sys.argv[2]).write_text(json.dumps(s))'),
                 str(reports / (request_id + '.md')), str(state_path)])
             sys.exit(0)
-        (reports / (request_id + '.md')).write_text('## Verdict\nship\n')
+        (reports / (request_id + '.md')).write_text('## Verdict\nship\n' + 'report detail\n' * int(os.environ.get('FAKE_REPORT_LINES', '0')))
         if os.environ.get('FAKE_QUESTION'):
             (reports / (request_id + '.needs-answer')).write_text(os.environ['FAKE_QUESTION'] + '\n')
 '''
@@ -537,7 +537,9 @@ class LauncherTests(unittest.TestCase):
 
     def test_missing_dependency_hook_is_nonfatal(self):
         (self.home / 'bin/pi').unlink()
-        result = self.run_cli('session-start', input='{}')
+        # Do not fall through to a real pi installed beside Node on the developer's PATH.
+        env = dict(self.env, PATH=f'{self.home / "bin"}:/usr/bin:/bin')
+        result = self.run_cli('session-start', input='{}', env=env)
         self.assertIn('missing dependency pi', result.stderr)
         self.assertEqual(result.stdout, '')
 
@@ -551,6 +553,130 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('SIDECAR_PI_SESSION=cc-pane-pane-1', env_file.read_text())
         self.assertEqual(sum(c[:2] == ['agent', 'start'] for c in self.calls()), 1)
 
+    def report_path(self, output):
+        first = output.splitlines()[0]
+        self.assertTrue(first.startswith('# Sidecar report ('), first)
+        return Path(first[len('# Sidecar report ('):-1])
+
+    def test_report_path_prints_before_the_request_completes(self):
+        self.run_cli('start')
+        process = subprocess.Popen([str(self.launcher), 'ask', 'Long task'], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=dict(self.env, HERDR_PROMPT_DELAY='2'))
+        try:
+            import select
+            self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+            path = self.report_path(process.stdout.readline())
+            self.assertIsNone(process.poll())
+            self.assertFalse(path.exists())
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertIn('ship', stdout)
+            self.assertEqual(path.read_text(), '## Verdict\nship\n')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_report_recovers_full_output_after_head_closes_the_pipe(self):
+        process = subprocess.Popen([str(self.launcher), '--slot', '2', 'ask', 'Long report'], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=dict(self.env, FAKE_REPORT_LINES='20000'))
+        try:
+            path = self.report_path(process.stdout.readline())
+            # Like piping through `head -n 1`: no reader remains for the full report.
+            process.stdout.close()
+            process.wait(timeout=10)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn('last report unprinted:', self.run_cli('--slot', '2', 'status').stdout)
+            result = self.run_cli('--slot', '2', 'report')
+            self.assertEqual(result.stdout.split('\n', 1)[1], path.read_text())
+            self.assertEqual(path.read_text().count('report detail'), 20000)
+            self.assertIn('last report printed:', self.run_cli('--slot', '2', 'status').stdout)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stderr.close()
+
+    def test_report_recovers_legacy_reports_without_metadata_and_keeps_slot_isolation(self):
+        reports = self.home / '.cache/claude-sidecar/reports'
+        reports.mkdir(parents=True)
+        first = reports / '20260101-010000-ask-sc-pane-1.old.md'
+        latest = reports / '20260101-020000-diff-sc-pane-1.new.md'
+        other = reports / '20260101-030000-ask-sc-pane-1-2.other.md'
+        for timestamp, path in enumerate((first, latest, other), start=1):
+            path.write_text(path.stem + '\n')
+            os.utime(path, (timestamp, timestamp))
+        self.assertIn('last report unprinted: ' + str(latest), self.run_cli('status').stdout)
+        self.assertEqual(self.report_path(self.run_cli('report').stdout), latest)
+        self.assertEqual(self.report_path(self.run_cli('--slot', '2', 'report').stdout), other)
+        self.assertIn('last report printed:', self.run_cli('status').stdout)
+
+    def test_report_and_wait_without_a_request_are_actionable(self):
+        for command in ('report', 'wait'):
+            result = self.run_cli(command, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('slot 1', result.stderr)
+
+    def test_wait_blocks_until_report_is_saved_and_does_not_print_it(self):
+        self.run_cli('start')
+        with ThreadPoolExecutor(2) as pool:
+            request = pool.submit(self.run_cli, 'ask', 'Long task',
+                                  env=dict(self.env, HERDR_PROMPT_DELAY='2'))
+            deadline = time.monotonic() + 5
+            while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            waiting = pool.submit(self.run_cli, 'wait')
+            time.sleep(0.2)
+            self.assertFalse(waiting.done())
+            result = waiting.result(timeout=10)
+            path = self.report_path(result.stdout)
+            self.assertTrue(path.is_file())
+            self.assertNotIn('## Verdict', result.stdout)
+            self.assertEqual(path, self.report_path(request.result().stdout))
+
+    def test_wait_preserves_question_exit_and_report_replays_question(self):
+        self.run_cli('ask', 'Task', env=dict(self.env, FAKE_QUESTION='Which?'), check=False)
+        result = self.run_cli('wait', check=False)
+        self.assertEqual(result.returncode, 3)
+        self.assertTrue(self.report_path(result.stdout).is_file())
+        self.assertIn('NEEDS_ANSWER: Which?', self.run_cli('report').stdout)
+
+    def test_wait_does_not_mistake_an_older_report_for_failed_request(self):
+        previous = self.report_path(self.run_cli('ask', 'First task').stdout)
+        failed = self.run_cli('ask', 'Failed task', check=False,
+                              env=dict(self.env, FAKE_NO_REPORT='1', SIDECAR_SETTLE_GRACE_S='0'))
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(self.run_cli('wait', check=False).returncode, 1)
+        self.assertEqual(self.report_path(self.run_cli('report').stdout), previous)
+        self.assertIn('exit 2', self.run_cli('status').stdout)
+
+    def test_status_reports_request_age_and_printed_state_per_slot(self):
+        result = self.run_cli('ask', 'Task')
+        path = self.report_path(result.stdout)
+        state_path = self.home / '.cache/claude-sidecar/sc-pane-1.request.json'
+        state = json.loads(state_path.read_text())
+        state.update(started=int(time.time()) - 6 * 3600, finished=int(time.time()) - 5 * 3600)
+        state_path.write_text(json.dumps(state))
+        status = self.run_cli('status').stdout
+        self.assertIn('done 5h ago', status)
+        self.assertIn('started 6h ago', status)
+        self.assertIn('last report printed: ' + str(path), status)
+        self.assertNotIn('last report', self.run_cli('--slot', '2', 'status').stdout)
+
+    def test_status_shows_start_age_while_request_runs(self):
+        self.run_cli('start')
+        with ThreadPoolExecutor(1) as pool:
+            request = pool.submit(self.run_cli, 'ask', 'Task', env=dict(self.env, HERDR_PROMPT_DELAY='2'))
+            deadline = time.monotonic() + 5
+            while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            self.assertIn('request: started', self.run_cli('status').stdout)
+            request.result()
+
     def test_requests_use_unique_reports(self):
         for _ in range(2):
             self.assertIn('ship', self.run_cli('ask', 'Review the design').stdout)
@@ -561,7 +687,7 @@ class LauncherTests(unittest.TestCase):
         env = dict(self.env, FAKE_QUESTION='May I add X?')
         result = self.run_cli('ask', 'Do the work', env=env, check=False)
         self.assertEqual(result.returncode, 3)
-        self.assertTrue(result.stdout.startswith('NEEDS_ANSWER: May I add X?'))
+        self.assertIn('NEEDS_ANSWER: May I add X?', result.stdout.splitlines()[1])
         answered = self.run_cli('answer', 'Yes, with constraint Y')
         self.assertIn('ship', answered.stdout)
         request_files = sorted((self.home / '.cache/claude-sidecar/requests').glob('*-answer-*.md'))
@@ -572,6 +698,7 @@ class LauncherTests(unittest.TestCase):
         result = self.run_cli('answer', 'hello', check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('no pending question', result.stderr)
+        self.assertIn('sidecar --slot 1 ask TEXT', result.stderr)
 
     def test_identical_inflight_request_rejected(self):
         env = dict(self.env, HERDR_PROMPT_DELAY='1.5')
@@ -655,6 +782,22 @@ class LauncherTests(unittest.TestCase):
         git('commit', '-m', 'Initial')
         (repo / 'a.txt').write_text('two\n')
         return repo, git
+
+    def test_diff_rejects_ranges_with_single_base_guidance(self):
+        repo, _ = self.repo_with_change()
+        for base in ('HEAD..HEAD', 'HEAD...HEAD'):
+            result = self.run_cli('diff', base, cwd=repo, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('single base ref, not a range', result.stderr)
+            self.assertIn('diff HEAD CONTEXT', result.stderr)
+        self.assertFalse(any(c[:2] == ['agent', 'prompt'] for c in self.calls()))
+
+    def test_diff_prints_a_recoverable_report_path_first(self):
+        repo, _ = self.repo_with_change()
+        result = self.run_cli('diff', cwd=repo)
+        path = self.report_path(result.stdout)
+        self.assertEqual(path.read_text(), '## Verdict\nship\n')
+        self.assertEqual(self.run_cli('report').stdout, result.stdout)
 
     def test_diff_request_requires_reproduced_findings(self):
         repo, _ = self.repo_with_change()
@@ -863,6 +1006,54 @@ class LauncherTests(unittest.TestCase):
         path = self.home / 'remote-state' / machine
         path.mkdir(parents=True, exist_ok=True)
         (path / 'panes.json').write_text(json.dumps(panes))
+
+    def test_remote_report_is_cached_and_recoverable_when_ssh_is_down(self):
+        self.add_machines()
+        for slot, transport in (('2', 'sh'), ('3', 'node')):
+            with self.subTest(transport=transport):
+                config = self.home / 'sidecar-machines.json'
+                config.write_text(json.dumps({'laptop': {'transport': transport}}))
+                env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config), FAKE_QUESTION='Remote choice?')
+                result = self.remote_run('--slot', slot, '--machine', 'laptop', 'ask', 'Task', env=env, check=False)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                path = self.report_path(result.stdout)
+                self.assertEqual(path.parent, self.home / '.cache/claude-sidecar/reports')
+                self.assertEqual(path.read_text(), '## Verdict\nship\n')
+                offline = dict(env, FAKE_SSH_DOWN='1')
+                replay = self.remote_run('--slot', slot, 'report', env=offline)
+                self.assertIn('NEEDS_ANSWER: Remote choice?', replay.stdout)
+                self.assertIn('ship', replay.stdout)
+                self.assertEqual(self.remote_run('--slot', slot, 'wait', env=offline, check=False).returncode, 3)
+
+    def test_remote_report_and_question_survive_a_closed_stdout_pipe(self):
+        self.add_machines()
+        env = dict(self.remote_env, FAKE_QUESTION='Remote choice?', FAKE_REPORT_LINES='20000')
+        process = subprocess.Popen([str(self.launcher), '--machine', 'laptop', 'ask', 'Task'], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=self.work)
+        try:
+            path = self.report_path(process.stdout.readline())
+            process.stdout.close()
+            process.wait(timeout=15)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(path.read_text().count('report detail'), 20000)
+            offline = dict(env, FAKE_SSH_DOWN='1')
+            replay = self.remote_run('report', env=offline)
+            self.assertIn('NEEDS_ANSWER: Remote choice?', replay.stdout)
+            self.assertEqual(replay.stdout.count('report detail'), 20000)
+            self.assertTrue((self.home / '.cache/claude-sidecar/sc-pane-1.pending').is_file())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stderr.close()
+
+    def test_bound_remote_cwd_error_explains_using_a_free_slot(self):
+        self.add_machines()
+        self.remote_run('--slot', '2', '--machine', 'laptop', 'start')
+        result = self.remote_run('--slot', '2', '--remote-cwd', '/another/checkout', 'ask', 'Task', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('slots cannot be rebound', result.stderr)
+        self.assertIn('Pick a free slot: sidecar --slot N --machine laptop', result.stderr)
 
     def test_node_transport_deploys_and_maps_checkout(self):
         self.add_machines()
@@ -1213,7 +1404,7 @@ class LauncherTests(unittest.TestCase):
         self.remote_run('--remote-cwd', str(checkout), 'status')
         result = self.remote_run('--remote-cwd', str(self.home), 'status', check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('works in %s on that machine' % checkout, result.stderr)
+        self.assertIn('bound to cwd %s on that machine' % checkout, result.stderr)
         # Tabs for later slot members open in the remembered checkout too.
         tab = next(c for c in self.remote_calls() if c[:2] == ['tab', 'create'])
         self.assertEqual(tab[tab.index('--cwd') + 1], str(checkout))
@@ -1277,7 +1468,7 @@ class LauncherTests(unittest.TestCase):
         env = dict(self.remote_env, FAKE_QUESTION='May I?')
         result = self.remote_run('--machine', 'laptop', 'ask', 'Do it', env=env, check=False)
         self.assertEqual(result.returncode, 3)
-        self.assertTrue(result.stdout.startswith('NEEDS_ANSWER: May I?'))
+        self.assertIn('NEEDS_ANSWER: May I?', result.stdout)
         answered = self.remote_run('answer', 'Yes')
         self.assertIn('ship', answered.stdout)
         answers = list((self.remote_home() / '.cache/claude-sidecar/requests').glob('*-answer-*.md'))

@@ -11,7 +11,9 @@
 #   sidecar restart              start the sidecar in a new pane when the pane holding its name runs another pi session
 #   sidecar reload               wait between requests, then reload pi resources without losing its report channel
 #   sidecar sync-machine NAME    fast-forward the machine's tooling checkouts from origin (no slot binding)
-#   sidecar status               print the sidecar's herdr agent state
+#   sidecar status               show agent state, request age and whether its last report was printed
+#   sidecar wait                 wait for the slot's launcher request; print its report path (run as a harness background task)
+#   sidecar report               print the latest saved report, including any pending question
 #   sidecar note TEXT            share context on ongoing work; no review
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
 #   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
@@ -31,6 +33,7 @@ THINKING=
 ROLE=reviewer
 BACKEND=pi
 INFLIGHT=
+ACTIVE_REQUEST=
 NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
 # After the sidecar settles without a report, recheck for this long before declaring the request abandoned.
@@ -63,7 +66,8 @@ require_herdr() {
 
 # Slots retain their role; do not silently reuse an implementer's context as a reviewer (or vice versa).
 resolve_role() {
-  local file="$STATE_DIR/$(agent_name).role" saved=
+  local file saved=
+  file="$STATE_DIR/$(agent_name).role"
   if [[ -f $file ]]; then saved=$(<"$file"); fi
   [[ -z $saved || $saved == reviewer || $saved == implementer ]] || die "invalid slot role in $file"
   if [[ -n $saved && -n $ROLE_ARG && $saved != "$ROLE_ARG" ]]; then
@@ -179,7 +183,7 @@ resolve_machine() {
     fi
     # The checkout chosen at start belongs to the slot, like its machine: follow-ups reuse it.
     if [[ -n $REMOTE_CWD && $REMOTE_CWD != "${bound_cwd:-$PWD}" ]]; then
-      die "slot $SLOT works in ${bound_cwd:-$PWD} on that machine; use another slot for --remote-cwd $REMOTE_CWD"
+      die "slot $SLOT is bound to cwd ${bound_cwd:-$PWD} on that machine; slots cannot be rebound. Pick a free slot: sidecar --slot N --machine $(jq -r '.label' <<<"$record") --remote-cwd $REMOTE_CWD ask TEXT"
     fi
     # A binding without a saved directory predates mappings: it keeps $PWD and must not acquire one.
     REMOTE_CWD=$bound_cwd
@@ -804,8 +808,33 @@ remote_checkout_note() {
   fi
 }
 
+# Saved reports are local even for remote slots, so recovery never needs a working SSH connection.
+# A printed marker means stdout accepted the full report, not that the orchestrator or a human read it.
+print_saved_report() {
+  local report=$1 question
+  [[ -f $report ]] || die "no saved report at $report; use sidecar --slot $SLOT wait for an active request"
+  question=
+  if [[ -s ${report%.md}.needs-answer ]]; then
+    IFS= read -r question <"${report%.md}.needs-answer" || true
+  fi
+  [[ -z $question ]] || echo "NEEDS_ANSWER: $question"
+  cat -- "$report" || return $?
+  date +%s >"${report%.md}.printed"
+}
+
+# Atomically finish the request's persistent status on every exit, including failures and signals.
+finish_request() {
+  local code=$1 tmp
+  [[ -n $ACTIVE_REQUEST ]] || return 0
+  tmp=$(mktemp "$ACTIVE_REQUEST.XXXXXX")
+  jq --argjson finished "$(date +%s)" --argjson code "$code" \
+    '. + {finished: $finished, exit_code: $code}' "$ACTIVE_REQUEST" >"$tmp"
+  mv -f -- "$tmp" "$ACTIVE_REQUEST"
+  ACTIVE_REQUEST=
+}
+
 # Sends a request and prints the submitted report. Exit codes: 0 report delivered, 2 no report,
-# 3 the sidecar is blocked on a question (first line `NEEDS_ANSWER: ...`; reply with `sidecar answer`),
+# 3 the sidecar is blocked on a question (`NEEDS_ANSWER: ...`; reply with `sidecar answer`),
 # 4 an identical request is already in flight, 5 the sidecar is blocked in its pane.
 request() {
   local kind=$1 body=$2 lock_mode=${3:-acquire} name hname id req report status hash question prompt_path
@@ -829,13 +858,21 @@ request() {
   INFLIGHT="$STATE_DIR/$name.inflight"
   printf '%s\n' "$hash" >"$INFLIGHT"
   # The background prompt must not outlive the launcher (Ctrl-C leaves it running otherwise).
-  trap 'rm -f -- "$INFLIGHT"; stop_prompt' EXIT
+  trap 'code=$?; finish_request "$code"; rm -f -- "$INFLIGHT"; stop_prompt' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   req=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-$kind-$name.XXXXXX.md")
   id=${req##*/}
   id=${id%.md}
-  report="$REPORT_DIR/$id.md"
+  local saved_report="$REPORT_DIR/$id.md" state_tmp
+  report=$saved_report
+  # Print the durable LOCAL path before startup, upload or waiting, not only at completion.
+  echo "# Sidecar report ($saved_report)"
+  ACTIVE_REQUEST="$STATE_DIR/$name.request.json"
+  state_tmp=$(mktemp "$ACTIVE_REQUEST.XXXXXX")
+  jq -n --arg id "$id" --arg report "$saved_report" --argjson started "$(date +%s)" \
+    '{id: $id, report: $report, started: $started}' >"$state_tmp"
+  mv -f -- "$state_tmp" "$ACTIVE_REQUEST"
   prompt_path=$req
   if [[ -n $MACHINE ]]; then
     body+="
@@ -858,17 +895,30 @@ $(remote_notice)"
   await_report "$hname" "$report"
   if report_exists "$report"; then
     question=$(marker_line "${report%.md}.needs-answer")
+    if [[ -n $MACHINE ]]; then
+      # Fetch completely before exposing the local report; a failed transfer must not look complete.
+      local copy
+      copy=$(mktemp "$saved_report.XXXXXX")
+      fetch_file "$report" >"$copy" || { rm -f -- "$copy"; die "could not save report from $MACHINE_LABEL: $report"; }
+      mv -f -- "$copy" "$saved_report"
+      [[ -z $question ]] || printf '%s\n' "$question" >"${saved_report%.md}.needs-answer"
+    fi
+    state_tmp=$(mktemp "$STATE_DIR/$name.report.XXXXXX")
+    printf '%s\n' "$saved_report" >"$state_tmp"
+    mv -f -- "$state_tmp" "$STATE_DIR/$name.report"
     if [[ -n $question ]]; then
       echo "$id" >"$STATE_DIR/$name.pending"
-      echo "NEEDS_ANSWER: $question"
-      echo "# Sidecar report (${MACHINE:+$MACHINE_LABEL:}$report)"
-      fetch_file "$report"
-      echo "sidecar: blocked on a question; reply with: sidecar answer TEXT" >&2
+    else
+      rm -f -- "$STATE_DIR/$name.pending"
+    fi
+    [[ -z $MACHINE ]] || echo "# Sidecar report ($MACHINE_LABEL:$report)"
+    if [[ -n $question ]]; then
+      print_saved_report "$saved_report"
+      echo "sidecar: blocked on a question; reply with: sidecar --slot $SLOT answer TEXT" >&2
       exit 3
     fi
-    rm -f -- "$STATE_DIR/$name.pending"
-    echo "# Sidecar report (${MACHINE:+$MACHINE_LABEL:}$report)"
-    fetch_file "$report"
+    print_saved_report "$saved_report"
+    finish_request 0
     return
   fi
   status=$(agent_status "$hname")
@@ -960,6 +1010,7 @@ cmd_unreviewed() {
 cmd_diff() {
   require_herdr
   local base=${1:-HEAD} id diff root f diff_path repo sha head rel manifest
+  [[ $base != *..* ]] || die "diff takes a single base ref, not a range ($base). Use: sidecar --slot $SLOT diff ${base%%..*} CONTEXT; it reviews that base through the working tree"
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
   root=$(git rev-parse --show-toplevel)
   id="$(date +%Y%m%d-%H%M%S)-$(agent_name)"
@@ -1022,7 +1073,7 @@ cmd_answer() {
   [[ $# -ge 1 ]] || die "usage: sidecar answer TEXT"
   local name prev
   name=$(agent_name)
-  [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question; use sidecar ask or sidecar note"
+  [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question in slot $SLOT; use: sidecar --slot $SLOT ask TEXT for a new request"
   prev=$(<"$STATE_DIR/$name.pending")
   request answer "# Answer from Claude
 
@@ -1156,11 +1207,83 @@ cmd_sync_machine() {
   esac
 }
 
+# Report recovery is entirely local and intentionally does not resolve/deploy a remote runtime.
+require_identity() {
+  [[ -n ${SIDECAR_AGENT:-} || -n ${HERDR_PANE_ID:-} ]] || die "no slot identity; run from the owning herdr pane"
+}
+
+# Older launcher versions saved local reports without a latest-report pointer or printed markers.
+latest_saved_report() {
+  local pointer
+  pointer="$STATE_DIR/$(agent_name).report"
+  if [[ -s $pointer ]]; then
+    head -n 1 "$pointer"
+  else
+    find "$REPORT_DIR" -maxdepth 1 -type f -name "*-$(agent_name).*.md" -printf '%T@ %p\n' |
+      LC_ALL=C sort -nr | cut -d' ' -f2- | awk 'NR == 1'
+  fi
+}
+
+cmd_report() {
+  require_identity
+  [[ $# == 0 ]] || die "usage: sidecar [--slot N] report"
+  local report
+  report=$(latest_saved_report)
+  [[ -n $report ]] || die "no saved report for slot $SLOT; use sidecar --slot $SLOT wait if a request is running"
+  echo "# Sidecar report ($report)"
+  print_saved_report "$report"
+}
+
+cmd_wait() {
+  require_identity
+  [[ $# == 0 ]] || die "usage: sidecar [--slot N] wait (run with run_in_background: true)"
+  local name state report code
+  name=$(agent_name)
+  # The original launcher holds this lock until it has cached its report and finished cleanup.
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  state="$STATE_DIR/$name.request.json"
+  [[ -s $state ]] || die "no request recorded for slot $SLOT; use sidecar --slot $SLOT ask TEXT"
+  report=$(jq -r '.report' "$state")
+  echo "# Sidecar report ($report)"
+  [[ -f $report ]] || die "request ended without a saved report; inspect sidecar --slot $SLOT status and its pane"
+  code=$(jq -r '.exit_code // 1' "$state")
+  [[ $code == 0 || $code == 3 ]] || die "request did not finish normally (exit $code); inspect the pane and recover with sidecar --slot $SLOT report"
+  # Waiting does not count as printing/reading the report. Use `report` to retrieve its contents.
+  return "$code"
+}
+
+age_ago() {
+  local elapsed=$(( $(date +%s) - $1 ))
+  (( elapsed >= 0 )) || elapsed=0
+  if (( elapsed >= 86400 )); then echo "$((elapsed / 86400))d ago"
+  elif (( elapsed >= 3600 )); then echo "$((elapsed / 3600))h ago"
+  elif (( elapsed >= 60 )); then echo "$((elapsed / 60))m ago"
+  else echo "${elapsed}s ago"; fi
+}
+
 cmd_status() {
   require_herdr
-  local name
+  local name state started finished code report printed
   name=$(herdr_agent)
   echo "$name: $(agent_status "$name") (pi session $(pi_session_id))${MACHINE:+ on $MACHINE_LABEL}"
+  state="$STATE_DIR/$(agent_name).request.json"
+  if [[ -s $state ]]; then
+    started=$(jq -r '.started' "$state")
+    finished=$(jq -r '.finished // empty' "$state")
+    code=$(jq -r '.exit_code // empty' "$state")
+    if [[ -n $finished ]]; then
+      echo "request: done $(age_ago "$finished") (exit $code); started $(age_ago "$started")"
+    else
+      echo "request: started $(age_ago "$started"); completion not recorded (use sidecar --slot $SLOT wait)"
+    fi
+  fi
+  report=$(latest_saved_report)
+  if [[ -n $report ]]; then
+    printed=unprinted
+    [[ ! -f ${report%.md}.printed ]] || printed=printed
+    echo "last report $printed: $report"
+  fi
   if [[ $(agent_status "$name") != missing ]] && ! agent_runs_sidecar_session "$name"; then
     echo "$name runs $(agent_session_file "$name"), not the sidecar session; run: sidecar restart" >&2
     return 1
@@ -1204,6 +1327,8 @@ case "${1:-}" in
   reload) shift; cmd_reload "$@" ;;
   sync-machine) shift; cmd_sync_machine "$@" ;;
   status) shift; cmd_status "$@" ;;
+  wait) shift; cmd_wait "$@" ;;
+  report) shift; cmd_report "$@" ;;
   note) shift; cmd_note "$@" ;;
   plan) shift; cmd_plan "$@" ;;
   diff) shift; cmd_diff "$@" ;;

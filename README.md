@@ -38,7 +38,7 @@ Tests use a fake Herdr and isolated home directories; they never start a real mo
 
 ## Blocked questions
 
-A sidecar that cannot continue without a decision submits its report with `needs_answer`. The launcher then prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. Requests have no deadline; a turn that ends without a report exits 2, and a sidecar blocked in its pane exits 5. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.
+A sidecar that cannot continue without a decision submits its report with `needs_answer`. After the first-line report path, the launcher prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. Requests have no deadline; a turn that ends without a report exits 2, and a sidecar blocked in its pane exits 5. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.
 
 ## Reload without interrupting work
 
@@ -71,6 +71,8 @@ The plugin source sets the new model default. An already-running sidecar retains
 
 ## Use the launcher directly
 
+**Notification safety:** run every `ask`, `diff`, `answer` and `steer` as a harness background task (`run_in_background: true` in Claude Code's Bash tool), including idle steering and follow-ups. Do the same for `plan`, `wait` and `reload`. Keep the launcher attached to that task so its completion notification reaches the orchestrator. Shell detachment (`&`, `disown`, `nohup`, `setsid`, or `( … & )`) does **not** produce a harness completion notification; a pane finishing does not wake Claude. Do not discard the task's output or assume a submitted request is finished.
+
 ```bash
 ./scripts/sidecar status
 ./scripts/sidecar note "The user approved the plan in docs/plan.md."
@@ -82,9 +84,19 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar --slot 3 ask "Review lifecycle handling independently."
 ./scripts/sidecar --slot 2 answer "Yes, keep backward compatibility."
 ./scripts/sidecar --slot 4 --machine laptop ask "Run the suite on the laptop."
+./scripts/sidecar --slot 2 wait     # blocking watcher; run as a harness background task
+./scripts/sidecar --slot 2 report   # recover the latest full report
 ```
 
-Commands run against the current working directory. The diff review includes commits since the base, working-tree changes, and untracked files. Requests serialize per slot, while different slots can work concurrently. Slot 1 is the default; each slot retains its own context and pending questions across follow-ups and `/clear`. Sidecars fill Claude's current tab up to four total panes, counting every pane open in it, including Claude's and other Claude panes' sidecars. Each new sidecar halves the largest pane: first left/right, then top/bottom in each column. A full tab sends further sidecars to overflow tabs of up to four panes each; closing a pane frees its room. Reuse slots for later tasks. A blocked reviewer needs human attention in its pane.
+### Completion and report recovery
+
+Every request prints `# Sidecar report (<local path>)` as its **first stdout line**, before starting or waiting for the agent. The full Markdown report is saved at that path, independently of stdout truncation by `head`, `tail`, or the harness. For remote slots, the launcher copies the full report locally before printing its contents; `report` works even when SSH is unavailable. The path is reserved at submission and the file exists only after a report is submitted (and, remotely, copied successfully).
+
+`sidecar --slot N status` shows when the latest request started and finished, its exit code, and the last saved report path with `printed` or `unprinted`. `printed` means the launcher successfully wrote the full report to stdout, **not** that Claude or a person read it; redirected output can still be marked printed. An interrupted launcher may have no recorded finish time.
+
+If a request was already launched without an observable harness task, start `sidecar --slot N wait` with `run_in_background: true`. It blocks on that slot's launcher lock until the active request has finished, then prints its local report path without consuming the report. Exit 0 means report available; exit 3 means a question needs an answer; exit 1 means no request/report or an abnormal launcher exit (inspect the pane). It observes the latest request when it acquires the lock, not future requests or work started directly in the pane. Then run `sidecar --slot N report` to print the latest saved report in full, including any question. `report` exits 0 on successful printing; the original question remains pending until `answer`. These recovery commands use local state and do not start an agent.
+
+Commands run against the current working directory. `diff` takes a **single base ref**, not an `A..B` or `A...B` range. The diff review includes commits since the base, working-tree changes, and untracked files. Requests serialize per slot, while different slots can work concurrently. Slot 1 is the default; each slot retains its own context and pending questions across follow-ups and `/clear`. Sidecars fill Claude's current tab up to four total panes, counting every pane open in it, including Claude's and other Claude panes' sidecars. Each new sidecar halves the largest pane: first left/right, then top/bottom in each column. A full tab sends further sidecars to overflow tabs of up to four panes each; closing a pane frees its room. Reuse slots for later tasks. A blocked reviewer needs human attention in its pane.
 
 Reviewers default to high reasoning. For implementation work, select `--role implementer` on a fresh slot to default to medium reasoning:
 
@@ -139,7 +151,7 @@ For a Windows machine whose OpenSSH shell is `cmd.exe`, use the Node transport. 
 }
 ```
 
-Keys are saved machine labels or IDs; IDs take precedence. The longest matching directory prefix maps the local checkout, including subdirectories. `--remote-cwd` overrides the mapping and accepts Windows drive paths; the slot remembers the chosen directory. A matching checkout must already exist on the machine. This does not clone, reset or synchronize repositories.
+Keys are saved machine labels or IDs; IDs take precedence. The longest matching directory prefix maps the local checkout, including subdirectories. `--remote-cwd` overrides the mapping and accepts Windows drive paths; the slot remembers the chosen directory and cannot be rebound. For another checkout, pick a free slot: `sidecar --slot N --machine NAME --remote-cwd DIR ask TEXT`. A matching checkout must already exist on the machine. This does not clone, reset or synchronize repositories.
 
 The Node transport copies only `sidecar.ts`, `reviewer.md` and `reload.mjs` into the same relative directory, rooted at `C:/` on Windows or the remote home on Linux (for example, `C:/git/claude-sidecar/sidecar` or `~/git/claude-sidecar/sidecar`), updating changed files on each invocation. If the local plugin is outside the local home, the relative directory defaults to `git/claude-sidecar/sidecar`. No plugin checkout or remote launcher dependencies are needed. Optional `home` names a different runtime deployment directory; `SIDECAR_REMOTE_HOME` overrides it. Already-running agents retain their loaded extension. Requests, answers and reports also transfer through Node, so the SSH default shell needs no POSIX commands. Pi's own Bash tool still needs its usual Windows shell setup (such as Git Bash).
 

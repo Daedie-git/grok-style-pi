@@ -7,6 +7,10 @@ description: Second-opinion review by a persistent pi agent in a Herdr pane. Use
 
 Persistent pi agents in Herdr panes review or implement work and remember their own history: notes you sent, past reviews, findings you rejected. No agent starts at Claude startup; the first `note`, `plan`, `diff`, or `ask` starts the selected sidecar. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative.
 
+## Notification safety
+
+Run **every** `ask`, `diff`, `answer` and `steer` with the Bash tool's `run_in_background: true`, including follow-ups and idle steering. Use the same harness background mode for `plan`, `wait` and `reload`. The harness completion notice is what wakes you when work finishes. Keep the launcher attached to that task: shell `&`, `disown`, `( … & )`, `nohup` and `setsid` produce no harness completion notification. Preserve its output, including question exit codes, and handle every completion.
+
 ## Parallel sidecars
 
 Use `--slot N` before the command to select an independent persistent sidecar (default `1`). Assign a different slot to each concurrent task and keep that slot for its notes, follow-ups, status checks and answers. Each slot has separate context, reports, pending questions and request locks; requests to the same slot serialize. Reuse existing slots after their work finishes.
@@ -21,7 +25,7 @@ For implementation tasks, select a fresh slot with `--role implementer` before `
 
 `--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for implementers, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). It returns reports by writing a file, and the slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there; `SIDECAR_CLAUDE_PERMISSION_MODE=bypassPermissions` lets it work unattended). It cannot be reloaded, and a busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
 
-Run independent requests with `run_in_background: true`. Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. Herdr fills Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus.
+Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. Herdr fills Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus.
 
 ## Sidecars on another machine
 
@@ -82,7 +86,7 @@ After every real implementation, before you report it done, run an **adversarial
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" diff <base> "Intent of the change and anything non-obvious"
 ```
 
-`<base>` is the commit the work started from (`HEAD` when all of it is uncommitted). The review covers commits since base, uncommitted changes, and untracked files. After committing or pushing, pass the pre-work commit as `<base>`; use `diff`, not `ask`, so the sidecar receives the diff.
+`<base>` is a single ref for the commit the work started from (`HEAD` when all of it is uncommitted), not an `A..B` or `A...B` range. The review covers commits since base, uncommitted changes, and untracked files. After committing or pushing, pass the pre-work commit as `<base>`; use `diff`, not `ask`, so the sidecar receives the diff.
 
 The sidecar reproduces each finding and quotes the command and output; it marks the rest `unverified`. A long request prints a status line to stderr every minute (`SIDECAR_PROGRESS_S`, `0` disables it). Before you report done or push, run `sidecar unreviewed`: it lists files changed since the last diff review and exits 1 if there are any. Send those back through `diff`.
 
@@ -92,7 +96,7 @@ When the review targets a GitLab/GitHub merge request, post each confirmed findi
 
 ## Handle the report
 
-The report prints on completion. Every finding is a claim to verify, not an instruction:
+The command's first stdout line is `# Sidecar report (<local path>)`, printed before the wait; the full Markdown report is saved there and prints on completion. Remote reports are copied locally before printing. If output was truncated, run `sidecar --slot N report` to recover the latest saved report in full, including any question, even without SSH. This exits 0 after printing; it does not answer or clear a pending question. Every finding is a claim to verify, not an instruction:
 
 1. Check each finding against the code. Mark it **confirmed** or **rejected** with the reason.
 2. Fix the confirmed ones.
@@ -103,11 +107,13 @@ Done when every finding is confirmed-and-fixed or rejected-with-reason, and the 
 
 ## Long-running requests
 
-`plan`, `diff`, `ask` and `answer` wait without a deadline until the sidecar submits its report, so an implementation task that takes hours is one command. Run every request with the Bash tool's `run_in_background: true` and let its completion notice wake you. Never detach it yourself with `&`, `( … &)`, `nohup` or `setsid`, and never redirect its output to `/dev/null`: the harness then cannot notify you, and the report or question goes unseen. If the sidecar's turn ends without a report (an aborted turn or failed context compaction), the command exits 2 with the pane's recent output within seconds; send the task again with `ask`.
+`plan`, `diff`, `ask`, `answer` and idle `steer` wait without a deadline until the sidecar submits its report, so an implementation task that takes hours is one harness background task. If an earlier launcher was detached or its completion notification was lost, run `sidecar --slot N wait` with `run_in_background: true` to restore an observable completion. It blocks until the slot's launcher releases its request lock, then prints the saved report path: exit 0 report available, 3 question pending, 1 no saved report or abnormal launcher exit. It observes the latest request when it gets the lock, not future requests or work started directly in the pane. Follow it with `sidecar --slot N report` to read the full result.
+
+`sidecar --slot N status` shows the latest request's start/finish ages and exit code, plus the last report path and `printed`/`unprinted`. `printed` only confirms stdout accepted the full report, not that you or the user read it; truncation or redirection can hide printed reports. If the sidecar's turn ends without a report (an aborted turn or failed context compaction), the original command exits 2 with the pane's recent output within seconds; send the task again with `ask`.
 
 ## Questions from the sidecar
 
-When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` first, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot N answer "<decision and constraints>"` using the requesting sidecar's slot; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
+When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` after its first-line report path, then its report, and exits with code 3 (a background run's completion notice shows this exit code). Decide, or ask the user, then reply with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot N answer "<decision and constraints>"` using the requesting sidecar's slot; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
 
 ## When it misbehaves
 

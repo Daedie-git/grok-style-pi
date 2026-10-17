@@ -6,7 +6,7 @@ The default model is `openai-codex/gpt-6.1-sol` with `high` thinking. pi needs a
 
 ## Requirements
 
-- Linux, Bash, Git, jq, and util-linux (`flock`).
+- Linux with Bash, Git, jq, and util-linux (`flock`), or Windows with Git Bash, Node.js, jq, and a Git-Bash-compatible `flock` on `PATH`.
 - Claude Code with plugin support.
 - Herdr with `pane` and `agent` commands on `PATH`; start interactive Claude inside a Herdr pane.
 - pi (`@earendil-works/pi-coding-agent`) on `PATH`, authenticated with the model provider.
@@ -32,6 +32,14 @@ claude plugin validate .claude-plugin/marketplace.json
 
 Tests use a fake Herdr and isolated home directories; they never start a real model session.
 
+## Windows hosts
+
+Windows pi sidecars use an in-process file channel instead of Herdr terminal prompt submission and agent-status detection. Herdr on Windows can report a working pi as idle and leave submitted text in the editor. The extension accepts requests directly, records delivery, and reports final settlement (including retries and compaction); the launcher waits for the report while retaining the slot lock. Busy steering uses this same channel and does not create another request. Linux sidecars keep their existing transport.
+
+The launcher verifies the native pi PID and `--session-id` through Herdr's `pane process-info`, then matches the extension's live owner record. It never trusts an agent name alone. Missing/stale receivers fail explicitly, and native jq's CRLF output is normalized. Requests use native Windows paths. Remote Windows pi slots use this adaptation with the Node transport too.
+
+After updating, run `sidecar --slot N reload` as a harness background task for each existing Windows pi sidecar. For the first upgrade from an older extension, run it once the sidecar is idle: that one bootstrap still uses Herdr and may time out if work is active. Subsequent reloads wait through the native channel for the current operation to become idle, then start the confirmation deadline; they do not interrupt work. New sidecars load the channel automatically. If reload cannot be confirmed, inspect the pane before retrying. Claude Code sidecars still use Herdr's terminal transport; this adaptation targets pi.
+
 ## Claude Code agents
 
 `sidecar --slot N --agent claude ask ...` starts a persistent Claude Code agent in a Herdr pane instead of pi. It uses `--session-id` on first start and `--resume` afterwards, `--effort` from the slot's role, and `SIDECAR_CLAUDE_MODEL` (default `opus` for reviewers, `sonnet` for implementers). The agent has no `submit_review` tool: requests tell it to write the report (and `.needs-answer` question) under `~/.cache/claude-sidecar/reports`, so exit codes 0 to 5 behave as for pi. With `--machine`, the agent runs in that machine's Herdr like a remote pi, and Claude Code there must be logged in. Limits: `reload` and busy-path `steer` are pi-only. The permission mode comes from the machine's Claude settings, so an approval prompt shows as exit 5; `SIDECAR_CLAUDE_PERMISSION_MODE` (for example `bypassPermissions`) passes `--permission-mode` at start. The `SessionStart` hook skips sessions named `claude-sidecar`, so these agents never start sidecars.
@@ -47,6 +55,8 @@ A sidecar that cannot continue without a decision submits its report with `needs
 Run it in the background like a request. Exit 0 confirms the fresh runtime; exit 1 means it was refused or not confirmed. `SIDECAR_RELOAD_TIMEOUT_S` (default 30) bounds confirmation **after** the request has finished, not the active task. On timeout, inspect the pane before retrying; reload might have started. A foreign or blocked session is not reloaded. This loads Pi's reloadable resources, not a new Pi executable or changed startup flags. The command never interrupts work to make a hung request finish.
 
 ## Steering a sidecar
+
+On Windows pi sidecars, busy steering uses the verified native channel described in [Windows hosts](#windows-hosts), without the grok-style-pi dependency. The inbox details in this section apply to Linux sidecars.
 
 If the slot is idle and its request lock is free, `steer TEXT` behaves like `ask TEXT`: it creates a request, waits without a deadline, and prints the submitted report. No steering extension is needed for this path. Its exit codes are the request codes: 0 report, 1 failure, 2 no report, 3 decision needed, 4 duplicate in flight, 5 approval blocked. A missing sidecar still needs `ask` or `start` first. If a request already owns the slot, steering stays on the busy path even during gaps between its turns.
 
@@ -153,7 +163,7 @@ For a Windows machine whose OpenSSH shell is `cmd.exe`, use the Node transport. 
 
 Keys are saved machine labels or IDs; IDs take precedence. The longest matching directory prefix maps the local checkout, including subdirectories. `--remote-cwd` overrides the mapping and accepts Windows drive paths; the slot remembers the chosen directory and cannot be rebound. For another checkout, pick a free slot: `sidecar --slot N --machine NAME --remote-cwd DIR ask TEXT`. A matching checkout must already exist on the machine. This does not clone, reset or synchronize repositories.
 
-The Node transport copies only `sidecar.ts`, `reviewer.md` and `reload.mjs` into the same relative directory, rooted at `C:/` on Windows or the remote home on Linux (for example, `C:/git/claude-sidecar/sidecar` or `~/git/claude-sidecar/sidecar`), updating changed files on each invocation. If the local plugin is outside the local home, the relative directory defaults to `git/claude-sidecar/sidecar`. No plugin checkout or remote launcher dependencies are needed. Optional `home` names a different runtime deployment directory; `SIDECAR_REMOTE_HOME` overrides it. Already-running agents retain their loaded extension. Requests, answers and reports also transfer through Node, so the SSH default shell needs no POSIX commands. Pi's own Bash tool still needs its usual Windows shell setup (such as Git Bash).
+The Node transport copies only `sidecar.ts`, `reviewer.md`, `reload.mjs` and `windows-runtime.mjs` into the same relative directory, rooted at `C:/` on Windows or the remote home on Linux (for example, `C:/git/claude-sidecar/sidecar` or `~/git/claude-sidecar/sidecar`), updating changed files on each invocation. If the local plugin is outside the local home, the relative directory defaults to `git/claude-sidecar/sidecar`. No plugin checkout or remote launcher dependencies are needed. Optional `home` names a different runtime deployment directory; `SIDECAR_REMOTE_HOME` overrides it. Already-running agents retain their loaded extension. Requests, answers and reports also transfer through Node, so the SSH default shell needs no POSIX commands. Pi's own Bash tool still needs its usual Windows shell setup (such as Git Bash).
 
 From a mapped checkout, start a new slot with `./scripts/sidecar --slot 2 --machine lappy ask "Run the tests there."`; follow-ups need only `--slot 2`. This transport has been smoke-tested with pi in a Windows Herdr pane, including tool execution, report delivery and answering a pending question.
 

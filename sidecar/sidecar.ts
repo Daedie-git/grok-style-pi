@@ -3,16 +3,19 @@
 // the alternate screen, where herdr cannot read it back.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { installReloadControl } from "./reload.mjs";
+import { installWindowsControl } from "./windows-runtime.mjs";
 
 const stateDir = join(homedir(), ".cache", "claude-sidecar");
 const reportDir = join(stateDir, "reports");
 
 export default function (pi: ExtensionAPI) {
   installReloadControl(pi, stateDir);
+  if (process.platform === "win32") installWindowsControl(pi, stateDir);
   pi.registerTool({
     name: "submit_review",
     label: "Submit review to Claude",
@@ -32,9 +35,13 @@ export default function (pi: ExtensionAPI) {
       if (!/^[A-Za-z0-9._-]+$/.test(params.request_id)) throw new Error(`invalid request_id: ${params.request_id}`);
       await mkdir(reportDir, { recursive: true });
       const path = join(reportDir, `${params.request_id}.md`);
-      await writeFile(path, params.report);
       const marker = join(reportDir, `${params.request_id}.needs-answer`);
       if (params.needs_answer?.trim()) await writeFile(marker, params.needs_answer.replace(/\s+/g, " ").trim() + "\n");
+      else await rm(marker, { force: true });
+      // The report's appearance is the completion signal. Publish only after its question marker and full body.
+      const temporary = `${path}.${randomUUID()}.tmp`;
+      try { await writeFile(temporary, params.report); await rename(temporary, path); }
+      finally { await rm(temporary, { force: true }); }
       return { content: [{ type: "text", text: `Delivered to Claude (${path}).` }], details: undefined };
     },
   });

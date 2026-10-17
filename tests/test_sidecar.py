@@ -65,6 +65,14 @@ elif args[:2] == ['pane', 'list']:
     print(json.dumps({'result': {'panes': [pane_info(p) for p in panes]}}))
 elif args[:2] == ['pane', 'get']:
     print(json.dumps({'result': {'pane': pane_info(find(args[2]))}}))
+elif args[:2] == ['pane', 'process-info']:
+    pane = args[args.index('--pane') + 1]
+    states = [json.loads(p.read_text()) for p in state_dir.glob('*.agent.json')]
+    states += [json.loads((state_dir / 'agent.json').read_text())] if (state_dir / 'agent.json').exists() else []
+    current = next(s for s in states if s.get('pane_id') == pane)
+    session = current['agent_session']['value'].split('time_', 1)[1][:-6]
+    print(json.dumps({'result': {'process_info': {'foreground_processes': [
+        {'pid': current['native_pid'], 'argv': ['node', 'pi', '--session-id', session]}]}}}))
 elif args[:2] in (['pane', 'split'], ['tab', 'create']):
     # Herdr never reuses a closed pane's ID.
     counter_path = state_dir / 'pane-counter'
@@ -107,8 +115,45 @@ elif args[:2] == ['agent', 'start']:
     target['agent'] = kind
     panes_path.write_text(json.dumps(panes))
     session = args[args.index('--session-id' if '--session-id' in args else '--resume') + 1]
+    record = {'agent': kind, 'agent_status': 'idle', 'pane_id': target['pane_id'],
+              'agent_session': {'value': '/tmp/time_' + session + '.jsonl'}}
+    if os.environ.get('FAKE_WINDOWS_CONTROL'):
+        import subprocess
+        runtime = pathlib.Path(args[args.index('-e') + 1]).with_name('windows-runtime.mjs')
+        source = r"""
+        const fs=require('node:fs'),path=require('node:path');
+        (async()=>{
+          const {installWindowsControl}=await import(require('node:url').pathToFileURL(process.argv[1]));
+          const handlers=new Map(),state=path.join(process.env.HOME,'.cache/claude-sidecar');
+          const session=process.argv[2],noReport=process.env.FAKE_NO_REPORT;
+          const pi={on:(e,h)=>handlers.set(e,h),sendMessage:message=>{
+            setTimeout(()=>{
+              handlers.get('message_end')({message:{role:'custom',...message}});
+              setTimeout(()=>{
+                const id=message.content.match(/\[request ([^\]]+)\]/)?.[1];
+                if(id&&!noReport){
+                  fs.mkdirSync(path.join(state,'reports'),{recursive:true});
+                  if(process.env.FAKE_QUESTION)fs.writeFileSync(path.join(state,'reports',id+'.needs-answer'),process.env.FAKE_QUESTION);
+                  fs.writeFileSync(path.join(state,'reports',id+'.md'),'## Verdict\nWindows ship\n');
+                }
+                handlers.get('agent_settled')({});
+              },Number(process.env.HERDR_PROMPT_DELAY||'0')*1000);
+            },0);
+          }};
+          installWindowsControl(pi,state);
+          handlers.get('session_start')({}, {sessionManager:{getSessionId:()=>session,getSessionFile:()=>'/tmp/time_'+session+'.jsonl'},
+            isIdle:()=>true,hasPendingMessages:()=>false,ui:{notify:()=>{}}});
+          setInterval(()=>{},1000);
+        })().catch(e=>{console.error(e);process.exit(1)});
+        """
+        child = subprocess.Popen(['node', '-e', source, str(runtime), session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        record['native_pid'] = child.pid
+        for _ in range(100):
+            if (data_home / '.cache/claude-sidecar/windows' / session / 'owner.json').exists():
+                break
+            time.sleep(.05)
     with state_path.open('x') as output:
-        json.dump({'agent': kind, 'agent_status': 'idle', 'agent_session': {'value': '/tmp/time_' + session + '.jsonl'}}, output)
+        json.dump(record, output)
 elif args[:2] == ['agent', 'wait']:
     while state_path.exists() and json.loads(state_path.read_text())['agent_status'] == 'working':
         time.sleep(0.05)
@@ -234,6 +279,66 @@ class LauncherTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.communicate()
+
+    def windows_env(self, **extra):
+        for name, source in {'uname': '#!/bin/sh\necho MINGW64_NT\n',
+                             'cygpath': '#!/bin/sh\nprintf "%s\\n" "$2"\n'}.items():
+            file = self.home / 'bin' / name
+            file.write_text(source)
+            file.chmod(0o755)
+        def stop_runtimes():
+            for file in self.home.glob('*.json'):
+                try:
+                    pid = json.loads(file.read_text()).get('native_pid')
+                    if pid:
+                        os.kill(pid, signal.SIGTERM)
+                except (ValueError, AttributeError, ProcessLookupError):
+                    pass
+        self.addCleanup(stop_runtimes)
+        return dict(self.env, FAKE_WINDOWS_CONTROL='1', **extra)
+
+    def test_windows_request_does_not_use_herdr_prompt_or_wait_and_returns_its_report(self):
+        result = self.run_cli('ask', 'Windows task', env=self.windows_env(HERDR_PROMPT_DELAY='0.5'))
+        self.assertIn('Windows ship', result.stdout)
+        self.assertFalse(any(c[:2] in (['agent', 'prompt'], ['agent', 'wait']) for c in self.calls()))
+
+    def test_windows_request_lock_keeps_busy_steering_on_the_original_request(self):
+        env = self.windows_env(HERDR_PROMPT_DELAY='3')
+        process = subprocess.Popen([str(self.launcher), 'ask', 'Original'], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        try:
+            directory = self.home / '.cache/claude-sidecar/windows/cc-pane-pane-1'
+            deadline = time.monotonic() + 10
+            while not list(directory.glob('*.ack')):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            duplicate = self.run_cli('ask', 'Original', env=env, check=False)
+            self.assertEqual(duplicate.returncode, 4, duplicate.stderr)
+            steered = self.run_cli('steer', 'New direction', env=env)
+            self.assertNotIn('# Sidecar report', steered.stdout)
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertIn('Windows ship', stdout)
+            self.assertEqual(len(list((self.home / '.cache/claude-sidecar/requests').glob('*.md'))), 1)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_windows_true_settlement_without_report_returns_exit_2(self):
+        result = self.run_cli('ask', 'No report', env=self.windows_env(FAKE_NO_REPORT='1'), check=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('no report submitted', result.stderr)
+
+    def test_windows_question_and_report_recovery_preserve_exit_3(self):
+        env = self.windows_env(FAKE_QUESTION='Which version?')
+        result = self.run_cli('ask', 'Question', env=env, check=False)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('NEEDS_ANSWER: Which version?', result.stdout)
+        self.assertIn('Windows ship', self.run_cli('report', env=env).stdout)
+
+    def test_windows_control_unit_tests(self):
+        subprocess.run(['node', '--test', str(ROOT / 'tests/test_windows.mjs')], check=True, capture_output=True)
 
     def test_start_default_and_idempotency(self):
         self.run_cli('start')

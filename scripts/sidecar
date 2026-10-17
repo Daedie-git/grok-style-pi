@@ -52,6 +52,13 @@ REMOTE_TRANSPORT='sh'
 # The directory sidecar panes open in: here, or its counterpart on the machine.
 WORK_DIR=$PWD
 RESOLVED=
+HOST_WINDOWS=
+case $(uname -s) in MINGW*|MSYS*|CYGWIN*) HOST_WINDOWS=1 ;; esac
+TARGET_WINDOWS=$HOST_WINDOWS
+# Native jq emits CRLF; strip only the record-ending CR, not escaped JSON string content.
+if [[ -n $HOST_WINDOWS ]]; then
+  jq() { command jq "$@" | sed 's/\r$//'; }
+fi
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 
 die() { echo "sidecar: $*" >&2; exit 1; }
@@ -59,6 +66,10 @@ die() { echo "sidecar: $*" >&2; exit 1; }
 # Every command that talks to herdr starts here, so the target machine is resolved once before any herdr call.
 require_herdr() {
   [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || die "not running inside a herdr pane"
+  local dependency
+  for dependency in herdr jq flock; do
+    type -P "$dependency" >/dev/null || die "missing dependency $dependency; install it on PATH before using sidecar"
+  done
   [[ -n $RESOLVED ]] || resolve_machine
   resolve_role
   resolve_backend
@@ -201,6 +212,7 @@ resolve_machine() {
   fi
   id=$(jq -r '.id' <<<"$record")
   MACHINE=$id
+  TARGET_WINDOWS=
   MACHINE_LABEL=$(jq -r '.label' <<<"$record")
   MACHINE_TARGET=$(jq -r '.target' <<<"$record")
   [[ -n $MACHINE_TARGET ]] || die "herdr machine '$MACHINE_LABEL' has no SSH target"
@@ -225,12 +237,13 @@ resolve_machine() {
     info=$(remote_node 'const home=os.homedir().replace(/\\/g,"/");
       if(!fs.existsSync(args[0]) || !fs.statSync(args[0]).isDirectory()) process.exit(12);
       const root=os.platform()==="win32" ? "C:/" : home+"/";
-      console.log(JSON.stringify({home,agentHome:args[1] || root+args[2]}));' "$WORK_DIR" "$AGENT_HOME" "$runtime_relative" </dev/null) || die "cannot access checkout $WORK_DIR on $MACHINE_LABEL; check SSH, Node and the machine path mapping"
+      console.log(JSON.stringify({home,windows:os.platform()==="win32",agentHome:args[1] || root+args[2]}));' "$WORK_DIR" "$AGENT_HOME" "$runtime_relative" </dev/null) || die "cannot access checkout $WORK_DIR on $MACHINE_LABEL; check SSH, Node and the machine path mapping"
     AGENT_HOME=$(jq -r '.agentHome' <<<"$info")
+    [[ $(jq -r '.windows' <<<"$info") != true ]] || TARGET_WINDOWS=1
     REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
-    # Deploy only the two runtime files, not a checkout or any credentials. Do not rewrite unchanged files.
+    # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files.
     local runtime_file
-    for runtime_file in sidecar.ts reviewer.md reload.mjs; do
+    for runtime_file in sidecar.ts reviewer.md reload.mjs windows-runtime.mjs; do
       remote_node 'const dest=args[0],data=fs.readFileSync(0);fs.mkdirSync(path.dirname(dest),{recursive:true});
         if(!fs.existsSync(dest)||!fs.readFileSync(dest).equals(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
     done
@@ -334,9 +347,35 @@ pi_session_id() {
   fi
 }
 
+# Verify the actual Windows pane process, not a name reused by a restored bare pi.
+windows_pid() {
+  local pane processes
+  pane=$(hd agent get "$1" | jq -er '.result.agent | select(.agent == "pi") | .pane_id') || return 1
+  processes=$(hd pane process-info --pane "$pane") || return 1
+  jq -er --arg session "$(pi_session_id)" '
+    [.result.process_info.foreground_processes[] | select(
+      .argv as $a | any(range(0; ($a | length) - 1); $a[.] == "--session-id" and $a[. + 1] == $session)) | .pid]
+    | if length == 1 then .[0] else empty end' <<<"$processes"
+}
+
+windows_control() {
+  local action=$1 text=${2:-} report=${3:-} request_id=${4:-} pid options
+  pid=$(windows_pid "$(herdr_agent)") || die "cannot verify the Windows pi process in this Herdr pane; nothing was sent"
+  if [[ -z $MACHINE && -n $report ]]; then report=$(cygpath -m "$report"); fi
+  options=$(jq -cn --arg action "$action" --arg session "$(pi_session_id)" --argjson pid "$pid" \
+    --arg report "$report" --arg requestId "$request_id" --argjson progress "$PROGRESS_S" \
+    '{action:$action,session:$session,pid:$pid,report:$report,requestId:$requestId,progress:$progress}')
+  # Both code and arbitrarily long text travel on stdin, including through cmd.exe SSH shells.
+  { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } |
+    run_node 'eval(fs.readFileSync(0,"utf8"));' "$options"
+}
+
 agent_status() {
-  local status
+  local status runtime
   status=$(hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null) || true
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi && -n $status ]]; then
+    if runtime=$(windows_control status 2>/dev/null); then status=$(jq -r '.status' <<<"$runtime"); else status=unknown; fi
+  fi
   echo "${status:-missing}"
 }
 
@@ -348,6 +387,10 @@ agent_session_file() {
 # (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
 agent_runs_sidecar_session() {
   local session attempt
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    windows_pid "$1" >/dev/null 2>&1
+    return
+  fi
   # Herdr publishes no session file for Claude Code agents; the name and the agent kind are the identity.
   if [[ $BACKEND == claude ]]; then
     [[ $(hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent // empty' 2>/dev/null) == claude ]]
@@ -363,11 +406,6 @@ agent_runs_sidecar_session() {
     fi
     sleep 0.5
   done
-  # Herdr builds that never publish pi session files (0.9.5 on Windows) leave the field out entirely: the agent
-  # name the launcher gave the pane is then the only identity available.
-  if ! hd agent get "$1" 2>/dev/null | jq -e '.result.agent | has("agent_session")' >/dev/null 2>&1; then
-    return 0
-  fi
   # Still unpublished after the wait: treat as not ours so a bare relaunched pi gets restarted.
   return 1
 }
@@ -488,7 +526,7 @@ cmd_reload() {
   require_herdr
   [[ $# == 0 ]] || die "usage: sidecar reload"
   [[ $BACKEND != claude ]] || die "reload applies to pi sidecars only; use restart"
-  local name hname session session_file dir id mode
+  local name hname session session_file dir id mode native_reload=
   name=$(agent_name)
   hname=$(herdr_agent)
   # Keep the existing ask's launcher and report channel intact: it releases this lock only after reading its report.
@@ -496,11 +534,27 @@ cmd_reload() {
   flock 9
   [[ $(agent_status "$hname") != missing ]] || die "no running sidecar to reload; use start first"
   agent_runs_sidecar_session "$hname" || die "$hname does not run this sidecar session; use restart first"
-  wait_until_ready "$hname"
   session=$(pi_session_id)
-  session_file=$(agent_session_file "$hname")
-  [[ -n $session_file ]] || die "cannot verify the sidecar session file for reload"
   dir="${REMOTE_STATE:-$STATE_DIR}/reload"
+  if [[ -n $TARGET_WINDOWS ]]; then
+    local pid
+    pid=$(windows_pid "$hname") || die "cannot verify the Windows process for reload"
+    if windows_control status >/dev/null 2>&1; then
+      windows_control wait
+      native_reload=1
+    else
+      echo "sidecar: upgrading an older Windows runtime through Herdr; if it is busy, retry reload once its work finishes" >&2
+    fi
+    if [[ -z $MACHINE ]]; then dir=$(cygpath -m "$dir"); fi
+    # Older Windows runtimes already publish reload receipts. Verify against the pane's actual native PID.
+    session_file=$(run_node 'const ready=JSON.parse(fs.readFileSync(path.join(args[0],args[1]+".ready"),"utf8"));
+      if(ready.pid!==Number(args[2]))throw Error("reload receiver is not the process in this pane");
+      console.log(ready.sessionFile);' "$dir" "$session" "$pid" </dev/null) || die "cannot verify the Windows reload receiver"
+  else
+    wait_until_ready "$hname"
+    session_file=$(agent_session_file "$hname")
+  fi
+  [[ -n $session_file ]] || die "cannot verify the sidecar session file for reload"
   id="reload-$(date +%s)-$$-$RANDOM"
   mode=$(run_node 'const norm=s=>{s=String(s||"").replace(/\\/g,"/");return /^[A-Za-z]:/.test(s)?s.toLowerCase():s};
     if(!/^[A-Za-z0-9._-]+$/.test(args[1]))throw Error("invalid session id");
@@ -512,7 +566,9 @@ cmd_reload() {
     console.log(live&&norm(ready.sessionFile)===norm(args[3])?"command":"bootstrap");' "$dir" "$session" "$id" "$session_file" </dev/null)
   # Built-in /reload bootstraps old runtime versions after the same idle/request guard. New versions additionally
   # wait through compaction/preparation with documented ExtensionCommandContext.waitForIdle().
-  if [[ $mode == command ]]; then
+  if [[ $mode == command && -n $native_reload ]]; then
+    windows_control reload "/sidecar-reload $id" >/dev/null
+  elif [[ $mode == command ]]; then
     hd agent prompt "$hname" "/sidecar-reload $id" >/dev/null || true
   else
     hd agent prompt "$hname" "/reload" >/dev/null || true
@@ -646,7 +702,7 @@ cmd_session_start() {
   [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || exit 0
   local dependency
   for dependency in herdr pi jq flock; do
-    if ! command -v "$dependency" >/dev/null 2>&1; then
+    if ! type -P "$dependency" >/dev/null 2>&1; then
       echo "sidecar: missing dependency $dependency; skipping startup" >&2
       exit 0
     fi
@@ -704,6 +760,13 @@ machine_guidance() {
 # Wait until the sidecar can take a prompt; the human may be talking to it.
 wait_until_ready() {
   local name=$1 status
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    if [[ $(agent_status "$name") == missing ]]; then cmd_start >&2; fi
+    # The request lock serializes requests. The native channel can queue behind an existing turn safely.
+    status=$(windows_control status) || return $?
+    [[ $(jq -r '.status' <<<"$status") != blocked ]] || die "$name is blocked in its pane"
+    return
+  fi
   status=$(agent_status "$name")
   if [[ $status == missing ]]; then
     cmd_start >&2
@@ -738,7 +801,11 @@ cmd_note() {
   exec 9>"$STATE_DIR/$name.lock"
   flock 9
   wait_until_ready "$hname"
-  send "$hname" "[note] $*" "$NOTE_TIMEOUT_MS"
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    windows_control note "[note] $*"
+  else
+    send "$hname" "[note] $*" "$NOTE_TIMEOUT_MS"
+  fi
   echo "noted"
 }
 
@@ -774,7 +841,7 @@ hd_detached() {
 stop_prompt() {
   [[ -n $PROMPT_PID ]] || return 0
   # The prompt runs as the leader of its own session, so one signal reaches the whole client tree.
-  kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true
+  if command -v setsid >/dev/null 2>&1; then kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true; fi
   kill "$PROMPT_PID" 2>/dev/null || true
 }
 
@@ -896,11 +963,18 @@ $(remote_notice)"
   if [[ $BACKEND == claude ]]; then
     finish="Finish by writing your report to $report with the Write tool; for a blocking question, first write it to ${report%.md}.needs-answer."
   fi
-  hd_detached agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" --wait >/dev/null 9>&- &
-  PROMPT_PID=$!
-  wait_with_progress "$PROMPT_PID" "$hname" "$id"
-  PROMPT_PID=
-  await_report "$hname" "$report"
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    if [[ -z $MACHINE ]]; then prompt_path=$(cygpath -m "$prompt_path"); fi
+    local result=0
+    windows_control request "[request $id] Read $prompt_path and do what it asks. $finish" "$report" "$id" || result=$?
+    [[ $result == 0 || $result == 2 ]] || exit "$result"
+  else
+    hd_detached agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" --wait >/dev/null 9>&- &
+    PROMPT_PID=$!
+    wait_with_progress "$PROMPT_PID" "$hname" "$id"
+    PROMPT_PID=
+    await_report "$hname" "$report"
+  fi
   if report_exists "$report"; then
     question=$(marker_line "${report%.md}.needs-answer")
     if [[ -n $MACHINE ]]; then
@@ -1126,6 +1200,10 @@ $*" held
     exec 9>&-
   fi
   [[ $BACKEND != claude ]] || die "a busy claude sidecar cannot be steered; wait for its report, then ask"
+  if [[ -n $TARGET_WINDOWS ]]; then
+    windows_control steer "[steer from Claude] $*"
+    return
+  fi
   session=$(pi_session_id)
   # Herdr can publish a new pi's session file late (notably on Windows); the owner check needs it.
   for ((attempt = 0; attempt < 10; attempt++)); do

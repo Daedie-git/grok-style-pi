@@ -1,4 +1,5 @@
 // Evaluated by run_node, locally or over SSH. `args[0]` is JSON; `text` arrives on stdin with this program.
+let completedReport = () => false;
 (async () => {
   const options = JSON.parse(args[0]);
   const dir = path.join(os.homedir(), '.cache', 'claude-sidecar', 'windows', options.session);
@@ -7,7 +8,19 @@
     try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
   };
-  const fail = (message, code = 1) => { console.error(`sidecar: ${message}`); process.exit(code); };
+  let submitted = false;
+  const reportReady = () => {
+    if (!submitted || !options.report) return false;
+    try { return fs.statSync(options.report).isFile(); }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  };
+  completedReport = reportReady;
+  const fail = (message, code = 1) => {
+    // A report may appear between the loop's check and a receiver-liveness failure.
+    // Once submitted, its atomic publication takes precedence over shutdown, reload or cancellation.
+    if (reportReady()) process.exit(0);
+    console.error(`sidecar: ${message}`); process.exit(code);
+  };
   const owner = read(path.join(dir, 'owner.json'));
   if (!owner || owner.pid !== options.pid) {
     fail('Windows control receiver does not match the process in this Herdr pane; reload the sidecar extension in its pane before retrying (nothing was sent)');
@@ -46,10 +59,16 @@
   ack = path.join(dir, `${id}.ack`);
   fs.writeFileSync(tmp, JSON.stringify({ token: owner.token, text, action: options.action }));
   fs.renameSync(tmp, file);
+  submitted = true;
   const start = Date.now();
   const timeout = options.timeout || 10000;
   let accepted = false, nextProgress = start + options.progress * 1000;
   while (true) {
+    // After submission the report is authoritative, even if the publishing runtime has already shut down.
+    if (reportReady()) {
+      fs.rmSync(ack, { force: true });
+      return;
+    }
     const receipt = read(ack);
     // Reload may already have replaced the old owner; this receipt confirms only command submission.
     if (options.action === 'reload' && receipt?.token === owner.token && receipt.status === 'accepted') {
@@ -59,14 +78,10 @@
     const state = check();
     if (receipt && receipt.token !== owner.token) fail('Windows delivery receipt belongs to another process');
     if (receipt?.status === 'rejected') fail(receipt.reason);
+    if (receipt?.status === 'aborted') fail(receipt.reason, 6);
     accepted ||= ['accepted', 'seen', 'settled'].includes(receipt?.status);
     if (accepted && options.action === 'steer') {
       console.log(receipt.status === 'accepted' ? 'queued: Windows sidecar accepted the steering message' : 'steered: delivered into the Windows sidecar conversation');
-      fs.rmSync(ack, { force: true });
-      return;
-    }
-    // The report is the completion contract, independent of Herdr's status or the turn's final chat text.
-    if (options.report && fs.existsSync(options.report)) {
       fs.rmSync(ack, { force: true });
       return;
     }
@@ -88,4 +103,10 @@
     }
     await sleep(250);
   }
-})().catch(error => { console.error(`sidecar: Windows control failed: ${error}`); process.exit(1); });
+})().catch(error => {
+  // Filesystem exceptions (including Windows sharing violations) must obey the same report priority.
+  let complete = false;
+  try { complete = completedReport(); } catch { /* If the report itself cannot be verified, keep the original error. */ }
+  if (complete) process.exit(0);
+  console.error(`sidecar: Windows control failed: ${error}`); process.exit(1);
+});

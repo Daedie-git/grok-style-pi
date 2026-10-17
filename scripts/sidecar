@@ -123,6 +123,11 @@ hd() {
 
 shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
 
+# Replace a background subshell with the client so its PID remains directly cancellable, including in Git Bash.
+exec_detached() {
+  if command -v setsid >/dev/null 2>&1; then exec setsid "$@"; else exec "$@"; fi
+}
+
 # Runs a POSIX sh script on the machine; SCRIPT sees ARGS as $1... Everything is quoted, so any path is safe. SSH
 # never prompts (BatchMode) and drops silent connections. Exit status 255 is SSH's own failure. Reads this shell's stdin.
 remote() {
@@ -140,7 +145,9 @@ remote_node() {
   shift
   args=$(jq -cn --args '$ARGS.positional' "$@")
   encoded=$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script" | base64 -w0)
-  ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "node -e \"eval(Buffer.from('$encoded','base64').toString())\""
+  local invoke=()
+  [[ ${NODE_DETACH:-} != 1 ]] || invoke=(exec_detached)
+  "${invoke[@]}" ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "node -e \"eval(Buffer.from('$encoded','base64').toString())\""
 }
 
 # Execute the same Node program locally or through the existing Windows-safe remote transport.
@@ -149,7 +156,9 @@ run_node() {
   local script=$1 args
   shift
   args=$(jq -cn --args '$ARGS.positional' "$@")
-  node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script")"
+  local invoke=()
+  [[ ${NODE_DETACH:-} != 1 ]] || invoke=(exec_detached)
+  "${invoke[@]}" node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script")"
 }
 
 # Saved herdr machines as a JSON array; fails on herdr older than 0.9 or when herdr does not answer in time.
@@ -365,9 +374,30 @@ windows_control() {
   options=$(jq -cn --arg action "$action" --arg session "$(pi_session_id)" --argjson pid "$pid" \
     --arg report "$report" --arg requestId "$request_id" --argjson progress "$PROGRESS_S" \
     '{action:$action,session:$session,pid:$pid,report:$report,requestId:$requestId,progress:$progress}')
-  # Both code and arbitrarily long text travel on stdin, including through cmd.exe SSH shells.
-  { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } |
-    run_node 'eval(fs.readFileSync(0,"utf8"));' "$options"
+  # Status is a short-lived probe; blocking operations must use Bash's interruptible wait builtin.
+  if [[ $action == status ]]; then
+    { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } |
+      run_node 'eval(fs.readFileSync(0,"utf8"));' "$options"
+    return
+  fi
+  # Install operation cleanup only after admission/slot locks have been acquired. Trapping TERM before a
+  # foreground flock would defer cancellation of lock-waiting commands until another request finished.
+  if [[ -z $ACTIVE_REQUEST ]]; then
+    trap 'stop_prompt' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+  # Feed code/text on stdin without a foreground pipeline that would defer the launcher's signal traps.
+  CONTROL_PROGRAM=$(mktemp "$STATE_DIR/windows-control.XXXXXX")
+  { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } >"$CONTROL_PROGRAM"
+  NODE_DETACH=1 run_node 'eval(fs.readFileSync(0,"utf8"));' "$options" <"$CONTROL_PROGRAM" 9>&- &
+  PROMPT_PID=$!
+  local result=0
+  wait "$PROMPT_PID" || result=$?
+  PROMPT_PID=
+  rm -f -- "$CONTROL_PROGRAM"
+  CONTROL_PROGRAM=
+  return "$result"
 }
 
 agent_status() {
@@ -829,20 +859,21 @@ await_report() {
 }
 
 PROMPT_PID=
-# Like hd, but replaces the (background) subshell with herdr in a new session: its pid is then the group to signal.
+CONTROL_PROGRAM=
+# Like hd, but replaces the background subshell with the directly cancellable client.
 hd_detached() {
-  # Git Bash on Windows has no setsid; herdr then stays in this subshell's group and stop_prompt signals its pid.
-  local detach=(setsid)
-  command -v setsid >/dev/null 2>&1 || detach=()
-  if [[ -n $MACHINE ]]; then exec "${detach[@]}" herdr --machine "$MACHINE" "$@"; else exec "${detach[@]}" herdr "$@"; fi
+  if [[ -n $MACHINE ]]; then exec_detached herdr --machine "$MACHINE" "$@"; else exec_detached herdr "$@"; fi
 }
 
 # shellcheck disable=SC2329  # run from the EXIT trap
 stop_prompt() {
-  [[ -n $PROMPT_PID ]] || return 0
-  # The prompt runs as the leader of its own session, so one signal reaches the whole client tree.
-  if command -v setsid >/dev/null 2>&1; then kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true; fi
-  kill "$PROMPT_PID" 2>/dev/null || true
+  if [[ -n $PROMPT_PID ]]; then
+    # Signal the client group only when setsid created one. Git Bash needs only the exec'd native client PID.
+    if command -v setsid >/dev/null 2>&1; then kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true; fi
+    kill "$PROMPT_PID" 2>/dev/null || true
+    wait "$PROMPT_PID" 2>/dev/null || true
+  fi
+  [[ -z $CONTROL_PROGRAM ]] || rm -f -- "$CONTROL_PROGRAM"
 }
 
 # Waits for the background prompt PID. A request can run for hours, so every PROGRESS_S seconds it prints how long

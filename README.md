@@ -38,6 +38,8 @@ Windows pi sidecars use an in-process file channel instead of Herdr terminal pro
 
 The launcher verifies the native pi PID and `--session-id` through Herdr's `pane process-info`, then matches the extension's live owner record. It never trusts an agent name alone. Missing/stale receivers fail explicitly, and native jq's CRLF output is normalized. Requests use native Windows paths. Remote Windows pi slots use this adaptation with the Node transport too.
 
+An aborted turn can discard a message that Windows pi accepted but had not yet delivered. Its waiter exits 6 (delivery unconfirmed; inspect the pane before resending), and that message no longer keeps the slot busy. Cancelling the launcher stops its local waiting client and releases the slot lock; it does not abort the sidecar's model turn. A fully published report takes precedence over a subsequent runtime shutdown or reload.
+
 After updating, run `sidecar --slot N reload` as a harness background task for each existing Windows pi sidecar. For the first upgrade from an older extension, run it once the sidecar is idle: that one bootstrap still uses Herdr and may time out if work is active. Subsequent reloads wait through the native channel for the current operation to become idle, then start the confirmation deadline; they do not interrupt work. New sidecars load the channel automatically. If reload cannot be confirmed, inspect the pane before retrying. Claude Code sidecars still use Herdr's terminal transport; this adaptation targets pi.
 
 ## Claude Code agents

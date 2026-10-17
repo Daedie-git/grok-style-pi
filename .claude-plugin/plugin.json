@@ -1,6 +1,6 @@
 {
   "name": "claude-sidecar",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Persistent second-opinion reviews from a pi agent alongside Claude Code in Herdr.",
   "author": { "name": "Daedie-git" },
   "repository": "https://github.com/Daedie-git/claude-sidecar",

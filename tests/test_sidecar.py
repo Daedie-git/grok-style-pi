@@ -325,6 +325,37 @@ class LauncherTests(unittest.TestCase):
                 process.kill()
                 process.communicate()
 
+    def test_windows_cancellation_releases_request_and_note_locks(self):
+        env = self.windows_env(HERDR_PROMPT_DELAY='30')
+        directory = self.home / '.cache/claude-sidecar/windows/cc-pane-pane-1'
+        for command in ('ask', 'note'):
+            with self.subTest(command=command):
+                previous = len(list(directory.glob('*.ack')))
+                process = subprocess.Popen([str(self.launcher), command, 'Long Windows task'], text=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                try:
+                    deadline = time.monotonic() + 10
+                    while len(list(directory.glob('*.ack'))) <= previous:
+                        self.assertIsNone(process.poll(), 'launcher exited before delivery')
+                        self.assertLess(time.monotonic(), deadline, 'request was not delivered')
+                        time.sleep(.05)
+                    process.send_signal(signal.SIGTERM)
+                    _, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 143, stderr)
+                    state = self.home / '.cache/claude-sidecar'
+                    self.assertFalse((state / 'sc-pane-1.inflight').exists())
+                    self.assertEqual(list(state.glob('windows-control.*')), [])
+                    if command == 'ask':
+                        request = json.loads((state / 'sc-pane-1.request.json').read_text())
+                        self.assertEqual(request['exit_code'], 143)
+                        self.assertIn('finished', request)
+                    lock = subprocess.run(['flock', '-n', str(state / 'sc-pane-1.lock'), 'true'], env=env)
+                    self.assertEqual(lock.returncode, 0, 'client must not retain the slot lock after cancellation')
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+
     def test_windows_true_settlement_without_report_returns_exit_2(self):
         result = self.run_cli('ask', 'No report', env=self.windows_env(FAKE_NO_REPORT='1'), check=False)
         self.assertEqual(result.returncode, 2, result.stderr)

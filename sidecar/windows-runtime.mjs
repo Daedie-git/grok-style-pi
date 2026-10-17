@@ -121,10 +121,17 @@ export function installWindowsControl(pi, stateDir) {
     receipt(id, { status: 'seen' });
   });
   // agent_end is too early: retries, compaction and queued continuations can still run afterward.
-  pi.on('agent_settled', () => {
+  pi.on('agent_settled', event => {
     for (const [id, message] of pending) {
-      if (!message.seen) continue;
-      receipt(id, { status: 'settled' });
+      if (!message.seen) {
+        // Escape can discard queued custom messages before aborted settlement, so they must not keep us busy.
+        // The public API cannot prove whether an unseen custom message was cleared or retained by another abort
+        // path. End its waiter with an unknown-delivery outcome, never a claim that resending is safe.
+        if (!event.aborted || ctx.hasPendingMessages()) continue;
+        receipt(id, { status: 'aborted', reason: 'turn aborted before sidecar delivery was confirmed; inspect the pane before resending' });
+      } else {
+        receipt(id, { status: 'settled' });
+      }
       pending.delete(id);
     }
     status = pending.size || ctx.hasPendingMessages() ? 'working' : 'idle';

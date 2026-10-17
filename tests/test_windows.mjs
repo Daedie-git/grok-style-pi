@@ -29,9 +29,9 @@ function fixture(t) {
   const seen = index => emit('message_end', { message: { role: 'custom', ...messages[index].message } });
   const read = file => JSON.parse(fs.readFileSync(join(dir, file), 'utf8'));
   t.after(() => { emit('session_shutdown'); fs.rmSync(home, { recursive: true, force: true }); });
-  function run(action, overrides = {}, text = 'request text') {
+  function run(action, overrides = {}, text = 'request text', beforeClient = '') {
     const options = { action, session: 'cc-test', pid: process.pid, progress: 0, ...overrides };
-    const source = `const fs=require('node:fs'),path=require('node:path'),os=require('node:os');const args=${JSON.stringify([JSON.stringify(options)])};const text=${JSON.stringify(text)};\n${client}`;
+    const source = `const fs=require('node:fs'),path=require('node:path'),os=require('node:os');const args=${JSON.stringify([JSON.stringify(options)])};const text=${JSON.stringify(text)};\n${beforeClient}\n${client}`;
     const child = spawn(process.execPath, ['-e', source], { env: { ...process.env, HOME: home, USERPROFILE: home } });
     let stdout = '', stderr = '';
     child.stdout.on('data', data => stdout += data);
@@ -86,6 +86,102 @@ test('Windows true settlement without a report returns exit 2, but unconsumed qu
   f.emit('agent_settled');
   assert.equal((await operation.done).code, 2);
   assert.equal(f.read('status.json').status, 'idle');
+});
+
+test('aborting discarded unseen requests and notes releases their waiters and the reload idle guard', { timeout: 5000 }, async t => {
+  const f = fixture(t);
+  for (const action of ['request', 'note']) {
+    const index = f.messages.length;
+    const operation = f.run(action);
+    await until(() => f.messages.length === index + 1);
+    // Pi's Escape path clears queued custom messages before emitting aborted settlement.
+    f.emit('agent_settled', { aborted: true });
+    const result = await operation.done;
+    assert.equal(result.code, 6, result.stderr);
+    assert.match(result.stderr, /aborted.*before.*confirmed/);
+    assert.match(result.stderr, /before resending/);
+    assert.equal(f.read('status.json').status, 'idle');
+    assert.equal((await f.run('wait').done).code, 0);
+  }
+});
+
+test('aborting an already acknowledged queued steer does not leave the runtime busy', async t => {
+  const f = fixture(t);
+  const steer = f.run('steer');
+  await until(() => f.messages.length === 1);
+  assert.equal((await steer.done).code, 0);
+  f.emit('agent_settled', { aborted: true });
+  assert.equal(f.read('status.json').status, 'idle');
+  assert.equal((await f.run('wait').done).code, 0);
+});
+
+test('aborted settlement preserves unseen messages when Pi still has queued work', async t => {
+  const f = fixture(t);
+  const operation = f.run('request');
+  await until(() => f.messages.length === 1);
+  f.ctx.hasPendingMessages = () => true;
+  f.emit('agent_settled', { aborted: true });
+  await sleep(300);
+  assert.equal(operation.child.exitCode, null);
+  assert.equal(f.read('status.json').status, 'working');
+  f.ctx.hasPendingMessages = () => false;
+  f.seen(0);
+  f.emit('agent_settled');
+  assert.equal((await operation.done).code, 2);
+});
+
+test('a completed report survives immediate runtime shutdown or replacement', async t => {
+  const f = fixture(t);
+  for (const event of ['session_shutdown', 'session_start']) {
+    if (event === 'session_start') f.emit('session_start');
+    const report = join(f.home, `${event}.md`), index = f.messages.length;
+    const operation = f.run('request', { report });
+    await until(() => f.messages.length === index + 1);
+    fs.writeFileSync(report, 'complete report');
+    f.emit(event);
+    const result = await operation.done;
+    assert.equal(result.code, 0, result.stderr);
+  }
+});
+
+test('a report published during the liveness check also takes precedence over shutdown', async t => {
+  const f = fixture(t), report = join(f.home, 'raced-report.md');
+  const beforeClient = `const originalRead=fs.readFileSync;
+    fs.readFileSync=function(file,...rest){
+      if(String(file)===${JSON.stringify(join(f.dir, 'owner.json'))} && fs.readdirSync(${JSON.stringify(f.dir)}).some(f=>f.endsWith('.inbox'))){
+        fs.writeFileSync(${JSON.stringify(report)},'complete raced report');
+        fs.rmSync(file,{force:true});
+      }
+      return originalRead.call(fs,file,...rest);
+    };`;
+  const result = await f.run('request', { report }, 'request text', beforeClient).done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(fs.readFileSync(report, 'utf8'), 'complete raced report');
+});
+
+test('a completed report also wins over a thrown Windows sharing violation during liveness checks', async t => {
+  const f = fixture(t), report = join(f.home, 'sharing-raced-report.md');
+  const beforeClient = `const originalRead=fs.readFileSync;
+    fs.readFileSync=function(file,...rest){
+      if(String(file)===${JSON.stringify(join(f.dir, 'owner.json'))} && fs.readdirSync(${JSON.stringify(f.dir)}).some(f=>f.endsWith('.inbox'))){
+        fs.writeFileSync(${JSON.stringify(report)},'complete report before EBUSY');
+        throw Object.assign(Error('Windows sharing violation'),{code:'EBUSY'});
+      }
+      return originalRead.call(fs,file,...rest);
+    };`;
+  const result = await f.run('request', { report }, 'request text', beforeClient).done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(fs.readFileSync(report, 'utf8'), 'complete report before EBUSY');
+});
+
+test('ownership loss without a report still fails instead of claiming completion', async t => {
+  const f = fixture(t);
+  const operation = f.run('request');
+  await until(() => f.messages.length === 1);
+  f.emit('session_shutdown');
+  const result = await operation.done;
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /owner changed|heartbeat is missing or stale/);
 });
 
 test('Windows note waits for actual settlement and status comes from the runtime', async t => {
@@ -185,7 +281,7 @@ test('Windows atomic records retry transient sharing violations without exposing
   assert.equal(f.read('status.json').status, 'working');
 });
 
-test('native Windows Git Bash launcher completes through the runtime without terminal prompts', { skip: process.platform !== 'win32' }, async t => {
+function nativeLauncherFixture(t) {
   const bash = 'C:/Program Files/Git/bin/bash.exe';
   if (!fs.existsSync(bash) || spawnSync(bash, ['-c', 'type -P jq >/dev/null && type -P flock >/dev/null']).status !== 0) {
     t.skip('Git Bash with jq and flock is required for the launcher integration test');
@@ -203,25 +299,101 @@ test('native Windows Git Bash launcher completes through the runtime without ter
     else {console.error('unexpected Herdr terminal operation: '+a);process.exit(1)}
     console.log(JSON.stringify({result}));`);
   fs.writeFileSync(join(f.home, 'bin', 'herdr'), `#!/usr/bin/env bash\nexec node '${stub.replace(/\\/g, '/')}' "$@"\n`);
+  const node = process.execPath.replace(/\\/g, '/');
+  fs.writeFileSync(join(f.home, 'bin', 'node'), `#!/usr/bin/env bash
+    if [[ $1 == -e && $2 == *'eval(fs.readFileSync(0'* ]]; then
+      program=$2; shift 2
+      exec '${node}' -e "require('node:fs').writeFileSync(process.env.CONTROL_PID_FILE,String(process.pid));$program" "$@"
+    fi
+    exec '${node}' "$@"
+`);
   const launcher = fileURLToPath(new URL('../scripts/sidecar', import.meta.url));
-  const child = spawn(bash, ['-c', 'export HOME="$(cygpath -u "$1")"; export PATH="$HOME/bin:$PATH"; exec bash "$2" ask "Native Windows fixture"', '--', f.home, launcher],
-    { env: { ...process.env, USERPROFILE: f.home, HERDR_ENV: '1', HERDR_PANE_ID: 'fixture:p1', SIDECAR_AGENT: 'sc-windows-test' } });
+  const child = spawn(bash, ['-c', 'export HOME="$(cygpath -u "$1")"; export PATH="$HOME/bin:$PATH"; printf "%s\\n" "$$" > "$HOME/launcher.pid"; exec bash "$2" ask "Native Windows fixture"', '--', f.home, launcher],
+    { env: { ...process.env, USERPROFILE: f.home, HERDR_ENV: '1', HERDR_PANE_ID: 'fixture:p1', SIDECAR_AGENT: 'sc-windows-test',
+      SIDECAR_PI_SESSION: '', SIDECAR_MACHINE: '', CONTROL_PID_FILE: join(f.home, 'client.pid') } });
   let stdout = '', stderr = '';
   child.stdout.on('data', data => stdout += data);
   child.stderr.on('data', data => stderr += data);
   t.after(() => { if (child.exitCode === null) child.kill(); });
   const done = new Promise(resolve => child.on('exit', code => resolve(code)));
-  for (let end = Date.now() + 30000; Date.now() < end && !f.messages.length && child.exitCode === null;) await sleep(50);
-  assert.equal(child.exitCode, null, stderr);
-  assert.equal(f.messages.length, 1, `No native delivery. stdout: ${stdout}; stderr: ${stderr}`);
+  const waitForMessage = async () => {
+    for (let end = Date.now() + 30000; Date.now() < end && !f.messages.length && child.exitCode === null;) await sleep(50);
+    assert.equal(child.exitCode, null, stderr);
+    assert.equal(f.messages.length, 1, `No native delivery. stdout: ${stdout}; stderr: ${stderr}`);
+  };
+  const publishReport = () => {
+    const id = f.messages[0].message.content.match(/\[request ([^\]]+)\]/)[1];
+    fs.mkdirSync(join(f.state, 'reports'), { recursive: true });
+    fs.writeFileSync(join(f.state, 'reports', `${id}.md`), 'Native Windows report received\n');
+  };
+  return { ...f, bash, child, done, waitForMessage, publishReport, output: () => ({ stdout, stderr }) };
+}
+
+test('native Windows Git Bash launcher completes through the runtime without terminal prompts', { skip: process.platform !== 'win32' }, async t => {
+  const f = nativeLauncherFixture(t);
+  if (!f) return;
+  await f.waitForMessage();
   f.seen(0);
-  const id = f.messages[0].message.content.match(/\[request ([^\]]+)\]/)[1];
-  fs.mkdirSync(join(f.state, 'reports'), { recursive: true });
-  fs.writeFileSync(join(f.state, 'reports', `${id}.md`), 'Native Windows report received\n');
+  f.publishReport();
   f.emit('agent_settled');
-  assert.equal(await done, 0, stderr);
-  assert.match(stdout, /Native Windows report received/);
+  assert.equal(await f.done, 0, f.output().stderr);
+  assert.match(f.output().stdout, /Native Windows report received/);
   assert.match(f.messages[0].message.content, /Read [A-Za-z]:\//);
+});
+
+test('native Windows SIGTERM cancels the launcher promptly, reaps its client, and releases the slot', { skip: process.platform !== 'win32' }, async t => {
+  const f = nativeLauncherFixture(t);
+  if (!f) return;
+  await f.waitForMessage();
+  const clientPid = Number(fs.readFileSync(join(f.home, 'client.pid'), 'utf8'));
+  const launcherPid = fs.readFileSync(join(f.home, 'launcher.pid'), 'utf8').trim();
+  // Node.kill() uses TerminateProcess; send an actual MSYS signal to exercise Bash's trapped SIGTERM instead.
+  const signal = spawnSync(f.bash, ['-c', 'kill -TERM "$1"', '--', launcherPid]);
+  assert.equal(signal.status, 0, signal.stderr.toString());
+  await Promise.race([f.done, sleep(8000)]);
+  const cancelledPromptly = f.child.exitCode !== null;
+  // If a regression defers TERM, release the old foreground wait so the failed test still cleans up its child.
+  if (!cancelledPromptly) { f.publishReport(); await f.done; }
+  assert.equal(cancelledPromptly, true, f.output().stderr);
+  assert.equal(f.child.exitCode, 143, f.output().stderr);
+  const request = JSON.parse(fs.readFileSync(join(f.state, 'sc-windows-test.request.json'), 'utf8'));
+  assert.equal(request.exit_code, 143);
+  assert.ok(request.finished);
+  assert.equal(fs.existsSync(join(f.state, 'sc-windows-test.inflight')), false);
+  assert.equal(fs.readdirSync(f.state).filter(name => name.startsWith('windows-control.')).length, 0);
+  assert.throws(() => process.kill(clientPid, 0), /ESRCH/);
+  const lock = spawnSync(f.bash, ['-c', 'exec 9>"$(cygpath -u "$1")"; flock -n 9', '--', join(f.state, 'sc-windows-test.lock')]);
+  assert.equal(lock.status, 0, lock.stderr.toString());
+});
+
+test('native Windows lock-waiting launcher remains cancellable before admission', { skip: process.platform !== 'win32' }, async t => {
+  const bash = 'C:/Program Files/Git/bin/bash.exe';
+  if (!fs.existsSync(bash) || spawnSync(bash, ['-c', 'type -P flock >/dev/null']).status !== 0) {
+    t.skip('Git Bash with flock is required for the launcher lock test');
+    return;
+  }
+  const f = fixture(t), lockPath = join(f.state, 'sc-windows-test.lock');
+  const holder = spawn(bash, ['-c', 'exec 9>"$(cygpath -u "$1")"; flock 9; echo locked; read -r release', '--', lockPath]);
+  let held = '';
+  holder.stdout.on('data', data => held += data);
+  const unlocked = new Promise(resolve => holder.on('exit', resolve));
+  t.after(() => { if (holder.exitCode === null) holder.kill(); });
+  await until(() => held.includes('locked'));
+  const launcher = fileURLToPath(new URL('../scripts/sidecar', import.meta.url));
+  const child = spawn(bash, ['-c', 'export HOME="$(cygpath -u "$1")"; printf "%s\\n" "$$" > "$HOME/lock-launcher.pid"; exec bash "$2" wait', '--', f.home, launcher],
+    { env: { ...process.env, USERPROFILE: f.home, SIDECAR_AGENT: 'sc-windows-test' } });
+  const done = new Promise(resolve => child.on('exit', resolve));
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  await until(() => fs.existsSync(join(f.home, 'lock-launcher.pid')));
+  await sleep(350); // Let the launcher block in foreground flock.
+  const pid = fs.readFileSync(join(f.home, 'lock-launcher.pid'), 'utf8').trim();
+  assert.equal(spawnSync(bash, ['-c', 'kill -TERM "$1"', '--', pid]).status, 0);
+  await Promise.race([done, sleep(3000)]);
+  const cancelledBeforeUnlock = child.exitCode !== null;
+  holder.stdin.end('release\n');
+  await unlocked;
+  await done;
+  assert.equal(cancelledBeforeUnlock, true, 'TERM must not wait for the original request to release its slot');
 });
 
 test('Windows reloading replaces its runtime token and does not retain watchers', t => {

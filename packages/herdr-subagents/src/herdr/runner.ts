@@ -303,7 +303,6 @@ export class HerdrRunner {
 		check(signal);
 		const claude = request.runtime === "claude-code";
 		if (claude && this.machine) throw new Error("Claude Code subagents currently support local Herdr panes only.");
-		if (claude && process.platform === "win32") throw new Error("Claude Code subagents currently require Linux or macOS.");
 		if (claude && request.inheritContext) throw new Error("Claude Code cannot inherit a Pi session. Provide context in prompt.");
 		if (claude && (!this.deps.client.startClaude || !this.deps.client.promptAgent)) throw new Error("The Herdr client does not support Claude Code launches.");
 		if (!request.paneId) throw new Error("Not inside a Herdr pane, so no subagent pane can be opened.");

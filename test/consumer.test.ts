@@ -82,6 +82,7 @@ test("consumer loads the shipped factory and wires public APIs", async () => {
 
 test("default export factory registers real create*Tool diamond overrides", async () => {
 	const registered: Array<Record<string, unknown>> = [];
+	const commands: string[] = [];
 	let start: Function | undefined;
 	await grokStylePi({
 		on(event: string, handler: Function) {
@@ -90,8 +91,10 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 		registerTool(tool: Record<string, unknown>) {
 			const index = registered.findIndex((entry) => entry.name === tool.name); if (index >= 0) registered[index] = tool; else registered.push(tool);
 		},
+		registerCommand(name: string) { commands.push(name); },
 	} as any);
 
+	assert.equal(commands.filter(name => name === "fast").length, 1);
 	assert.ok(start, "session_start handler should be registered");
 	// Pi rebuilds history before session_start during /reload. Capture the
 	// definition at that point, as the transcript component does.

@@ -50,14 +50,13 @@ export function claudeTools(tools: string[]): string[] {
 	}))];
 }
 
-function quote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
-
 /** Native interactive Claude; no permission bypass, print-mode subprocess, or transcript scraping. */
 export function claudeArgs(task: HerdrTask, sessionId: string, root: string): string[] {
-	const command = [process.execPath, fileURLToPath(new URL("./claude-hook-entry.mjs", import.meta.url)), root, task.id].map(quote).join(" ");
+	// Exec-form hooks bypass Bash/PowerShell and preserve native paths, spaces, and shell metacharacters.
+	const hookArgs = [fileURLToPath(new URL("./claude-hook-entry.mjs", import.meta.url)), root, task.id];
 	const hooks = Object.fromEntries([
 		"UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop", "StopFailure", "SessionEnd", "Notification",
-	].map((event) => [event, [{ hooks: [{ type: "command", command, timeout: 10 }] }]]));
+	].map((event) => [event, [{ hooks: [{ type: "command", command: process.execPath, args: hookArgs, timeout: 10 }] }]]));
 	const args = ["--session-id", sessionId, "--settings", JSON.stringify({ hooks }), "--name", task.id];
 	if (task.model) args.push("--model", task.model);
 	if (task.thinking) args.push("--effort", task.thinking);

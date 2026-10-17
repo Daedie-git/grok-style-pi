@@ -10,7 +10,7 @@ import type { HerdrClient } from "../src/herdr/client.ts";
 import { HerdrRunner, type SpawnRequest } from "../src/herdr/runner.ts";
 
 function fixture(t: TestContext, extra: Partial<HerdrClient> = {}) {
-	const root = mkdtempSync(join(tmpdir(), "herdr-claude-"));
+	const root = mkdtempSync(join(tmpdir(), "herdr-claude space-'$`&-é-"));
 	const live = new Map<string, string>();
 	const prompts: string[] = [];
 	const starts: string[][] = [];
@@ -192,7 +192,12 @@ test("Claude tool selection maps built-ins without granting permission bypass", 
 	assert.ok(args.includes("--strict-mcp-config"));
 	assert.ok(!args.includes("--allowedTools"));
 	const hooks = JSON.parse(args[args.indexOf("--settings") + 1]).hooks;
-	assert.match(hooks.Stop[0].hooks[0].command, /claude-hook-entry.mjs/);
+	const entry = fileURLToPath(new URL("../src/herdr/claude-hook-entry.mjs", import.meta.url));
+	for (const event of Object.keys(hooks)) {
+		assert.deepEqual(hooks[event][0].hooks, [{
+			type: "command", command: process.execPath, args: [entry, "/state path/'quoted", "agent"], timeout: 10,
+		}], `${event} must launch Node directly, without a shell or embedded quotes`);
+	}
 });
 
 test("Claude launch arguments carry multiline instructions only through task submission", async (t) => {
@@ -341,15 +346,22 @@ test("Native Claude agents cannot clear each other's approvals or settle the mai
 	assert.equal((await f.runner.read(ref)).result, "Main result");
 });
 
-test("Standalone Claude hook entry communicates through the real SQLite worker", async (t) => {
+test("Generated exec-form Claude hooks communicate through SQLite with native paths and shell metacharacters", async (t) => {
 	const f = fixture(t);
 	const ref = await f.runner.spawn(f.request);
 	const record = await f.runner.resolve(ref.agentId);
-	const entry = fileURLToPath(new URL("../src/herdr/claude-hook-entry.mjs", import.meta.url));
-	for (const [event, data] of [["UserPromptSubmit", { prompt: f.prompts[0] }], ["Stop", { last_assistant_message: "Entry result" }]] as const) {
-		const result = spawnSync(process.execPath, [entry, f.root, record.id], { input: JSON.stringify({ session_id: record.sessionId, hook_event_name: event, ...data }), encoding: "utf8", timeout: 15_000 });
+	const hooks = JSON.parse(f.starts[0][f.starts[0].indexOf("--settings") + 1]).hooks;
+	const invoke = (event: string, data: Record<string, unknown>) => {
+		const hook = hooks[event][0].hooks[0];
+		return spawnSync(hook.command, hook.args, { input: JSON.stringify({ session_id: record.sessionId, hook_event_name: event, ...data }), encoding: "utf8", timeout: 15_000 });
+	};
+	for (const [event, data] of [["UserPromptSubmit", { prompt: f.prompts[0] }], ["Stop", { last_assistant_message: "Entry result é" }]] as const) {
+		const result = invoke(event, data);
 		assert.equal(result.status, 0, result.stderr);
 		assert.equal(result.stdout, "");
 	}
-	assert.equal((await f.runner.read(ref)).result, "Entry result");
+	assert.equal((await f.runner.read(ref)).result, "Entry result é");
+	const stale = invoke("UserPromptSubmit", { prompt: f.prompts[0] });
+	assert.equal(stale.status, 0, stale.stderr);
+	assert.equal(JSON.parse(stale.stdout).decision, "block", "exec form preserves fail-closed input decisions");
 });

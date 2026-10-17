@@ -101,7 +101,7 @@ The grayscale values follow Grok Build's GrokNight implementation: Markdown body
 
 Our blue accent overrides remain a customization: Grok Build's source also uses teal/purple headings and mixed syntax colors. Pi exposes a single heading color, while Grok Build styles heading levels separately. Run `/reload` after editing the palette. Terminal colors are applied at session startup before file-link setup and tool settings are loaded, with one full redraw to repaint unchanged rows. With terminal colors disabled, plain assistant prose and editor input inherit your terminal's colors. In fullscreen mode, a Node process warning triggers a full repaint so its raw stderr text cannot remain over an unchanged composer or footer; the warning also appears as a Pi notification. This does not suppress host warnings, and the listener is removed on shutdown or reload. On Node 22, database and visual workers suppress the specific `UNDICI-EHPA` proxy-agent startup notice, which otherwise writes into Pi before worker JavaScript runs. Proxy behavior and unrelated diagnostics remain unchanged. Pi controls Markdown list markers (dashes), selection rendering, and transcript spacing; this extension does not replace those renderers.
 
-The footer shows context and allowance only for the selected model. Other providers are omitted, and their refresh stops on model change. With the `/fast` extension installed, GPT models on `openai` or `openai-codex` also show an accent-colored `Fast: on` while priority processing is requested, or `Fast: off` in the footer's default color otherwise. The indicator disappears when a non-GPT model is selected; it does not confirm that the server granted priority processing.
+The footer shows context and allowance only for the selected model. Other providers are omitted, and their refresh stops on model change. GPT models on `openai` or `openai-codex` also show an accent-colored `Fast: on` while the included `/fast` command requests priority processing, or `Fast: off` in the footer's default color otherwise. The indicator disappears when a non-GPT model is selected; it does not confirm that the server granted priority processing.
 
 Context uses this Pi session's estimated token count and the selected model's context-window limit (for example, `Context 24,800/200,000 used`). Unknown counts show `?`, including after compaction until usage becomes available again.
 
@@ -112,6 +112,14 @@ For `xai`, that is this Pi session's context and allowance remaining (`Weekly N%
 For Codex and xAI logins, the footer appends `Account <email or name>` after usage. If the login token provides neither, it shows the account ID instead. Identity refreshes at startup, on model changes, and once per minute using the existing Pi login, without extra account endpoint requests. API keys and logins without a readable identity omit this item. On narrow terminals, the account is shortened first and dropped when fewer than 12 columns remain, so the path and model stay visible.
 
 Any other model shows this Pi session's context token counts and no subscription line.
+
+## Fast mode
+
+Both full entrypoints (`extensions/index.ts` and `integrations/subagents.ts`) include the same `/fast` command on Windows, Linux, and macOS. No separate extension is needed. Disable any previous standalone `/fast` extension or package to avoid duplicate command registrations; media-only and standalone Herdr installations do not include this command.
+
+Use `/fast on` to request priority processing, `/fast off` to stop requesting it, `/fast status` to inspect the setting, or `/fast` to toggle it. New sessions default to off. The choice is saved in the active session branch and restored on reload, resume, fork, and tree navigation, including previously saved `openai-fast` entries. Turning Grok's visual features off does not change this setting.
+
+Fast mode adds `service_tier: "priority"` only to GPT requests on the `openai` and `openai-codex` providers. It does not change the model or transport, and other providers and model families are unaffected. Switching away from a supported model hides the footer indicator without forgetting the setting. Priority service is requested, not guaranteed, and may increase cost or usage. `/fast off` leaves the provider's normal request defaults unchanged.
 
 ## Diamond interaction
 

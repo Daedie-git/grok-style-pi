@@ -54,11 +54,11 @@ Tasks are submitted with `herdr agent prompt`. Per-session Claude command hooks 
 - Agent-file prompts and tool lists carry over; `find` and `ls` map to `Glob`. Lists restrict tool availability, not permission approval, and disable extra MCP tools and slash commands.
 - `resume` reuses the same Claude conversation without changing runtimes. Live steering, interactive `max_turns`, and context inheritance are unsupported.
 - Cancellation closes the owned pane and confirms closure before reporting `stopped`; a cancelled Claude instance cannot resume.
-- Only local Linux/macOS panes are supported. Remote machines and Windows are rejected before pane creation. Keep the parent Pi session open for follow-ups and cancellation.
+- Local Windows, Linux, and macOS panes are supported. Remote machines are rejected before pane creation. Keep the parent Pi session open for follow-ups and cancellation.
 
 Existing user/project hooks remain active. Avoid Stop hooks that continue a response after this runner records its result. Manually interrupting Claude without closing its pane does not emit a Stop hook; close the pane or cancel through the runner to settle the run.
 
-The bridge uses documented [Claude command hooks](https://code.claude.com/docs/en/hooks): `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolBatch`, `Stop`, `StopFailure`, and `SessionEnd`. It uses Stop's `last_assistant_message`, not potentially lagging transcript files. Claude Code 2.1.285 is the development reference; older versions without these hooks cannot reliably report results.
+The bridge uses documented [Claude command hooks](https://code.claude.com/docs/en/hooks): `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolBatch`, `Stop`, `StopFailure`, and `SessionEnd`. Hooks use exec form (`command` plus `args`) to launch Node directly, without Bash or PowerShell quoting, including for Windows paths containing spaces. It uses Stop's `last_assistant_message`, not potentially lagging transcript files. Claude Code 2.1.301 is the development reference; older versions without these hooks and exec-form support cannot reliably report results.
 
 ## Remote machines
 

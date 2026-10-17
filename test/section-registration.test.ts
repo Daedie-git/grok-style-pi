@@ -88,8 +88,9 @@ test("either runner shares the installed core, with one chrome lifecycle and opt
 			};
 			await loadSubagentExtension(h.pi, env, { current: factory("current"), herdr: factory("herdr") }, features.toolStyling, runtime.styleTool);
 			assert.deepEqual(runners, [env.HERDR_ENV ? "herdr" : "current"]);
-			assert.equal(h.handlers.get("session_start")!.length, enabled ? 3 : 2); // chrome + steering, plus shared media when styled
+			assert.equal(h.handlers.get("session_start")!.length, enabled ? 4 : 3); // chrome + fast mode + steering, plus shared media when styled
 			assert.equal(h.commands.filter(name => name === "grok-style").length, 1);
+			assert.equal(h.commands.filter(name => name === "fast").length, 1);
 			assert.equal(constructed, enabled ? 1 : 0);
 			assert.equal(executed, enabled ? 1 : 0);
 			assert.equal(h.tools.has("codemode"), enabled);
@@ -97,7 +98,7 @@ test("either runner shares the installed core, with one chrome lifecycle and opt
 			assert.equal(h.tools.get("steer_subagent").renderShell, enabled ? "self" : undefined);
 			assert.match(h.tools.get("Agent").description, /explicitly asked/);
 			if (enabled) assert.equal(h.tools.get("codemode").execute, codemode.execute);
-			for (const handler of h.handlers.get("session_shutdown") ?? []) handler();
+			for (const handler of h.handlers.get("session_shutdown") ?? []) handler({}, { ui: { setStatus() {} } });
 		}
 	}
 });

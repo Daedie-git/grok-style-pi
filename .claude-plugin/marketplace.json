@@ -1,12 +1,13 @@
 {
   "name": "daedie-sidecar",
   "owner": { "name": "Daedie-git" },
-  "metadata": { "description": "Persistent second-opinion reviewers for Claude Code." },
+  "metadata": { "version": "0.9.0", "description": "Persistent pi, Claude Code, and Codex CLI sidecars." },
   "plugins": [
     {
       "name": "claude-sidecar",
+      "version": "0.9.0",
       "source": "./",
-      "description": "Persistent pi review partner for Claude Code in Herdr."
+      "description": "Persistent pi, Claude Code, and Codex CLI sidecars in Herdr."
     }
   ]
 }

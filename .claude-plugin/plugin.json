@@ -1,8 +1,8 @@
 {
   "name": "claude-sidecar",
-  "version": "0.8.2",
-  "description": "Persistent second-opinion reviews from a pi agent alongside Claude Code in Herdr.",
+  "version": "0.9.0",
+  "description": "Persistent pi, Claude Code, and Codex CLI sidecars in Herdr.",
   "author": { "name": "Daedie-git" },
   "repository": "https://github.com/Daedie-git/claude-sidecar",
-  "keywords": ["review", "sidecar", "pi", "herdr"]
+  "keywords": ["review", "sidecar", "pi", "codex", "herdr"]
 }

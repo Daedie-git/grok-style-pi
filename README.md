@@ -24,7 +24,7 @@ claude --plugin-dir "$PWD"
 The plugin exposes `/claude-sidecar:sidecar-review` and a `SessionStart` hook. Restart Claude after changing plugin files. Runtime requests, reports, logs, locks, and session markers stay in `~/.cache/claude-sidecar`, outside the plugin checkout.
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 tests/run.py
 shellcheck scripts/sidecar
 claude plugin validate .claude-plugin/plugin.json
 claude plugin validate .claude-plugin/marketplace.json

@@ -55,7 +55,7 @@ Select Codex on a fresh slot:
 ./scripts/sidecar --slot 3 --agent codex --role implementer ask "Implement the parser fix in this checkout."
 ```
 
-Codex CLI must be on `PATH` and logged in on the machine running the agent. Install Herdr's Codex integration there with `herdr integration install codex`, then enable and trust its hooks in Codex; the launcher needs its session UUID hook. Both roles default to `gpt-6.1-sol` with `ultra` reasoning; set `SIDECAR_CODEX_MODEL` or `SIDECAR_THINKING` before launch to override them. The slot remembers its backend and resumes the same Codex session after a restart. Reports and blocking questions use files, with the same request exit codes as pi and Claude Code. Idle `steer` works like `ask`; `reload` and busy steering are pi-only. Codex inherits that machine's permission and sandbox settings.
+Codex CLI must be on `PATH` and logged in on the machine running the agent. Install Herdr's Codex integration there with `herdr integration install codex`, then enable and trust its hooks in Codex; the launcher needs its session UUID hook. Both roles default to `gpt-6.1-sol` with `ultra` reasoning; set `SIDECAR_CODEX_MODEL` or `SIDECAR_THINKING` before launch to override them. The slot remembers its backend and resumes the same Codex session after a restart. Reports and blocking questions use files, with the same request exit codes as pi and Claude Code. Idle `steer` works like `ask`; `reload` and busy steering are pi-only. Codex runs with `--yolo`: no approval prompts and no sandbox.
 
 Add `--machine NAME` to launch on a saved Herdr machine.
 

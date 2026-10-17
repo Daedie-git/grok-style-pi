@@ -750,7 +750,7 @@ start_codex() {
   fi
   config=$(jq -Rn --arg path "$prompt" '$path')
   if ! CODEX_START_ERR=$(hd agent start "$hname" --kind codex --pane "$pane" --timeout 60000 -- \
-    "${resume[@]}" --model "${SIDECAR_CODEX_MODEL:-gpt-6.1-sol}" \
+    "${resume[@]}" --yolo --model "${SIDECAR_CODEX_MODEL:-gpt-6.1-sol}" \
     -c "model_reasoning_effort=\"$THINKING\"" -c "model_instructions_file=$config" \
     --add-dir "$state_dir" 2>&1 >/dev/null); then
     return 1

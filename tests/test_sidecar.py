@@ -466,7 +466,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(start[start.index('--add-dir') + 1], str(self.home / '.cache/claude-sidecar'))
         self.assertNotIn('--session-id', start)
         self.assertNotIn('resume', start)
-        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', start)
+        self.assertIn('--yolo', start)
         session = (self.home / '.cache/claude-sidecar/sc-pane-1.codex-session').read_text().strip()
         self.assertRegex(session, r'^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
         self.assertEqual(json.loads((self.home / 'agent.json').read_text())['agent_session']['value'], session)

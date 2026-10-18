@@ -1401,6 +1401,34 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('FIRST_CHECK', stdout)
         self.assertNotIn('Launcher checks', second.stdout)
 
+    def test_quoted_verdicts_do_not_withdraw_a_standing_finding(self):
+        env = self.fake_reports({'reject:sc-pane-1': 'R1: stands\nThe requested `R1: withdrawn` is unjustified.\n```\nR1: withdrawn\n```\n'})
+        self.run_cli('reject', '#1: reason', env=env)
+        ledger = json.loads((self.home / '.cache/claude-sidecar/sc-pane-1.rejections.jsonl').read_text())
+        self.assertEqual(ledger['status'], 'stands')
+
+    def test_acceptance_children_do_not_hold_the_slot(self):
+        repo, _ = self.repo_with_change()
+        pid = self.home / 'child.pid'
+        self.run_cli('--slot', '2', '--role', 'implementer', 'ask', '--accept', f'sleep 30 >/dev/null 2>&1 & echo $! >"{pid}"', 'Task', cwd=repo)
+        result = self.run_cli('--slot', '2', 'ask', 'Next', cwd=repo, env=dict(self.env, SIDECAR_NO_QUEUE='1'), check=False)
+        os.kill(int(pid.read_text()), signal.SIGTERM)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_identical_checked_asks_are_not_queued_twice(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('--slot', '2', '--role', 'implementer', 'start', cwd=repo)
+        args = [str(self.launcher), '--slot', '2', 'ask', '--accept', 'true', 'Task']
+        first = subprocess.Popen(args, cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 env=dict(self.env, HERDR_PROMPT_DELAY='1'))
+        deadline = time.monotonic() + 5
+        while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        duplicate = subprocess.run(args, cwd=repo, text=True, capture_output=True, env=self.env)
+        first.communicate(timeout=20)
+        self.assertEqual(duplicate.returncode, 4, duplicate.stderr)
+
     def test_concurrent_rejections_get_distinct_ids(self):
         with ThreadPoolExecutor(6) as pool:
             list(pool.map(lambda n: self.run_cli('reject', f'#{n}: reason'), range(6)))
@@ -1439,12 +1467,14 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.gate('git push', repo).stdout, '')
         (repo / 'late.txt').write_text('unreviewed\n')
         for command in ('git push', f'git -C {repo} push -u origin b', f'cd "{repo}" && git push', 'git -c push.autoSetupRemote=true push',
-                        'git --no-pager push', 'gh pr create --fill', 'glab mr create', 'SIDECAR_REVIEW_SKIP=x git status; git push'):
+                        'git --no-pager push', 'gh pr create --fill', 'glab mr create', 'SIDECAR_REVIEW_SKIP=x git status; git push',
+                        f'(cd "{self.home}" && pwd); git push', 'cd -- . && git push', 'cd "$PWD" && git push', 'git \\\n push',
+                        'cd /nonexistent; git push'):
             denied = json.loads(self.gate(command, repo.parent if repo.name in command else repo).stdout)['hookSpecificOutput']
             self.assertEqual(denied['permissionDecision'], 'deny', command)
             self.assertIn('late.txt', denied['permissionDecisionReason'])
         for command in ('git status', 'git log --grep push', 'SIDECAR_REVIEW_SKIP=tickets git push', 'echo "Use git push after review"',
-                        f'git -C {self.home} push'):
+                        f'git -C {self.home} push', f'(cd "{self.home}" && git push)'):
             self.assertEqual(self.gate(command, repo).stdout, '', command)
         outside = dict(self.env)
         outside.pop('HERDR_ENV')

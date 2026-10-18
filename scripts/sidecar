@@ -47,6 +47,7 @@ ROLE=reviewer
 BACKEND=pi
 INFLIGHT=
 ACTIVE_REQUEST=
+REQUEST_KEY=
 NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
 # After the sidecar settles without a report, recheck for this long before declaring the request abandoned.
@@ -1137,7 +1138,8 @@ request() {
   local kind=$1 body=$2 lock_mode=${3:-acquire} name hname id req report status hash question prompt_path
   name=$(agent_name)
   hname=$(herdr_agent)
-  hash=$(sha256sum <<<"$body" | cut -d' ' -f1)
+  # An ask that changes checks identifies itself by its arguments (REQUEST_KEY), since its body depends on the checks.
+  hash=${REQUEST_KEY:-$(sha256sum <<<"$body" | cut -d' ' -f1)}
   # The idle-steer caller already holds descriptor 9 so its idle decision and request are serialized together.
   [[ $lock_mode != acquire ]] || lock_slot "$hash"
   # A slot may have been bound to another agent while this request waited for the lock.
@@ -1351,47 +1353,64 @@ cmd_push_gate() {
 }
 
 # Prints, NUL-separated, the directory each publishing command in a shell command line runs in: `git [global options]
-# push`, `gh pr create`, `glab mr create`. Quotes, escapes, `cd DIR` and `git -C DIR` are followed; heredocs are not.
+# push`, `gh pr create`, `glab mr create`. Quotes, escapes, line continuations, `( … )` subshell scope, `cd DIR` and
+# `git -C DIR` are followed. A directory it cannot resolve (an expansion, `cd -`, a missing path) leaves the previous one,
+# so an unknown `cd` never moves the check away from a repository. Heredocs are not followed.
 PUBLISH_DIRS_JS='
 const [command, start, home] = process.argv.slice(1);
-const path = require("path");
-const segments = [];
-let words = [], word = "", has = false, quote = "";
-const endWord = () => { if (has) words.push(word); word = ""; has = false; };
-const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
+const path = require("path"), fs = require("fs");
+const items = [];
+let words = [], word = "", has = false, raw = false, quote = "";
+const endWord = () => { if (has) words.push({ text: word, plain: !raw }); word = ""; has = false; raw = false; };
+const endSegment = () => { endWord(); if (words.length) items.push(words); words = []; };
 for (let i = 0; i < command.length; i++) {
   const c = command[i];
+  if (c === "\\" && command[i + 1] === "\n" && quote !== "\x27") { i++; continue; }
   if (quote) {
     if (c === quote) quote = "";
     else if (c === "\\" && quote === "\"" && i + 1 < command.length) word += command[++i];
-    else word += c;
+    else { if (c === "$" || c === "`") raw = true; word += c; }
   } else if (c === "\x27" || c === "\"") { quote = c; has = true; }
   else if (c === "\\" && i + 1 < command.length) { word += command[++i]; has = true; }
   else if (/\s/.test(c) && c !== "\n") endWord();
-  else if (";&|()\n".includes(c)) endSegment();
-  else { word += c; has = true; }
+  else if (c === "(" || c === ")") { endSegment(); items.push(c); }
+  else if (";&|\n".includes(c)) endSegment();
+  else { if (c === "$" || c === "`" || (c === "~" && has)) raw = true; word += c; has = true; }
 }
 endSegment();
-const resolve = (dir, to) => path.resolve(dir, to === undefined ? home : to.replace(/^~(?=\/|$)/, home));
+const resolve = (dir, to) => {
+  if (to === undefined) return home;
+  if (!to.plain || to.text === "-") return dir;
+  const next = path.resolve(dir, to.text.replace(/^~(?=\/|$)/, home));
+  return fs.existsSync(next) ? next : dir;
+};
+const stack = [];
 let dir = start;
-for (let words of segments) {
-  let skip = false;
-  while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]) || words[0] === "env" || words[0] === "command")) {
-    if (words[0].startsWith("SIDECAR_REVIEW_SKIP=")) skip = true;
+for (const item of items) {
+  if (item === "(") { stack.push(dir); continue; }
+  if (item === ")") { if (stack.length) dir = stack.pop(); continue; }
+  let words = item, skip = false;
+  while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text) || ["env", "command", "builtin"].includes(words[0].text))) {
+    if (words[0].text.startsWith("SIDECAR_REVIEW_SKIP=")) skip = true;
     words = words.slice(1);
   }
-  const [name, ...rest] = words;
-  if (name === "cd") { dir = resolve(dir, rest[0]); continue; }
+  const name = words[0]?.text, rest = words.slice(1);
+  if (name === "cd" || name === "pushd") {
+    let i = 0;
+    while (i < rest.length && /^-[LPe@]*$/.test(rest[i].text) && rest[i].text !== "-") { const end = rest[i].text === "--"; i++; if (end) break; }
+    dir = resolve(dir, rest[i]);
+    continue;
+  }
   if (skip) continue;
   if (name === "git") {
     let target = dir, i = 0;
-    while (i < rest.length && rest[i].startsWith("-")) {
-      if (rest[i] === "-C") { target = resolve(target, rest[i + 1]); i += 2; }
-      else if (["-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].includes(rest[i])) i += 2;
+    while (i < rest.length && rest[i].text.startsWith("-")) {
+      if (rest[i].text === "-C") { target = resolve(target, rest[i + 1]); i += 2; }
+      else if (["-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].includes(rest[i].text)) i += 2;
       else i++;
     }
-    if (rest[i] === "push") process.stdout.write(target + "\0");
-  } else if ((name === "gh" && rest[0] === "pr" && rest[1] === "create") || (/^glab(-bot)?$/.test(name ?? "") && rest[0] === "mr" && rest[1] === "create")) {
+    if (rest[i]?.text === "push") process.stdout.write(target + "\0");
+  } else if ((name === "gh" && rest[0]?.text === "pr" && rest[1]?.text === "create") || (/^glab(-bot)?$/.test(name ?? "") && rest[0]?.text === "mr" && rest[1]?.text === "create")) {
     process.stdout.write(dir + "\0");
   }
 }
@@ -1490,7 +1509,8 @@ cmd_ask() {
   if (( ${#accept[@]} + ${#scope[@]} )) || [[ -n $clear ]]; then
     [[ -z $MACHINE || -n $clear ]] || die "--accept and --scope run in this checkout; they are not supported for a slot on another machine"
     # A running request still owns the current checks; replace them only once it has finished.
-    lock_slot ""
+    REQUEST_KEY=$(printf '%s\0' ask "$text" "${accept[@]}" -- "${scope[@]}" "$clear" | sha256sum | cut -d' ' -f1)
+    lock_slot "$REQUEST_KEY"
     lock_mode=held
     if [[ -n $clear ]]; then rm -f -- "$(checks_file)"; else save_checks accept scope; fi
   fi
@@ -1589,7 +1609,8 @@ run_checks() {
       n=$((n + 1))
       log="${report%.md}.accept-$n.log"
       code=0
-      (cd -- "$cwd" && timeout "${SIDECAR_ACCEPT_TIMEOUT_S:-1800}" bash -c "$cmd") </dev/null >"$log" 2>&1 || code=$?
+      # The command's own background children must not inherit the slot lock (descriptor 9) or the ledger lock.
+      (cd -- "$cwd" && timeout "${SIDECAR_ACCEPT_TIMEOUT_S:-1800}" bash -c "$cmd") </dev/null >"$log" 2>&1 9>&- 6>&- || code=$?
       if [[ $code == 0 ]]; then echo "- Acceptance \`$cmd\`: **PASS** (log: $log)"; else echo "- Acceptance \`$cmd\`: **FAIL, exit $code** (log: $log)"; fi
       echo
       echo '```'
@@ -1649,7 +1670,15 @@ rejections_parse() {
   while read -r id verdict; do
     rejection_set "$id" "$verdict" || true
     [[ $verdict != stands ]] || echo "sidecar: the reviewer holds $id; fix it, or reject again with new evidence, or overrule it with: sidecar --slot $SLOT reject --overrule $id REASON (then tell the user)" >&2
-  done < <(grep -oE '\bR[0-9]+: *(withdrawn|stands)\b' -- "$report" | sed 's/: */ /' | sort -u)
+  done < <(awk '
+    /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
+    !fenced && match($0, /^[[:space:]]*([-*][[:space:]]+)?`?R[0-9]+: *(withdrawn|stands)/) {
+      line = substr($0, RSTART, RLENGTH); gsub(/^[[:space:]]*([-*][[:space:]]+)?`?/, "", line)
+      split(line, part, /: */); id = part[1]; v = part[2]
+      # Conflicting verdicts for one finding resolve to stands: a finding is withdrawn only unambiguously.
+      if (!(id in verdict) || v == "stands") verdict[id] = v
+    }
+    END { for (id in verdict) print id, verdict[id] }' "$report")
 }
 
 cmd_reject() {

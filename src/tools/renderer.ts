@@ -264,8 +264,44 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 				? previousSelection : { content: result.content, details: result.details, args: context?.args } as CodeSelection;
 			if (selectionGroup.active === previousSelection && selection !== previousSelection) selectionGroup.active = undefined;
 			if (owner) selections.set(owner, selection);
+			// Maps each rendered row to its source line for clicks and selections. Built on first use per width:
+			// rewrapping every row on each resize stalls Pi for large diffs.
+			let codeLinesWidth: number | undefined;
+			const sourceLines = () => {
+				if (cachedWidth === undefined || codeLinesWidth === cachedWidth) return codeLines;
+				codeLinesWidth = cachedWidth;
+				codeLines = [];
+				const width = cachedWidth ?? 0;
+				if (!fileRow || !path) return codeLines;
+				// Use the same wrapping width as layoutTool, so a click on a continuation
+				// row still refers to the logical source line rather than the next one.
+				const inner = Math.max(0, width - (width > 2 ? 2 : 0));
+				if (prose) {
+					for (const [index, source] of plainProse.replace(/\t/g, "   ").split("\n").entries()) {
+						const wraps = source && inner > 0 ? wrapTextWithAnsi(source, inner).length : 1;
+						const number = index < readCode.length ? Math.max(1, Math.trunc(line)) + index :
+							index >= previewStart && previewStart >= 0 && index < previewStart + previewLength ? index - previewStart + 1 : undefined;
+						for (let row = 0; row < wraps; row++) codeLines.push(number);
+					}
+				}
+				if (prose && rows.length) codeLines.push(undefined); // blank separator
+				const createdCount = summary?.kind === "created" ? rows.length - diffLines.length : 0;
+				let lineDelta = 0;
+				for (const [index, row] of plainRows.entries()) {
+						const source = diffLines[index - createdCount];
+						const numbered = source && /^[ +\-]\s*(\d+) /.exec(source);
+						// Pi prints old-file numbers on unchanged context, but new-file
+						// numbers on additions. Account for preceding inserted/deleted lines.
+						const number = index < createdCount ? index + 1 : numbered && (row.kind === "add" || row.kind === "remove" || row.kind === "context")
+							? Number(numbered[1]) + (row.kind === "context" ? lineDelta : 0) : undefined;
+						if (row.kind === "add") lineDelta++;
+						if (row.kind === "remove") lineDelta--;
+						for (let part = 0; part < paintRows([row], width, width > 2 ? "  " : "", palette).length; part++) codeLines.push(number);
+					}
+				return codeLines;
+			};
 			const clickedLine = (event: TuiMouseEvent) => Number.isInteger(event.y) && event.y >= 0 && Number.isInteger(event.x) && event.x >= 0 && event.x < (cachedWidth ?? 0)
-				? codeLines[event.y] : undefined;
+				? sourceLines()[event.y] : undefined;
 			return {
 				invalidate() { cachedWidth = undefined; layout.invalidate(); },
 				handleMouse(raw: TuiMouseEvent) {
@@ -278,7 +314,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 					}
 					const location = event.button === "left" && !event.alt && !event.ctrl &&
 						Number.isInteger(event.y) && event.y >= 0 && Number.isInteger(event.x) && event.x >= 0 && event.x < (cachedWidth ?? 0)
-						? codeLines[event.y] : undefined;
+						? sourceLines()[event.y] : undefined;
 					const point = location === undefined ? undefined : { x: event.x, y: event.y, line: location };
 					if (event.type === "press") {
 						// A moved release does not produce a click, so expire suppression on every new press.
@@ -309,7 +345,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 						if (!end && selection.anchor && Number.isInteger(event.y)) {
 							const forward = event.y > selection.anchor.y;
 							for (let y = event.y; forward ? y > selection.anchor.y : y < selection.anchor.y; y += forward ? -1 : 1) {
-								const sourceLine = codeLines[y];
+								const sourceLine = sourceLines()[y];
 								if (sourceLine !== undefined) {
 									end = { x: forward ? (cachedWidth ?? 1) - 1 : 0, y, line: sourceLine };
 									break;
@@ -358,33 +394,6 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 					}
 					cachedWidth = width;
 					cachedLines = layout.render(width);
-					codeLines = [];
-					if (!fileRow || !path) return cachedLines;
-					// Use the same wrapping width as layoutTool, so a click on a continuation
-					// row still refers to the logical source line rather than the next one.
-					const inner = Math.max(0, width - (width > 2 ? 2 : 0));
-					if (prose) {
-						for (const [index, source] of plainProse.replace(/\t/g, "   ").split("\n").entries()) {
-							const wraps = source && inner > 0 ? wrapTextWithAnsi(source, inner).length : 1;
-							const number = index < readCode.length ? Math.max(1, Math.trunc(line)) + index :
-								index >= previewStart && previewStart >= 0 && index < previewStart + previewLength ? index - previewStart + 1 : undefined;
-							for (let row = 0; row < wraps; row++) codeLines.push(number);
-						}
-					}
-					if (prose && rows.length) codeLines.push(undefined); // blank separator
-					const createdCount = summary?.kind === "created" ? rows.length - diffLines.length : 0;
-					let lineDelta = 0;
-					for (const [index, row] of plainRows.entries()) {
-							const source = diffLines[index - createdCount];
-							const numbered = source && /^[ +\-]\s*(\d+) /.exec(source);
-							// Pi prints old-file numbers on unchanged context, but new-file
-							// numbers on additions. Account for preceding inserted/deleted lines.
-							const number = index < createdCount ? index + 1 : numbered && (row.kind === "add" || row.kind === "remove" || row.kind === "context")
-								? Number(numbered[1]) + (row.kind === "context" ? lineDelta : 0) : undefined;
-							if (row.kind === "add") lineDelta++;
-							if (row.kind === "remove") lineDelta--;
-							for (let part = 0; part < paintRows([row], width, width > 2 ? "  " : "", palette).length; part++) codeLines.push(number);
-						}
 					return cachedLines;
 				},
 			};

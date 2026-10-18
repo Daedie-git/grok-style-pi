@@ -15,6 +15,8 @@ export type VisualRequest = {
 	colors: StyleColors;
 	palette?: DiffPalette;
 	paint?: Record<"toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext", string>;
+	/** Precomputed identity of every field except `width` and `colors`, for callers that repeat one request at many widths. */
+	contentKey?: string;
 };
 export type VisualResult = { lines?: string[]; rows?: RenderRow[]; retry?: boolean };
 export type VisualExecutor = { run(request: VisualRequest): Promise<VisualResult>; dispose(): void };
@@ -68,6 +70,15 @@ function workerExecutor(): VisualExecutor {
 	};
 }
 
+/** Approximate serialized size of a row's fields besides its text. */
+const ROW_OVERHEAD = 48;
+
+/** Serializes a request's identity; without `width` and `colors` unless `complete`. */
+export function visualContentKey(request: VisualRequest, complete = false): string {
+	return JSON.stringify([request.kind, request.text, request.lang, request.filePath, request.palette, request.paint, request.rows, request.background, request.fallbacks ?? [],
+		...(complete ? [request.colors, request.width] : [])]);
+}
+
 /** Deduplicated, bounded work queue and byte-limited LRU. Cache misses never block a render. */
 export class VisualPreparation {
 	private cache = new Map<string, Cached>();
@@ -82,9 +93,11 @@ export class VisualPreparation {
 	constructor(executor?: VisualExecutor, limit = 16 * 1024 * 1024) { this.executor = executor ?? workerExecutor(); this.limit = limit; }
 
 	request(request: VisualRequest, owner: object, notify: () => void): VisualResult | undefined {
-		if ((!request.text && request.kind !== "layout") || request.text.length + (request.rows?.reduce((sum, row) => sum + row.text.length, 0) ?? 0) > 512_000) return;
-		const serialized = JSON.stringify([request.kind, request.text, request.lang, request.filePath, request.colors, request.palette, request.paint, request.rows, request.width, request.background, request.fallbacks ?? []]);
-		const key = createHash("sha256").update(serialized).digest("hex");
+		const size = request.text.length + (request.rows?.reduce((sum, row) => sum + row.text.length, 0) ?? 0);
+		if ((!request.text && request.kind !== "layout") || size > 512_000) return;
+		const key = request.contentKey !== undefined
+			? JSON.stringify([request.contentKey, request.colors, request.width])
+			: createHash("sha256").update(visualContentKey(request, true)).digest("hex");
 		const cached = this.cache.get(key);
 		if (cached && cached.expires > Date.now()) {
 			this.cache.delete(key); this.cache.set(key, cached);
@@ -94,7 +107,8 @@ export class VisualPreparation {
 		const existing = this.pending.get(key);
 		if (existing) { existing.listeners.set(owner, notify); return; }
 		if (Date.now() < this.retryAt) return;
-		const bytes = serialized.length * 2;
+		// Charge row objects and fallbacks too, so many short rows cannot slip past the queue budget.
+		const bytes = 2 * (size + (request.rows?.length ?? 0) * ROW_OVERHEAD + (request.fallbacks?.reduce((sum, [key, lines]) => sum + key.length + lines.reduce((n, l) => n + l.length + 4, 0), 0) ?? 0));
 		// Old queued transcript work yields to newer output. Never interrupt the active job.
 		while (this.pending.size >= 32 || this.queuedBytes + bytes > 4 * 1024 * 1024) {
 			const oldest = [...this.pending.keys()].find((candidate) => candidate !== this.active);

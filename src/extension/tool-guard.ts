@@ -170,8 +170,16 @@ function command(words: string[]): { name: string; args: string[]; assignments: 
 }
 
 /** Why a shell command would store something under /tmp, or undefined when it does not. */
-export function tmpWriteReason(text: string): string | undefined {
-	for (const segment of parseShell(text)) {
+/**
+ * False only when no parse can find WORD: quotes, escapes and line continuations can assemble it, as in `ct""est`.
+ */
+function mayContain(text: string, word: string): boolean {
+	return text.includes(word) || /["'\\]/.test(text);
+}
+
+export function tmpWriteReason(text: string, segments?: Segment[]): string | undefined {
+	if (!mayContain(text, "/tmp")) return undefined;
+	for (const segment of segments ?? parseShell(text)) {
 		if (segment.outputs.some((target) => /^\/tmp(\/|$)/.test(target))) return "redirects output into /tmp";
 		const { name, args, assignments } = command(segment.words);
 		if (assignments.some((word) => /^TMPDIR=\/tmp(\/|$)/.test(word))) return "points TMPDIR at /tmp";
@@ -183,8 +191,10 @@ export function tmpWriteReason(text: string): string | undefined {
 }
 
 /** True when some test-runner invocation in the command has no timeout of its own. */
-export function needsTestTimeout(text: string): boolean {
-	return parseShell(text).some((segment) => {
+export function needsTestTimeout(text: string, segments?: Segment[]): boolean {
+	// Every runner name contains "test".
+	if (!mayContain(text, "test")) return false;
+	return (segments ?? parseShell(text)).some((segment) => {
 		const { name, args } = command(segment.words);
 		if (name === "timeout") return false;
 		return TEST_RUNNER.test([name, ...args].join(" ")) && !args.some((word) => /^--(?:test-)?timeout(=|$)/.test(word));
@@ -207,9 +217,10 @@ export function installToolGuard(pi: ExtensionAPI, options: ToolGuardOptions = {
 		}
 		if (event.toolName !== "bash") return undefined;
 		const input = event.input as { command: string; timeout?: number };
-		const why = tmpWriteReason(input.command);
+		const segments = mayContain(input.command, "/tmp") || mayContain(input.command, "test") ? parseShell(input.command) : [];
+		const why = tmpWriteReason(input.command, segments);
 		if (why) return { block: true, reason: `Blocked: the command ${why}. ${advice}` };
-		if (input.timeout === undefined && needsTestTimeout(input.command)) input.timeout = testTimeoutS;
+		if (input.timeout === undefined && needsTestTimeout(input.command, segments)) input.timeout = testTimeoutS;
 		return undefined;
 	});
 }

@@ -26,6 +26,8 @@ test("commands that store files in /tmp are refused; reads and cleanup are not",
 		"ls `touch /tmp/x`",
 		"diff <(sort a) b > /tmp/d",
 		"export TMPDIR=/tmp",
+		"cp build.log /t\"\"mp/log",
+		"echo hello > /t\\\nmp/log",
 	]) assert.ok(tmpWriteReason(command), command);
 	for (const command of [
 		"ls -la /tmp",
@@ -49,7 +51,7 @@ test("commands that store files in /tmp are refused; reads and cleanup are not",
 });
 
 test("test runners need a timeout unless one is given", () => {
-	for (const command of ["ctest -j2 -LE gpu", "cd build && ./renderer_tests", "npm test", "just test-gpu", "pytest -x", "timeout 60 npm test && pytest", "echo --timeout; ctest", "cat <<< \"hello\"\nctest", "echo \"$(ctest)\""])
+	for (const command of ["ctest -j2 -LE gpu", "cd build && ./renderer_tests", "npm test", "just test-gpu", "pytest -x", "timeout 60 npm test && pytest", "echo --timeout; ctest", "cat <<< \"hello\"\nctest", "echo \"$(ctest)\"", "ct\"\"est", "npm te\\\nst"])
 		assert.ok(needsTestTimeout(command), command);
 	for (const command of ["timeout 600 ctest -j2", "ctest --timeout 300", "cmake --build build", "git log -- tests/", "echo 'ctest'", "cat <<'EOF'\nctest\nEOF"])
 		assert.ok(!needsTestTimeout(command), command);

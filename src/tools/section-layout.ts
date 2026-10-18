@@ -1,8 +1,10 @@
 import type { ThemeColor } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { hexToRgb, styleColors } from "../chrome/style-colors.ts";
 import { buildDiffRows, type DiffPalette, type RenderRow } from "../rendering/diff-render.ts";
 import { highlightLines } from "../rendering/highlight.ts";
 import { layoutTool } from "../rendering/tool-layout.ts";
+import { visualContentKey, type VisualRequest } from "../rendering/visual-preparation.ts";
 import { sanitizeToolText, type ToolResult, type ToolResultOptions, type ToolRenderContext, type textComponent } from "./diamond.ts";
 import type { DiamondHooks, ThemeLike } from "./renderer.ts";
 
@@ -80,13 +82,20 @@ export function createSectionLayouts(hooks?: DiamondHooks) {
 					const plainProse = large && preparation ? sanitizeToolText(prose) : prose;
 					let cachedWidth: number | undefined;
 					let cachedLines: string[] = [];
+					let contentKey: string | undefined;
 					return {
 						plainRows, plainProse,
 						invalidate() { cachedWidth = undefined; },
 						render(width: number) {
 							if (width === cachedWidth) return cachedLines;
 							cachedWidth = width;
-							const ready = large && owner ? preparation?.request({ kind: "layout", text: prose, rows, width, palette, background, colors: styleColors() }, owner, notify) : undefined;
+							let ready;
+							if (large && owner && preparation) {
+								const request: VisualRequest = { kind: "layout", text: prose, rows, width, palette, background, colors: styleColors() };
+								// Hash the rows once per panel, not on every width change.
+								contentKey ??= createHash("sha256").update(visualContentKey(request)).digest("hex");
+								ready = preparation.request({ ...request, contentKey }, owner, notify);
+							}
 							cachedLines = ready?.lines ?? layoutTool(plainProse, plainRows, width, palette, background);
 							return cachedLines;
 						},

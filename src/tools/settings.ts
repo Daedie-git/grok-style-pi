@@ -1,5 +1,6 @@
 import { SettingsManager, type ToolsOptions } from "@earendil-works/pi-coding-agent";
 import type { SessionContext } from "../extension/types.ts";
+import { scratchTmpdir } from "../extension/tool-guard.ts";
 
 /** Match the settings Pi passes to its built-in tool factories. */
 export function loadToolOptions(ctx: SessionContext, agentDir?: string): ToolsOptions {
@@ -11,6 +12,7 @@ export function loadToolOptions(ctx: SessionContext, agentDir?: string): ToolsOp
 		bash: {
 			commandPrefix: settings.getShellCommandPrefix(),
 			shellPath: settings.getShellPath(),
+			spawnHook: scratchTmpdir,
 		},
 	};
 }

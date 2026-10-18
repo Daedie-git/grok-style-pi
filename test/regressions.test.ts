@@ -8,6 +8,7 @@ import { stripTerminalSequences as stripAnsi, visibleWidth } from "@earendil-wor
 import { textComponent } from "../src/tools/diamond.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { loadToolOptions } from "../src/tools/settings.ts";
+import { scratchTmpdir } from "../src/extension/tool-guard.ts";
 import { wrapWithDiamondRenderer, type DiamondTool } from "../src/tools/renderer.ts";
 import { DELETE_BG, DELETE_CHAR_BG, INSERT_BG, INSERT_CHAR_BG } from "../src/rendering/diff-render.ts";
 import { grokNightPath, loadThemeJson, resolveThemeColors } from "../src/chrome/theme.ts";
@@ -183,7 +184,7 @@ test("registered tools honor global and trusted project shell/image settings", a
 		await start!({}, { cwd, isProjectTrusted: () => trusted, hasUI: false, mode: "print", ui: {} });
 		const expected = trusted ? "project" : "global";
 		assert.deepEqual(readOptions, { autoResizeImages: trusted });
-		assert.deepEqual(bashOptions, { shellPath: "/bin/bash", commandPrefix: `export GROK_REVIEW_PROBE=${expected}` });
+		assert.deepEqual(bashOptions, { shellPath: "/bin/bash", commandPrefix: `export GROK_REVIEW_PROBE=${expected}`, spawnHook: scratchTmpdir });
 		const result = await registered.find((tool) => tool.name === "bash")!.execute("settings-probe", {
 			command: 'printf "%s" "${GROK_REVIEW_PROBE:-missing}"',
 		});

@@ -7,6 +7,7 @@ import { installActivityPanel } from "../src/activity/panel.ts";
 import { registerStyledCodemode } from "../src/tools/codemode.ts";
 import { installSteeringInbox } from "../src/steering/inbox.ts";
 import { installFastMode } from "../src/extension/fast-mode.ts";
+import { installToolGuard } from "../src/extension/tool-guard.ts";
 
 type PiObjects = Pick<typeof import("@earendil-works/pi-coding-agent"), "CustomEditor" | "createReadToolDefinition" | "createBashToolDefinition" | "createPowerShellToolDefinition" | "createEditToolDefinition" | "createWriteToolDefinition" | "createGrepToolDefinition" | "createFindToolDefinition" | "createLsToolDefinition"> & { createCodemodeExtension?: () => ExtensionFactory };
 type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features };
@@ -18,6 +19,7 @@ export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {})
 	useStyleColors(loadStyleColors());
 	installFeatureSettings(pi);
 	installFastMode(pi);
+	installToolGuard(pi);
 	installSteeringInbox(pi);
 	const activity = features.activity ? installActivityPanel(pi) : undefined;
 	const runtime = createGrokStyleExtension(pi, {

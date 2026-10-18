@@ -121,6 +121,13 @@ Use `/fast on` to request priority processing, `/fast off` to stop requesting it
 
 Fast mode adds `service_tier: "priority"` only to GPT requests on the `openai` and `openai-codex` providers. It does not change the model or transport, and other providers and model families are unaffected. Switching away from a supported model hides the footer indicator without forgetting the setting. Priority service is requested, not guaranteed, and may increase cost or usage. `/fast off` leaves the provider's normal request defaults unchanged.
 
+## Tool guard
+
+Both full entrypoints enforce two rules on Linux and macOS:
+
+- **Nothing is stored in `/tmp`.** `write` and `edit` into `/tmp` are blocked. So are shell commands that redirect into `/tmp`, set `TMPDIR=/tmp`, run `find` with a writing or `-exec` action there, or run anything other than a read, print, measure or remove command (`ls`, `du`, `cat`, `echo`, `rm`, …) on a `/tmp` path. Quoted text and heredoc bodies are not commands. Shell commands whose `TMPDIR` is unset or under `/tmp` run with `TMPDIR=~/.cache/pi-tmp` (when tool styling is on, which owns the `bash` tool). Pi's own environment keeps its `TMPDIR`.
+- **Test runs time out.** A shell call that runs `ctest`, `pytest`, `npm test`, `cargo test`, `go test`, `node --test`, `just test…` or a `*_tests` binary, whose own invocation has no `timeout` wrapper or `--timeout` flag, and no tool timeout, gets a 1800-second tool timeout. `PI_TEST_TIMEOUT_S` changes it.
+
 ## Diamond interaction
 
 Mouse input needs Pi's fullscreen mode. Every diamond follows one table, defined in `src/tools/interaction.ts`:

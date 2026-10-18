@@ -18,6 +18,7 @@ function host() {
 	const commands: string[] = [];
 	const pi = {
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
+		getAllTools() { return [...tools.values()]; },
 		registerCommand(name: string) { commands.push(name); },
 		registerMessageRenderer() {},
 		on(event: string, handler: Function) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
@@ -42,6 +43,21 @@ test("factory forwarding retains non-tool registrations and original exceptions"
 	assert.equal(h.tools.get("read").label, "decorated");
 	const error = new Error("owner failure");
 	await assert.rejects(registerToolExtension(h.pi, () => { throw error; }, tool => tool), caught => caught === error);
+});
+
+test("owners recognize decorated tools without hiding foreign workflow descriptions", async () => {
+	const h = host();
+	const original = fixture("SubagentWorkflow");
+	let owner!: ExtensionAPI;
+	await registerToolExtension(h.pi, api => {
+		owner = api;
+		api.registerTool(original);
+	}, tool => ({ ...tool, description: `gated ${tool.description}` }));
+	assert.equal(h.pi.getAllTools()[0].description, "gated SubagentWorkflow");
+	assert.equal(owner.getAllTools()[0].description, original.description);
+	h.tools.set(original.name, { ...original, description: "foreign workflow" });
+	assert.equal(owner.getAllTools()[0].description, "foreign workflow");
+
 });
 
 test("the core runtime uses injected adapters and disabled styling returns the original", () => {

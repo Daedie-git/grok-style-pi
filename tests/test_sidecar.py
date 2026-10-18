@@ -70,9 +70,12 @@ elif args[:2] == ['pane', 'process-info']:
     states = [json.loads(p.read_text()) for p in state_dir.glob('*.agent.json')]
     states += [json.loads((state_dir / 'agent.json').read_text())] if (state_dir / 'agent.json').exists() else []
     current = next(s for s in states if s.get('pane_id') == pane)
-    session = current['agent_session']['value'].split('time_', 1)[1][:-6]
+    if '_argv' in current:
+        argv = current['_argv']
+    else:
+        argv = ['node', 'pi', '--session-id', current['agent_session']['value'].split('time_', 1)[1][:-6]]
     print(json.dumps({'result': {'process_info': {'foreground_processes': [
-        {'pid': current['native_pid'], 'argv': ['node', 'pi', '--session-id', session]}]}}}))
+        {'pid': current.get('native_pid', 1), 'argv': argv}]}}}))
 elif args[:2] in (['pane', 'split'], ['tab', 'create']):
     # Herdr never reuses a closed pane's ID.
     counter_path = state_dir / 'pane-counter'
@@ -93,6 +96,14 @@ elif args[:2] in (['pane', 'split'], ['tab', 'create']):
     panes_path.write_text(json.dumps(panes))
     key = 'root_pane' if args[0] == 'tab' else 'pane'
     print(json.dumps({'result': {key: {'pane_id': pane['pane_id']}}}))
+elif args[:2] == ['pane', 'close']:
+    closed = args[2]
+    panes = [p for p in panes if p['pane_id'] != closed]
+    panes_path.write_text(json.dumps(panes))
+    for agent_file in list(state_dir.glob('*.agent.json')) + [state_dir / 'agent.json']:
+        if agent_file.exists() and json.loads(agent_file.read_text()).get('pane_id') == closed:
+            agent_file.unlink()
+    print(json.dumps({'result': {}}))
 elif args[:2] == ['agent', 'get']:
     time.sleep(float(os.environ.get('HERDR_GET_DELAY', '0')))
     if state is None:
@@ -124,6 +135,9 @@ elif args[:2] == ['agent', 'start']:
               'agent_session': {'value': session_value}}
     if kind == 'codex':
         record['_codex_session'] = session
+    if kind == 'claude':
+        flag = '--session-id' if '--session-id' in args else '--resume'
+        record['_argv'] = ['claude', flag, session]
     if kind == 'pi' and os.environ.get('FAKE_WINDOWS_CONTROL'):
         import subprocess
         runtime = pathlib.Path(args[args.index('-e') + 1]).with_name('windows-runtime.mjs')
@@ -402,6 +416,122 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(starts[0][starts[0].index('--model') + 1], 'openai-codex/gpt-6.1-sol')
         self.assertEqual(starts[0][starts[0].index('--thinking') + 1], 'high')
         self.assertEqual(starts[0][starts[0].index('-e') + 1], str(self.plugin / 'sidecar/sidecar.ts'))
+
+    def start_pane(self):
+        start = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
+        return start[start.index('--pane') + 1]
+
+    def test_stop_closes_the_pane_and_the_next_request_resumes_the_session(self):
+        self.run_cli('start')
+        pane = self.start_pane()
+        result = self.run_cli('stop')
+        self.assertIn('stopped', result.stdout)
+        self.assertIn(['pane', 'close', pane], self.calls())
+        self.assertIn(': stopped (', self.run_cli('status').stdout)
+        self.run_cli('stop')  # Idempotent: nothing left to close.
+        self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 1)
+        self.run_cli('ask', 'Resume after stop')
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[1][starts[1].index('--session-id') + 1], starts[0][starts[0].index('--session-id') + 1])
+        self.assertNotEqual(self.start_pane(), pane)
+        self.assertNotIn(': stopped (', self.run_cli('status').stdout)
+
+    def test_stop_refuses_during_a_request_unless_forced(self):
+        self.run_cli('start')
+        lock = self.home / '.cache/claude-sidecar/sc-pane-1.lock'
+        holder = subprocess.Popen(['flock', str(lock), 'sleep', '30'])
+        self.addCleanup(holder.kill)
+        deadline = time.time() + 5
+        while subprocess.run(['flock', '-n', str(lock), 'true']).returncode == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        refused = self.run_cli('stop', check=False)
+        self.assertEqual(refused.returncode, 7)
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
+        forced = self.run_cli('stop', '--force')
+        self.assertIn('--force', forced.stderr)
+        self.assertTrue(any(c[:2] == ['pane', 'close'] for c in self.calls()))
+
+    def test_stop_leaves_a_foreign_agent_in_the_pane(self):
+        self.run_cli('start')
+        agent = self.home / 'agent.json'
+        state = json.loads(agent.read_text())
+        state['agent_session'] = {'value': '/tmp/time_someone-else.jsonl'}
+        agent.write_text(json.dumps(state))
+        result = self.run_cli('stop')
+        self.assertIn('left it running', result.stderr)
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
+
+    def test_stop_fresh_starts_a_new_pi_session(self):
+        self.run_cli('start')
+        self.run_cli('stop', '--fresh')
+        self.run_cli('start')
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        first, second = (s[s.index('--session-id') + 1] for s in starts)
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.startswith(first + '-f'))
+        self.run_cli('stop')
+        self.run_cli('start')
+        third = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
+        self.assertEqual(third[third.index('--session-id') + 1], second)
+
+    def test_stop_fresh_survives_the_session_start_hook_reexport(self):
+        env = dict(self.env, SIDECAR_PI_SESSION='cc-first')
+        self.run_cli('start', env=env)
+        self.run_cli('stop', '--fresh', env=env)
+        self.run_cli('start', env=env)
+        fresh = (self.home / '.cache/claude-sidecar/sc-pane-1.session').read_text().strip()
+        self.assertTrue(fresh.startswith('cc-first-f'))
+        # The hook exports the effective id; it must map to the same session, not a doubly suffixed one.
+        hooked = dict(self.env, SIDECAR_PI_SESSION=fresh)
+        self.assertEqual(self.run_cli('status', env=hooked).returncode, 0)
+        self.run_cli('start', env=hooked)
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(len(starts), 2)
+
+    def test_stop_fresh_claude_session_survives_the_hook_reexport(self):
+        env = dict(self.env, SIDECAR_PI_SESSION='cc-first')
+        self.run_cli('--agent', 'claude', 'start', env=env)
+        self.run_cli('stop', '--fresh', env=env)
+        self.run_cli('start', env=env)
+        created = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
+        uuid = created[created.index('--session-id') + 1]
+        fresh = (self.home / '.cache/claude-sidecar/sc-pane-1.session').read_text().strip()
+        hooked = dict(self.env, SIDECAR_PI_SESSION=fresh)
+        self.run_cli('stop', env=hooked)
+        self.run_cli('start', env=hooked)
+        resumed = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
+        self.assertEqual(resumed[resumed.index('--resume') + 1], uuid)
+
+    def test_stop_leaves_a_foreign_claude_conversation_running(self):
+        self.run_cli('--agent', 'claude', 'start')
+        agent = self.home / 'agent.json'
+        state = json.loads(agent.read_text())
+        state['_argv'] = ['claude', '--resume', 'aaaaaaaa-bbbb-4ccc-addd-eeeeeeeeeeee']
+        agent.write_text(json.dumps(state))
+        result = self.run_cli('stop')
+        self.assertIn('left it running', result.stderr)
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
+        self.assertTrue(agent.exists())
+
+    def test_stop_fresh_drops_the_codex_session(self):
+        self.run_cli('--agent', 'codex', 'start')
+        session_file = self.home / '.cache/claude-sidecar/sc-pane-1.codex-session'
+        old = session_file.read_text().strip()
+        self.run_cli('stop', '--fresh')
+        self.assertFalse(session_file.exists())
+        self.run_cli('start')
+        last = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
+        self.assertNotIn('resume', last)
+        self.assertNotEqual(session_file.read_text().strip(), old)
+
+    def test_stop_all_stops_every_slot(self):
+        self.run_cli('start')
+        self.run_cli('--slot', '3', '--agent', 'codex', 'start')
+        result = self.run_cli('stop', '--all')
+        self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 2)
+        self.assertIn('sc-pane-1 stopped', result.stdout)
+        self.assertIn('sc-pane-1-3 stopped', result.stdout)
 
     def test_implementer_defaults_to_medium_and_remembers_role(self):
         self.run_cli('--slot', '2', '--role', 'implementer', 'start')

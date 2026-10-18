@@ -10,6 +10,10 @@
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when its name belongs to another session
 #   sidecar reload               wait between requests, then reload pi resources without losing its report channel
+#   sidecar stop [--force] [--fresh] [--all]
+#                                close the sidecar's pane; the next request resumes its session. Refuses (exit 7)
+#                                while a request runs unless --force; --fresh drops the saved session so the next
+#                                start begins a new one; --all stops every slot of this Claude pane
 #   sidecar sync-machine NAME    fast-forward the machine's tooling checkouts from origin (no slot binding)
 #   sidecar status               show agent state, request age and whether its last report was printed
 #   sidecar wait                 wait for the slot's launcher request; print its report path (run as a harness background task)
@@ -345,15 +349,21 @@ pi_session_id() {
   local marker owner_marker base
   marker="$STATE_DIR/$(agent_name).session"
   owner_marker="$STATE_DIR/$(owner_name).session"
+  # After `stop --fresh`, a generation suffix gives the slot a new session. The SessionStart hook re-exports the
+  # effective id, so an id that already ends with the suffix keeps it once.
+  local fresh="" fresh_file
+  fresh_file="$STATE_DIR/$(agent_name).fresh"
+  if [[ -s $fresh_file ]]; then fresh="-$(head -n 1 "$fresh_file")"; fi
   if [[ $SLOT == 1 && -n "${SIDECAR_PI_SESSION:-}" ]]; then
-    echo "$SIDECAR_PI_SESSION"
+    if [[ -n $fresh && $SIDECAR_PI_SESSION == *"$fresh" ]]; then echo "$SIDECAR_PI_SESSION"; else echo "$SIDECAR_PI_SESSION$fresh"; fi
   elif [[ -s "$marker" ]]; then
     head -n 1 "$marker"
   else
     base=${SIDECAR_PI_SESSION:-}
     if [[ -z $base && -s "$owner_marker" ]]; then base=$(head -n 1 "$owner_marker"); fi
     base=${base:-cc-pane-$(tr 'A-Z:' 'a-z-' <<<"$HERDR_PANE_ID")}
-    if [[ $SLOT == 1 ]]; then echo "$base"; else echo "$base-$SLOT"; fi
+    if [[ $SLOT != 1 ]]; then base="$base-$SLOT"; fi
+    if [[ -n $fresh && $base == *"$fresh" ]]; then echo "$base"; else echo "$base$fresh"; fi
   fi
 }
 
@@ -572,6 +582,85 @@ cmd_restart() {
   ( flock 8; restart_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
 }
 
+# Herdr publishes no session for Claude agents, so before a destructive action prove the pane's Claude runs this slot's
+# conversation: its foreground process must carry the slot's UUID. Other backends are already verified by session.
+owns_pane_process() {
+  [[ $BACKEND == claude ]] || return 0
+  local pane uuid
+  uuid=$(claude_session_uuid)
+  pane=$(hd agent get "$1" | jq -er '.result.agent.pane_id') || return 1
+  hd pane process-info --pane "$pane" 2>/dev/null | jq -e --arg uuid "$uuid" '
+    any(.result.process_info.foreground_processes[]; .argv as $a |
+      any(range(0; ($a | length) - 1); ($a[.] == "--session-id" or $a[.] == "--resume") and $a[. + 1] == $uuid))' >/dev/null
+}
+
+# Stops the slot's agent by closing its pane. Everything the next start needs stays: the session record, role, agent and
+# machine binding, so the next request resumes the conversation. --fresh forgets the session instead.
+cmd_stop() {
+  local force="" fresh="" all="" arg slot code=0 file
+  for arg in "$@"; do
+    case $arg in
+      --force) force=1 ;;
+      --fresh) fresh=1 ;;
+      --all) all=1 ;;
+      *) die "usage: sidecar [--slot N] stop [--force] [--fresh] [--all]" ;;
+    esac
+  done
+  if [[ -n $all ]]; then
+    require_identity
+    local owner flags=()
+    owner=$(owner_name)
+    [[ -z $force ]] || flags+=(--force)
+    [[ -z $fresh ]] || flags+=(--fresh)
+    shopt -s nullglob
+    for file in "$STATE_DIR/$owner.agent" "$STATE_DIR/$owner"-*.agent; do
+      slot=${file##*/}
+      slot=${slot%.agent}
+      if [[ $slot == "$owner" ]]; then slot=1; else slot=${slot#"$owner"-}; fi
+      [[ $slot =~ ^[1-9][0-9]*$ ]] || continue
+      "$0" --slot "$slot" stop "${flags[@]}" || code=$?
+    done
+    return "$code"
+  fi
+  require_herdr
+  ( flock 8; stop_unlocked "$force" "$fresh"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+stop_unlocked() {
+  local force=$1 fresh=$2 name hname pane
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  resolve_backend
+  exec 9>"$STATE_DIR/$name.lock"
+  if ! flock -n 9; then
+    if [[ -z $force ]]; then
+      echo "sidecar: $hname is handling a request; wait for it or use stop --force" >&2
+      exit 7
+    fi
+    echo "sidecar: stopping $hname during a request (--force); that request will end without a report" >&2
+  fi
+  if [[ $(agent_status "$hname") == missing ]]; then
+    echo "$hname is not running"
+  elif agent_runs_sidecar_session "$hname" && owns_pane_process "$hname"; then
+    pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || die "cannot find the pane of $hname"
+    hd pane close "$pane" >/dev/null || die "could not close pane $pane of $hname"
+    echo "$hname stopped (closed $pane)"
+  else
+    # Another session took the pane over; it is not ours to close.
+    echo "$hname: its pane runs $(agent_session_file "$hname"), not the sidecar session; left it running" >&2
+  fi
+  forget_pane "$name"
+  if [[ -n $fresh ]]; then
+    {
+      flock 7
+      rm -f -- "$STATE_DIR/$name.codex-session" "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session"
+      printf 'f%s\n' "$(date +%s%N)" >"$STATE_DIR/$name.fresh"
+    } 7>"$STATE_DIR/$name.identity.lock"
+    echo "$hname: the next start begins a new $BACKEND session"
+  fi
+  : >"$STATE_DIR/$name.stopped"
+}
+
 cmd_reload() {
   require_herdr
   [[ $# == 0 ]] || die "usage: sidecar reload"
@@ -658,6 +747,7 @@ start_unlocked() {
       printf '%s\n' "$BACKEND" >"$STATE_DIR/$name.agent"
     fi
   } 7>"$STATE_DIR/$name.identity.lock"
+  rm -f -- "$STATE_DIR/$name.stopped"
   if [[ $(agent_status "$hname") != missing ]]; then
     if agent_runs_sidecar_session "$hname"; then
       echo "$hname already running"
@@ -1475,7 +1565,10 @@ cmd_status() {
     codex) session=$(codex_session_id) ;;
     *) session=$(pi_session_id) ;;
   esac
-  echo "$name: $(agent_status "$name") ($BACKEND session ${session:-not started})${MACHINE:+ on $MACHINE_LABEL}"
+  local live
+  live=$(agent_status "$name")
+  if [[ $live == missing && -f "$STATE_DIR/$(agent_name).stopped" ]]; then live=stopped; fi
+  echo "$name: $live ($BACKEND session ${session:-not started})${MACHINE:+ on $MACHINE_LABEL}"
   state="$STATE_DIR/$(agent_name).request.json"
   if [[ -s $state ]]; then
     started=$(jq -r '.started' "$state")
@@ -1534,6 +1627,7 @@ case "${1:-}" in
   start) shift; cmd_start "$@" ;;
   restart) shift; cmd_restart "$@" ;;
   reload) shift; cmd_reload "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
   sync-machine) shift; cmd_sync_machine "$@" ;;
   status) shift; cmd_status "$@" ;;
   wait) shift; cmd_wait "$@" ;;

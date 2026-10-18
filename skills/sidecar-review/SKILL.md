@@ -58,6 +58,10 @@ When asked to update a saved machine's sidecar tooling, run `sidecar sync-machin
 
 After updating sidecar or Pi extension files, run `sidecar [--slot N] reload` in the background. It waits for the active request's report and Pi's idle state, then reloads without changing the session or pending question. The original request still prints its own report. Exit 0 confirms a fresh runtime; exit 1 means refusal or missing confirmation (inspect the pane before retrying). Confirmation has a 30-second default timeout, configurable with `SIDECAR_RELOAD_TIMEOUT_S`; waiting for active work has no deadline. It does not cancel hung work or replace Pi's executable/startup flags.
 
+## Stop sidecars
+
+When a slot's work is finished, run `sidecar [--slot N] stop`; `stop --all` stops every slot of this Claude pane. It closes the agent's pane and keeps its session, so the next request to that slot resumes it. While a request runs it refuses with exit 7; `--force` stops it anyway, and that request ends without a report. `--fresh` drops the saved session so the next start begins a new conversation, for example after changing the agent's account or model. A pane taken over by another agent is left running.
+
 ## Steer a sidecar
 
 If the running slot is idle and has no request in flight, `steer TEXT` creates an `ask` request and waits for its report. Handle its result like any request: exit 0 report, 2 no report, 3 question, 4 duplicate, 5 approval blocked, or 1 failure. Use a background Bash run for this case. A missing sidecar needs `ask` or `start` first.

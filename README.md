@@ -69,6 +69,10 @@ A sidecar that cannot continue without a decision submits its report with `needs
 
 Run it in the background like a request. Exit 0 confirms the fresh runtime; exit 1 means it was refused or not confirmed. `SIDECAR_RELOAD_TIMEOUT_S` (default 30) bounds confirmation **after** the request has finished, not the active task. On timeout, inspect the pane before retrying; reload might have started. A foreign or blocked session is not reloaded. This loads Pi's reloadable resources, not a new Pi executable or changed startup flags. The command never interrupts work to make a hung request finish.
 
+## Stopping a sidecar
+
+`sidecar [--slot N] stop` closes the slot's pane after checking that it runs the sidecar's own session; a pane another agent took over is left running. The session, role, agent and machine binding are kept, so the next request resumes the conversation in a new pane, and `status` shows `stopped` meanwhile. It refuses with exit 7 while a request holds the slot; `--force` stops anyway, ending that request without a report. `--fresh` also drops the saved pi, Claude or Codex session, so the next start begins a new one. `--all` stops every slot of the calling Claude pane. A slot on a machine is stopped there.
+
 ## Steering a sidecar
 
 On Windows pi sidecars, busy steering uses the verified native channel described in [Windows hosts](#windows-hosts), without the grok-style-pi dependency. The inbox details in this section apply to Linux sidecars.
@@ -92,7 +96,7 @@ A private repository requires GitHub access on the installing machine. Restart C
 
 Before enabling this plugin, remove the old SessionStart hook that invokes `~/.claude/bin/sidecar session-start` from your Claude settings, and move `~/.claude/skills/sidecar-review` outside the skills directory. Otherwise both integrations may launch and Claude may choose the old skill. Keep the old files as backups until a real plugin review succeeds. The plugin reuses the existing runtime cache and live reviewer where possible.
 
-The plugin source sets the new model default. An already-running sidecar retains its model; start a fresh Claude session in a new Herdr pane to use the new default. `restart` only replaces a pane running the wrong pi session; it does not force model changes on a matching live session.
+The plugin source sets the new model default. An already-running sidecar retains its model; `sidecar stop` it, and the next request starts it with the new default. `restart` only replaces a pane running the wrong pi session; it does not force model changes on a matching live session.
 
 ## Use the launcher directly
 

@@ -2,10 +2,12 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import re
 import signal
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -211,7 +213,21 @@ elif args[:2] == ['agent', 'prompt']:
         request_id = prompt.split(']', 1)[0].split()[1]
         reports = data_home / '.cache/claude-sidecar/reports'
         reports.mkdir(parents=True, exist_ok=True)
-        time.sleep(float(os.environ.get('HERDR_PROMPT_DELAY', '0')))
+        started = time.time()
+        time.sleep(float(os.environ.get('HERDR_PROMPT_DELAY_' + name.replace('-', '_'), os.environ.get('HERDR_PROMPT_DELAY', '0'))))
+        import re
+        kind = re.match(r'\d{8}-\d{6}-([a-z]+)-', request_id).group(1)
+        with (home / 'prompts.jsonl').open('a') as log:
+            log.write(json.dumps({'kind': kind, 'name': name, 'start': started, 'end': time.time()}) + '\n')
+        # FAKE_REPORTS maps "kind:agent" to canned report text, or {"report": ..., "question": ...}.
+        canned = json.loads(pathlib.Path(os.environ['FAKE_REPORTS']).read_text()).get(kind + ':' + name) if os.environ.get('FAKE_REPORTS') else None
+        if canned is not None:
+            if isinstance(canned, str):
+                canned = {'report': canned}
+            (reports / (request_id + '.md')).write_text(canned['report'])
+            if canned.get('question'):
+                (reports / (request_id + '.needs-answer')).write_text(canned['question'] + '\n')
+            sys.exit(0)
         if os.environ.get('FAKE_NO_REPORT'):
             sys.exit(0)
         if os.environ.get('FAKE_LATE_REPORT'):
@@ -2340,6 +2356,483 @@ class LauncherTests(unittest.TestCase):
         result = self.remote_run('steer', 'Hello', env=dict(self.remote_env, FAKE_SSH_DOWN='1'), check=False)
         self.assertEqual(result.returncode, 1)
         self.assertIn('cannot reach laptop', result.stderr)
+
+
+    PI, CL = 'sc-pane-1-98', 'sc-pane-1-99'
+
+    def coop(self, *args, reports=None, env=None, check=True):
+        repo, _ = self.repo_with_change()
+        extra = dict(env or {})
+        if reports is not None:
+            (self.home / 'fake-reports.json').write_text(json.dumps(reports))
+            extra['FAKE_REPORTS'] = str(self.home / 'fake-reports.json')
+        return self.run_cli('coop-review', *args, cwd=repo, env=dict(self.env, **extra), check=check)
+
+    def coop_report(self, reports, **kwargs):
+        reports = {'diff:' + self.PI: '## Findings\nNone.\n', 'diff:' + self.CL: '## Findings\nNone.\n',
+                   'ask:' + self.PI: 'Nothing.\n', 'ask:' + self.CL: 'Nothing.\n', **reports}
+        result = self.coop(reports=reports, **kwargs)
+        return self.report_path(result.stdout).read_text()
+
+    def prompts(self):
+        return [json.loads(line) for line in (self.home / 'prompts.jsonl').read_text().splitlines()]
+
+    def requests(self, kind, name):
+        return sorted((self.home / '.cache/claude-sidecar/requests').glob(f'*-{kind}-{name}.*.md'))
+
+    @staticmethod
+    def section(report, title):
+        return re.search(rf'^## {title} \(\d+\)\n(.*?)(?=^## |\Z)', report, re.M | re.S).group(1)
+
+    def test_coop_review_rejects_bad_arguments(self):
+        for args, message in (
+                (['--pi-slot', 'x'], '--pi-slot requires an integer'),
+                (['--claude-slot', '0'], '--claude-slot requires an integer'),
+                (['--bogus', '1'], 'unknown coop-review option'),
+                (['--pi-slot', '2', '--claude-slot', '2'], 'must differ'),
+                (['HEAD', 'ctx', 'extra'], 'usage: sidecar coop-review')):
+            result = self.run_cli('coop-review', *args, check=False)
+            self.assertEqual(result.returncode, 1, args)
+            self.assertIn(message, result.stderr)
+        for option in (['--slot', '3'], ['--agent', 'pi'], ['--role', 'implementer']):
+            result = self.run_cli(*option, 'coop-review', check=False)
+            self.assertEqual(result.returncode, 1, option)
+            self.assertIn('chooses its own slots', result.stderr)
+        self.assertEqual([c for c in self.calls() if c[:2] == ['agent', 'start']], [])
+
+    def test_coop_review_uses_dedicated_slots_for_a_pi_and_a_claude_reviewer(self):
+        result = self.coop('HEAD', 'Intent')
+        self.assertTrue(self.report_path(result.stdout).name.endswith('.md'))
+        starts = [c[c.index('--kind') + 1] for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertEqual(sorted(starts), ['claude', 'pi'])
+        state = self.home / '.cache/claude-sidecar'
+        self.assertEqual((state / f'{self.PI}.agent').read_text().strip(), 'pi')
+        self.assertEqual((state / f'{self.CL}.agent').read_text().strip(), 'claude')
+        self.assertEqual((state / f'{self.CL}.role').read_text().strip(), 'reviewer')
+        self.assertFalse((state / 'sc-pane-1.agent').exists())
+
+    def test_coop_review_slot_flags_choose_the_slots_and_rounds_reuse_them(self):
+        first = self.coop('--pi-slot', '3', '--claude-slot', '4', 'HEAD', 'Round 1')
+        state = self.home / '.cache/claude-sidecar'
+        self.assertEqual((state / 'sc-pane-1-3.agent').read_text().strip(), 'pi')
+        self.assertEqual((state / 'sc-pane-1-4.agent').read_text().strip(), 'claude')
+        second = self.run_cli('coop-review', '--pi-slot', '3', '--claude-slot', '4', 'HEAD', 'Round 2',
+                              cwd=self.home / 'repo')
+        self.assertNotEqual(self.report_path(first.stdout), self.report_path(second.stdout))
+        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 2)
+        self.assertEqual(len(self.requests('diff', 'sc-pane-1-3')), 2)
+        self.assertIn('Round 2', self.requests('diff', 'sc-pane-1-4')[1].read_text())
+
+    def test_coop_review_slot_bound_to_the_other_agent_fails(self):
+        self.run_cli('--slot', '98', '--agent', 'claude', 'start')
+        result = self.coop(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('slot already runs claude', result.stderr)
+
+    def test_coop_review_fails_fast_when_a_slot_is_busy(self):
+        import fcntl
+        state = self.home / '.cache/claude-sidecar'
+        state.mkdir(parents=True, exist_ok=True)
+        with (state / f'{self.CL}.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            started = time.monotonic()
+            result = self.coop(check=False)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('slot 99 is busy with another request', result.stderr)
+        self.assertIn('--claude-slot', result.stderr)
+        self.assertEqual([c for c in self.calls() if c[:2] == ['agent', 'prompt']], [])
+
+    def test_coop_review_runs_both_reviewers_in_parallel(self):
+        self.coop(env={'HERDR_PROMPT_DELAY': '1'})
+        prompts = self.prompts()
+        diffs = [p for p in prompts if p['kind'] == 'diff']
+        asks = [p for p in prompts if p['kind'] == 'ask']
+        self.assertEqual((len(diffs), len(asks)), (2, 2))
+        # Each phase overlaps in time, and cross-verification starts only after both reports exist.
+        self.assertLess(max(p['start'] for p in diffs), min(p['end'] for p in diffs))
+        self.assertLess(max(p['start'] for p in asks), min(p['end'] for p in asks))
+        self.assertLess(max(p['end'] for p in diffs), min(p['start'] for p in asks))
+
+    def test_coop_review_sends_the_same_numbered_format_diff_request_to_both(self):
+        self.coop('HEAD', 'Intent of the change')
+        pi, claude = (re.sub(r'`[^`]*\.diff`', 'DIFF', self.requests('diff', name)[0].read_text())
+                      for name in (self.PI, self.CL))
+        self.assertEqual(pi, claude)
+        self.assertIn('Intent of the change', pi)
+        self.assertIn('Reproduce each finding', pi)
+        self.assertIn('`### N. Title` heading', pi)
+
+    def test_coop_review_cross_verification_carries_the_other_report_and_ids(self):
+        self.coop(reports={'diff:' + self.PI: '## Findings\n### 1. Parser overflow\nPI detail\n### 2. Leak\nPI leak detail\n',
+                           'diff:' + self.CL: '## Findings\n### 1. Init race\nCLAUDE detail\n'})
+        to_pi = self.requests('ask', self.PI)[0].read_text()
+        to_claude = self.requests('ask', self.CL)[0].read_text()
+        self.assertIn('CLAUDE detail', to_pi)
+        self.assertNotIn('PI detail', to_pi)
+        self.assertIn('PI detail', to_claude)
+        self.assertNotIn('CLAUDE detail', to_claude)
+        self.assertIn('- C1: Init race', to_pi)
+        self.assertIn('- P1: Parser overflow\n- P2: Leak', to_claude)
+        self.assertIn('Your own findings\n\n- P1: Parser overflow', to_pi)
+        for body, peer in ((to_pi, 'Claude Code (slot 99)'), (to_claude, 'pi (slot 98)')):
+            self.assertIn(f"check {peer}'s findings", body)
+            self.assertIn('Do not re-review the change from scratch', body)
+            self.assertIn('### [CONFIRMED] <ID>', body)
+            self.assertIn('### [REJECTED] <ID>', body)
+            self.assertIn('[WITHDRAWN]', body)
+
+    def test_ask_reads_its_text_from_stdin(self):
+        self.run_cli('ask', '-', input='Long text from stdin\n')
+        self.assertIn('Long text from stdin', self.requests('ask', 'sc-pane-1')[0].read_text())
+
+    def test_coop_review_combines_verdicts_into_one_report(self):
+        result_reports = {
+            'diff:' + self.PI: '## Findings\n### 1. Parser overflow\nOverflow at a.c:1\n### 2. Wrong sign\nSign at c.c:5\n'
+                               '### 3. Stale cache\nCache at d.c:3\n### 4. Race in init\nRace at e.c:9\n',
+            'diff:' + self.CL: '## Findings\n### 1. Lifecycle leak\nLeak at b.c:10\n',
+            'ask:' + self.CL: '### [CONFIRMED] P1 Parser overflow\nEvidence: a.c:1\n'
+                              '### [REJECTED] P2 Wrong sign\nReason: covered by test_sign\n'
+                              '### [REJECTED] P3 Stale cache\nReason: invalidated at d.c:3\n'
+                              '### [UNVERIFIED] P4 Race in init\nReason: no way to trigger it\n',
+            'ask:' + self.PI: '### [CONFIRMED] C1 Lifecycle leak\nEvidence: ran t, saw leak\n'
+                              '### [WITHDRAWN] P3 Stale cache\nOn reflection the cache is invalidated.\n'}
+        result = self.coop(reports=result_reports)
+        path = self.report_path(result.stdout)
+        report = path.read_text()
+        self.assertEqual(result.stdout, f'# Sidecar report ({path})\n' + report)
+        both = self.section(report, 'Confirmed by both')
+        disputed = self.section(report, 'Disputed')
+        rejected = self.section(report, 'Rejected by both')
+        self.assertIn('Findings: 4 from pi (slot 98), 1 from Claude Code (slot 99). Confirmed by both 2, disputed 2, rejected by both 1.', report)
+        self.assertIn('### P1: Parser overflow\nOrigin: pi (slot 98). Confirmed by Claude Code (slot 99).', both)
+        self.assertIn('Overflow at a.c:1', both)
+        self.assertIn('### C1: Lifecycle leak\nOrigin: Claude Code (slot 99). Confirmed by pi (slot 98).', both)
+        self.assertIn('### P2: Wrong sign\nOrigin: pi (slot 98). Claude Code (slot 99) rejected it.', disputed)
+        self.assertIn("**pi (slot 98)'s finding:**\n\nSign at c.c:5", disputed)
+        self.assertIn('covered by test_sign', disputed)
+        self.assertIn('### P4: Race in init', disputed)
+        self.assertIn('could not decide; unverified', disputed)
+        self.assertIn('### P3: Stale cache\nOrigin: pi (slot 98). Rejected by Claude Code (slot 99) and withdrawn by pi (slot 98).', rejected)
+        self.assertIn('On reflection the cache is invalidated.', rejected)
+        self.assertNotIn('## Warnings', report)
+        self.assertEqual(len(re.findall(r'^- .*: .*/reports/.*\.md$', report, re.M)), 4)
+
+    def test_coop_review_accounts_for_findings_the_peer_never_checked(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### 1. Parser overflow\nOverflow at parser.c:10\n### 2. Lifecycle leak\nLeak at lifecycle.c:20\n',
+            'diff:' + self.CL: '## Findings\n### 1. Init race\nRace at init.c:30\n',
+            'ask:' + self.PI: '### [CONFIRMED] C1 Init race\nEvidence: test_race failed\n',
+            'ask:' + self.CL: '### [CONFIRMED] P1 Parser overflow\nEvidence: test_overflow failed\n'})
+        self.assertIn('Findings: 2 from pi (slot 98), 1 from Claude Code (slot 99). Confirmed by both 2, disputed 1, rejected by both 0.', report)
+        disputed = self.section(report, 'Disputed')
+        self.assertIn('### P2: Lifecycle leak', disputed)
+        self.assertIn('Claude Code (slot 99) did not check it; unverified', disputed)
+        self.assertIn('Leak at lifecycle.c:20', disputed)
+
+    def test_coop_review_flags_unknown_and_duplicate_entries_instead_of_trusting_them(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### 1. Parser overflow\nOverflow\n',
+            'ask:' + self.CL: '### [CONFIRMED] P1 Parser overflow\nEvidence: one\n'
+                              '### [REJECTED] P1 Parser overflow\nReason: two\n'
+                              '### [CONFIRMED] P9 Invented finding\nEvidence: made up\n'})
+        self.assertNotIn('Confirmed by both (1)', report)
+        self.assertIn('Findings: 1 from pi (slot 98), 0 from Claude Code (slot 99). Confirmed by both 0, disputed 1, rejected by both 0.', report)
+        disputed = self.section(report, 'Disputed')
+        self.assertIn('gave 2 conflicting or repeated entries (flagged); unverified', disputed)
+        self.assertIn('Evidence: one', disputed)
+        self.assertIn('Reason: two', disputed)
+        warnings = report[report.index('## Warnings'):report.index('## Confirmed by both')]
+        self.assertIn('`[CONFIRMED] P9 Invented finding` matches no finding', warnings)
+        self.assertNotIn('Invented finding', self.section(report, 'Confirmed by both'))
+        self.assertNotIn('Invented finding', disputed)
+
+    def test_coop_review_does_not_merge_titles_that_differ_only_by_punctuation(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### Accept +n\nPositive rejected\n### Accept -n\nNegative rejected\n',
+            'ask:' + self.CL: '### [REJECTED] Accept +n\nReason: positive works\n### [CONFIRMED] Accept -n\nEvidence: cli -1 fails\n'})
+        self.assertIn('### P1: Accept +n\nOrigin: pi (slot 98). Claude Code (slot 99) rejected it.', self.section(report, 'Disputed'))
+        self.assertIn('### P2: Accept -n\nOrigin: pi (slot 98). Confirmed by Claude Code (slot 99).', self.section(report, 'Confirmed by both'))
+
+    def test_coop_review_ambiguous_titles_without_an_id_are_flagged_not_applied(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### Same title\nFirst\n### Same title\nSecond\n',
+            'ask:' + self.CL: '### [CONFIRMED] Same title\nEvidence: which one?\n'})
+        self.assertEqual(self.section(report, 'Confirmed by both').strip(), 'None.')
+        self.assertEqual(report.count('did not check it; unverified'), 2)
+        self.assertIn('matches several of pi (slot 98)\'s findings and it cites no ID', report)
+
+    def test_coop_review_a_lone_withdrawal_is_disputed_not_rejected_by_both(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### 1. Bad timeout\nToo short\n### 2. Bad retry\nToo many\n',
+            'ask:' + self.PI: '### [WITHDRAWN] P1 Bad timeout\nI withdraw this.\n### [WITHDRAWN] P2 Bad retry\nWithdrawn too.\n',
+            'ask:' + self.CL: '### [REJECTED] P2 Bad retry\nReason: retries are capped.\n'})
+        self.assertEqual(self.section(report, 'Rejected by both').count('###'), 1)
+        self.assertIn('### P2: Bad retry\nOrigin: pi (slot 98). Rejected by', self.section(report, 'Rejected by both'))
+        disputed = self.section(report, 'Disputed')
+        self.assertIn('### P1: Bad timeout', disputed)
+        self.assertIn('did not check it; unverified; pi (slot 98) withdrew it', disputed)
+        self.assertIn('I withdraw this.', disputed)
+
+    def test_coop_review_warns_when_nothing_could_be_extracted_or_checked(self):
+        report = self.coop_report({'diff:' + self.PI: '## Findings\nA free-form paragraph without headings.\n',
+                                   'diff:' + self.CL: '## Findings\n### 1. Leak\nDetail\n'})
+        self.assertIn('No findings were extracted from pi (slot 98)\'s review', report)
+        self.assertIn('Claude Code (slot 99)', report)
+        self.assertIn('pi (slot 98) returned no parseable verdicts; every finding of Claude Code (slot 99) is listed as unchecked.', report)
+        self.assertIn('### C1: Leak', self.section(report, 'Disputed'))
+
+    def test_coop_review_question_exits_3_with_the_slot_to_answer(self):
+        result = self.coop(reports={'diff:' + self.CL: {'report': '## Blocked\n', 'question': 'Which API?'}}, check=False)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('asked a question: Which API?', result.stdout)
+        self.assertIn('sidecar --slot 99 answer TEXT', result.stdout)
+        self.assertIn('pi (slot 98): done', result.stdout)
+        self.assertEqual(self.requests('ask', self.PI), [])
+        self.assertEqual(self.run_cli('--slot', '99', 'answer', 'The new one').returncode, 0)
+
+    def test_coop_review_remote_question_is_read_from_the_marker_not_a_fixed_line(self):
+        self.add_machines()
+        repo, _ = self.make_repo()
+        checkout = self.home / 'laptop-checkout'
+        checkout.mkdir()
+        result = self.run_cli('--machine', 'laptop', '--remote-cwd', str(checkout), 'coop-review',
+                              env=dict(self.remote_env, FAKE_QUESTION='Which API?'), cwd=repo, check=False)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('asked a question: Which API?', result.stdout)
+        self.assertNotIn('asked a question: \n', result.stdout)
+
+    def test_coop_review_failure_propagates_the_reviewers_exit_code(self):
+        result = self.coop(env={'FAKE_NO_REPORT': '1', 'SIDECAR_SETTLE_GRACE_S': '0'}, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('failed with exit 2', result.stdout)
+        self.assertIn('stopped during review', result.stderr)
+        self.assertEqual(self.requests('ask', self.PI), [])
+
+    def test_coop_review_unknown_base_fails_without_a_report(self):
+        result = self.coop('nosuchref', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unknown base: nosuchref', result.stderr)
+
+    def test_coop_review_second_phase_fails_fast_when_another_request_takes_a_slot(self):
+        import fcntl
+        repo, _ = self.repo_with_change()
+        state = self.home / '.cache/claude-sidecar'
+        env = dict(self.env, HERDR_PROMPT_DELAY_sc_pane_1_99='2')
+        process = subprocess.Popen([str(self.launcher), 'coop-review'], cwd=repo, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.home / 'prompts.jsonl').exists() or not any(p['name'] == self.PI for p in self.prompts()):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            # Another request grabs the pi slot as soon as the pi review releases it.
+            with (state / f'{self.PI}.lock').open('w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 1)
+            self.assertIn('slot 98 is busy with another request', stderr)
+            self.assertNotIn('waiting for it', stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+
+    def test_coop_review_cancellation_signals_nothing_and_releases_the_reservations(self):
+        import fcntl
+        repo, _ = self.repo_with_change()
+        stranger = subprocess.Popen(['sleep', '60'])
+        process = subprocess.Popen([str(self.launcher), 'coop-review'], cwd=repo, env=dict(self.env, HERDR_PROMPT_DELAY='4'),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            while subprocess.run(['pgrep', '-fc', re.escape(f'{self.home}/bin/herdr') + ' agent prompt sc-pane-1-9'], capture_output=True, text=True).stdout.strip() != '2':
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            launchers = [int(pid) for pid in subprocess.run(['pgrep', '-P', str(process.pid)], capture_output=True, text=True).stdout.split()
+                         if '--slot 9' in Path('/proc', pid, 'cmdline').read_bytes().replace(b'\0', b' ').decode()]
+            self.assertEqual(len(launchers), 2)
+            started = time.monotonic()
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertEqual(process.returncode, 143)
+            self.assertIn('# Cooperative review interrupted (during review)', stdout)
+            # Nothing was signalled: the launchers (and an unrelated process) are still running.
+            for pid in launchers:
+                self.assertTrue(Path('/proc', str(pid)).exists())
+                self.assertNotIn('Z', Path('/proc', str(pid), 'stat').read_text().rsplit(') ', 1)[1][:1])
+            self.assertIsNone(stranger.poll())
+            for slot in (self.PI, self.CL):
+                with (self.home / '.cache/claude-sidecar' / f'{slot}.coop.lock').open('w') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # While the detached launchers hold their slots, a new run fails fast.
+            busy = self.run_cli('coop-review', cwd=repo, check=False)
+            self.assertEqual(busy.returncode, 1)
+            self.assertIn('is busy with another request', busy.stderr)
+            # Once they finish, the slots are usable again.
+            deadline = time.monotonic() + 15
+            while any(Path('/proc', str(pid)).exists() and
+                      Path('/proc', str(pid), 'stat').read_text().rsplit(') ', 1)[1][:1] != 'Z' for pid in launchers):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.1)
+            self.assertEqual(self.run_cli('coop-review', cwd=repo).returncode, 0)
+        finally:
+            stranger.kill()
+            stranger.wait()
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+
+    def test_coop_review_launcher_crash_does_not_keep_the_callers_pipes_open(self):
+        repo, _ = self.repo_with_change()
+        # The pi review's prompt client outlives its killed launcher for 8 s; the Claude review ends at once.
+        env = dict(self.env, HERDR_PROMPT_DELAY_sc_pane_1_98='8', HERDR_PROMPT_DELAY_sc_pane_1_99='0')
+        process = subprocess.Popen([str(self.launcher), 'coop-review'], cwd=repo, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            victim = None
+            while victim is None:
+                self.assertLess(time.monotonic(), deadline)
+                for pid in subprocess.run(['pgrep', '-P', str(process.pid)], capture_output=True, text=True).stdout.split():
+                    try:
+                        command = Path('/proc', pid, 'cmdline').read_bytes().replace(b'\0', b' ').decode()
+                    except FileNotFoundError:
+                        continue
+                    if '--slot 98 ' in command:
+                        victim = int(pid)
+                time.sleep(.05)
+            while subprocess.run(['pgrep', '-f', re.escape(f'{self.home}/bin/herdr') + ' agent prompt sc-pane-1-98'], capture_output=True).returncode != 0:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            os.kill(victim, signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 137)
+            self.assertIn('failed with exit 137', stdout)
+            # The orphaned prompt client is still sleeping, yet the caller's pipes are closed.
+            self.assertEqual(subprocess.run(['pgrep', '-f', re.escape(f'{self.home}/bin/herdr') + ' agent prompt sc-pane-1-98'], capture_output=True).returncode, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+
+    def test_coop_review_launcher_stderr_is_relayed_with_the_reviewer_label(self):
+        result = self.coop(env={'HERDR_PROMPT_DELAY': '1', 'SIDECAR_PROGRESS_S': '1'})
+        self.assertRegex(result.stderr, r'\[pi slot 98\] sidecar: \S+ still working')
+        self.assertRegex(result.stderr, r'\[claude slot 99\] sidecar: \S+ still working')
+
+    def test_concurrent_coop_reviews_cannot_both_be_admitted_to_the_same_slots(self):
+        repo, _ = self.repo_with_change()
+        # Delay the reviewers' start so both runs would pass an idle probe before either takes a slot lock.
+        real = shutil.which('setsid')
+        wrapper = self.home / 'bin/setsid'
+        wrapper.write_text(f'#!/bin/sh\nsleep .5\nexec {real} "$@"\n')
+        wrapper.chmod(0o755)
+        jobs = [subprocess.Popen([str(self.launcher), 'coop-review', 'HEAD', f'Round {i}'], cwd=repo, env=self.env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in (1, 2)]
+        results = [job.communicate(timeout=30) + (job.returncode,) for job in jobs]
+        codes = sorted(r[2] for r in results)
+        self.assertEqual(codes, [0, 1], results)
+        loser = next(r for r in results if r[2] == 1)
+        self.assertIn('is in use by another coop-review', loser[1])
+        self.assertEqual(len([p for p in self.prompts() if p['kind'] == 'diff']), 2)
+
+    def test_coop_review_fenced_code_does_not_cut_a_finding_short(self):
+        report = self.coop_report({
+            'diff:' + self.PI: ('## Findings\n### 1. Parser bug\nAt parser.c:10, wrong output.\n'
+                                'Reproduce:\n```sh\n# Create the failing input\ncli --input bad\n```\n'
+                                '~~~~\n## still code\n~~~\nObserved output: segmentation fault\nSuggested fix: validate the input.\n'
+                                '~~~~\n### 2. Second\nSecond detail\n')})
+        text = report[report.index('Findings:'):]
+        self.assertIn('Findings: 2 from pi', text)
+        for needle in ('# Create the failing input', 'cli --input bad', 'segmentation fault', 'Suggested fix: validate the input.'):
+            self.assertIn(needle, text)
+
+    def test_coop_review_fenced_verdict_examples_are_not_verdicts(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### 1. Parser bug\nAt parser.c:10.\n### 2. Lifecycle leak\nAt lifecycle.c:20.\n',
+            'ask:' + self.CL: ('### [CONFIRMED] P1 Parser bug\nEvidence: this input crashes the parser:\n'
+                               '```markdown\n### [CONFIRMED] P2 Lifecycle leak\nEvidence: example text, not a verdict.\n```\n'
+                               '````\n```\n### [CONFIRMED] P2 Lifecycle leak\n````\n'
+                               'I have not yet checked the lifecycle issue.\n')})
+        self.assertIn('### P1: Parser bug\nOrigin: pi (slot 98). Confirmed by Claude Code (slot 99).', self.section(report, 'Confirmed by both'))
+        self.assertIn('example text, not a verdict.', self.section(report, 'Confirmed by both'))
+        disputed = self.section(report, 'Disputed')
+        self.assertIn('### P2: Lifecycle leak\nOrigin: pi (slot 98). Claude Code (slot 99) did not check it; unverified.', disputed)
+        self.assertNotIn('matches no finding', report)
+
+    def test_coop_review_contradictory_id_and_title_is_flagged_not_applied(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### 1. Parser bug\nAt parser.c:10.\n### 2. Lifecycle leak\nAt lifecycle.c:20.\n',
+            'ask:' + self.CL: ('### [CONFIRMED] P1 Lifecycle leak\nEvidence: lifecycle_test fails.\n'
+                               '### [REJECTED] P2 Parser bug\nReason: parser_test passes.\n')})
+        self.assertEqual(self.section(report, 'Confirmed by both').strip(), 'None.')
+        self.assertEqual(self.section(report, 'Rejected by both').strip(), 'None.')
+        self.assertEqual(report.count('did not check it; unverified'), 2)
+        self.assertIn('`[CONFIRMED] P1 Lifecycle leak` matches no finding (it cites P1 but its title matches another finding)', report)
+        self.assertIn('`[REJECTED] P2 Parser bug` matches no finding (it cites P2 but its title matches another finding)', report)
+
+    def test_coop_review_a_paraphrased_title_with_a_valid_id_is_accepted(self):
+        report = self.coop_report({
+            'diff:' + self.PI: '## Findings\n### 1. Parser bug\nAt parser.c:10.\n',
+            'ask:' + self.CL: '### [CONFIRMED] P1 Parser crashes on bad input\nEvidence: test.\n'})
+        self.assertIn('### P1: Parser bug', self.section(report, 'Confirmed by both'))
+
+
+    def test_coop_review_reads_crlf_reports(self):
+        original = ('## Findings\n### 1. Parser bug\nAt parser.c:10.\n```sh\n# comment\ncli --input bad\n```\n'
+                    '### 2. Lifecycle leak\nAt lifecycle.c:20, confirmed by test_leak.\n')
+        report = self.coop_report({
+            'diff:' + self.PI: original.replace('\n', '\r\n'),
+            'ask:' + self.CL: ('### [CONFIRMED] P1 Parser bug\nEvidence: parser test fails.\n```\nexample\n```\n'
+                               '### [CONFIRMED] P2 Lifecycle leak\nEvidence: lifecycle test fails.\n').replace('\n', '\r\n')})
+        self.assertIn('Findings: 2 from pi (slot 98), 0 from Claude Code (slot 99). Confirmed by both 2, disputed 0', report)
+        both = self.section(report, 'Confirmed by both')
+        self.assertIn('### P2: Lifecycle leak', both)
+        self.assertIn('cli --input bad', both)
+        self.assertIn('lifecycle test fails.', both)
+        self.assertNotIn('\r', report)
+
+    def test_coop_review_sigkill_during_final_output_releases_the_slot_reservations(self):
+        import fcntl
+        repo, _ = self.repo_with_change()
+        canned = self.home / 'large-report.json'
+        canned.write_text(json.dumps({
+            'diff:' + self.PI: '## Findings\n### 1. Large finding\n' + 'Detailed argument.\n' * 50000,
+            'ask:' + self.CL: '### [CONFIRMED] P1 Large finding\nEvidence: test fails.\n'}))
+        process = subprocess.Popen([str(self.launcher), 'coop-review'], cwd=repo, env=dict(self.env, FAKE_REPORTS=str(canned)),
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        orphan = None
+        try:
+            # Nothing reads stdout, so the final report print blocks once the pipe fills.
+            deadline = time.monotonic() + 20
+            while orphan is None:
+                self.assertLess(time.monotonic(), deadline)
+                for pid in subprocess.run(['pgrep', '-P', str(process.pid)], capture_output=True, text=True).stdout.split():
+                    try:
+                        command = Path('/proc', pid, 'cmdline').read_bytes().replace(b'\0', b' ').decode()
+                    except FileNotFoundError:
+                        continue
+                    if command.startswith('cat -- ') and '-coop-review.' in command:
+                        orphan = int(pid)
+                time.sleep(.02)
+            process.kill()
+            process.wait(timeout=5)
+            time.sleep(.2)
+            self.assertTrue(Path('/proc', str(orphan)).exists())
+            for slot in (self.PI, self.CL):
+                with (self.home / '.cache/claude-sidecar' / f'{slot}.coop.lock').open('w') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if orphan:
+                try:
+                    os.kill(orphan, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
 
 
 if __name__ == '__main__':

@@ -96,6 +96,16 @@ After every real implementation, before you report it done, run an **adversarial
 
 The sidecar reproduces each finding and quotes the command and output; it marks the rest `unverified`. A long request prints a status line to stderr every minute (`SIDECAR_PROGRESS_S`, `0` disables it). Before you report done or push, run `sidecar unreviewed`: it lists files changed since the last diff review and exits 1 if there are any. Send those back through `diff`.
 
+## Co-op review
+
+Use `coop-review` only when the user asks for it or the change warrants a thorough review. It costs about three single reviews. Run it in the background like `diff`:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" coop-review [--pi-slot N] [--claude-slot M] <base> "Intent of the change"
+```
+
+A pi reviewer (slot 98) and a Claude Code reviewer (slot 99) review the diff in parallel, then check each other's numbered findings. The slots are dedicated and the command reserves them for the whole run and fails at once if one is busy or in another coop-review. The report accounts for every finding: confirmed by both, disputed (each side's argument, including unchecked ones), or rejected by both, each with its origin. It decides nothing: settle disputes and fixes yourself, verifying each as usual. After fixing, call `coop-review` again with the same slots so both reviewers keep their memory. Exit 3 names the slot that asked; reply with `sidecar --slot N answer`, then rerun. Cancelling it (exit 130/143) stops nothing: the reviewers finish their requests and the slots stay busy until then. It accepts `--machine` for both reviewers, but not `--slot`, `--agent` or `--role`.
+
 ## Reviewing a merge request
 
 When the review targets a GitLab/GitHub merge request, post each confirmed finding as an **inline discussion on the diff line** it concerns. Never post a summary note, and never post without the user's go-ahead. Review a worktree at the MR head so the user's checkout stays untouched, and run the sidecar from inside it.

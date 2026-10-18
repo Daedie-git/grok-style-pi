@@ -107,6 +107,7 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar note "The user approved the plan in docs/plan.md."
 ./scripts/sidecar plan docs/plan.md "Goals and constraints"
 ./scripts/sidecar diff HEAD "Intent of the implementation"
+./scripts/sidecar coop-review HEAD "Intent of the implementation"
 ./scripts/sidecar unreviewed
 ./scripts/sidecar ask "Recheck finding 2 after the fix."
 ./scripts/sidecar --slot 2 ask "Review the parser independently."
@@ -116,6 +117,14 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar --slot 2 wait     # blocking watcher; run as a harness background task
 ./scripts/sidecar --slot 2 report   # recover the latest full report
 ```
+
+### Cooperative review
+
+`sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]` has two persistent reviewers review the same change: a pi reviewer and a Claude Code reviewer (`--agent claude`, Opus). They use dedicated slots, 98 and 99 by default, so the review never queues behind or mixes context with everyday slots; the flags choose others. A coop-review reserves both slots for its whole run, so a second one on the same slots, or any slot busy with another request, fails at once instead of queueing; its reviewer requests fail fast too if something else takes a slot mid-run. It runs `diff BASE CONTEXT` on both in parallel and asks each reviewer to number its findings (`### N. Title`). The launcher inventories them as `P1..` (pi) and `C1..` (Claude Code), then sends each reviewer the other's report and IDs to check without re-reviewing: every finding is marked confirmed (with evidence) or rejected (with a reason) by ID, and a reviewer may withdraw its own wrong findings.
+
+The launcher prints one combined report, saved like any other, with the usual `# Sidecar report (<path>)` first line. Every inventoried finding appears in exactly one section: **Confirmed by both**, **Rejected by both** (rejected by the peer and withdrawn by its author), or **Disputed** (each side's argument; also unchecked, unverified, duplicated or lone-withdrawn findings). Each finding names its origin, and the four underlying reports are linked. Fenced code in a report is never read as headings or verdicts. Check entries that match no finding (an unknown ID, or an ID whose title names a different finding), and reports with no extractable findings, are listed under Warnings and never shown as findings. The command settles nothing; the caller decides disputes and fixes.
+
+Slots keep their agent and memory, so a later round on the fixes is another `coop-review` call with the same slots. A slot already bound to the other agent, role or machine fails; pick other slots with the flags. `--machine` and `--remote-cwd` go before the command and apply to both reviewers. `--slot`, `--agent` and `--role` are rejected. A reviewer's question exits 3 and names its slot; answer with `sidecar --slot N answer TEXT`, then run `coop-review` again. Any other failure exits with the first reviewer's code. Reviewer launchers write to files, not the caller's pipes, and their progress is relayed with a `[pi slot N]` or `[claude slot M]` prefix. Cancelling coop-review (exit 130 or 143) signals nothing: it saves and prints an "interrupted" report and releases its reservations. The detached launchers finish their own requests, and the reviewers' turns continue in their panes; a new coop-review on the same slots fails fast as busy until they finish. The cost is about three single reviews: two reviews and two checks, two at a time. `sidecar ask -` reads the request text from stdin.
 
 ### Completion and report recovery
 

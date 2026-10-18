@@ -21,8 +21,11 @@
 #   sidecar note TEXT            share context on ongoing work; no review
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
 #   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
+#   sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]
+#                                cooperative diff review by a pi and a Claude Code reviewer (default dedicated slots 98 and 99): both
+#                                review in parallel, check each other's findings, and one combined report is printed
 #   sidecar unreviewed           list files changed since the last diff review (exit 1 when there are any)
-#   sidecar ask TEXT             follow-up request; prints the report
+#   sidecar ask TEXT|-           follow-up request (- reads TEXT from stdin); prints the report
 #   sidecar answer TEXT          answer the sidecar's pending question (exit 3 from a request); resumes that task
 #   sidecar steer TEXT           redirect busy work now; when idle, run a request and print its report
 set -euo pipefail
@@ -1117,6 +1120,7 @@ request() {
   if [[ $lock_mode == acquire ]]; then
     exec 9>"$STATE_DIR/$name.lock"
     if ! flock -n 9; then
+      [[ -z ${SIDECAR_NO_QUEUE:-} ]] || die "slot $SLOT is busy with another request"
       if [[ -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
         echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
         exit 4
@@ -1352,10 +1356,393 @@ ${2:-(none)}"
 
 cmd_ask() {
   require_herdr
-  [[ $# -ge 1 ]] || die "usage: sidecar ask TEXT"
+  [[ $# -ge 1 ]] || die "usage: sidecar ask TEXT|-"
+  local text="$*"
+  if [[ $# == 1 && $1 == - ]]; then text=$(cat); fi
   request ask "# Follow-up from Claude
 
-$*"
+$text"
+}
+
+COOP_PIDS=()
+COOP_LABELS=()
+COOP_ERRS=()
+COOP_SEEN=()
+COOP_DIR=
+COOP_KEEP=
+COOP_PHASE=
+COOP_COMBINED=
+# Dedicated slots, away from the default slot 1 and the low numbers used for everyday parallel work.
+COOP_PI_SLOT=98
+COOP_CLAUDE_SLOT=99
+
+# Runs an external command without the slot reservations (descriptors 7 and 8), so a helper that outlives this launcher
+# cannot keep the slots reserved.
+coop_x() { "$@" 7>&- 8>&-; }
+
+# Cancelling coop-review signals nothing. The reviewer launchers hold only files and their own slot request locks, so they
+# finish their requests on their own (the reviewers' turns would continue anyway); a later coop-review on the same slots
+# reports them as busy until they do.
+# shellcheck disable=SC2329  # run from the EXIT trap
+coop_cleanup() {
+  [[ -z $COOP_DIR || -n $COOP_KEEP ]] || coop_x rm -rf -- "$COOP_DIR"
+}
+
+# True while a launched reviewer launcher is still running (read-only; never used to signal).
+coop_busy() { [[ -n $(jobs -rp) ]]; }
+
+# Interrupted by INT or TERM: save and print what is available, leave the launchers running, exit with STATUS.
+# shellcheck disable=SC2329  # run from the INT and TERM traps
+coop_interrupt() {
+  local status=$1 side
+  COOP_KEEP=1
+  coop_relay
+  {
+    echo "# Cooperative review interrupted (during $COOP_PHASE)"
+    echo
+    echo "The reviewer launchers keep running and finish their own requests; coop-review on these slots reports them busy until then."
+    for side in pi claude; do
+      if [[ $COOP_PHASE == verify ]]; then echo "- $side review: $(coop_report_path "$COOP_DIR/$side.review")"; fi
+    done
+    echo "- Read a slot's latest report when it finishes: sidecar --slot N report"
+  } >"$COOP_COMBINED"
+  coop_x cat -- "$COOP_COMBINED"
+  exit "$status"
+}
+
+# Runs this launcher for one reviewer in the background, so each request keeps its own locking, progress and exit code.
+# Usage: coop_launch OUT LABEL SLOT AGENT STDIN COMMAND...  (OUT gets stdout, OUT.err stderr; coop_wait relays stderr)
+coop_launch() {
+  local out=$1 label=$2 slot=$3 agent=$4 input=$5
+  shift 5
+  local opts=(--slot "$slot" --agent "$agent" --role reviewer)
+  [[ -z $MACHINE_ARG ]] || opts+=(--machine "$MACHINE_ARG")
+  [[ -z $REMOTE_CWD ]] || opts+=(--remote-cwd "$REMOTE_CWD")
+  SIDECAR_NO_QUEUE=1 "$0" "${opts[@]}" "$@" <"$input" >"$out" 2>"$out.err" 7>&- 8>&- &
+  COOP_PIDS+=($!)
+  COOP_LABELS+=("$label")
+  COOP_ERRS+=("$out.err")
+  COOP_SEEN+=(0)
+}
+
+# Prints the complete lines each reviewer wrote to its stderr since the last call, prefixed with its label.
+coop_relay() {
+  local i line count
+  for i in ${COOP_PIDS[@]+"${!COOP_PIDS[@]}"}; do
+    [[ -r ${COOP_ERRS[i]} ]] || continue
+    count=0
+    while IFS= read -r line; do
+      count=$((count + 1))
+      if (( count > COOP_SEEN[i] )); then printf '[%s] %s\n' "${COOP_LABELS[i]}" "$line" >&2; fi
+    done <"${COOP_ERRS[i]}"
+    COOP_SEEN[i]=$count
+  done
+}
+
+# Waits for the launched reviewers, relaying their progress. Sets COOP_CODE_1 and COOP_CODE_2 (pi, then Claude Code).
+coop_wait() {
+  while coop_busy; do
+    coop_relay
+    coop_x sleep 0.2
+  done
+  coop_relay
+  COOP_CODE_1=0 COOP_CODE_2=0
+  wait "${COOP_PIDS[0]}" || COOP_CODE_1=$?
+  wait "${COOP_PIDS[1]}" || COOP_CODE_2=$?
+}
+
+# First stdout line of a finished request: its saved local report.
+coop_report_path() { coop_x sed -n '1s/^# Sidecar report (\(.*\))$/\1/p' "$1"; }
+
+# A reviewer's findings are its `### N. Title` headings, numbered in order and tagged with PREFIX (P1, C2, ...). Prints one
+# record per finding: ID, title and body (newlines as \037), separated by tabs.
+coop_inventory() {
+  coop_x awk -v prefix="$2" '
+    function fence(line,   lead, t, ch, n, rest) {
+      if (!match(line, /^ *(```+|~~~+)/)) return 0
+      t = substr(line, RSTART, RLENGTH); rest = substr(line, RLENGTH + 1); sub(/^ +/, "", t)
+      if (RLENGTH - length(t) > 3) return 0
+      ch = substr(t, 1, 1); n = length(t)
+      if (!infence) {
+        if (ch == "`" && index(rest, "`")) return 0
+        infence = 1; fch = ch; fn = n; return 1
+      }
+      if (ch == fch && n >= fn && rest ~ /^[ \t]*$/) { infence = 0; return 1 }
+      return 0
+    }
+    function flush() { if (open) { sub(/\n+$/, "", body); gsub(/\n/, "\037", body); printf "%s%d\t%s\t%s\n", prefix, n, title, body } open = 0 }
+    { sub(/\r$/, "") }
+    fence($0) || infence { if (open) body = body $0 "\n"; next }
+    /^# / || /^## / || /^### / { flush() }
+    /^### / {
+      title = $0; sub(/^### +/, "", title); sub(/^[0-9]+[.):]? +/, "", title); sub(/[ \t]+$/, "", title); gsub(/\t/, " ", title)
+      n++; body = ""; open = 1; next
+    }
+    open { body = body $0 "\n" }
+    END { flush() }' "$1"
+}
+
+# The cross-verification request: the peer's report to check, the IDs to cite, and the entry format coop_combine parses.
+# Usage: coop_verify_request PEER_LABEL PEER_REPORT PEER_INVENTORY OWN_INVENTORY
+coop_verify_request() {
+  local peer=$1 report=$2 peer_inventory=$3 own_inventory=$4
+  cat <<EOF
+# Cooperative review: check $peer's findings
+
+$peer reviewed the same change independently. Its report is below. Do not re-review the change from scratch: check each of its findings against the code, reproducing where you can.
+
+## Findings to check
+
+$(coop_x cut -f1,2 "$peer_inventory" | coop_x sed 's/\t/: /; s/^/- /')
+$(if [[ ! -s $peer_inventory ]]; then echo "(none found: its report has no \`###\` finding headings)"; fi)
+
+Answer with exactly one entry per finding above, citing its ID, using exactly these headings so the launcher can combine the reports:
+
+\`\`\`
+### [CONFIRMED] <ID> <title>
+Evidence: <command and its output, or file:line>
+
+### [REJECTED] <ID> <title>
+Reason: <why it is wrong, with evidence>
+\`\`\`
+
+Use \`[UNVERIFIED]\` with the reason only when you cannot decide either way. If you reported the same issue yourself, say so in the evidence. Findings with no entry count as unchecked.
+
+## Your own findings
+
+$(coop_x cut -f1,2 "$own_inventory" | coop_x sed 's/\t/: /; s/^/- /')
+
+If this report shows one of your own findings to be wrong, add \`### [WITHDRAWN] <your ID> <title>\` with the reason. Do not edit files. Use \`###\` headings only for these entries.
+
+## $peer's report
+
+$(coop_x cat -- "$report")
+EOF
+}
+
+# Combines the two reviews and their checks into the three sections of the final report. Arguments: PI_LABEL CLAUDE_LABEL
+# PI_INVENTORY CLAUDE_INVENTORY PI_VERIFICATION CLAUDE_VERIFICATION. Every inventoried finding lands in exactly one
+# section. Confirmed by both: confirmed by the peer and not withdrawn. Rejected by both: rejected by the peer and withdrawn
+# by its author. Everything else (rejected only, unverified, unchecked, duplicate, or a lone withdrawal) is disputed.
+# Entries that match no finding are flagged, never reported as findings.
+coop_combine() {
+  coop_x awk -v label1="$1" -v label2="$2" -v q="'" '
+    function norm(s) { s = tolower(s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function chomp(s) { sub(/\n+$/, "", s); return s }
+    function who(i) { return i == 1 ? label1 : label2 }
+    function fence(line,   lead, t, ch, n, rest) {
+      if (!match(line, /^ *(```+|~~~+)/)) return 0
+      t = substr(line, RSTART, RLENGTH); rest = substr(line, RLENGTH + 1); sub(/^ +/, "", t)
+      if (RLENGTH - length(t) > 3) return 0
+      ch = substr(t, 1, 1); n = length(t)
+      if (!infence) {
+        if (ch == "`" && index(rest, "`")) return 0
+        infence = 1; fch = ch; fn = n; return 1
+      }
+      if (ch == fch && n >= fn && rest ~ /^[ \t]*$/) { infence = 0; return 1 }
+      return 0
+    }
+    function save() {
+      if (!cur) return
+      ne[r]++; ek[r, ne[r]] = kind; ei[r, ne[r]] = id; et[r, ne[r]] = title; eb[r, ne[r]] = chomp(body); cur = 0
+    }
+    { sub(/\r$/, "") }
+    FILENAME != last { save(); infence = 0; last = FILENAME; for (k = 1; k <= 4; k++) if (ARGV[k] == FILENAME) f = k; r = f - 2 }
+    f <= 2 {
+      a = index($0, "\t"); rest = substr($0, a + 1); b = index(rest, "\t")
+      o = f; ni[o]++; iid[o, ni[o]] = substr($0, 1, a - 1); it[o, ni[o]] = substr(rest, 1, b - 1)
+      ib[o, ni[o]] = substr(rest, b + 1); gsub(/\037/, "\n", ib[o, ni[o]])
+      ido[toupper(iid[o, ni[o]])] = o; idi[toupper(iid[o, ni[o]])] = ni[o]
+      k = norm(it[o, ni[o]]); tc[o, k]++; if (tc[o, k] == 1) tf[o, k] = ni[o]
+      next
+    }
+    fence($0) || infence { if (cur) body = body $0 "\n"; next }
+    toupper($0) !~ /^### *\[(CONFIRMED|REJECTED|UNVERIFIED|WITHDRAWN)\]/ && ($0 ~ /^# / || $0 ~ /^## /) { save(); next }
+    toupper($0) ~ /^### *\[(CONFIRMED|REJECTED|UNVERIFIED|WITHDRAWN)\]/ {
+      save(); u = toupper($0); match(u, /\[[A-Z]+\]/)
+      kind = substr(u, RSTART + 1, RLENGTH - 2); rest = trim(substr($0, RSTART + RLENGTH)); id = ""
+      w = rest; sub(/[ \t].*/, "", w)
+      if (toupper(w) ~ /^[A-Z][0-9]+:?$/) { id = toupper(w); sub(/:$/, "", id); rest = trim(substr(rest, length(w) + 1)) }
+      title = rest; body = ""; cur = 1; next
+    }
+    cur { body = body $0 "\n" }
+    END {
+      save()
+      for (r = 1; r <= 2; r++) for (e = 1; e <= ne[r]; e++) {
+        want = (ek[r, e] == "WITHDRAWN") ? r : 3 - r; i = 0; why = ""
+        if (ei[r, e] != "" && (ei[r, e] in ido)) {
+          if (ido[ei[r, e]] != want) why = "ID " ei[r, e] " belongs to " who(ido[ei[r, e]]) q "s findings"
+          else {
+            i = idi[ei[r, e]]; k = norm(et[r, e])
+            if (k != "" && k != norm(it[want, i]) && tc[want, k] >= 1) {
+              why = "it cites " ei[r, e] " but its title matches another finding"; i = 0
+            }
+          }
+        } else {
+          k = norm(et[r, e])
+          if (tc[want, k] == 1) i = tf[want, k]
+          else if (tc[want, k] > 1) why = "its title matches several of " who(want) q "s findings and it cites no ID"
+          else why = "no finding of " who(want) " has this ID or title"
+        }
+        if (i == 0) { nu++; un = un "- " who(r) " entry `[" ek[r, e] "] " ei[r, e] " " et[r, e] "` matches no finding (" why "); ignored.\n"; continue }
+        if (ek[r, e] == "WITHDRAWN") { wd[want, i]++; if (wd[want, i] == 1) wdb[want, i] = eb[r, e] }
+        else { vc[want, i]++; vk[want, i, vc[want, i]] = ek[r, e]; vb[want, i, vc[want, i]] = eb[r, e] }
+      }
+      for (o = 1; o <= 2; o++) for (i = 1; i <= ni[o]; i++) {
+        v = 3 - o; n = vc[o, i]; w = wd[o, i] > 0
+        head = "### " iid[o, i] ": " it[o, i] "\nOrigin: " who(o) ". "
+        arg = "\n\n**" who(o) q "s finding:**\n\n" ib[o, i]
+        if (n == 1 && vk[o, i, 1] == "CONFIRMED" && !w) {
+          nb++; both = both head "Confirmed by " who(v) "." arg "\n\n**" who(v) q "s evidence:** " vb[o, i, 1] "\n\n"
+        } else if (n == 1 && vk[o, i, 1] == "REJECTED" && w) {
+          nr++; rej = rej head "Rejected by " who(v) " and withdrawn by " who(o) "." arg "\n\n**" who(v) " rejected:** " vb[o, i, 1] "\n\n**" who(o) " withdrew:** " wdb[o, i] "\n\n"
+        } else {
+          nd++
+          if (n == 0) st = who(v) " did not check it; unverified"
+          else if (n > 1) st = who(v) " gave " n " conflicting or repeated entries (flagged); unverified"
+          else if (vk[o, i, 1] == "REJECTED") st = who(v) " rejected it"
+          else if (vk[o, i, 1] == "CONFIRMED") st = who(v) " confirmed it"
+          else st = who(v) " could not decide; unverified"
+          out = head st (w ? "; " who(o) " withdrew it" : "") "." arg
+          for (c = 1; c <= n; c++) out = out "\n\n**" who(v) q "s check (" tolower(vk[o, i, c]) "):** " vb[o, i, c]
+          if (w) out = out "\n\n**" who(o) " withdrew:** " wdb[o, i]
+          disp = disp out "\n\n"
+        }
+      }
+      for (o = 1; o <= 2; o++) {
+        if (ni[o] == 0) warn = warn "- No findings were extracted from " who(o) q "s review (expected `### N. Title` headings); if it reported any, they are not covered below. Read its report.\n"
+        if (ni[3 - o] > 0 && ne[o] == 0) warn = warn "- " who(o) " returned no parseable verdicts; every finding of " who(3 - o) " is listed as unchecked.\n"
+      }
+      printf "Findings: %d from %s, %d from %s. Confirmed by both %d, disputed %d, rejected by both %d.\n\n", ni[1], label1, ni[2], label2, nb, nd, nr
+      if (warn != "" || un != "") printf "## Warnings\n\n%s%s\n", warn, un
+      printf "## Confirmed by both (%d)\n\n%s", nb, nb ? both : "None.\n\n"
+      printf "## Disputed (%d)\n\n%s", nd, nd ? disp : "None.\n\n"
+      printf "## Rejected by both (%d)\n\n%s", nr, nr ? rej : "None.\n\n"
+    }' "$3" "$4" "$5" "$6"
+}
+
+# Reserves a reviewer slot for this whole coop-review: a per-slot lock held on descriptor FD until exit, so two
+# coop-reviews cannot both pass admission. A slot busy with an unrelated request is refused rather than queued behind;
+# the reviewer launchers also fail fast instead of queueing (SIDECAR_NO_QUEUE).
+coop_reserve() {
+  local fd=$1 slot=$2 flag=$3 name lock
+  name=$(owner_name)
+  [[ $slot == 1 ]] || name+="-$slot"
+  if [[ $fd == 7 ]]; then exec 7>"$STATE_DIR/$name.coop.lock"; else exec 8>"$STATE_DIR/$name.coop.lock"; fi
+  if ! flock -n "$fd"; then
+    die "slot $slot is in use by another coop-review; choose another slot with $flag"
+  fi
+  lock="$STATE_DIR/$name.lock"
+  if ! ( coop_x flock -n 9 ) 9>"$lock"; then
+    die "slot $slot is busy with another request; wait for it or choose another slot with $flag"
+  fi
+}
+
+# Cooperative review: a pi and a Claude Code reviewer each review the diff, then each checks the other's findings.
+# The combined report decides nothing; the caller adjudicates. Exit codes follow the other requests: 0 combined report,
+# 3 a reviewer asked a question (answer it on its slot), otherwise the first reviewer's nonzero exit.
+cmd_coop_review() {
+  local pi_slot=$COOP_PI_SLOT claude_slot=$COOP_CLAUDE_SLOT base context combined pi_label claude_label phase
+  while [[ ${1:-} == --* ]]; do
+    case $1 in
+      --pi-slot|--claude-slot)
+        [[ ${2:-} =~ ^[1-9][0-9]{0,3}$ ]] || die "$1 requires an integer from 1 to 9999"
+        if [[ $1 == --pi-slot ]]; then pi_slot=$2; else claude_slot=$2; fi ;;
+      *) die "unknown coop-review option $1" ;;
+    esac
+    shift 2
+  done
+  [[ $# -le 2 ]] || die "usage: sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]"
+  [[ -z $SLOT_ARG && -z $ROLE_ARG && -z $AGENT_ARG ]] || die "coop-review chooses its own slots, agents and roles; use --pi-slot and --claude-slot"
+  [[ $pi_slot != "$claude_slot" ]] || die "--pi-slot and --claude-slot must differ"
+  require_identity
+  type -P flock >/dev/null || die "missing dependency flock; install it on PATH before using sidecar"
+  coop_reserve 7 "$pi_slot" --pi-slot
+  coop_reserve 8 "$claude_slot" --claude-slot
+  base=${1:-HEAD}
+  context="${2:-(none)}
+
+## Report format (cooperative review)
+Give each finding its own \`### N. Title\` heading, numbered from 1, and use no other \`###\` headings. The other reviewer will check every finding by its number."
+  pi_label="pi (slot $pi_slot)"
+  claude_label="Claude Code (slot $claude_slot)"
+  combined=$(coop_x mktemp "$REPORT_DIR/$(coop_x date +%Y%m%d-%H%M%S)-coop-review.XXXXXX.md")
+  COOP_DIR=$(coop_x mktemp -d "$REQUEST_DIR/coop.XXXXXX")
+  trap 'coop_cleanup' EXIT
+  COOP_COMBINED=$combined
+  trap 'coop_interrupt 130' INT
+  trap 'coop_interrupt 143' TERM
+  echo "# Sidecar report ($combined)"
+
+  # Phase 1: both reviewers review the same change; phase 2: each checks the other's report.
+  for phase in review verify; do
+    COOP_PHASE=$phase
+    COOP_PIDS=() COOP_LABELS=() COOP_ERRS=() COOP_SEEN=()
+    if [[ $phase == review ]]; then
+      coop_launch "$COOP_DIR/pi.$phase" "pi slot $pi_slot" "$pi_slot" pi /dev/null diff "$base" "$context"
+      coop_launch "$COOP_DIR/claude.$phase" "claude slot $claude_slot" "$claude_slot" claude /dev/null diff "$base" "$context"
+    else
+      coop_inventory "$(coop_report_path "$COOP_DIR/pi.review")" P >"$COOP_DIR/pi.inventory"
+      coop_inventory "$(coop_report_path "$COOP_DIR/claude.review")" C >"$COOP_DIR/claude.inventory"
+      coop_verify_request "$claude_label" "$(coop_report_path "$COOP_DIR/claude.review")" "$COOP_DIR/claude.inventory" "$COOP_DIR/pi.inventory" >"$COOP_DIR/pi.request"
+      coop_verify_request "$pi_label" "$(coop_report_path "$COOP_DIR/pi.review")" "$COOP_DIR/pi.inventory" "$COOP_DIR/claude.inventory" >"$COOP_DIR/claude.request"
+      coop_launch "$COOP_DIR/pi.$phase" "pi slot $pi_slot" "$pi_slot" pi "$COOP_DIR/pi.request" ask -
+      coop_launch "$COOP_DIR/claude.$phase" "claude slot $claude_slot" "$claude_slot" claude "$COOP_DIR/claude.request" ask -
+    fi
+    coop_wait
+    local pi_code=$COOP_CODE_1 claude_code=$COOP_CODE_2
+    if (( pi_code != 0 || claude_code != 0 )); then
+      coop_incomplete "$phase" "$combined" "$pi_code" "$claude_code" "$pi_slot" "$claude_slot" "$pi_label" "$claude_label"
+    fi
+  done
+
+  {
+    echo "# Cooperative review"
+    echo
+    echo "Base \`$base\`. Reviewers: $pi_label and $claude_label. Each finding names its origin. This report decides nothing: the caller settles disputes and fixes."
+    echo
+    echo "- $pi_label review: $(coop_report_path "$COOP_DIR/pi.review")"
+    echo "- $claude_label review: $(coop_report_path "$COOP_DIR/claude.review")"
+    echo "- $pi_label check of $claude_label's findings: $(coop_report_path "$COOP_DIR/pi.verify")"
+    echo "- $claude_label check of $pi_label's findings: $(coop_report_path "$COOP_DIR/claude.verify")"
+    echo
+    coop_combine "$pi_label" "$claude_label" "$COOP_DIR/pi.inventory" "$COOP_DIR/claude.inventory" \
+      "$(coop_report_path "$COOP_DIR/pi.verify")" "$(coop_report_path "$COOP_DIR/claude.verify")"
+  } >"$combined"
+  coop_x cat -- "$combined"
+}
+
+# Writes and prints the report of a coop-review that stopped in PHASE, then exits: 3 when a reviewer asked a question.
+coop_incomplete() {
+  local phase=$1 combined=$2 pi_code=$3 claude_code=$4 pi_slot=$5 claude_slot=$6 pi_label=$7 claude_label=$8
+  local code slot label question path status=0 side
+  {
+    echo "# Cooperative review incomplete (during $phase)"
+    echo
+    for side in pi claude; do
+      if [[ $side == pi ]]; then code=$pi_code slot=$pi_slot label=$pi_label; else code=$claude_code slot=$claude_slot label=$claude_label; fi
+      path=$(coop_report_path "$COOP_DIR/$side.$phase")
+      case $code in
+        0) echo "- $label: done${path:+; report $path}" ;;
+        3)
+          question=$(coop_x sed -n 's/\r$//; s/^NEEDS_ANSWER: //p' "$COOP_DIR/$side.$phase" | coop_x head -n 1)
+          echo "- $label: asked a question: $question"
+          echo "  Reply with: sidecar --slot $slot answer TEXT${path:+ (report $path)}" ;;
+        *) echo "- $label: failed with exit $code${path:+; report $path}" ;;
+      esac
+    done
+  } >"$combined"
+  coop_x cat -- "$combined"
+  if [[ $pi_code == 3 || $claude_code == 3 ]]; then
+    status=3
+    echo "sidecar: coop-review is blocked on a question; answer it with sidecar --slot N answer TEXT, then run coop-review again" >&2
+  else
+    status=$pi_code
+    [[ $status != 0 ]] || status=$claude_code
+    echo "sidecar: coop-review stopped during $phase (pi exit $pi_code, claude exit $claude_code)" >&2
+  fi
+  exit "$status"
 }
 
 cmd_answer() {
@@ -1593,6 +1980,7 @@ cmd_status() {
 }
 
 SLOT=1
+SLOT_ARG=
 ROLE_ARG=
 AGENT_ARG=
 MACHINE_ARG=
@@ -1601,7 +1989,8 @@ while [[ ${1:-} == --* ]]; do
   case $1 in
     --slot)
       [[ ${2:-} =~ ^[1-9][0-9]{0,3}$ ]] || die "--slot requires an integer from 1 to 9999"
-      SLOT=$2 ;;
+      SLOT=$2
+      SLOT_ARG=$2 ;;
     --role)
       [[ ${2:-} == reviewer || ${2:-} == implementer ]] || die "--role requires reviewer or implementer"
       ROLE_ARG=$2 ;;
@@ -1635,6 +2024,7 @@ case "${1:-}" in
   note) shift; cmd_note "$@" ;;
   plan) shift; cmd_plan "$@" ;;
   diff) shift; cmd_diff "$@" ;;
+  coop-review) shift; cmd_coop_review "$@" ;;
   unreviewed) shift; cmd_unreviewed "$@" ;;
   ask) shift; cmd_ask "$@" ;;
   answer) shift; cmd_answer "$@" ;;

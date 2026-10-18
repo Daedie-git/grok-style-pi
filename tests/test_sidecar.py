@@ -213,6 +213,9 @@ elif args[:2] == ['agent', 'prompt']:
         request_id = prompt.split(']', 1)[0].split()[1]
         reports = data_home / '.cache/claude-sidecar/reports'
         reports.mkdir(parents=True, exist_ok=True)
+        # FAKE_TOUCH: colon-separated paths the "sidecar" writes during its turn.
+        for touched in filter(None, os.environ.get('FAKE_TOUCH', '').split(':')):
+            pathlib.Path(touched).write_text('changed by the sidecar\n')
         started = time.time()
         time.sleep(float(os.environ.get('HERDR_PROMPT_DELAY_' + name.replace('-', '_'), os.environ.get('HERDR_PROMPT_DELAY', '0'))))
         import re
@@ -1306,6 +1309,147 @@ class LauncherTests(unittest.TestCase):
         request = next((self.home / '.cache/claude-sidecar/requests').glob('*-diff-*.md')).read_text()
         self.assertIn('Reproduce each finding before you report it', request)
         self.assertIn('unverified', request)
+
+    def request_text(self, kind):
+        return sorted((self.home / '.cache/claude-sidecar/requests').glob(f'*-{kind}-*.md'))[-1].read_text()
+
+    def fake_reports(self, mapping):
+        path = self.home / 'fake-reports.json'
+        path.write_text(json.dumps(mapping))
+        return dict(self.env, FAKE_REPORTS=str(path))
+
+    def test_diff_against_a_moved_base_reviews_since_the_merge_base(self):
+        repo, git = self.repo_with_change()
+        git('commit', '-am', 'Work')
+        git('branch', 'work')
+        git('checkout', '-q', 'HEAD~1')
+        (repo / 'upstream.txt').write_text('new upstream code\n')
+        git('add', '.')
+        git('commit', '-m', 'Upstream moved')
+        git('branch', 'upstream')
+        git('checkout', '-q', 'work')
+        result = self.run_cli('diff', 'upstream', cwd=repo)
+        self.assertIn('not an ancestor of HEAD', result.stderr)
+        diff = next((self.home / '.cache/claude-sidecar/requests').glob('*.diff')).read_text()
+        self.assertNotIn('upstream code', diff)
+        self.assertIn('+two', diff)
+        self.assertIn('upstream (merge-base', self.request_text('diff'))
+
+    def test_diff_and_plan_requests_ask_for_origin_and_measurements(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('diff', cwd=repo)
+        request = self.request_text('diff')
+        self.assertIn('`pre-existing`', request)
+        self.assertIn('git show', request)
+        plan = repo / 'plan.md'
+        plan.write_text('# Plan\n')
+        self.run_cli('plan', str(plan), cwd=repo)
+        self.assertIn('cites no measurement', self.request_text('plan'))
+
+    def test_implementer_ask_carries_the_contract_and_launcher_checks(self):
+        repo, git = self.repo_with_change()
+        (repo / 'src').mkdir()
+        env = dict(self.env, FAKE_TOUCH='src/in.txt:outside.txt')
+        result = self.run_cli('--slot', '2', '--role', 'implementer', 'ask', '--accept', 'echo accepted-output; exit 3',
+                              '--accept', 'true', '--scope', 'src/*', 'Implement it', cwd=repo, env=env)
+        request = self.request_text('ask')
+        self.assertIn('Completion contract', request)
+        self.assertIn('the launcher runs `echo accepted-output; exit 3` itself', request)
+        self.assertIn('`src/*`', request)
+        self.assertIn('**Outside the stated scope:** outside.txt', result.stdout)
+        self.assertNotIn('a.txt', result.stdout.split('## Verdict')[0], 'files dirty before the task are not flagged')
+        self.assertIn('FAIL, exit 3', result.stdout)
+        self.assertIn('accepted-output', result.stdout)
+        self.assertIn('`true`: **PASS**', result.stdout)
+        saved = self.report_path(result.stdout).read_text()
+        self.assertTrue(saved.startswith('## Launcher checks'))
+        self.assertIn('## Verdict', saved)
+        # Checks persist for follow-ups until cleared.
+        again = self.run_cli('--slot', '2', 'ask', 'Fix the failure', cwd=repo, env=env)
+        self.assertIn('Launcher checks', again.stdout)
+        cleared = self.run_cli('--slot', '2', 'ask', '--no-checks', 'Something else', cwd=repo, env=env)
+        self.assertNotIn('Launcher checks', cleared.stdout)
+
+    def test_scope_sees_reverted_dirty_files_and_real_names(self):
+        repo, git = self.repo_with_change()
+        (repo / 'my dir').mkdir()
+        # a.txt is dirty before the task; the "sidecar" overwrites it and writes a file in scope with a space in its path.
+        env = dict(self.env, FAKE_TOUCH='a.txt:my dir/new.txt')
+        result = self.run_cli('--slot', '2', '--role', 'implementer', 'ask', '--scope', 'my dir/*', 'Task', cwd=repo, env=env)
+        self.assertIn('**Outside the stated scope:** a.txt', result.stdout)
+        self.assertNotIn('new.txt', result.stdout.split('## Verdict')[0])
+
+    def test_multiline_acceptance_runs_as_one_command(self):
+        repo, _ = self.repo_with_change()
+        (repo / 'sub').mkdir()
+        (repo / 'sub/expected').write_text('x')
+        result = self.run_cli('--slot', '2', '--role', 'implementer', 'ask', '--accept', 'cd sub\ntest -f expected', 'Task', cwd=repo)
+        self.assertEqual(result.stdout.count('Acceptance `'), 1, result.stdout)
+        self.assertIn('**PASS**', result.stdout)
+
+    def test_a_queued_ask_does_not_replace_the_running_asks_checks(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('--slot', '2', '--role', 'implementer', 'start', cwd=repo)
+        first = subprocess.Popen([str(self.launcher), '--slot', '2', 'ask', '--accept', 'echo FIRST_CHECK', 'First'], cwd=repo, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(self.env, HERDR_PROMPT_DELAY='1'))
+        deadline = time.monotonic() + 5
+        while not any(c[:2] == ['agent', 'prompt'] for c in self.calls()):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        second = self.run_cli('--slot', '2', 'ask', '--no-checks', 'Second', cwd=repo)
+        stdout, _ = first.communicate(timeout=20)
+        self.assertIn('FIRST_CHECK', stdout)
+        self.assertNotIn('Launcher checks', second.stdout)
+
+    def test_concurrent_rejections_get_distinct_ids(self):
+        with ThreadPoolExecutor(6) as pool:
+            list(pool.map(lambda n: self.run_cli('reject', f'#{n}: reason'), range(6)))
+        ledger = [json.loads(line) for line in (self.home / '.cache/claude-sidecar/sc-pane-1.rejections.jsonl').read_text().splitlines()]
+        self.assertEqual(sorted(r['id'] for r in ledger), sorted(f'R{n}' for n in range(1, 7)))
+
+    def test_reviewer_ask_has_no_implementer_contract(self):
+        self.run_cli('ask', 'Look at this')
+        self.assertNotIn('Completion contract', self.request_text('ask'))
+
+    def test_rejections_are_held_rechecked_and_overruled(self):
+        repo, _ = self.repo_with_change()
+        env = self.fake_reports({'reject:sc-pane-1': 'R1: stands\nRepro: `./x` crashes\n'})
+        result = self.run_cli('reject', 'Finding 2 (null deref): the pointer is never null here', cwd=repo, env=env)
+        self.assertIn('reviewer holds R1', result.stderr)
+        self.assertIn('Concede only to evidence', self.request_text('reject'))
+        self.run_cli('diff', cwd=repo)
+        self.assertIn('R1 (stands): Finding 2 (null deref)', self.request_text('diff'))
+        self.run_cli('reject', '--overrule', 'R1', 'User decided', cwd=repo)
+        time.sleep(1.1)
+        self.run_cli('diff', cwd=repo)
+        self.assertNotIn('Findings Claude rejected earlier', self.request_text('diff'))
+        env = self.fake_reports({'reject:sc-pane-1': 'R2: withdrawn, the guard on line 4 covers it\n'})
+        self.run_cli('reject', 'Finding 3: guarded', cwd=repo, env=env)
+        ledger = [json.loads(line) for line in (self.home / '.cache/claude-sidecar/sc-pane-1.rejections.jsonl').read_text().splitlines()]
+        self.assertEqual([(r['id'], r['status']) for r in ledger], [('R1', 'overruled'), ('R2', 'withdrawn')])
+
+    def gate(self, command, cwd):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': str(cwd)})
+        return self.run_cli('push-gate', input=payload)
+
+    def test_push_gate_denies_pushes_with_unreviewed_changes(self):
+        repo, git = self.repo_with_change()
+        self.assertEqual(self.gate('git push origin HEAD', repo).stdout, '', 'no review recorded: no gate')
+        self.run_cli('--slot', '3', 'diff', cwd=repo)
+        self.assertEqual(self.gate('git push', repo).stdout, '')
+        (repo / 'late.txt').write_text('unreviewed\n')
+        for command in ('git push', f'git -C {repo} push -u origin b', f'cd "{repo}" && git push', 'git -c push.autoSetupRemote=true push',
+                        'git --no-pager push', 'gh pr create --fill', 'glab mr create', 'SIDECAR_REVIEW_SKIP=x git status; git push'):
+            denied = json.loads(self.gate(command, repo.parent if repo.name in command else repo).stdout)['hookSpecificOutput']
+            self.assertEqual(denied['permissionDecision'], 'deny', command)
+            self.assertIn('late.txt', denied['permissionDecisionReason'])
+        for command in ('git status', 'git log --grep push', 'SIDECAR_REVIEW_SKIP=tickets git push', 'echo "Use git push after review"',
+                        f'git -C {self.home} push'):
+            self.assertEqual(self.gate(command, repo).stdout, '', command)
+        outside = dict(self.env)
+        outside.pop('HERDR_ENV')
+        payload = json.dumps({'tool_input': {'command': 'git push'}, 'cwd': str(repo)})
+        self.assertEqual(self.run_cli('push-gate', input=payload, env=outside).stdout, '')
 
     def test_unreviewed_tracks_changes_since_the_last_diff_review(self):
         repo, git = self.repo_with_change()

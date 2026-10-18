@@ -25,7 +25,13 @@
 #                                cooperative diff review by a pi and a Claude Code reviewer (default dedicated slots 98 and 99): both
 #                                review in parallel, check each other's findings, and one combined report is printed
 #   sidecar unreviewed           list files changed since the last diff review (exit 1 when there are any)
-#   sidecar ask TEXT|-           follow-up request (- reads TEXT from stdin); prints the report
+#   sidecar ask [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-
+#                                follow-up request (- reads TEXT from stdin); prints the report. --accept runs CMD here
+#                                after the report and --scope flags changed files outside GLOB; both persist on the slot
+#   sidecar reject TEXT          tell the reviewer a finding is rejected and why; it withdraws with evidence or stands
+#   sidecar reject --overrule R<n> REASON
+#                                settle a standing rejection without the reviewer's agreement
+#   sidecar push-gate            PreToolUse hook entry: deny pushes while files changed since the latest diff review
 #   sidecar answer TEXT          answer the sidecar's pending question (exit 3 from a request); resumes that task
 #   sidecar steer TEXT           redirect busy work now; when idle, run a request and print its report
 set -euo pipefail
@@ -1098,6 +1104,22 @@ print_saved_report() {
 }
 
 # Atomically finish the request's persistent status on every exit, including failures and signals.
+# Takes the slot's request lock on descriptor 9, queueing behind a running request; exit 4 when HASH is already in flight.
+lock_slot() {
+  local hash=$1 name
+  name=$(agent_name)
+  exec 9>"$STATE_DIR/$name.lock"
+  if ! flock -n 9; then
+    [[ -z ${SIDECAR_NO_QUEUE:-} ]] || die "slot $SLOT is busy with another request"
+    if [[ -n $hash && -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
+      echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
+      exit 4
+    fi
+    echo "sidecar: another request is in flight; waiting for it" >&2
+    flock 9
+  fi
+}
+
 finish_request() {
   local code=$1 tmp
   [[ -n $ACTIVE_REQUEST ]] || return 0
@@ -1117,18 +1139,7 @@ request() {
   hname=$(herdr_agent)
   hash=$(sha256sum <<<"$body" | cut -d' ' -f1)
   # The idle-steer caller already holds descriptor 9 so its idle decision and request are serialized together.
-  if [[ $lock_mode == acquire ]]; then
-    exec 9>"$STATE_DIR/$name.lock"
-    if ! flock -n 9; then
-      [[ -z ${SIDECAR_NO_QUEUE:-} ]] || die "slot $SLOT is busy with another request"
-      if [[ -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
-        echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
-        exit 4
-      fi
-      echo "sidecar: another request is in flight; waiting for it" >&2
-      flock 9
-    fi
-  fi
+  [[ $lock_mode != acquire ]] || lock_slot "$hash"
   # A slot may have been bound to another agent while this request waited for the lock.
   resolve_backend
   INFLIGHT="$STATE_DIR/$name.inflight"
@@ -1192,6 +1203,11 @@ $(remote_notice)"
       mv -f -- "$copy" "$saved_report"
       [[ -z $question ]] || printf '%s\n' "$question" >"${saved_report%.md}.needs-answer"
     fi
+    rejections_parse "$saved_report"
+    if [[ -z $question && ( $kind == ask || $kind == answer ) && -s $(checks_file) ]]; then
+      echo "sidecar: running launcher checks" >&2
+      run_checks "$saved_report"
+    fi
     state_tmp=$(mktemp "$STATE_DIR/$name.report.XXXXXX")
     printf '%s\n' "$saved_report" >"$state_tmp"
     mv -f -- "$state_tmp" "$STATE_DIR/$name.report"
@@ -1243,6 +1259,8 @@ $(remote_checkout_note "$sha")
 
 Look for: wrong assumptions about the existing code, missing steps or cases, ownership/lifecycle/concurrency problems, conflicts with ADRs and documented contracts, ordering mistakes, and simpler alternatives that would clearly be better. Verify claims against the repository.
 
+Flag every claim about performance, cost or frequency (a speedup, frame time, memory, \"hot path\", \"rarely happens\") that cites no measurement, profile or capture, and name the measurement that would settle it.
+
 ## Context from Claude
 ${2:-(none)}"
 }
@@ -1251,7 +1269,7 @@ ${2:-(none)}"
 # throwaway index first, so untracked files, deletions, symlinks (by link text), executable bits and submodule commits
 # are compared as Git sees them, whatever the real index or diff.relative says. LC_ALL=C keeps names and order stable.
 change_manifest() {
-  local base=$1 root index raw status=0 meta path
+  local base=$1 names=${2:-} root index raw status=0 meta path
   root=$(git rev-parse --show-toplevel) || return 1
   index=$(mktemp "$STATE_DIR/index.XXXXXX") || return 1
   raw=$(mktemp "$STATE_DIR/raw.XXXXXX") || { rm -f -- "$index"; return 1; }
@@ -1264,8 +1282,11 @@ change_manifest() {
     GIT_INDEX_FILE=$index git -C "$root" -c diff.relative=false diff --cached --raw -z --no-renames --no-ext-diff --no-abbrev "$base" >"$raw" || status=1
   fi
   if (( status == 0 )); then
+    [[ -z $names ]] || : >"$names"
     while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
       LC_ALL=C printf '%q\t%s\n' "$path" "${meta#:* }"
+      # NAMES, when given, maps each escaped name to the real path (NUL-separated pairs).
+      [[ -z $names ]] || LC_ALL=C printf '%q\0%s\0' "$path" "$path" >>"$names"
     done <"$raw"
   fi
   rm -f -- "$index" "$raw"
@@ -1278,8 +1299,11 @@ reviewed_file() {
 }
 
 cmd_unreviewed() {
-  local file base now changed
-  file=$(reviewed_file)
+  unreviewed_since "$(reviewed_file)"
+}
+
+unreviewed_since() {
+  local file=$1 base now changed
   if [[ ! -s $file ]]; then
     now=$(change_manifest HEAD) || die "could not fingerprint the working tree"
     [[ -z $now ]] && { echo "no changes, and no diff review recorded"; return 0; }
@@ -1298,11 +1322,94 @@ cmd_unreviewed() {
   return 1
 }
 
+# PreToolUse hook: refuse `git push` and PR/MR creation while files changed since this Claude's latest diff review in the
+# repository the command publishes from (any slot). Repositories with no recorded review pass, as do commands run with
+# SIDECAR_REVIEW_SKIP=<why> in their environment assignments.
+cmd_push_gate() {
+  local input command cwd dir repo file latest reason reasons=()
+  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || return 0
+  input=$(cat)
+  command=$(jq -r '.tool_input.command // empty' <<<"$input")
+  # Cheap filter first: this hook runs for every Bash call.
+  [[ $command == *push* || $command == *create* ]] || return 0
+  cwd=$(jq -r '.cwd // empty' <<<"$input")
+  type -P node >/dev/null || return 0
+  SLOT=1
+  while IFS= read -r -d '' dir; do
+    [[ -d $dir ]] || continue
+    repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
+    latest=
+    for file in "$STATE_DIR/$(owner_name)"{,-*}".reviewed.$(sha256sum <<<"$repo" | cut -c1-12)"; do
+      if [[ -s $file && ( -z $latest || $file -nt $latest ) ]]; then latest=$file; fi
+    done
+    [[ -n $latest ]] || continue
+    if ! reason=$(cd -- "$repo" && unreviewed_since "$latest" 2>&1); then reasons+=("$repo: $reason"); fi
+  done < <(node -e "$PUBLISH_DIRS_JS" "$command" "${cwd:-$PWD}" "$HOME")
+  (( ${#reasons[@]} )) || return 0
+  jq -n --arg reason "Sidecar review gate: ${reasons[*]}. Run \`sidecar diff <base>\` over them first. Only if this push needs no review (tickets, docs), run it with SIDECAR_REVIEW_SKIP=<why> and tell the user." \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
+}
+
+# Prints, NUL-separated, the directory each publishing command in a shell command line runs in: `git [global options]
+# push`, `gh pr create`, `glab mr create`. Quotes, escapes, `cd DIR` and `git -C DIR` are followed; heredocs are not.
+PUBLISH_DIRS_JS='
+const [command, start, home] = process.argv.slice(1);
+const path = require("path");
+const segments = [];
+let words = [], word = "", has = false, quote = "";
+const endWord = () => { if (has) words.push(word); word = ""; has = false; };
+const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
+for (let i = 0; i < command.length; i++) {
+  const c = command[i];
+  if (quote) {
+    if (c === quote) quote = "";
+    else if (c === "\\" && quote === "\"" && i + 1 < command.length) word += command[++i];
+    else word += c;
+  } else if (c === "\x27" || c === "\"") { quote = c; has = true; }
+  else if (c === "\\" && i + 1 < command.length) { word += command[++i]; has = true; }
+  else if (/\s/.test(c) && c !== "\n") endWord();
+  else if (";&|()\n".includes(c)) endSegment();
+  else { word += c; has = true; }
+}
+endSegment();
+const resolve = (dir, to) => path.resolve(dir, to === undefined ? home : to.replace(/^~(?=\/|$)/, home));
+let dir = start;
+for (let words of segments) {
+  let skip = false;
+  while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]) || words[0] === "env" || words[0] === "command")) {
+    if (words[0].startsWith("SIDECAR_REVIEW_SKIP=")) skip = true;
+    words = words.slice(1);
+  }
+  const [name, ...rest] = words;
+  if (name === "cd") { dir = resolve(dir, rest[0]); continue; }
+  if (skip) continue;
+  if (name === "git") {
+    let target = dir, i = 0;
+    while (i < rest.length && rest[i].startsWith("-")) {
+      if (rest[i] === "-C") { target = resolve(target, rest[i + 1]); i += 2; }
+      else if (["-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].includes(rest[i])) i += 2;
+      else i++;
+    }
+    if (rest[i] === "push") process.stdout.write(target + "\0");
+  } else if ((name === "gh" && rest[0] === "pr" && rest[1] === "create") || (/^glab(-bot)?$/.test(name ?? "") && rest[0] === "mr" && rest[1] === "create")) {
+    process.stdout.write(dir + "\0");
+  }
+}
+'
+
 cmd_diff() {
   require_herdr
-  local base=${1:-HEAD} id diff root f diff_path repo sha head rel manifest
+  local base=${1:-HEAD} id diff root f diff_path repo sha head rel manifest label fork rejected
   [[ $base != *..* ]] || die "diff takes a single base ref, not a range ($base). Use: sidecar --slot $SLOT diff ${base%%..*} CONTEXT; it reviews that base through the working tree"
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
+  label=$base
+  # A base that moved past the work (origin/main after a fetch) would show its new commits as removals.
+  if ! git merge-base --is-ancestor "$base" HEAD; then
+    fork=$(git merge-base "$base" HEAD) || die "$base and HEAD share no history"
+    echo "sidecar: $base is not an ancestor of HEAD; reviewing changes since their merge-base ${fork:0:12}" >&2
+    label="$base (merge-base ${fork:0:12})"
+    base=$fork
+  fi
   root=$(git rev-parse --show-toplevel)
   id="$(date +%Y%m%d-%H%M%S)-$(agent_name)"
   diff=$(mktemp "$REQUEST_DIR/$id.XXXXXX.diff")
@@ -1334,14 +1441,26 @@ cmd_diff() {
     diff_path=$(cygpath -m "$diff_path")
     repo=$(cygpath -m "$repo")
   fi
+  rejected=$(rejections_unsettled)
+  if [[ -n $rejected ]]; then
+    rejected="
+## Findings Claude rejected earlier
+Re-check each against the current code. Report one that still holds as a finding again. Add a section \`## Rejected findings re-check\` with one line per entry: \`R<n>: withdrawn\` or \`R<n>: stands\`, and the reason.
+$rejected
+"
+  fi
   request diff "# Adversarial implementation review
 
-Find bugs in the change in \`$diff_path\` (repository: \`$repo\`, base \`$base\`).
+Find bugs in the change in \`$diff_path\` (repository: \`$repo\`, base \`$label\`, commit \`$sha\`).
 $(remote_checkout_note "$head" "$sha")
+The change is exactly what the diff shows. Code that exists only on a newer upstream branch is not part of it, and the change does not remove it.
 
 Read the diff, then read the surrounding code it touches and its callers. Hunt for real defects: logic errors, broken invariants, lifecycle and ownership mistakes, races, missed error paths, edge inputs, stale callers, and behaviour that contradicts the intent below or earlier agreed decisions. Give each finding a concrete failure scenario. Skip style.
 
 Reproduce each finding before you report it: run the existing tests or a short script that triggers it, and quote the command and its output in the finding. Mark a finding you could not reproduce \`unverified\` and say why.
+
+Give each finding an origin: \`introduced\` when the change adds or exposes it, \`pre-existing\` when the same defect exists at the base (check with \`git show $sha:<path>\`). Put pre-existing findings last, under \`## Pre-existing (not blocking)\`, and only when the change makes them more reachable or they defeat its intent.
+$rejected
 
 ## Intent and context from Claude
 ${2:-(none)}"
@@ -1355,13 +1474,203 @@ ${2:-(none)}"
 }
 
 cmd_ask() {
+  local accept=() scope=() clear='' text
+  while [[ ${1:-} == --accept || ${1:-} == --scope || ${1:-} == --no-checks ]]; do
+    case $1 in
+      --accept) [[ -n ${2:-} ]] || die "--accept requires a command"; accept+=("$2"); shift 2 ;;
+      --scope) [[ -n ${2:-} ]] || die "--scope requires a path glob"; scope+=("$2"); shift 2 ;;
+      --no-checks) clear=1; shift ;;
+    esac
+  done
   require_herdr
-  [[ $# -ge 1 ]] || die "usage: sidecar ask TEXT|-"
-  local text="$*"
+  [[ $# -ge 1 ]] || die "usage: sidecar ask [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-"
+  text="$*"
   if [[ $# == 1 && $1 == - ]]; then text=$(cat); fi
+  local lock_mode=acquire
+  if (( ${#accept[@]} + ${#scope[@]} )) || [[ -n $clear ]]; then
+    [[ -z $MACHINE || -n $clear ]] || die "--accept and --scope run in this checkout; they are not supported for a slot on another machine"
+    # A running request still owns the current checks; replace them only once it has finished.
+    lock_slot ""
+    lock_mode=held
+    if [[ -n $clear ]]; then rm -f -- "$(checks_file)"; else save_checks accept scope; fi
+  fi
+  if [[ $ROLE == implementer ]]; then
+    text+="
+
+$(implementer_contract)"
+  fi
   request ask "# Follow-up from Claude
 
-$text"
+$text" "$lock_mode"
+}
+
+# Launcher-run checks of an implementer's work: they persist on the slot (so answers and idle steers rerun them) until
+# replaced by another ask with --accept/--scope, or cleared with --no-checks.
+checks_file() { echo "$STATE_DIR/$(agent_name).checks.json"; }
+
+save_checks() {
+  local -n accept_ref=$1 scope_ref=$2
+  local root start before file tmp
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die "--accept and --scope need a git checkout; run the ask from the implementer's checkout"
+  start=$(git rev-parse HEAD)
+  file=$(checks_file)
+  before="${file%.json}.before"
+  # Files already dirty before the task are not the implementer's unless they change again.
+  change_manifest "$start" "$before.names" >"$before" || die "could not fingerprint the working tree"
+  tmp=$(mktemp "$file.XXXXXX")
+  jq -n --arg cwd "$PWD" --arg root "$root" --arg start "$start" --arg before "$before" \
+    '{cwd: $cwd, root: $root, start: $start, before: $before, accept: $ARGS.positional[0:($n|tonumber)], scope: $ARGS.positional[($n|tonumber):]}' \
+    --arg n "${#accept_ref[@]}" --args "${accept_ref[@]}" "${scope_ref[@]}" >"$tmp"
+  mv -f -- "$tmp" "$file"
+}
+
+implementer_contract() {
+  local file cmd glob
+  file=$(checks_file)
+  echo "## Completion contract"
+  echo
+  echo "- First line of your report: \`Status: done\`, \`Status: partial\` or \`Status: blocked\`. Partial work is never done."
+  echo "- Exercise the change through the real entry point a user or caller uses (the CLI command, editor action, app or service run), not only tests that call internals directly. A section \`## Verified\` quotes each command you ran and its result."
+  echo "- A section \`## Not verified\` lists what you did not run (GPU, other platforms, slow suites) and why."
+  echo "- Change only what the task needs. List anything else you think should change under \`## Suggested follow-ups\` instead of doing it. A section \`## Files changed\` lists every file you touched."
+  [[ -s $file ]] || return 0
+  while IFS= read -r -d '' cmd; do
+    echo "- After your report, the launcher runs \`$cmd\` itself in \`$(jq -r .cwd "$file")\` and shows its result to Claude. Run it first."
+  done < <(jq -j '.accept[] | . + "\u0000"' "$file")
+  if [[ $(jq '.scope | length' "$file") != 0 ]]; then
+    echo "- Scope: change only files matching $(jq -r '.scope | map("`" + . + "`") | join(", ")' "$file"). The launcher flags any other file you change."
+  fi
+  return 0
+}
+
+# Prepends the launcher's own scope and acceptance results to REPORT.
+run_checks() {
+  local report=$1 file cwd root start before out now changed outside=() path glob matched cmd n=0 code log key raw
+  local -A names=()
+  file=$(checks_file)
+  cwd=$(jq -r .cwd "$file")
+  root=$(jq -r .root "$file")
+  start=$(jq -r .start "$file")
+  before=$(jq -r .before "$file")
+  out=$(mktemp "$report.checks.XXXXXX")
+  {
+    echo "## Launcher checks"
+    echo
+    echo "Run by the launcher after the sidecar reported, in \`$cwd\`."
+    echo
+    if [[ $(jq '.scope | length' "$file") != 0 ]]; then
+      if now=$(cd -- "$root" && change_manifest "$start" "$before.after-names"); then
+        # Escaped manifest names map back to real paths, recorded before and after the task.
+        for raw in "$before.names" "$before.after-names"; do
+          while IFS= read -r -d '' key && IFS= read -r -d '' path; do names[$key]=$path; done <"$raw"
+        done
+        # Both sides: a file the task created or edited, and a dirty file it reverted or deleted.
+        changed=$(LC_ALL=C comm -3 <(LC_ALL=C sort "$before") <(LC_ALL=C sort <<<"$now") | sed 's/^\t//' | cut -f1 | LC_ALL=C sort -u)
+        while IFS= read -r key; do
+          [[ -n $key ]] || continue
+          path=${names[$key]:-$key}
+          matched=
+          while IFS= read -r -d '' glob; do
+            # shellcheck disable=SC2053  # the glob is a pattern on purpose
+            if [[ $path == $glob ]]; then matched=1; break; fi
+          done < <(jq -j '.scope[] | . + "\u0000"' "$file")
+          [[ -n $matched ]] || outside+=("$key")
+        done <<<"$changed"
+        if (( ${#outside[@]} )); then
+          echo "- **Outside the stated scope:** ${outside[*]}"
+        else
+          echo "- Scope: every changed file is within $(jq -r '.scope | join(", ")' "$file")."
+        fi
+      else
+        echo "- Scope: could not fingerprint \`$root\`."
+      fi
+    fi
+    while IFS= read -r -d '' cmd; do
+      n=$((n + 1))
+      log="${report%.md}.accept-$n.log"
+      code=0
+      (cd -- "$cwd" && timeout "${SIDECAR_ACCEPT_TIMEOUT_S:-1800}" bash -c "$cmd") </dev/null >"$log" 2>&1 || code=$?
+      if [[ $code == 0 ]]; then echo "- Acceptance \`$cmd\`: **PASS** (log: $log)"; else echo "- Acceptance \`$cmd\`: **FAIL, exit $code** (log: $log)"; fi
+      echo
+      echo '```'
+      tail -n 20 -- "$log"
+      echo '```'
+    done < <(jq -j '.accept[] | . + "\u0000"' "$file")
+    echo
+    cat -- "$report"
+  } >"$out"
+  mv -f -- "$out" "$report"
+}
+
+# Findings Claude rejected, per slot, so the reviewer can hold its ground and later diff reviews re-check them.
+rejections_file() { echo "$STATE_DIR/$(agent_name).rejections.jsonl"; }
+
+# Every ledger read-modify-write holds this lock, so concurrent rejections get distinct IDs and no update is lost.
+rejection_add() {
+  local file id
+  file=$(rejections_file)
+  exec 6>"$file.lock"
+  flock 6
+  id="R$(( $( [[ -s $file ]] && wc -l <"$file" || echo 0) + 1 ))"
+  jq -cn --arg id "$id" --arg text "$1" '{id: $id, text: $text, status: "open"}' >>"$file"
+  exec 6>&-
+  echo "$id"
+}
+
+rejection_set() {
+  local id=$1 status=$2 reason=${3:-} file tmp result=0
+  file=$(rejections_file)
+  exec 6>"$file.lock"
+  flock 6
+  if [[ -s $file ]] && jq -e --arg id "$id" 'select(.id == $id)' "$file" >/dev/null; then
+    tmp=$(mktemp "$file.XXXXXX")
+    jq -c --arg id "$id" --arg status "$status" --arg reason "$reason" \
+      'if .id == $id then .status = $status | (if $reason != "" then .reason = $reason else . end) else . end' "$file" >"$tmp"
+    mv -f -- "$tmp" "$file"
+  else
+    result=1
+  fi
+  exec 6>&-
+  return "$result"
+}
+
+# Rejections the reviewer has not withdrawn and Claude has not overruled.
+rejections_unsettled() {
+  local file
+  file=$(rejections_file)
+  [[ -s $file ]] || return 0
+  jq -r 'select(.status == "open" or .status == "stands") | "- \(.id) (\(.status)): \(.text)"' "$file"
+}
+
+# Applies `R<n>: withdrawn|stands` verdicts from REPORT and tells Claude about the ones still standing.
+rejections_parse() {
+  local report=$1 id verdict
+  [[ -s $(rejections_file) ]] || return 0
+  while read -r id verdict; do
+    rejection_set "$id" "$verdict" || true
+    [[ $verdict != stands ]] || echo "sidecar: the reviewer holds $id; fix it, or reject again with new evidence, or overrule it with: sidecar --slot $SLOT reject --overrule $id REASON (then tell the user)" >&2
+  done < <(grep -oE '\bR[0-9]+: *(withdrawn|stands)\b' -- "$report" | sed 's/: */ /' | sort -u)
+}
+
+cmd_reject() {
+  if [[ ${1:-} == --overrule ]]; then
+    [[ ${2:-} =~ ^R[0-9]+$ && -n ${3:-} ]] || die "usage: sidecar reject --overrule R<n> REASON"
+    rejection_set "$2" overruled "${*:3}" || die "slot $SLOT has no rejection $2"
+    echo "sidecar: $2 overruled; tell the user, with the reviewer's failure scenario and your reason"
+    return
+  fi
+  require_herdr
+  [[ $# -ge 1 ]] || die "usage: sidecar reject 'FINDING: REASON' | --overrule R<n> REASON"
+  local id
+  id=$(rejection_add "$*")
+  echo "sidecar: recorded rejection $id" >&2
+  request reject "# Claude rejected one of your findings ($id)
+
+$*
+
+Re-check the finding against the current code. Concede only to evidence that refutes your failure scenario; agreement, authority or repetition is not evidence.
+- If the rejection holds, start your report with \`$id: withdrawn\` and name the evidence that convinced you.
+- If it does not, start with \`$id: stands\` and restate the failure scenario with a reproduction: the command and its output."
 }
 
 COOP_PIDS=()
@@ -2026,6 +2335,8 @@ case "${1:-}" in
   diff) shift; cmd_diff "$@" ;;
   coop-review) shift; cmd_coop_review "$@" ;;
   unreviewed) shift; cmd_unreviewed "$@" ;;
+  push-gate) shift; cmd_push_gate "$@" ;;
+  reject) shift; cmd_reject "$@" ;;
   ask) shift; cmd_ask "$@" ;;
   answer) shift; cmd_answer "$@" ;;
   steer) shift; cmd_steer "$@" ;;

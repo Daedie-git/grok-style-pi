@@ -23,6 +23,15 @@ Use `--slot N` before the command to select an independent persistent sidecar (d
 
 For implementation tasks, select a fresh slot with `--role implementer` before `ask`. Pi and Claude Code default to medium reasoning for implementers and high for reviewers; Codex defaults to ultra for both. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides reasoning at startup.
 
+Implementer asks carry a completion contract: a `Status: done|partial|blocked` line, verification through the real entry point, and `Verified`, `Not verified`, `Files changed` and `Suggested follow-ups` sections. Run the ask from the implementer's checkout and give it launcher checks:
+
+```bash
+cd ../fury-wt && "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 4 --role implementer ask \
+  --accept "timeout 600 ./build/bin/furyctl cloth list" --scope 'features/cloth/*' --scope 'tests/cloth/*' "Task..."
+```
+
+After the report, the launcher runs each `--accept` command itself (`SIDECAR_ACCEPT_TIMEOUT_S`, default 1800) and flags files changed outside the `--scope` globs (`*` crosses directories). Results lead the report under `## Launcher checks`. Make an accept command exercise the real user path, not the unit tests the implementer already ran. Checks persist on the slot through answers, steers and follow-up asks until another ask sets new ones or passes `--no-checks`. They run only for local slots.
+
 `--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for implementers, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). It returns reports by writing a file, and the slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there; `SIDECAR_CLAUDE_PERMISSION_MODE=bypassPermissions` lets it work unattended). It cannot be reloaded, and a busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
 
 `--agent codex` on a fresh slot runs Codex CLI with `gpt-6.1-sol` and ultra reasoning (`SIDECAR_CODEX_MODEL` overrides the model). The slot remembers its backend and session for follow-ups and restarts. It returns reports by file and supports `--machine`; Codex CLI must be logged in where it runs, with Herdr's Codex integration installed and its hooks enabled and trusted. It runs with `--yolo` (no approvals or sandbox). Idle `steer` works like `ask`; `reload` and busy steering are pi-only.
@@ -92,9 +101,11 @@ After every real implementation, before you report it done, run an **adversarial
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" diff <base> "Intent of the change and anything non-obvious"
 ```
 
-`<base>` is a single ref for the commit the work started from (`HEAD` when all of it is uncommitted), not an `A..B` or `A...B` range. The review covers commits since base, uncommitted changes, and untracked files. After committing or pushing, pass the pre-work commit as `<base>`; use `diff`, not `ask`, so the sidecar receives the diff.
+`<base>` is a single ref for the commit the work started from (`HEAD` when all of it is uncommitted), not an `A..B` or `A...B` range. The review covers commits since base, uncommitted changes, and untracked files. A base that is not an ancestor of HEAD (an updated `origin/main`) is replaced by the merge-base. After committing or pushing, pass the pre-work commit as `<base>`; use `diff`, not `ask`, so the sidecar receives the diff.
 
-The sidecar reproduces each finding and quotes the command and output; it marks the rest `unverified`. A long request prints a status line to stderr every minute (`SIDECAR_PROGRESS_S`, `0` disables it). Before you report done or push, run `sidecar unreviewed`: it lists files changed since the last diff review and exits 1 if there are any. Send those back through `diff`.
+The sidecar reproduces each finding and quotes the command and output; it marks the rest `unverified`. Each finding states its origin, `introduced` or `pre-existing`; pre-existing ones come last and do not block. A long request prints a status line to stderr every minute (`SIDECAR_PROGRESS_S`, `0` disables it). Before you report done or push, run `sidecar unreviewed`: it lists files changed since the last diff review and exits 1 if there are any. Send those back through `diff`.
+
+A PreToolUse hook enforces this: in a repository with a recorded diff review from any of your slots, `git push`, `gh pr create` and `glab mr create` are denied while files changed since the latest one. Review them. Only a push that needs no review (tickets, docs) may be prefixed with `SIDECAR_REVIEW_SKIP=<why>`, and you tell the user you did.
 
 ## Co-op review
 
@@ -116,10 +127,11 @@ The command's first stdout line is `# Sidecar report (<local path>)`, printed be
 
 1. Check each finding against the code. Mark it **confirmed** or **rejected** with the reason.
 2. Fix the confirmed ones.
-3. When you rejected a finding or changed a lot, tell the sidecar so its memory stays accurate: `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" ask "Rejected #2: <reason>. Fixed #1 and #3 in <files>; re-check those."`
-4. Tell the user, in your final summary, which sidecar findings you fixed and which you rejected and why.
+3. Reject each finding through `reject`, one per call, in the background: `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" reject "#2 (title): <reason with evidence>"`. The reviewer re-checks and answers `R<n>: withdrawn` with what convinced it, or `R<n>: stands` with a reproduction. A standing finding is a defect until you fix it or disprove it with new evidence. Later diff reviews on that slot re-check every rejection not yet withdrawn. `reject --overrule R<n> REASON` settles one against the reviewer; tell the user with the reviewer's failure scenario.
+4. After fixing, tell the sidecar what changed: `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" ask "Fixed #1 and #3 in <files>; re-check those."`
+5. Tell the user, in your final summary, which sidecar findings you fixed, which you rejected and why, and which you overruled.
 
-Done when every finding is confirmed-and-fixed or rejected-with-reason, and the user has that list.
+Done when every finding is fixed, withdrawn by the reviewer, or overruled, and the user has that list.
 
 ## Long-running requests
 

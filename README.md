@@ -110,6 +110,8 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar coop-review HEAD "Intent of the implementation"
 ./scripts/sidecar unreviewed
 ./scripts/sidecar ask "Recheck finding 2 after the fix."
+./scripts/sidecar reject "#3 (stale handle): the handle is regenerated in reset()"
+./scripts/sidecar --slot 5 --role implementer ask --accept "timeout 600 make smoke" --scope 'src/parser/*' "Implement X."
 ./scripts/sidecar --slot 2 ask "Review the parser independently."
 ./scripts/sidecar --slot 3 ask "Review lifecycle handling independently."
 ./scripts/sidecar --slot 2 answer "Yes, keep backward compatibility."
@@ -125,6 +127,18 @@ The plugin source sets the new model default. An already-running sidecar retains
 The launcher prints one combined report, saved like any other, with the usual `# Sidecar report (<path>)` first line. Every inventoried finding appears in exactly one section: **Confirmed by both**, **Rejected by both** (rejected by the peer and withdrawn by its author), or **Disputed** (each side's argument; also unchecked, unverified, duplicated or lone-withdrawn findings). Each finding names its origin, and the four underlying reports are linked. Fenced code in a report is never read as headings or verdicts. Check entries that match no finding (an unknown ID, or an ID whose title names a different finding), and reports with no extractable findings, are listed under Warnings and never shown as findings. The command settles nothing; the caller decides disputes and fixes.
 
 Slots keep their agent and memory, so a later round on the fixes is another `coop-review` call with the same slots. A slot already bound to the other agent, role or machine fails; pick other slots with the flags. `--machine` and `--remote-cwd` go before the command and apply to both reviewers. `--slot`, `--agent` and `--role` are rejected. A reviewer's question exits 3 and names its slot; answer with `sidecar --slot N answer TEXT`, then run `coop-review` again. Any other failure exits with the first reviewer's code. Reviewer launchers write to files, not the caller's pipes, and their progress is relayed with a `[pi slot N]` or `[claude slot M]` prefix. Cancelling coop-review (exit 130 or 143) signals nothing: it saves and prints an "interrupted" report and releases its reservations. The detached launchers finish their own requests, and the reviewers' turns continue in their panes; a new coop-review on the same slots fails fast as busy until they finish. The cost is about three single reviews: two reviews and two checks, two at a time. `sidecar ask -` reads the request text from stdin.
+
+### Implementer checks
+
+Implementer asks append a completion contract: a `Status: done|partial|blocked` first line, verification through the real entry point, and `Verified`, `Not verified`, `Files changed` and `Suggested follow-ups` sections. `ask --accept CMD` (repeatable) runs CMD with `bash -c` in the ask's directory after the report arrives, with a `SIDECAR_ACCEPT_TIMEOUT_S` limit (default 1800); `--scope GLOB` (repeatable) lists files the task changed outside the globs. Changed files are those whose content differs from the state recorded at the ask, so files already dirty then count only if they change again. The results lead the saved report under `## Launcher checks`, with full logs next to it. Checks persist on the slot for answers, steers and later asks until replaced or cleared with `--no-checks`. Slots on another machine do not support them.
+
+### Rejected findings
+
+`sidecar reject TEXT` records a rejection as `R<n>` for the slot and sends it to the reviewer, which re-checks and starts its report with `R<n>: withdrawn` (with the evidence that convinced it) or `R<n>: stands` (with a reproduction). The launcher reads these verdicts from any later report on the slot. Every later `diff` request lists the rejections that are open or standing, and the reviewer re-checks them. `reject --overrule R<n> REASON` closes one against the reviewer. The ledger is `~/.cache/claude-sidecar/<agent>.rejections.jsonl`.
+
+### Push gate
+
+The plugin's PreToolUse hook runs `sidecar push-gate` for every Bash call. Inside Herdr, it denies `git push`, `gh pr create` and `glab mr create` when the repository has a recorded diff review from any slot of this Claude pane and `unreviewed` against the newest record finds changed files. Repositories without a record pass. A command containing `SIDECAR_REVIEW_SKIP=<why>` passes.
 
 ### Completion and report recovery
 
@@ -223,6 +237,6 @@ The reviewer inspects by default, but can edit and commit when asked. It may pus
 
 ## Review progress and coverage
 
-A request prints `sidecar: <id> still working (3m00s); last output: ...` to stderr every `SIDECAR_PROGRESS_S` seconds (default 60; `0` turns it off), taken from the last line of the sidecar's pane. A `diff` request asks the sidecar to reproduce each finding with a command and quote its output, and to mark the rest `unverified`.
+A request prints `sidecar: <id> still working (3m00s); last output: ...` to stderr every `SIDECAR_PROGRESS_S` seconds (default 60; `0` turns it off), taken from the last line of the sidecar's pane. A `diff` request asks the sidecar to reproduce each finding with a command and quote its output, and to mark the rest `unverified`. Each finding also states whether it is `introduced` or `pre-existing` at the base. A base that is not an ancestor of HEAD is replaced by the merge-base, so newer upstream commits never look like removals. A `plan` request asks the reviewer to flag performance and cost claims that cite no measurement.
 
 After a `diff` report is delivered, the launcher records the mode and object id of every path that differs from the base (the working tree as Git would stage it: untracked files included, ignored files excluded, symlinks by link text, submodules by commit), per slot and repository, together with the base commit. A dirty submodule's uncommitted content is not compared. `sidecar unreviewed` compares the working tree with that record against the same base, prints the files whose content differs, and exits 1 if there are any (or if no review is recorded and files have changed). Committing reviewed content does not count as a change.

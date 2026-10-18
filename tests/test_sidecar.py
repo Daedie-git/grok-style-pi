@@ -1287,6 +1287,25 @@ class LauncherTests(unittest.TestCase):
         (repo / 'a.txt').write_text('two\n')
         return repo, git
 
+    def test_untracked_diff_keeps_renames_literal_names_and_survives_bad_entries(self):
+        repo, git = self.repo_with_change()
+        git('mv', 'a.txt', 'moved.txt')
+        git('reset', '-q', '--', 'moved.txt')
+        (repo / ':(exclude)nothing').write_text('magic name\n')
+        self.run_cli('diff', cwd=repo)
+        diff = sorted((self.home / '.cache/claude-sidecar/requests').glob('*.diff'))[-1].read_text()
+        self.assertIn('+two', diff.split('# Untracked files')[1], 'a moved file stays an addition')
+        self.assertIn('+magic name', diff)
+        nested = repo / 'nested'
+        nested.mkdir()
+        subprocess.run(['git', 'init', '-q', str(nested)], check=True)
+        (repo / 'ordinary.txt').write_text('ordinary content\n')
+        for old in (self.home / '.cache/claude-sidecar/requests').glob('*.diff'):
+            old.unlink()
+        self.run_cli('diff', cwd=repo, check=False)
+        diff = next((self.home / '.cache/claude-sidecar/requests').glob('*.diff')).read_text()
+        self.assertIn('+ordinary content', diff)
+
     def test_diff_rejects_ranges_with_single_base_guidance(self):
         repo, _ = self.repo_with_change()
         for base in ('HEAD..HEAD', 'HEAD...HEAD'):
@@ -1459,6 +1478,20 @@ class LauncherTests(unittest.TestCase):
     def gate(self, command, cwd):
         payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': str(cwd)})
         return self.run_cli('push-gate', input=payload)
+
+    def test_push_gate_wrapper_starts_the_launcher_only_for_possible_publishes(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('diff', cwd=repo)
+        (repo / 'late.txt').write_text('unreviewed\n')
+        wrapper = self.plugin / 'scripts/push-gate'
+        def hook(command, env=None):
+            payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': str(repo)})
+            return subprocess.run([str(wrapper)], input=payload, text=True, capture_output=True, env=env or self.env, check=True)
+        self.assertIn('"deny"', hook('git -C "$PWD" push').stdout)
+        self.assertEqual(hook('ls && pushd x').stdout, '')
+        outside = dict(self.env)
+        outside.pop('HERDR_ENV')
+        self.assertEqual(hook('git push', outside).stdout, '')
 
     def test_push_gate_denies_pushes_with_unreviewed_changes(self):
         repo, git = self.repo_with_change()
@@ -2552,7 +2585,8 @@ class LauncherTests(unittest.TestCase):
         return [json.loads(line) for line in (self.home / 'prompts.jsonl').read_text().splitlines()]
 
     def requests(self, kind, name):
-        return sorted((self.home / '.cache/claude-sidecar/requests').glob(f'*-{kind}-{name}.*.md'))
+        # Creation order: requests in the same second share a timestamp, and their random suffixes do not sort.
+        return sorted((self.home / '.cache/claude-sidecar/requests').glob(f'*-{kind}-{name}.*.md'), key=lambda path: path.stat().st_mtime_ns)
 
     @staticmethod
     def section(report, title):

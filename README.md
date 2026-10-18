@@ -138,7 +138,7 @@ Implementer asks append a completion contract: a `Status: done|partial|blocked` 
 
 ### Push gate
 
-The plugin's PreToolUse hook runs `sidecar push-gate` for every Bash call. Inside Herdr, it denies `git push`, `gh pr create` and `glab mr create` when the repository has a recorded diff review from any slot of this Claude pane and `unreviewed` against the newest record finds changed files. Repositories without a record pass. A command containing `SIDECAR_REVIEW_SKIP=<why>` passes.
+The plugin's PreToolUse hook runs `scripts/push-gate` for every Bash call (about 1 ms). It starts `sidecar push-gate` only for commands that could publish. Inside Herdr, it denies `git push`, `gh pr create` and `glab mr create` when the repository has a recorded diff review from any slot of this Claude pane and `unreviewed` against the newest record finds changed files. Repositories without a record pass. A command containing `SIDECAR_REVIEW_SKIP=<why>` passes.
 
 ### Completion and report recovery
 

@@ -48,6 +48,7 @@ BACKEND=pi
 INFLIGHT=
 ACTIVE_REQUEST=
 REQUEST_KEY=
+PROGRESS_TIMER=
 NOTE_TIMEOUT_MS=300000
 REVIEW_TIMEOUT_MS=3600000
 # After the sidecar settles without a report, recheck for this long before declaring the request abandoned.
@@ -1059,6 +1060,7 @@ hd_detached() {
 
 # shellcheck disable=SC2329  # run from the EXIT trap
 stop_prompt() {
+  [[ -z $PROGRESS_TIMER ]] || kill "$PROGRESS_TIMER" 2>/dev/null || true
   if [[ -n $PROMPT_PID ]]; then
     # Signal the client group only when setsid created one. Git Bash needs only the exec'd native client PID.
     if command -v setsid >/dev/null 2>&1; then kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true; fi
@@ -1071,15 +1073,24 @@ stop_prompt() {
 # Waits for the background prompt PID. A request can run for hours, so every PROGRESS_S seconds it prints how long
 # the sidecar has been working and the last line of its pane.
 wait_with_progress() {
-  local pid=$1 name=$2 id=$3 start=$SECONDS elapsed last next=$PROGRESS_S
+  local pid=$1 name=$2 id=$3 start=$SECONDS elapsed last
+  # Block in the interruptible `wait` builtin; a timer job only wakes it for progress lines.
   while kill -0 "$pid" 2>/dev/null; do
-    sleep 0.2
-    elapsed=$((SECONDS - start))
-    if (( PROGRESS_S > 0 && elapsed >= next )); then
-      last=$(hd agent read "$name" --source recent-unwrapped --lines 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
-      echo "sidecar: $id still working ($((elapsed / 60))m$((elapsed % 60))s)${last:+; last output: $last}" >&2
-      next=$((elapsed + PROGRESS_S))
+    if (( PROGRESS_S <= 0 )); then break; fi
+    # The timer must not inherit the slot or coop locks, or a killed launcher would hold them until it fires.
+    # Background jobs ignore SIGINT here, so stop_prompt kills it and it holds no output pipe.
+    sleep "$PROGRESS_S" >/dev/null 2>&1 9>&- 8>&- 7>&- &
+    PROGRESS_TIMER=$!
+    wait -n "$pid" "$PROGRESS_TIMER" 2>/dev/null || true
+    if kill -0 "$PROGRESS_TIMER" 2>/dev/null; then
+      kill "$PROGRESS_TIMER" 2>/dev/null; wait "$PROGRESS_TIMER" 2>/dev/null || true; PROGRESS_TIMER=; break
     fi
+    wait "$PROGRESS_TIMER" 2>/dev/null || true
+    PROGRESS_TIMER=
+    kill -0 "$pid" 2>/dev/null || break
+    elapsed=$((SECONDS - start))
+    last=$(hd agent read "$name" --source recent-unwrapped --lines 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
+    echo "sidecar: $id still working ($((elapsed / 60))m$((elapsed % 60))s)${last:+; last output: $last}" >&2
   done
   wait "$pid" || true
 }
@@ -1432,9 +1443,32 @@ for (const item of items) {
 }
 '
 
+# Untracked files as new-file diffs, from one git run: they are added intent-to-add to a copy of the index.
+untracked_diff() {
+  local root=$1 index
+  index=$(mktemp "$STATE_DIR/index.XXXXXX") || return 1
+  rm -f -- "$index"
+  cp -p -- "$(git -C "$root" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || true
+  # Literal pathspecs: an untracked name such as `:(exclude)x` is a file, not pathspec magic. No renames: a moved
+  # tracked file's new name must still show as an addition.
+  local out f
+  out=$(mktemp "$STATE_DIR/untracked.XXXXXX") || { rm -f -- "$index"; return 1; }
+  if git -C "$root" ls-files --others --exclude-standard -z |
+    GIT_INDEX_FILE=$index git -C "$root" --literal-pathspecs add --intent-to-add --sparse --pathspec-from-file=- --pathspec-file-nul >/dev/null 2>&1 &&
+    GIT_INDEX_FILE=$index git -C "$root" -c diff.relative=false diff --no-ext-diff --no-renames --diff-filter=A >"$out" 2>/dev/null; then
+    cat -- "$out"
+  else
+    # One unindexable entry (a nested repository without commits) fails the batch; keep every other file.
+    while IFS= read -r -d '' f; do
+      git -C "$root" diff --no-index -- /dev/null "$f" || true
+    done < <(git -C "$root" ls-files --others --exclude-standard -z)
+  fi
+  rm -f -- "$index" "$out"
+}
+
 cmd_diff() {
   require_herdr
-  local base=${1:-HEAD} id diff root f diff_path repo sha head rel manifest label fork rejected
+  local base=${1:-HEAD} id diff root diff_path repo sha head rel manifest label fork rejected
   [[ $base != *..* ]] || die "diff takes a single base ref, not a range ($base). Use: sidecar --slot $SLOT diff ${base%%..*} CONTEXT; it reviews that base through the working tree"
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
   label=$base
@@ -1456,9 +1490,7 @@ cmd_diff() {
     git -c diff.relative=false diff "$base"
     echo
     echo "# Untracked files"
-    while IFS= read -r -d '' f; do
-      git -C "$root" diff --no-index -- /dev/null "$f" || true
-    done < <(git -C "$root" ls-files --others --exclude-standard -z)
+    untracked_diff "$root"
   } >"$diff"
   [[ -s "$diff" ]] || die "no changes since $base"
   # An unfingerprintable tree is still reviewed, but never recorded as covered.

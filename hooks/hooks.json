@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar\" push-gate",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/push-gate\"",
             "timeout": 30
           }
         ]

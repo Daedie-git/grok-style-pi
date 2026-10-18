@@ -265,11 +265,12 @@ resolve_machine() {
     AGENT_HOME=$(jq -r '.agentHome' <<<"$info")
     [[ $(jq -r '.windows' <<<"$info") != true ]] || TARGET_WINDOWS=1
     REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
-    # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files.
+    # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files: a Windows checkout
+    # holds them with CRLF endings, and rewriting identical content dirties it and blocks sync-machine.
     local runtime_file
     for runtime_file in sidecar.ts reviewer.md reload.mjs windows-runtime.mjs; do
-      remote_node 'const dest=args[0],data=fs.readFileSync(0);fs.mkdirSync(path.dirname(dest),{recursive:true});
-        if(!fs.existsSync(dest)||!fs.readFileSync(dest).equals(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
+      remote_node 'const dest=args[0],data=fs.readFileSync(0),lf=b=>b.toString("utf8").replace(/\r\n/g,"\n");fs.mkdirSync(path.dirname(dest),{recursive:true});
+        if(!fs.existsSync(dest)||lf(fs.readFileSync(dest))!==lf(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
     done
     return
   fi
@@ -379,13 +380,28 @@ pi_session_id() {
 
 # Verify the actual Windows pane process, not a name reused by a restored bare pi.
 windows_pid() {
-  local pane processes
+  local pane processes session wrapper
   pane=$(hd agent get "$1" | jq -er '.result.agent | select(.agent == "pi") | .pane_id') || return 1
   processes=$(hd pane process-info --pane "$pane") || return 1
-  jq -er --arg session "$(pi_session_id)" '
+  session=$(pi_session_id)
+  if jq -er --arg session "$session" '
     [.result.process_info.foreground_processes[] | select(
       .argv as $a | any(range(0; ($a | length) - 1); $a[.] == "--session-id" and $a[. + 1] == $session)) | .pid]
-    | if length == 1 then .[0] else empty end' <<<"$processes"
+    | if length == 1 then .[0] else empty end' <<<"$processes"; then
+    return
+  fi
+  # A pi installed as pi.cmd runs under `cmd.exe /c "…pi.cmd --session-id ID …"`: the foreground process is cmd.exe and
+  # its command line is one string. The pi process, whose pid the runtime records, is its node.exe child.
+  wrapper=$(jq -er --arg session "$session" '
+    [.result.process_info.foreground_processes[]
+      | select(((.cmdline // ((.argv // []) | join(" "))) + " ") | contains(" --session-id " + $session + " ")) | .pid]
+    | if length == 1 then .[0] else empty end' <<<"$processes") || return 1
+  run_node 'const out=require("child_process").execFileSync("powershell.exe",["-NoProfile","-NonInteractive","-Command",
+      "Get-CimInstance Win32_Process -Filter \"ParentProcessId="+Number(args[0])+"\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"],
+      {encoding:"utf8",stdio:["ignore","pipe","ignore"]}).trim();
+    let list=out?JSON.parse(out):[];if(!Array.isArray(list))list=[list];
+    const own=list.filter(p=>(p.CommandLine||"").split(/\s+/).some((w,i,a)=>w==="--session-id"&&a[i+1]===args[1]));
+    if(own.length!==1)process.exit(1);console.log(own[0].ProcessId);' "$wrapper" "$session" </dev/null
 }
 
 windows_control() {

@@ -22,7 +22,18 @@ let completedReport = () => false;
     console.error(`sidecar: ${message}`); process.exit(code);
   };
   const owner = read(path.join(dir, 'owner.json'));
-  if (!owner || owner.pid !== options.pid) {
+  // The pane's foreground process can be the cmd.exe wrapper (pi.cmd) of the node process that owns the receiver.
+  const descends = (pid, ancestor) => {
+    if (pid === ancestor) return true;
+    try {
+      const rows = JSON.parse(require('child_process').execFileSync('powershell', ['-NoProfile', '-Command',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'], { encoding: 'utf8' }));
+      const parent = new Map((Array.isArray(rows) ? rows : [rows]).map(r => [r.ProcessId, r.ParentProcessId]));
+      for (let p = parent.get(pid), n = 0; p && n < 16; p = parent.get(p), n++) if (p === ancestor) return true;
+    } catch {}
+    return false;
+  };
+  if (!owner || !descends(owner.pid, options.pid)) {
     fail('Windows control receiver does not match the process in this Herdr pane; reload the sidecar extension in its pane before retrying (nothing was sent)');
   }
   let ack;

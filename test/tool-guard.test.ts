@@ -19,6 +19,13 @@ test("commands that store files in /tmp are refused; reads and cleanup are not",
 		"cd /tmp && git clone x",
 		"git worktree add /tmp/review main",
 		"python3 -c 'open(\"/tmp/x\", \"w\")'",
+		"cat <<< \"hello\"\ncp build.log /tmp/log",
+		"echo '<<EOF'\ncp build.log /tmp/log",
+		"echo \"$(mktemp /tmp/report.XXXXXX)\"",
+		"cat <<EOF\n$(touch /tmp/example)\nEOF",
+		"ls `touch /tmp/x`",
+		"diff <(sort a) b > /tmp/d",
+		"export TMPDIR=/tmp",
 	]) assert.ok(tmpWriteReason(command), command);
 	for (const command of [
 		"ls -la /tmp",
@@ -32,13 +39,19 @@ test("commands that store files in /tmp are refused; reads and cleanup are not",
 		"cat <<'EOF'\n/tmp/example is a path\nEOF",
 		"echo 'see /tmp/x' && ls",
 		"find /tmp/old -delete",
+		"grep 'x > /tmp/file' README.md",
+		"echo 'example > /tmp/file'",
+		"cat <<'EOF'\n$(touch /tmp/example)\nEOF",
+		"git commit -m \"stop writing /tmp files\"",
+		"cmd 2>&1 | tee captures/log",
+		"sort < /tmp/input > captures/out",
 	]) assert.equal(tmpWriteReason(command), undefined, command);
 });
 
 test("test runners need a timeout unless one is given", () => {
-	for (const command of ["ctest -j2 -LE gpu", "cd build && ./renderer_tests", "npm test", "just test-gpu", "pytest -x", "timeout 60 npm test && pytest", "echo --timeout; ctest"])
+	for (const command of ["ctest -j2 -LE gpu", "cd build && ./renderer_tests", "npm test", "just test-gpu", "pytest -x", "timeout 60 npm test && pytest", "echo --timeout; ctest", "cat <<< \"hello\"\nctest", "echo \"$(ctest)\""])
 		assert.ok(needsTestTimeout(command), command);
-	for (const command of ["timeout 600 ctest -j2", "ctest --timeout 300", "cmake --build build", "git log -- tests/"])
+	for (const command of ["timeout 600 ctest -j2", "ctest --timeout 300", "cmake --build build", "git log -- tests/", "echo 'ctest'", "cat <<'EOF'\nctest\nEOF"])
 		assert.ok(!needsTestTimeout(command), command);
 });
 

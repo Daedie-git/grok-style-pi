@@ -193,6 +193,25 @@ test("RR03: an earlier equal message does not prove a newly stripped instance wa
 	assert.match(second.refusedReason!, /context transform/i);
 });
 
+test("RR03: a transform that clones and re-times every message does not refuse visible input", { timeout: 20_000 }, async t => {
+	offline(t);
+	const marker = "RETIMED_CONTINUATION_RR03";
+	const h = await createHarness({ parent: foregroundParent, child: () => () => ({ text: "child report" }) });
+	t.after(() => h.close());
+	await h.parent.prompt("go", { source: "extension" });
+	const id = [...h.children.keys()][0], child = h.children.get(id)!;
+	const idle = () => !h.engine.control.get(id)?.active && !h.engine.control.get(id)?.exiting;
+	await until(idle);
+	const transform = child.agent.transformContext;
+	child.agent.transformContext = async (messages, signal) => {
+		const projected = transform ? await transform(messages, signal) : messages;
+		return projected.map(message => ({ ...message, timestamp: 0 }) as typeof message);
+	};
+	await h.engine.sendMessage({ to: id, message: marker }, ROOT_CALLER, "retimed");
+	await until(() => h.requests.children.get(id) === 2 && idle());
+	assert.equal(h.engine.inbox(id).all()[0].state, "included");
+});
+
 test("RR07: both public stop paths retry failed pane cancellation and emit stop-failed", { timeout: 20_000 }, async t => {
 	offline(t);
 	for (const retry of ["userStop", "stop"] as const) await t.test(retry, async t => {

@@ -72,8 +72,8 @@ interface RunState {
 	prompt: string;
 	/** Whether the first provider request still carried the prompt after every context transform. */
 	promptIncluded?: boolean;
-	/** Wall-clock start of the run: only user messages from here on can be this run's prompt instance. */
-	promptAfter: number;
+	/** The user message this run appended for its prompt, by identity (observed when Pi starts it). */
+	inputMessage?: object;
 }
 
 export class InProcessBackend {
@@ -113,7 +113,7 @@ export class InProcessBackend {
 		const state: RunState = {
 			runId: run.runId, listeners: new Set(), tracker: new UsageTracker(), turns: 0, maxTurns: run.maxTurns,
 			maxTurnsReached: false, toolsInFlight: 0, lastProgress: this.now(), pendingEnvelopes: new Map(), dispatched: false,
-			prompt: run.prompt, promptAfter: Date.now(),
+			prompt: run.prompt,
 		};
 		const emit = (event: BackendEvent) => { for (const listener of state.listeners) listener(event); };
 		let resolveStarted!: () => void;
@@ -245,11 +245,12 @@ export class InProcessBackend {
 	 */
 	private installInclusionProbe(child: LiveChild): void {
 		const agent = child.session.agent;
-		const stream = agent.streamFunction;
-		agent.streamFunction = (model, context, options) => {
+		const convert = agent.convertToLlm;
+		// convertToLlm receives the final transformed context of each request, before provider conversion.
+		agent.convertToLlm = (messages) => {
 			const state = child.current;
-			if (state && state.promptIncluded === undefined) state.promptIncluded = requestCarries(context.messages, state.prompt, state.promptAfter);
-			return stream(model, context, options);
+			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(messages, agent.state.messages, state);
+			return convert(messages);
 		};
 	}
 
@@ -286,6 +287,7 @@ export class InProcessBackend {
 				emit({ type: "turn", turns: state.turns });
 				break;
 			case "message_start":
+				if (event.message?.role === "user" && !state.inputMessage && textOf(event.message as { content?: unknown }).includes(state.prompt.trim())) state.inputMessage = event.message;
 				if (event.message?.role === "assistant") {
 					for (const [id, envelopeState] of state.pendingEnvelopes) {
 						if (envelopeState !== "persisted") continue;
@@ -370,18 +372,24 @@ export function formatEnvelope(envelope: Envelope): string {
 	return `Message from ${sender}:\n\n${envelope.text}`;
 }
 
-/** Whether a user message of the projected request contains the prompt text (transforms may wrap it, not drop it). */
-function requestCarries(messages: readonly { role: string; content?: unknown; timestamp?: number }[], prompt: string, after: number): boolean {
-	const needle = prompt.trim();
+/**
+ * Whether this run's input instance survived every context transform (re-review RR03, second re-review). Identity first: the
+ * appended message object itself. A transform that clones messages loses identity, so the fallback compares how many user
+ * messages carry the prompt before and after the transform: equal means nothing carrying it was removed, fewer is treated as
+ * a removal of this input (explicit refusal, never a retry). Text of an earlier equal message alone is never proof.
+ */
+function inputSurvived(projected: readonly { role?: string; content?: unknown }[], history: readonly { role?: string; content?: unknown }[], state: { prompt: string; inputMessage?: object }): boolean {
+	const needle = state.prompt.trim();
 	if (!needle) return true;
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		// Equal text from an earlier run proves nothing about this run's input instance (re-review 2, RR03).
-		if (message.role !== "user" || (message.timestamp !== undefined && message.timestamp < after)) continue;
-		const content = message.content;
-		const text = typeof content === "string" ? content
-			: Array.isArray(content) ? content.map((part) => (part as { type?: string; text?: string }).type === "text" ? (part as { text?: string }).text ?? "" : "").join("\n") : "";
-		if (text.includes(needle)) return true;
-	}
-	return false;
+	if (state.inputMessage && projected.includes(state.inputMessage as never)) return true;
+	const carrying = (messages: readonly { role?: string; content?: unknown }[]) => messages.filter((message) => message.role === "user" && textOf(message).includes(needle)).length;
+	const before = carrying(history);
+	return before === 0 ? carrying(projected) > 0 : carrying(projected) >= before;
+}
+
+function textOf(message: { content?: unknown }): string {
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map((part) => (part as { type?: string; text?: string }).type === "text" ? (part as { text?: string }).text ?? "" : "").join("\n");
 }

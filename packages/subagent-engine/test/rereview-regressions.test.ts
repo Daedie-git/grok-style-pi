@@ -643,3 +643,46 @@ for (const entrance of ["engine message", "follow-up"] as const) {
 		}
 	});
 }
+
+// Co-op review of the third re-review fixes.
+test("co-op: a message to an exhausted workflow agent after it settles is refused up front, durably", { timeout: 30_000 }, async t => {
+	offline(t);
+	const source = "export const meta={name:'exhaust',description:'review',phases:[]};return await agent('number',{schema:{type:'number'}});";
+	const h = await createHarness({ env: { PI_WORKFLOW_APPROVE: "1" }, parent: () => ({ text: "done" }), child: () => async ({ index }) =>
+		index < 5 ? { tools: [{ name: "StructuredOutput", args: { result: "invalid" } }] } : { text: "continued answer" } });
+	t.after(() => h.close());
+	const launch = await h.engine.workflows().launch({ script: source }, h.parent.extensionRunner.createContext());
+	const file = join(h.root, "agent/subagents", h.parent.sessionId, "workflows", `${(launch.details as { runId: string }).runId}.json`);
+	await until(() => existsSync(file) && JSON.parse(readFileSync(file, "utf8")).status === "failed");
+	const [id] = [...h.children.keys()];
+	const conversation = h.engine.control.get(id)!;
+	await until(() => !conversation.active && !conversation.exiting);
+	assert.equal(conversation.meta.hostEnded, true, "exhaustion is recorded on the conversation, not only on the live session");
+	const parentRequests = h.requests.parent;
+	const receipt = await h.engine.sendMessage({ to: id, message: "please continue" }, ROOT_CALLER, "after-exhaust");
+	assert.equal(receipt.success, false);
+	assert.match(receipt.message, /ended its work/);
+	await tick();
+	assert.equal(conversation.meta.runs.length, 1, "no continuation run is started");
+	assert.equal(h.requests.children.get(id), 5);
+	assert.equal(h.requests.parent, parentRequests, "the root is not woken by a failed continuation");
+	assert.equal(h.engine.inbox(id).all().at(-1)!.state, "refused");
+});
+
+test("co-op: an unreadable owner inbox does not fail the first bind during receipt reconciliation", { timeout: 20_000 }, async t => {
+	const h = await createHarness({ parent: () => ({ text: "unused" }), child: () => () => ({ text: "unused" }) });
+	const internals = h.engine as unknown as { root: { pi: ExtensionAPI; ctx: ExtensionContext }; deps: ConstructorParameters<typeof Engine>[0]; outbox: Outbox };
+	const { pi, ctx } = internals.root;
+	const sessionId = h.parent.sessionId;
+	internals.outbox.create({ rootSessionId: sessionId, agentId: "child", runId: "r1", kind: "terminal_result", destination: "owner1", passive: false,
+		payload: { agentId: "child", description: "d", status: "completed", resultText: "x", resultTruncated: false, transcriptPath: "t", resumable: true } as never });
+	await h.engine.shutdownRoot("reload");
+	writeFileSync(agentFiles(join(h.root, "agent"), sessionId, "owner1").inboxFile, "{not json\n");
+	const restored = new Engine(internals.deps);
+	t.after(async () => { await restored.shutdownRoot("quit"); await h.close(); });
+	await restored.bindRoot(pi, ctx);
+	const bound = await Promise.race([(restored as unknown as { bound: Promise<void> }).bound.then(() => "bound"), new Promise(resolve => setTimeout(() => resolve("unbound"), 2000))]);
+	assert.equal(bound, "bound");
+	const record = (restored as unknown as { outbox: Outbox }).outbox.unfinished().find(candidate => candidate.destination === "owner1");
+	assert.ok(record, "the unconfirmed owner receipt stays unfinished, not acknowledged");
+});

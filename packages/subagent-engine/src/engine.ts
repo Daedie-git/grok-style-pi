@@ -714,6 +714,8 @@ export class Engine {
 	 * Built-ins and forks always remain available; a stored snapshot is a record of what ran, not a grant.
 	 */
 	private async continuationRefusal(conversation: Conversation, reserved = false): Promise<string | undefined> {
+		// Durable, so it holds after the live session is evicted too (co-op review).
+		if (conversation.meta.hostEnded) return "The agent ended its work and cannot take more messages.";
 		const definition = conversation.meta.definition;
 		if (conversation.meta.isFork) return undefined;
 		if (!this.root) return undefined;
@@ -848,13 +850,18 @@ export class Engine {
 
 	/**
 	 * Finish destination handoffs a restart interrupted (re-review 3): a persisted root notice is already in root history, and an
-	 * owner notice whose envelope the owner's inbox accepted is already delivered. Both complete their acknowledgement, which
+	 * owner notice whose envelope the owner's inbox accepted is durably queued for the owner (dispatched on its next wake). Both complete their acknowledgement, which
 	 * also releases a pane source. Unconfirmed records stay as they are; nothing is acknowledged speculatively.
 	 */
 	private reconcileReceipts(): void {
 		const keys: string[] = [];
 		for (const record of this.outbox?.unfinished() ?? []) {
-			if (record.destination === "root" ? record.state === "persisted" : this.inbox(record.destination).hasAcceptance(`notice:${record.key}`)) keys.push(record.key);
+			// One unreadable owner inbox must not fail the bind; that record stays unfinished (co-op review).
+			try {
+				if (record.destination === "root" ? record.state === "persisted" : this.inbox(record.destination).hasAcceptance(`notice:${record.key}`)) keys.push(record.key);
+			} catch (inboxError) {
+				this.reportDiagnostics(record.destination as AgentId, [`Could not reconcile a notice receipt: ${(inboxError as Error).message}`]);
+			}
 		}
 		if (keys.length > 0) this.ackNotices(keys);
 	}
@@ -933,6 +940,11 @@ export class Engine {
 	 */
 	/** A host-ended run: drop its queue and refuse, explicitly, the input it can no longer use (no continuation). */
 	private refuseQueuedInput(agentId: AgentId, reason: string): void {
+		const meta = this.control.get(agentId)?.meta;
+		if (meta && !meta.hostEnded) {
+			meta.hostEnded = true;
+			this.persistMeta(meta);
+		}
 		this.backend?.clearQueue(agentId);
 		const inbox = this.inbox(agentId);
 		for (const envelope of inbox.undelivered()) {

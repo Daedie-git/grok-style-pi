@@ -168,6 +168,8 @@ export interface AgentMeta {
 	definition: AgentDefinition;
 	missingTools?: string[];
 	stoppedByUser?: boolean;
+	/** The host ended this agent for good (exhausted workflow handbacks): it takes no further input or continuation. */
+	hostEnded?: boolean;
 	stopGeneration: number;
 	finished?: boolean;
 	retain?: boolean;

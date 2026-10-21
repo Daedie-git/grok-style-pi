@@ -15,6 +15,8 @@ export interface HerdrBackendHandle {
 	capabilities(agentId: string): { liveDelivery: boolean; maxTurns: boolean; fork: false; sharedTasks: boolean };
 	onNotice(listener: (notice: HerdrBackendNotice) => void): () => void;
 	acknowledge(noticeId: string): Promise<void>;
+	/** This Pi runs as a Herdr pane child. */
+	paneChild?(): boolean;
 }
 
 interface BackendHost {
@@ -22,6 +24,7 @@ interface BackendHost {
 	spawn(request: HerdrBackendRequest, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ runner: HerdrRunner; agentId: string; runId: string }>;
 	content(notice: CompletionNotice, machine?: string): string;
 	assertActive(): void;
+	paneChild(): boolean;
 }
 
 /** The store remains the outbox. Reading, waiting and listener delivery never acknowledge it. */
@@ -43,6 +46,7 @@ export function createBackendController(host: BackendHost) {
 		return { ...routed, id: record.id, record };
 	}
 	const handle: HerdrBackendHandle = {
+		paneChild: () => host.paneChild(),
 		async spawn(request, ctx, signal) {
 			host.assertActive();
 			const launched = await host.spawn(request, ctx, signal);

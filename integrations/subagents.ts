@@ -42,9 +42,9 @@ export function createGrokSubagents(options: { engine?: SubagentEngineOptions; s
 		const { runtime, features, activity } = await installGrokStyle(pi, options.style);
 		const env = options.env ?? process.env;
 		const inHerdr = selectSubagentRuntime(env) === "herdr";
-		// Inside Herdr the engine stays the runner (in-process by default); Herdr becomes its pane backend, used only when an
-		// Agent call asks for a pane, a saved machine or the Claude Code runtime. Its headless mode also keeps this Pi working as
-		// a pane child (child lifecycle, tool scope) for parents that launch it.
+		// Inside Herdr the engine stays the runner; Herdr becomes its pane backend for general-purpose agents (the `panes`
+		// feature) and for calls that ask for a pane, a saved machine or the Claude Code runtime. Its headless mode also keeps
+		// this Pi working as a pane child (child lifecycle, tool scope) for parents that launch it.
 		let current: Engine | undefined;
 		let handle: HerdrBackendHandle | undefined;
 		let detach: (() => void) | undefined;
@@ -59,6 +59,7 @@ export function createGrokSubagents(options: { engine?: SubagentEngineOptions; s
 		const engine = createSubagentEngine({
 			...options.engine,
 			panes: inHerdr || options.engine?.panes,
+			paneDefault: options.engine?.paneDefault ?? (inHerdr && features.panes),
 			autonomy: features.autonomy ? "positive" : "explicit",
 			onEngine(created) { activity?.attachEngine(created); current = created; connect(); options.engine?.onEngine?.(created); },
 		});

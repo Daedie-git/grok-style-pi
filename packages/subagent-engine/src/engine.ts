@@ -55,7 +55,7 @@ export const ROOT_CALLER: Caller = { depth: 0, background: false, isFork: false 
 export interface AgentParams {
 	description: string;
 	prompt: string;
-	/** Herdr panes only (plan §13): explicit opt-in to a pane, a saved machine, or the Claude Code runtime. */
+	/** Herdr panes only (plan §13): a pane, a saved machine, or the Claude Code runtime; see EngineDeps.paneDefault. */
 	backend?: "in-process" | "pane";
 	runtime?: "pi" | "claude-code";
 	machine?: string;
@@ -104,6 +104,8 @@ export interface EngineDeps {
 	homeDir?: string;
 	/** TaskCreated/TaskCompleted hook adapters (plan §9). */
 	taskHooks?: (engine: Engine) => TaskHooks;
+	/** Root general-purpose launches that name no backend run in a Herdr pane while one is attached. */
+	paneDefault?: boolean;
 }
 
 interface RootBinding {
@@ -161,7 +163,7 @@ export class Engine {
 	 * Rebind runtime-scoped dependencies after a reload handover: children created from now on must use the new runtime's
 	 * policy (autonomy) and installers, not closures captured by the runtime that created this engine.
 	 */
-	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks">>): void {
+	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault">>): void {
 		this.deps = { ...this.deps, ...deps };
 		this.tasks = undefined;
 	}
@@ -381,9 +383,12 @@ export class Engine {
 		// A fork inherits the caller's own conversation: the root's, or the calling agent's (plan §2.2).
 		const parent = isFork ? this.parentContext(caller, invocation.ctx) : undefined;
 		if (isFork && !parent) return error("The calling conversation is not available to fork.");
-		const pane = params.backend === "pane" || Boolean(params.machine?.trim()) || params.runtime === "claude-code";
-		if (pane && !this.paneRuns.available()) return error("Herdr panes are only available when running inside Herdr.");
-		if (pane && (isFork || isolate || invocation.internal || skill)) return error("Forks, worktree isolation, workflow agents and skill agents run in-process; omit backend/machine/runtime.");
+		const explicitPane = params.backend === "pane" || Boolean(params.machine?.trim()) || params.runtime === "claude-code";
+		if (explicitPane && !this.paneRuns.available()) return error("Herdr panes are only available when running inside Herdr.");
+		if (explicitPane && (isFork || isolate || invocation.internal || skill)) return error("Forks, worktree isolation, workflow agents and skill agents run in-process; omit backend/machine/runtime.");
+		// Panes apply only their own agent files, so other definitions keep their prompt and tool policy in-process.
+		const pane = explicitPane || (params.backend === undefined && this.deps.paneDefault === true && !caller.agentId
+			&& definition.builtIn === "general-purpose" && !isolate && !invocation.internal && !skill && this.paneRuns.defaultsHere());
 		const name = params.name?.trim();
 		if (name && !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name)) return error("Agent names use letters, digits, underscores and hyphens, starting with a letter.");
 		if (name === "main") return error(`"main" is reserved for the main conversation.`);
@@ -831,7 +836,11 @@ export class Engine {
 		invocation: { toolCallId: string; signal?: AbortSignal; ctx: ExtensionContext }): Promise<ToolText> {
 		const result = await this.paneRuns.spawn(meta, runId, {
 			prompt: params.prompt, description: meta.description, subagentType: definition.agentType, cwd: invocation.ctx.cwd, runInBackground: background,
-			runtime: params.runtime, name: meta.name, model: params.model, thinking: params.effort, projectTrusted: this.projectTrusted,
+			runtime: params.runtime, name: meta.name, projectTrusted: this.projectTrusted,
+			// A local Pi pane runs the engine's resolved model and effort, as an in-process child would.
+			...(params.runtime === "claude-code" || params.machine?.trim()
+				? { model: params.model, thinking: params.effort }
+				: { model: meta.model?.effective, thinking: meta.effort?.effective }),
 			definitionsCwd: invocation.ctx.cwd, machine: params.machine?.trim() || undefined, machineCwd: params.machine_cwd,
 		}, invocation.ctx, { background, signal: invocation.signal });
 		return { text: result.text, isError: result.isError, details: result.details };

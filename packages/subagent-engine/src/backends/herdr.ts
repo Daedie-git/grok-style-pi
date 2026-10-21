@@ -53,6 +53,8 @@ export class HerdrBackendAdapter {
 		return result.ok ? { ok: true, state: "submitted" } : { ok: false, reason: "failed", message: result.message };
 	}
 
+	paneChild(): boolean { return this.handle.paneChild?.() ?? false; }
+
 	cancel(meta: AgentMeta) { return this.handle.cancel(this.identity(meta), { runId: meta.herdr?.runId }); }
 
 	onNotice(listener: (notice: HerdrProxyNotice) => void): () => void {

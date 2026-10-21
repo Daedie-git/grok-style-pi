@@ -26,6 +26,7 @@ class FakeHerdr implements HerdrBackendHandle {
 	spawnGate?: Promise<void>;
 	autoCancel = true;
 	completeBeforeSpawnReturns = false;
+	child = false;
 	rootHasNotice: () => boolean = () => false;
 	private sequence = 0;
 
@@ -66,6 +67,7 @@ class FakeHerdr implements HerdrBackendHandle {
 		return { liveDelivery: pi, maxTurns: pi, fork: false as const, sharedTasks: pi && !agentId.includes("@") };
 	}
 	onNotice(listener: (notice: HerdrBackendNotice) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+	paneChild() { return this.child; }
 	async acknowledge(noticeId: string) { this.acknowledgements.push({ noticeId, rootHasNotice: this.rootHasNotice() }); }
 	notice(agentId: string, status: "completed" | "failed" | "stopped" = "completed", text = "Pane notice: found src/panes.ts") {
 		const run = this.agents.get(agentId)!;
@@ -91,10 +93,11 @@ function firstProxy(harness: Harness) {
 	assert(proxy, "Agent must create an engine proxy");
 	return proxy;
 }
-async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string> } = {}) {
+async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean } = {}) {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
-	const harness = await createHarness({ parent, panes: true, env: options.env, child: () => () => ({ text: "Unexpected in-process child" }) });
+	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, env: options.env, child: () => () => ({ text: "Unexpected in-process child" }) });
 	const fake = new FakeHerdr();
+	fake.child = options.paneChild === true;
 	fake.rootHasNotice = () => rootNotices(harness).length > 0;
 	const detach = options.attach === false ? () => {} : harness.engine.attachHerdr(new HerdrBackendAdapter(fake));
 	t.after(async () => {
@@ -221,6 +224,35 @@ test("TaskStop cancels the active pane, without pretending the cancellation requ
 	fake.notice("pane-1", "stopped", "Pane acknowledged cancellation");
 	await until(() => !proxy.active);
 	assert.equal(proxy.meta.runs[0].status, "killed");
+});
+
+test("paneDefault runs a general-purpose Agent in a pane with the resolved model and effort", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { description: "Default pane", prompt: "Inspect pane routing" } }] } : { text: "Parent useful work" }, { paneDefault: true });
+	await harness.parent.prompt("Delegate by default", { source: "extension" });
+	assert.equal(fake.spawns.length, 1);
+	assert.equal(harness.children.size, 0);
+	const proxy = firstProxy(harness);
+	assert.equal(proxy.meta.backend, "herdr");
+	assert.equal(fake.spawns[0].model, proxy.meta.model?.effective);
+	assert.equal(fake.spawns[0].thinking, proxy.meta.effort?.effective);
+	assert.equal(fake.spawns[0].subagentType, "general-purpose");
+});
+
+for (const [label, args, options] of [
+	["Explore", { subagent_type: "Explore" }, {}],
+	["backend: in-process", { backend: "in-process" }, {}],
+	["no attached backend", {}, { attach: false }],
+	["paneDefault off", {}, { paneDefault: false }],
+	["a pane child's own launch", {}, { paneChild: true }],
+] as const) test(`paneDefault keeps an Agent in-process for ${label}`, { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { description: "Stay in-process", prompt: "Look around", run_in_background: false, ...args } }] } : { text: "Parent done" },
+	{ paneDefault: true, ...options });
+	await harness.parent.prompt(`Delegate with ${label}`, { source: "extension" });
+	assert.equal(fake.spawns.length, 0);
+	assert.equal(harness.children.size, 1);
+	assert.equal(firstProxy(harness).meta.backend, "in-process");
 });
 
 test("pane Agent is refused without an attached Herdr backend", { timeout: 20_000 }, async (t) => {

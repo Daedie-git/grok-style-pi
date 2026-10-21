@@ -10,6 +10,8 @@ export interface ToolOptions {
 	policy: () => PolicyInput;
 	/** Expose Herdr pane parameters (only inside Herdr, where a pane backend is attached). */
 	panes?: boolean;
+	/** General-purpose launches default to a pane (EngineDeps.paneDefault). */
+	paneDefault?: boolean;
 }
 
 /** `engine` is resolved per call: after a reload the root's tools route to the adopted engine (plan §17.11). */
@@ -29,7 +31,9 @@ export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => En
 			name: Type.Optional(Type.String({ description: "Optional name, so SendMessage can address this agent by name." })),
 			isolation: Type.Optional(Type.Literal("worktree", { description: "Run in an isolated git worktree." })),
 			...(options.panes ? {
-				backend: Type.Optional(Type.Union([Type.Literal("in-process"), Type.Literal("pane")], { description: "Default in-process. Use pane only when the user asks for a visible Herdr pane." })),
+				backend: Type.Optional(Type.Union([Type.Literal("in-process"), Type.Literal("pane")], { description: options.paneDefault
+					? "In a top-level Herdr session, general-purpose agents default to a pane; other types and nested agents run in-process. Use in-process only when the user asks to keep the agent out of a pane."
+					: "Default in-process. Use pane only when the user asks for a visible Herdr pane." })),
 				runtime: Type.Optional(Type.Union([Type.Literal("pi"), Type.Literal("claude-code")], { description: "Use claude-code only when the user asks for Claude Code; runs in a pane." })),
 				machine: Type.Optional(Type.String({ description: "A saved Herdr SSH machine to run on, only when the user asks; runs in a pane there." })),
 				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine." })),

@@ -11,9 +11,10 @@ export const featureLabels = {
 	terminalColors: "Terminal background, text and cursor colors",
 	communication: "Communication style and clickable file references",
 	autonomy: "Autonomous in-process subagent delegation",
+	panes: "General-purpose subagents in Herdr panes",
 } as const;
 export type Features = Record<keyof typeof featureLabels, boolean>;
-export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true };
+export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true, panes: true };
 
 export function loadFeatures(path = featureSettingsPath()): Features {
 	const values = readSettingsObject(path);

@@ -21,6 +21,8 @@ export interface HerdrRunsPort {
 	cancel(meta: AgentMeta): Promise<{ acknowledged: boolean; message: string }>;
 	onNotice(listener: (notice: PaneNotice) => void): () => void;
 	acknowledge(noticeId: string): Promise<void>;
+	/** This Pi is itself a Herdr pane child. */
+	paneChild?(): boolean;
 }
 export interface RunSettlingResult { ok: false; reason: "not-running"; settling: true; message: string }
 export interface HerdrRunHandle extends Omit<RunHandle, "cancel" | "deliver"> {
@@ -133,6 +135,8 @@ export class HerdrRuns {
 		return () => { if (this.generation === generation) { this.generation++; this.unsubscribe?.(); this.unsubscribe = undefined; this.port = undefined; } };
 	}
 	available(): boolean { return Boolean(this.port) && !this.disposed; }
+	/** A pane child's own launches are nested agents, which stay in-process unless a call asks for a pane. */
+	defaultsHere(): boolean { return this.available() && !this.port!.paneChild?.(); }
 	pendingAcknowledgements(): number { return this.acks.size; }
 	getHandle(runId: string): HerdrRunHandle | undefined { return this.runs.get(runId)?.handle; }
 

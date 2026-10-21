@@ -200,6 +200,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 
 		const backend = overrides.mode === "backend" ? createBackendController({
 			assertActive() { if (stopped) throw new Error("Herdr backend is shut down"); },
+			paneChild: () => child !== undefined,
 			async route(agentId) {
 				if (stopped) throw new Error("Herdr backend is shut down");
 				let target = await route(agentId);

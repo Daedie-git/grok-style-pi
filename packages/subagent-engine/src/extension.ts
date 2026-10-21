@@ -87,7 +87,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		});
 		const create = (): Engine => {
 			const created = new Engine({
-				env, agentDir, homeDir: options.homeDir ?? homedir(), now: options.now, onSessionCreated: options.onSessionCreated,
+				env, agentDir, homeDir: options.homeDir ?? homedir(), now: options.now, onSessionCreated: options.onSessionCreated, paneDefault: options.paneDefault,
 				modelRuntime: options.modelRuntime ?? (() => ModelRuntime.create({
 					authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), modelsStorePath: join(agentDir, "models-store.json"),
 				})),
@@ -98,7 +98,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 			return created;
 		};
 		let engine = create();
-		registerEngineTools(pi, () => engine, ROOT_CALLER, { policy, panes: options.panes });
+		registerEngineTools(pi, () => engine, ROOT_CALLER, { policy, panes: options.panes, paneDefault: options.paneDefault });
 		if (env.PI_SUBAGENT_ALIASES !== "0") registerCompatAliases(pi, () => engine, ROOT_CALLER);
 		if (env.PI_SUBAGENT_TASKS !== "0") registerTaskTools(pi, { store: () => engine.taskStore(), caller: {} });
 		if (env.PI_SUBAGENT_WORKFLOW !== "0") registerWorkflowTool(pi, () => engine.workflows());
@@ -120,6 +120,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 				adopted.rebindRuntime({
 					childInstaller: options.childInstaller ?? childInstaller(policy),
 					taskHooks: options.taskHooks ?? ((owner) => taskHooks(owner.hookEnvironment(), () => owner.rootHookContext())),
+					paneDefault: options.paneDefault,
 				});
 				// Integrations (activity panel) must follow the adopted engine, not the fresh one this runtime created.
 				options.onEngine?.(adopted);

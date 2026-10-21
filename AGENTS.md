@@ -8,7 +8,7 @@ Stay on documented Pi extension APIs: `setFooter`, `setEditorComponent` wrapping
 
 `createGrokStyleExtension` takes injected factories. Wire real Pi objects only in an entrypoint. Load exactly one of `extensions/index.ts` or `integrations/subagents.ts`.
 
-`src/subagents/adapter.ts` owns run identity, subscriptions, and cancellation for in-process Pi Subagents. The activity UI consumes its projections. `integrations/subagents.ts` loads the standalone runner in `packages/herdr-subagents` when `HERDR_ENV=1`, and Pi Subagents otherwise. Keep the Herdr package independent of Grok sources; its README owns runner behavior. The Herdr runner does not use the adapter. Load its standalone entrypoint or the Grok integration, never both.
+`src/subagents/adapter.ts` owns activity run identity, subscriptions and user-stop routing through the engine's public `agentSnapshots()` and event APIs; never read Control or child sessions. `integrations/subagents.ts` always loads the bundled engine, with in-process children by default. Inside Herdr it attaches `packages/herdr-subagents` in headless backend mode for explicit pane, machine or Claude Code requests. Herdr owns pane execution and its outbox; the engine routes notices and acknowledges Herdr after a destination receipt. Keep the Herdr package independent of Grok sources. Its standalone entrypoint retains its own tools and explicit-request policy; load it or the combined integration, never both.
 
 Match the existing TypeScript style: tabs, and `.ts` import specifiers.
 
@@ -18,4 +18,4 @@ Route every header and body `handleMouse` through `handleDiamondClick` in `src/t
 
 ## Verify
 
-`npm test` is the gate (Node 22+ type stripping): strict typechecks and tests for Grok and the standalone Herdr package. When you touch subagent manager behavior, also run `npm run test:subagents`. When you touch `bat` highlighting, also run `npm run test:bat`.
+`npm test` is the gate (Node 22+ type stripping): strict typechecks and tests for Grok and the standalone Herdr package. When you touch subagent integration, also run `node --test test/activity.test.ts test/subagent-contract.test.ts test/workflow-activity.test.ts test/herdr-integration.test.ts`. When you touch `bat` highlighting, also run `npm run test:bat`.

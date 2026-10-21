@@ -4,13 +4,15 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { ActivityPanel, ActivityViewer, type Activity } from "../src/activity/ui.ts";
 import { installActivityPanel } from "../src/activity/panel.ts";
 import { subagentRuntimeLabel } from "../src/subagents/adapter.ts";
+import { FakeEngine, agentSnapshot } from "./fixtures/engine-activity.ts";
 import { wrapWithDiamondRenderer } from "../src/tools/renderer.ts";
 
 const theme = { fg: (_token: string, text: string) => text };
 const click = (x: number, y: number) => ({ type: "click", button: "left", x, y } as any);
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-function harness(getRecord = (_id: string): any => undefined, mode = "tui") {
+function harness(_unused?: undefined, mode = "tui") {
+	const engine = new FakeEngine();
 	const handlers = new Map<string, Function[]>();
 	const bus = new Map<string, Set<Function>>();
 	const commands = new Map<string, any>();
@@ -48,13 +50,118 @@ function harness(getRecord = (_id: string): any => undefined, mode = "tui") {
 			return new Promise<void>((resolve) => { viewer = factory(tui, theme, {}, () => { viewer = undefined; resolve(); }); });
 		},
 	} };
-	const controller = installActivityPanel(pi as any, getRecord);
+	const controller = installActivityPanel(pi as any);
+	controller.attachEngine(engine);
 	const emit = (name: string) => { for (const handler of handlers.get(name) ?? []) handler({}, ctx); };
 	emit("session_start");
-	return { controller, ctx, events, emit, commands, notifications, panel: () => panel!, viewer: () => viewer, redraws: () => redraws,
+	return { engine, controller, ctx, events, emit, commands, notifications, panel: () => panel!, viewer: () => viewer, redraws: () => redraws,
 		widget: () => widget, overlayCalls: () => overlayCalls,
 		listenerCount: () => [...bus.values()].reduce((sum, set) => sum + set.size, 0) };
 }
+
+test("engine activity follows live events and Stop requests a user-source stop", async (t) => {
+	const h = harness(); t.after(() => h.emit("session_shutdown"));
+	h.engine.spawn();
+	assert.match(h.panel().render(100).join("\n"), /Explore: inspect build/);
+	assert.match(h.panel().render(100).join("\n"), /grok-4.6 · high/);
+	const viewing = h.commands.get("activity").handler();
+	await flush();
+	h.engine.text("Reading build files");
+	assert.match(h.viewer()!.render(80).join("\n"), /Reading build files/);
+	h.viewer()!.handleInput("x"); await flush();
+	assert.deepEqual(h.engine.stops, ["one"]);
+	assert.equal(h.controller.list()[0].status, "stopping");
+	h.engine.settle("killed");
+	assert.equal(h.controller.list()[0].status, "stopped");
+	assert.equal(h.controller.list()[0].stop, undefined);
+	assert.deepEqual(h.panel().render(80), []);
+	h.viewer()!.handleInput("\x1b"); await viewing;
+	assert.deepEqual(h.notifications, []);
+});
+
+test("shutdown closes viewers and unsubscribes engine; headless sessions remain inert", async () => {
+	const h = harness(); h.engine.spawn();
+	const viewing = h.commands.get("activity").handler(); await flush();
+	assert.equal(h.engine.listeners.size, 1);
+	h.emit("session_shutdown"); await viewing;
+	assert.equal(h.engine.listeners.size, 0);
+	assert.equal(h.controller.list().length, 0);
+	const headless = harness(undefined, "print");
+	assert.equal(headless.engine.listeners.size, 0);
+	headless.emit("session_shutdown");
+});
+
+test("dismissed agents stay inspectable, resumes reappear, and replacement engines disconnect", async (t) => {
+	const h = harness(); t.after(() => h.emit("session_shutdown"));
+	h.engine.spawn();
+	const row = h.panel().render(100)[1];
+	h.panel().handleMouse(click(row.indexOf("[Close]"), 1));
+	assert.deepEqual(h.panel().render(100), []);
+	assert.equal(h.controller.list().length, 1);
+	h.engine.settle();
+	h.engine.emit({ type: "run-event", agentId: "one", runId: "r2", event: { type: "started" } });
+	assert.match(h.panel().render(100).join("\n"), /inspect build/);
+	const replacement = new FakeEngine(); h.controller.attachEngine(replacement);
+	assert.equal(h.engine.listeners.size, 0);
+	assert.equal(replacement.listeners.size, 1);
+	assert.equal(h.controller.list().length, 0);
+});
+
+test("engine attachment restores already-running agents from public snapshots", async (t) => {
+	const h = harness(); t.after(() => h.emit("session_shutdown"));
+	const engine = new FakeEngine();
+	h.controller.attachEngine({
+		subscribe: (listener) => engine.subscribe(listener),
+		userStop: (id) => engine.userStop(id),
+		agentSnapshots: () => [agentSnapshot()],
+	});
+	assert.equal(h.controller.list().length, 1);
+	assert.match(h.panel().render(100).join("\n"), /Explore: inspect build/);
+	await h.controller.list()[0].stop!();
+	assert.deepEqual(engine.stops, ["one"]);
+	engine.settle("killed");
+	assert.equal(h.controller.list()[0].status, "stopped");
+});
+
+test("snapshot hydration needs no registry and skips inactive or unidentified runs", async (t) => {
+	const h = harness(); t.after(() => h.emit("session_shutdown"));
+	const engine = new FakeEngine();
+	Object.defineProperty(engine, "control", { get() { throw new Error("Activity must not read the engine registry"); } });
+	engine.snapshots = [
+		{ ...agentSnapshot("pane", "pane-run"), backend: "herdr", model: "provider/pane-model", effort: "low", startedAt: 123 },
+		{ ...agentSnapshot("finished"), running: false, status: "completed" },
+		{ ...agentSnapshot("without-run"), runId: undefined },
+	];
+	h.controller.attachEngine(engine);
+	assert.deepEqual(h.controller.list().map((entry) => entry.id), ["agent:pane"]);
+	const entry = h.controller.list()[0];
+	assert.equal(entry.startedAt, 123);
+	assert.equal(entry.model, "provider/pane-model · low");
+	await entry.stop!();
+	assert.deepEqual(engine.stops, ["pane"]);
+});
+
+test("engine text events coalesce redraws and bounded terminal output keeps diagnostics", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+	const h = harness(); t.after(() => h.emit("session_shutdown")); h.engine.spawn();
+	const before = h.redraws();
+	for (let i = 0; i < 100; i++) h.engine.text(`token ${i}\n`);
+	assert.equal(h.redraws(), before);
+	t.mock.timers.tick(16); assert.equal(h.redraws(), before + 1);
+	h.engine.text("x".repeat(100000));
+	assert.equal(h.controller.list()[0].transcript!().length, 64000);
+	h.engine.emit({ type: "diagnostics", agentId: "one", messages: ["diagnostic"] });
+	h.engine.settle("failed");
+	assert.equal(h.controller.list()[0].status, "failed");
+	assert.match(h.controller.list()[0].output, /diagnostic/);
+	assert.ok(h.controller.list()[0].output.length <= 64000);
+	assert.equal(h.controller.list()[0].transcript, undefined);
+});
+
+test("runtime labels use engine effective model and effort and sanitize controls", () => {
+	assert.equal(subagentRuntimeLabel({ model: "grok\x1b[31m", effort: "high" }), "grok · high");
+	assert.equal(subagentRuntimeLabel({}), undefined);
+});
 
 test("panel buttons retain correct hit targets at narrow and wide widths", () => {
 	const entry: Activity = { id: "a", kind: "command", title: "echo 中文", status: "running", stop: () => {}, startedAt: Date.now(), output: "" };
@@ -116,54 +223,7 @@ test("stopping one command preserves its peer and parent signal, output stays in
 	assert.equal(h.controller.list().find((entry) => entry.id === "command:two")!.output, "finished second");
 });
 
-test("subagent viewer follows its session and Stop uses RPC without consuming its result", async (t) => {
-	const listeners = new Set<Function>();
-	const record = { status: "running", session: {
-		state: { messages: [{ role: "user", content: "inspect the build" }] },
-		subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
-	} };
-	const h = harness((id) => id === "agent-1" ? record : undefined);
-	t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "agent-1", type: "Explore", description: "inspect build" });
-	h.events.emit("subagents:created", { id: "agent-1", type: "Explore", description: "inspect build" });
-	assert.equal(h.controller.list()[0].status, "running");
-	const selecting = h.commands.get("activity").handler();
-	await flush();
-	for (const listener of listeners) listener({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "Reading build files" }] } });
-	assert.match(h.viewer()!.render(80).join("\n"), /Reading build files/);
-	let stopped = "", consumed = false;
-	h.events.on("subagents:rpc:consume", () => { consumed = true; });
-	h.events.on("subagents:rpc:stop", (request: any) => {
-		stopped = request.agentId;
-		record.status = "stopped";
-		h.events.emit("subagents:failed", { id: "agent-1", status: "stopped", error: "Stopped" });
-		h.events.emit(`subagents:rpc:stop:reply:${request.requestId}`, { success: true });
-	});
-	h.viewer()!.handleInput("x");
-	await flush();
-	assert.equal(stopped, "agent-1");
-	assert.equal(consumed, false);
-	assert.equal(h.controller.list()[0].status, "stopped");
-	assert.equal(listeners.size, 0);
-	h.viewer()!.handleInput("\x1b");
-	await selecting;
-	assert.deepEqual(h.notifications, []);
-});
 
-test("session shutdown closes viewers and releases all activity listeners", async () => {
-	let unsubscribed = false;
-	const h = harness(() => ({ status: "running", session: { state: { messages: [] }, subscribe: () => () => { unsubscribed = true; } } }));
-	h.events.emit("subagents:started", { id: "one" });
-	const viewing = h.commands.get("activity").handler();
-	await flush();
-	assert.ok(h.viewer());
-	h.emit("session_shutdown");
-	await viewing;
-	assert.equal(unsubscribed, true);
-	assert.equal(h.listenerCount(), 0);
-	assert.equal(h.controller.list().length, 0);
-	assert.equal(h.viewer(), undefined);
-});
 
 test("headless sessions do not subscribe or render an activity panel", () => {
 	const h = harness(undefined, "print");
@@ -209,31 +269,6 @@ test("viewer frame and header Close survive resizing without stopping the agent"
 	assert.equal(closed, 6);
 });
 
-test("activity reserves widget rows without overlays and dismissed agents remain inspectable", async (t) => {
-	const h = harness(); t.after(() => h.emit("session_shutdown"));
-	assert.equal(h.overlayCalls(), 0);
-	assert.deepEqual(h.widget().render(80), []);
-	assert.deepEqual(h.panel().render(80), []);
-	let stopped = false;
-	h.events.on("subagents:rpc:stop", () => { stopped = true; });
-	h.events.emit("subagents:started", { id: "one", type: "Explore", description: "inspect build" });
-	assert.equal(h.widget().render(80).length, 2);
-	assert.equal(h.overlayCalls(), 0);
-	const row = h.panel().render(80)[1];
-	h.panel().handleMouse(click(row.indexOf("[Close]"), 1));
-	assert.deepEqual(h.panel().render(80), []);
-	assert.equal(h.controller.list()[0].status, "running");
-	const viewing = h.commands.get("activity").handler();
-	await flush();
-	const header = h.viewer()!.render(80)[1];
-	h.viewer()!.handleMouse(click(header.indexOf("[Close]"), 1));
-	await viewing;
-	assert.equal(h.viewer(), undefined);
-	assert.equal(stopped, false);
-	h.emit("session_shutdown");
-	assert.equal(h.panel(), undefined);
-});
-
 
 test("activity viewer retains its output limit and refreshes cached output", () => {
 	const entry: Activity = { id: "a", kind: "command", title: "test", status: "running", startedAt: 0,
@@ -246,15 +281,6 @@ test("activity viewer retains its output limit and refreshes cached output", () 
 	assert.match(viewer.render(80).join("\n"), /Updated live output/);
 });
 
-test("failed subagents preserve terminal diagnostics alongside their transcript", (t) => {
-	const record = { status: "running", session: { state: { messages: [{ role: "user", content: "inspect files" }] }, subscribe: () => () => {} } };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "failed" });
-	record.status = "error";
-	h.events.emit("subagents:failed", { id: "failed", error: "429 Too Many Requests" });
-	assert.match(h.controller.list()[0].output, /inspect files/);
-	assert.match(h.controller.list()[0].output, /429 Too Many Requests/);
-});
 
 test("real failed shell output is retained once with its exit status", async (t) => {
 	const { createBashTool } = await import("@earendil-works/pi-coding-agent");
@@ -277,52 +303,7 @@ test("diagnostic merging retains the size limit and distinct failures", async ()
 	assert.ok(output.endsWith("independent failure"));
 });
 
-test("subagent runtime label prefers the live session and notes an overridden request", () => {
-	assert.equal(subagentRuntimeLabel({
-		session: { model: { name: "Grok 4.6", id: "xai/grok-4.6", provider: "xai", api: "openai-completions" }, thinkingLevel: "high" } as any,
-		invocation: { modelName: "other", thinking: "xhigh", requestedThinking: "xhigh", requestedModel: "opus" },
-	}), "Grok 4.6 (asked opus) · high (asked xhigh)");
-	assert.equal(subagentRuntimeLabel({
-		invocation: { modelName: "haiku 4.5", modelId: "anthropic/claude-haiku-4.5", thinking: "medium" },
-	}), "haiku 4.5 · medium");
-	assert.equal(subagentRuntimeLabel({ invocation: { modelName: "grok\x1b[31m", thinking: "low" } }), "grok · low");
-	assert.equal(subagentRuntimeLabel({}), undefined);
-});
 
-test("active subagent rows, viewer, and activity list show model and thinking level", async (t) => {
-	const record: any = {
-		status: "running", startedAt: 1,
-		invocation: { modelName: "stale", thinking: "xhigh", requestedThinking: "xhigh" },
-		session: {
-			model: { name: "Grok 4.6", id: "xai/grok-4.6" }, thinkingLevel: "high",
-			state: { messages: [] }, subscribe() { return () => {}; },
-		},
-	};
-	const h = harness((id) => id === "agent-1" ? record : undefined);
-	t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "agent-1", type: "Explore", description: "inspect build" });
-	const rows = h.panel().render(100);
-	assert.match(rows[1], /Explore: inspect build/);
-	assert.match(rows[1], /\[View\]/);
-	assert.match(rows[2], /Grok 4.6 · high \(asked xhigh\)/);
-	assert.doesNotMatch(rows[2], /\[View\]/);
-	assert.ok(rows.every((line) => visibleWidth(line) <= 100));
-	let labels: string[] = [];
-	h.ctx.ui.select = async (_title: string, options: string[]) => { labels = options; return options[0]; };
-	const selecting = h.commands.get("activity").handler();
-	await flush();
-	const viewer = h.viewer()!.render(80);
-	assert.match(viewer[1], /\[Close\]/);
-	assert.match(viewer[2], /Grok 4.6 · high \(asked xhigh\)/);
-	assert.match(labels[0], /Grok 4.6 · high \(asked xhigh\) · running/);
-	h.viewer()!.handleInput("\x1b");
-	await selecting;
-	record.session.thinkingLevel = "low";
-	record.invocation.requestedThinking = undefined;
-	h.events.emit("subagents:started", { id: "agent-1", type: "Explore", description: "inspect build" });
-	assert.match(h.panel().render(100)[2], /Grok 4.6 · low/);
-	assert.doesNotMatch(h.panel().render(100).join("\n"), /asked/);
-});
 
 test("panel separates active subagents and tasks and removes empty sections", () => {
 	const make = (id: string, kind: Activity["kind"], status: string): Activity => ({ id, kind, status, title: id, startedAt: 0, output: "" });
@@ -350,140 +331,11 @@ test("panel separates active subagents and tasks and removes empty sections", ()
 	assert.deepEqual(panel.render(80), []);
 });
 
-test("activity selector strips terminal controls from titles and statuses", async (t) => {
-	const h = harness(); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:failed", { id: "unsafe", description: "task\x1b]52;c;VEVTVA==\x07\nnext", status: "error\x1b[31m" });
-	let labels: string[] = [];
-	h.ctx.ui.select = async (_title, options) => { labels = options; return undefined as any; };
-	await h.commands.get("activity").handler();
-	assert.equal(labels.length, 1);
-	assert.doesNotMatch(labels[0], /[\x00-\x1f\x7f]|VEVTVA/);
-	assert.match(labels[0], /task next · error/);
-});
 
-test("registry polling revives foreground resumes without lifecycle events", (t) => {
-	t.mock.timers.enable({ apis: ["setInterval"] });
-	const listeners = new Set<Function>();
-	const record = { status: "running", startedAt: 10, completedAt: undefined as number | undefined, session: {
-		state: { messages: [{ role: "user", content: "initial" }] }, abort: async () => {},
-		subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
-	} };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "one" });
-	record.status = "completed"; record.completedAt = 20;
-	h.events.emit("subagents:completed", { id: "one" });
-	assert.equal(listeners.size, 0);
-	assert.deepEqual(h.panel().render(100), []);
-	const idleRedraws = h.redraws();
-	t.mock.timers.tick(1000);
-	assert.equal(h.redraws(), idleRedraws);
-	record.status = "running"; record.startedAt = 30; record.completedAt = undefined;
-	record.session.state.messages.push({ role: "user", content: "resumed request" });
-	t.mock.timers.tick(500);
-	const entry = h.controller.list()[0];
-	assert.equal(entry.status, "running");
-	assert.equal(entry.startedAt, 30);
-	assert.equal(entry.endedAt, undefined);
-	assert.equal(listeners.size, 1);
-	assert.match(entry.transcript!(), /resumed request/);
-	assert.match(h.panel().render(100).join("\n"), /\[Stop\]/);
-	record.status = "completed"; record.completedAt = 40;
-	t.mock.timers.tick(500);
-	assert.equal(entry.status, "completed");
-	assert.equal(listeners.size, 0);
-	assert.deepEqual(h.panel().render(100), []);
-});
 
-test("subagent partial tool output tracks concurrent calls and retires completed partials", (t) => {
-	const listeners = new Set<Function>();
-	const record = { status: "running", session: {
-		state: { messages: [] as any[] }, subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
-	} };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "one" });
-	const emit = (event: any) => { for (const fn of listeners) fn(event); };
-	for (const id of ["a", "b"]) {
-		emit({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: id } });
-		emit({ type: "tool_execution_update", toolCallId: id, toolName: "bash", partialResult: { content: [{ type: "text", text: `partial ${id}` }] } });
-	}
-	const entry = h.controller.list()[0];
-	assert.match(entry.transcript!(), /partial a/);
-	assert.match(entry.transcript!(), /partial b/);
-	emit({ type: "tool_execution_update", toolCallId: "b", toolName: "bash", partialResult: { content: [{ type: "text", text: "updated b" }] } });
-	assert.doesNotMatch(entry.transcript!(), /partial b/);
-	emit({ type: "tool_execution_end", toolCallId: "a" });
-	record.session.state.messages.push({ role: "toolResult", toolCallId: "a", toolName: "bash", content: [{ type: "text", text: "final a" }] });
-	assert.doesNotMatch(entry.transcript!(), /partial a/);
-	assert.match(entry.transcript!(), /final a/);
-	assert.match(entry.transcript!(), /updated b/);
-	assert.equal(entry.detail, "bash b");
-});
 
-test("a foreground resume that fails between polls replaces the previous success", (t) => {
-	t.mock.timers.enable({ apis: ["setInterval"] });
-	const record = { status: "running", startedAt: 10, completedAt: undefined as number | undefined,
-		result: "", error: "", session: { state: { messages: [] as any[] }, subscribe: () => () => {} } };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "fast" });
-	record.status = "completed"; record.completedAt = 20; record.result = "old success";
-	h.events.emit("subagents:completed", { id: "fast", result: "old success" });
-	const redraws = h.redraws();
-	// No running state or lifecycle event is observable at the next poll.
-	record.startedAt = 30; record.completedAt = 31; record.status = "error";
-	record.result = ""; record.error = "429 Too Many Requests";
-	t.mock.timers.tick(500);
-	const entry = h.controller.list()[0];
-	assert.equal(entry.status, "error");
-	assert.equal(entry.startedAt, 30);
-	assert.equal(entry.endedAt, 31);
-	assert.match(entry.output, /429 Too Many Requests/);
-	assert.doesNotMatch(entry.output, /old success/);
-	assert.ok(h.redraws() > redraws);
-	const after = h.redraws();
-	t.mock.timers.tick(500);
-	assert.equal(h.redraws(), after);
-});
 
-test("foreground-resume Stop aborts its live session instead of the stale RPC controller", async (t) => {
-	t.mock.timers.enable({ apis: ["setInterval"] });
-	let executing = false, aborted = 0, rpc = 0;
-	const record = { status: "running", startedAt: 10, completedAt: undefined as number | undefined, session: {
-		state: { messages: [] }, subscribe: () => () => {},
-		async abort() { aborted++; executing = false; record.status = "error"; record.completedAt = 40; },
-	} };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.on("subagents:rpc:stop", () => { rpc++; });
-	h.events.emit("subagents:started", { id: "resume" });
-	record.status = "completed"; record.completedAt = 20;
-	h.events.emit("subagents:completed", { id: "resume" });
-	record.status = "running"; record.startedAt = 30; record.completedAt = undefined; executing = true;
-	t.mock.timers.tick(500);
-	const rows = h.panel().render(100);
-	h.panel().handleMouse(click(rows[1].indexOf("[Stop]"), 1));
-	await flush();
-	assert.equal(aborted, 1);
-	assert.equal(executing, false);
-	assert.equal(rpc, 0);
-	assert.deepEqual(h.panel().render(100), []);
-});
 
-test("resumes without session cancellation do not offer Stop", (t) => {
-	t.mock.timers.enable({ apis: ["setInterval"] });
-	const record = { status: "running", startedAt: 10, session: { state: { messages: [] }, subscribe: () => () => {} } };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "resume" });
-	record.status = "completed";
-	h.events.emit("subagents:completed", { id: "resume" });
-	record.status = "running"; record.startedAt = 20;
-	t.mock.timers.tick(500);
-	assert.equal(h.controller.list()[0].stop, undefined);
-	assert.doesNotMatch(h.panel().render(100).join("\n"), /\[Stop\]/);
-	let stopped = false;
-	const viewer = new ActivityViewer(h.controller.list()[0], theme, () => 24, () => {}, () => {}, () => { stopped = true; });
-	assert.doesNotMatch(viewer.render(100).join("\n"), /\[Stop/);
-	viewer.handleInput("x");
-	assert.equal(stopped, false);
-});
 
 test("agent and task viewer scrollbars track position, jump on click, and follow new output", () => {
 	for (const kind of ["agent", "command"] as const) {
@@ -531,43 +383,4 @@ test("viewer scrollbar handles real fullscreen press/drag/release dispatch in an
 	send(0, 49, 7); // Adjacent border is part of the generous scrollbar hit target.
 	send(0, 49, 7, true);
 	assert.match(viewer.render(40)[3], /line 0/);
-});
-
-test("streaming events share a frame and completed activity redraws immediately", (t) => {
-	t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-	const listeners = new Set<Function>();
-	const record = { status: "running", session: {
-		state: { messages: [] }, subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
-	} };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "stream" });
-	const before = h.redraws();
-	for (let index = 0; index < 100; index++) for (const emit of listeners) emit({ type: "message_update", message: { content: `token ${index}` } });
-	assert.equal(h.redraws(), before);
-	t.mock.timers.tick(16);
-	assert.equal(h.redraws(), before + 1);
-	assert.match(h.controller.list()[0].transcript!(), /token 99/);
-	record.status = "completed";
-	h.events.emit("subagents:completed", { id: "stream" });
-	assert.equal(h.redraws(), before + 2);
-});
-
-test("live transcript preparation is lazy, bounded and reused until a session event", (t) => {
-	let reads = 0;
-	const listeners = new Set<Function>();
-	const record = { status: "running", session: {
-		state: { messages: [{ role: "assistant", get content() { reads++; return "x".repeat(100_000); } }] },
-		subscribe(fn: Function) { listeners.add(fn); return () => listeners.delete(fn); },
-	} };
-	const h = harness(() => record); t.after(() => h.emit("session_shutdown"));
-	h.events.emit("subagents:started", { id: "large" });
-	assert.equal(reads, 0);
-	const entry = h.controller.list()[0];
-	assert.equal(entry.transcript!().length, 64_000);
-	const firstReads = reads;
-	entry.transcript!(); entry.transcript!();
-	assert.equal(reads, firstReads);
-	for (const emit of listeners) emit({ type: "message_end" });
-	entry.transcript!();
-	assert.ok(reads > firstReads);
 });

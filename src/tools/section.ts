@@ -7,7 +7,7 @@ import { toolDisplay } from "./section-state.ts";
 import type { DiamondHooks, DiamondTool, OriginalTool } from "./renderer.ts";
 
 export type SectionView = { args: ToolArgs; result?: ToolResult; isError: boolean; isPartial: boolean };
-export type SectionSummary = { title: string; target?: string; detail?: string };
+export type SectionSummary = { title: string; target?: string; detail?: string; filePath?: string; errorPrefix?: boolean };
 export type SectionBlock =
 	| { kind: "text"; text: string; tone?: "output" | "muted" | "error" }
 	| { kind: "code"; text: string; language: string };
@@ -24,7 +24,7 @@ export function withDiamondSection<T extends OriginalTool>(tool: T, section: Dia
 	const cleanSummary = (view: SectionView) => {
 		const summary = section.summary(view);
 		const clean = (value: string | undefined) => value === undefined ? undefined : sanitizeToolText(value).replace(/\s+/g, " ").trim();
-		return { title: clean(summary.title) ?? "", target: clean(summary.target), detail: clean(summary.detail) };
+		return { title: clean(summary.title) ?? "", target: clean(summary.target), detail: clean(summary.detail), filePath: summary.filePath, errorPrefix: summary.errorPrefix };
 	};
 	return {
 		...tool,
@@ -43,15 +43,16 @@ export function withDiamondSection<T extends OriginalTool>(tool: T, section: Dia
 					const saved = context?.state?.grokSection;
 					const summary = saved?.summary ?? initial;
 					const failed = saved?.isError ?? !!context?.isError;
-					const label = paint(theme, failed ? "error" : "toolTitle", `◆ ${failed ? "Failed: " : ""}${summary.title}`) +
+					const label = paint(theme, failed ? "error" : "toolTitle", `◆ ${failed && summary.errorPrefix !== false ? "Failed: " : ""}${summary.title}`) +
 						(summary.target ? " " + paint(theme, failed ? "error" : "text", summary.target) : "") +
 						(summary.detail ? " " + paint(theme, failed ? "error" : "muted", summary.detail) : "");
 					return [truncateToWidth(label, width)];
 				},
 				handleMouse(event: TuiMouseEvent) {
+					const path = context?.state?.grokSection?.summary.filePath ?? initial.filePath;
 					return handleDiamondClick(event, "header", {
 						display: context?.state && context.invalidate ? display : undefined, invalidate: context?.invalidate,
-						openTarget: fileTarget(context?.args ?? args, 1, context?.cwd, onModifierOpen),
+						openTarget: fileTarget({ ...(context?.args ?? args), ...(path ? { path } : {}) }, 1, context?.cwd, onModifierOpen),
 					});
 				},
 			};
@@ -78,9 +79,10 @@ export function withDiamondSection<T extends OriginalTool>(tool: T, section: Dia
 					invalidate: layout.invalidate,
 					render: layout.render,
 					handleMouse(event: TuiMouseEvent) {
+						const path = cleanSummary(view).filePath;
 						return handleDiamondClick(event, "body", {
 							display: context?.state && context.invalidate ? display : undefined, invalidate: context?.invalidate,
-							openTarget: fileTarget(view.args, 1, context?.cwd, onModifierOpen),
+							openTarget: fileTarget({ ...view.args, ...(path ? { path } : {}) }, 1, context?.cwd, onModifierOpen),
 						});
 					},
 				};

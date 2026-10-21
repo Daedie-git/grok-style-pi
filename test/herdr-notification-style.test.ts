@@ -74,10 +74,11 @@ test("completion diamonds sanitize content, fit narrow widths, and use the curre
 	assert.match(colored.render(100)[0], /^new:◆/);
 });
 
-test("native notifications remain untouched outside styled Herdr integration", async () => {
+test("Herdr notifications remain native outside styled Herdr integration", async () => {
 	for (const [enabled, env] of [[false, { HERDR_ENV: "1" }], [true, {}]] as const) {
 		const h = await host(enabled, env);
-		assert.equal(h.renderers.size, 0);
+		assert.equal(h.renderers.has("herdr-subagent-notification"), false);
+		assert.equal(h.renderers.size, enabled ? 4 : 0);
 		assert.equal(h.sent[0][0], h.message);
 		assert.equal(h.sent[0][1], h.delivery);
 	}

@@ -70,6 +70,32 @@ test("steering uses a collapsible diamond while preserving the owning tool", asy
 	}
 });
 
+test("all engine tool diamonds preserve policy metadata and shared gestures", async () => {
+	const fixtures = [
+		{ name: "SendMessage", args: { to: "reviewer", message: "message" }, title: "Message reviewer", details: {} },
+		{ name: "TaskStop", args: { task_id: "a123" }, title: "Stop agent a123", details: {} },
+		{ name: "TaskCreate", args: { subject: "work", description: "details" }, title: "Task #3 · pending", details: { task: { id: "3", status: "pending" } } },
+		{ name: "TaskGet", args: { taskId: "3" }, title: "Task #3 · in_progress", details: { task: { id: "3", status: "in_progress" } } },
+		{ name: "TaskUpdate", args: { taskId: "3", status: "completed" }, title: "Task #3 · completed", details: { task: { id: "3", status: "completed" } } },
+		{ name: "TaskList", args: {}, title: "Tasks · 2", details: { tasks: [{ id: "1" }, { id: "2" }] } },
+	];
+	for (const fixture of fixtures) {
+		const result = { content: [{ type: "text" as const, text: "Complete tool result" }], details: fixture.details };
+		const original = { name: fixture.name, description: "Engine policy stays here", promptSnippet: "original snippet", promptGuidelines: ["original guideline"], parameters: {}, execute: async () => result } as ToolDefinition;
+		let styled!: ToolDefinition;
+		await registerStyledSubagents({ registerTool(tool) { styled = tool; } } as ExtensionAPI, (pi) => { pi.registerTool(original); }, true);
+		for (const key of ["execute", "parameters", "description", "promptSnippet", "promptGuidelines"] as const) assert.equal(styled[key], original[key]);
+		const theme = { fg: (_: string, text: string) => text } as any;
+		const context = { args: fixture.args, state: {}, invalidate() {} };
+		const header = styled.renderCall!(fixture.args, theme, context as any) as any;
+		assert.deepEqual(styled.renderResult!(result, { expanded: false }, theme, context as any).render(80), []);
+		assert.deepEqual(header.render(80), [`◆ ${fixture.title}`]);
+		const body = styled.renderResult!(result, { expanded: true }, theme, context as any) as any;
+		assert.match(body.render(80).join("\n"), /Complete tool result/);
+		assertDiamondGestures(fixture.name, { header: header.handleMouse, body: body.handleMouse, isOpen: () => styled.renderResult!(result, { expanded: true }, theme, context as any).render(80).length > 0 });
+	}
+});
+
 test("agent launches collapse to a sanitized purpose summary without changing execution", async () => {
 	const original = {
 		name: "Agent", label: "Agent", description: "Launch agent", parameters: {},
@@ -83,7 +109,7 @@ test("agent launches collapse to a sanitized purpose summary without changing ex
 		assert.equal(registered!.execute, original.execute);
 		assert.equal(registered!.promptSnippet, undefined);
 		assert.equal(registered!.promptGuidelines, undefined);
-		assert.match(registered!.description, /explicitly asked/);
+		assert.equal(registered!.description, original.description);
 		if (!enabled) {
 			assert.equal(registered!.renderCall, original.renderCall);
 			continue;

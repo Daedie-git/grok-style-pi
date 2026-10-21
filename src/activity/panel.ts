@@ -3,7 +3,7 @@ import { ActivityPanel, ActivityViewer, isActive, plainText, type Activity } fro
 import { extractResultTail, type ToolResult } from "../tools/diamond.ts";
 import type { OriginalTool } from "../tools/renderer.ts";
 
-import { SubagentAdapter, agentRecord } from "../subagents/adapter.ts";
+import { SubagentAdapter, type ActivityEngine } from "../subagents/adapter.ts";
 
 /** Preserve distinct diagnostics without repeating output embedded in shell errors. */
 export function mergeActivityOutput(output: string, diagnostic: string): string {
@@ -12,7 +12,8 @@ export function mergeActivityOutput(output: string, diagnostic: string): string 
 	return `${output}\n${diagnostic}`.slice(-64000);
 }
 
-export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRecord) {
+export function installActivityPanel(pi: ExtensionAPI) {
+	let engine: ActivityEngine | undefined;
 	const entries = new Map<string, Activity>();
 	const hidden = new Set<string>();
 	let adapter: SubagentAdapter | undefined;
@@ -43,13 +44,10 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 		for (const entry of finished.slice(12)) remove(entry.id);
 		redraw?.();
 		viewerRedraw?.();
-		const needsPolling = list().some((entry) => isActive(entry) || entry.kind === "agent");
+		const needsPolling = list().some(isActive);
 		if (!timer && needsPolling) {
 			timer = setInterval(() => {
-				const wasActive = list().some(isActive);
-				const updated = adapter?.poll();
-				// Check retained records for resumes without repainting an idle UI.
-				if (updated || wasActive || list().some(isActive)) changed();
+				if (list().some(isActive)) changed();
 			}, 500);
 			timer.unref?.();
 		} else if (timer && !needsPolling) {
@@ -61,7 +59,7 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 		if (!isActive(entry)) { remove(entry.id); changed(); return; }
 		if (entry.status === "stopping") return;
 		if (!entry.stop) throw new Error("This activity cannot be stopped individually.");
-		if (entry.kind === "agent") { await entry.stop(); return; }
+		if (entry.kind !== "command") { await entry.stop(); return; }
 		const previous = entry.status;
 		entry.status = "stopping";
 		changed();
@@ -123,17 +121,30 @@ export function installActivityPanel(pi: ExtensionAPI, getAgentRecord = agentRec
 			return new ActivityPanel(visibleEntries, theme,
 				(entry) => safely(() => view(entry)), (entry) => safely(() => act(entry)), () => safely(choose), dismiss);
 		}, { placement: "aboveEditor" });
-		if (pi.events) adapter = new SubagentAdapter(pi.events, getAgentRecord, (entry, newRun, streaming) => {
+		connectEngine();
+	});
+	pi.on("session_shutdown", cleanup);
+	pi.on("tool_result", (event) => {
+		if (event.toolName === "Workflow" || event.toolName === "RunWorkflow") adapter?.workflowReceipt(event.details);
+	});
+	pi.registerCommand?.("activity", { description: "View or stop active commands and subagents", handler: async () => { await choose(); } });
+
+	function connectEngine() {
+		adapter?.dispose(); adapter = undefined;
+		if (ctx && engine) adapter = new SubagentAdapter(engine, (entry, newRun, streaming) => {
 			if (newRun) hidden.delete(entry.id);
 			entries.set(entry.id, entry);
 			changed(streaming);
 		});
-	});
-	pi.on("session_shutdown", cleanup);
-	pi.registerCommand?.("activity", { description: "View or stop active commands and subagents", handler: async () => { await choose(); } });
-
+	}
 	return {
 		list,
+		attachEngine(source: ActivityEngine) {
+			engine = source;
+			for (const entry of list()) if (entry.kind !== "command") { entries.delete(entry.id); hidden.delete(entry.id); }
+			connectEngine();
+			if (ctx) changed();
+		},
 		wrapTool<T extends OriginalTool>(tool: T): T {
 			if (!["bash", "powershell"].includes(tool.name)) return tool;
 			return { ...tool, async execute(id, args, signal, onUpdate, context) {

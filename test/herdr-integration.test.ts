@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 test("the Grok package ships the standalone runner and both compatibility entries", { timeout: 30_000 }, () => {
 	const packed = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
@@ -26,9 +26,9 @@ test("the Grok package ships the standalone runner and both compatibility entrie
 	]) assert.ok(paths.includes(path), `${path} must ship with Grok`);
 });
 
-test("Herdr selects the pane runner; other sessions retain Pi Subagents", async () => {
+test("Herdr availability enables the standalone loader; the combined entrypoint keeps its engine", async () => {
 	assert.equal(selectSubagentRuntime({ HERDR_ENV: "1" }), "herdr");
-	assert.equal(selectSubagentRuntime({}), "pi-subagents");
+	assert.equal(selectSubagentRuntime({}), "engine");
 	const loaded: string[] = [];
 	const pi = { registerTool() {} } as unknown as ExtensionAPI;
 	const factory = (name: string): ExtensionFactory => () => { loaded.push(name); };
@@ -59,10 +59,27 @@ test("the extracted runner keeps Grok diamonds optional without changing executi
 	}
 });
 
+test("engine message renderers use title-first diamonds only when styling is enabled", async () => {
+	for (const styling of [true, false]) {
+		const renderers = new Map<string, any>();
+		const pi = { registerTool() {}, registerMessageRenderer(type: string, renderer: any) { renderers.set(type, renderer); } } as unknown as ExtensionAPI;
+		await loadSubagentExtension(pi, {}, { current: () => {}, herdr: () => { assert.fail("wrong runtime"); } }, styling);
+		assert.equal(renderers.size, styling ? 4 : 0);
+		for (const type of ["subagent-notification", "subagent-message", "agent-message", "subagent-stop-feedback"]) {
+			if (!styling) continue;
+			const renderer = renderers.get(type);
+			const message = { content: "First title\n\nDetailed message" };
+			const theme = { fg: (_: string, text: string) => text };
+			assert.deepEqual(renderer(message, { expanded: false }, theme).render(80), ["◆ First title"]);
+			assert.match(renderer(message, { expanded: true }, theme).render(80).join("\n"), /Detailed message/);
+		}
+	}
+});
+
 test("the combined entrypoint keeps implicit remote Grok roots and respects explicit standalone overrides", () => {
 	const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" };
 	const combined = herdrIntegrationEnvironment(env);
-	assert.equal(remoteWorkerEntry(combined), fileURLToPath(new URL("../src/herdr/worker-entry.mjs", import.meta.url)));
+	assert.equal(resolve(remoteWorkerEntry(combined)), fileURLToPath(new URL("../src/herdr/worker-entry.mjs", import.meta.url)));
 	assert.deepEqual(env, { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, "the caller's environment is not mutated");
 	assert.equal(remoteWorkerEntry(herdrIntegrationEnvironment({ ...env, GROK_HERDR_REMOTE_PACKAGE: "/legacy" })), "/legacy/src/herdr/worker-entry.mjs");
 	assert.equal(remoteWorkerEntry(herdrIntegrationEnvironment({ ...env, HERDR_SUBAGENTS_REMOTE_PACKAGE: "/standalone", GROK_HERDR_REMOTE_PACKAGE: "/legacy" })), "/standalone/src/herdr/worker-entry.mjs");

@@ -21,9 +21,10 @@ export function withoutSubagentInitiative<T extends InitiativeTool>(tool: T): T 
 }
 
 /** Decorate registration, preserving the owning extension's execution and metadata. */
-export async function registerStyledSubagents(pi: ExtensionAPI, factory: ExtensionFactory, enabled: boolean, styleTool: ToolTransform = wrapWithDiamondRenderer) {
+export async function registerStyledSubagents(pi: ExtensionAPI, factory: ExtensionFactory, enabled: boolean, styleTool: ToolTransform = wrapWithDiamondRenderer, herdrPolicy = false) {
 	await registerToolExtension(pi, factory, (tool) => {
-		const gated = withoutSubagentInitiative(tool);
-		return enabled && ["Agent", "get_subagent_result", "steer_subagent"].includes(gated.name) ? styleTool(gated) : gated;
+		// The engine renders its own autonomy policy. Only the legacy Herdr route keeps this gate.
+		const gated = herdrPolicy ? withoutSubagentInitiative(tool) : tool;
+		return enabled && ["Agent", "SendMessage", "TaskStop", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "get_subagent_result", "steer_subagent", "Workflow", "RunWorkflow"].includes(gated.name) ? styleTool(gated) : gated;
 	});
 }

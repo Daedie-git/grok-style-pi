@@ -1,0 +1,333 @@
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentMeta, BackendEvent, DeliveryResult, Envelope, KilledBy, RunHandle, RunOutcome } from "../types.ts";
+import { launchResultText } from "../policy/text.ts";
+
+export type PanePhase = "queued" | "starting" | "running" | "blocked" | "completed" | "failed" | "stopped";
+export type PaneTerminalPhase = Extract<PanePhase, "completed" | "failed" | "stopped">;
+export interface PaneRead { phase: PanePhase; resultText: string; text: string; status: string; runId?: string }
+export interface PaneNotice { noticeId: string; agentId: string; herdrAgentId: string; runId: string; phase: PaneTerminalPhase; text: string; machine?: string }
+export interface PaneRequest {
+	prompt: string; description: string; subagentType: string; cwd: string; runInBackground: boolean;
+	runtime?: "pi" | "claude-code"; name?: string; model?: string; thinking?: string; maxTurns?: number;
+	projectTrusted?: boolean; definitionsCwd?: string; machine?: string; machineCwd?: string;
+}
+/** Structural engine-owned port; no dependency on Herdr's unpublished package layout. */
+export interface HerdrRunsPort {
+	proxy(meta: AgentMeta, ref: { agentId: string; runId: string; machine?: string }): AgentMeta;
+	spawn(request: PaneRequest, ctx: ExtensionContext, meta: AgentMeta, signal?: AbortSignal): Promise<{ agentId: string; runId: string; text: string; meta: AgentMeta }>;
+	resume(meta: AgentMeta, prompt: string, ctx: ExtensionContext): Promise<{ runId: string; text: string; meta: AgentMeta }>;
+	read(meta: AgentMeta, options?: { runId?: string; wait?: boolean; signal?: AbortSignal }): Promise<PaneRead>;
+	deliver(meta: AgentMeta, envelope: Envelope): Promise<DeliveryResult>;
+	cancel(meta: AgentMeta): Promise<{ acknowledged: boolean; message: string }>;
+	onNotice(listener: (notice: PaneNotice) => void): () => void;
+	acknowledge(noticeId: string): Promise<void>;
+}
+export interface HerdrRunHandle extends Omit<RunHandle, "cancel"> { cancel(source: KilledBy): Promise<void> }
+export interface PaneToolResult { text: string; isError?: boolean; details: Record<string, unknown> }
+export interface HerdrRunsHost {
+	/** Same execution.then(settle) registration as Engine.trackRun. */
+	trackRun(agentId: string, runId: string, handle: HerdrRunHandle, background: boolean): void;
+	/** Fail a reserved run whose launch/setup could not register a handle. */
+	settle(agentId: string, runId: string, outcome: RunOutcome): void;
+	persist(meta: AgentMeta): void;
+	forwardPendingStop(agentId: string, runId: string, handle: HerdrRunHandle): void | Promise<void>;
+	/** A blocked foreground wait has not delivered the final result; its eventual notice must wake the owner/root. */
+	backgroundRun(agentId: string, runId: string): void;
+	/** Durable responsibility transfer. Engine dispatch must not overwrite included with submitted for pane deliveries. */
+	includeEnvelopes(agentId: string, runId: string, ids: string[]): void;
+	emit(event: { type: "spawned"; agentId: string; runId: string; meta: AgentMeta } | { type: "run-event"; agentId: string; runId: string; event: BackendEvent }): void;
+	diagnostic(message: string): void;
+}
+export interface HerdrRunsOptions {
+	now?: () => number;
+	maxAttempts?: number;
+	backoffMs?: number;
+	maxBackoffMs?: number;
+	schedule?: (callback: () => void, delay: number) => { cancel(): void };
+}
+interface Identity { readonly agentId: string; readonly runId: string; readonly herdrAgentId: string; readonly herdrRunId: string }
+interface LiveRun {
+	identity: Identity; meta: AgentMeta; handle: HerdrRunHandle; resolve: (outcome: RunOutcome) => void;
+	outcome?: RunOutcome; processing?: Promise<void>; cancelSource?: KilledBy; sourceAcknowledged?: boolean; accepted: Set<string>; deliveries: Set<Promise<unknown>>;
+}
+interface PendingNotice { notice: PaneNotice; attempts: number; next: number; processing?: Promise<void> }
+interface PendingAck { agentId: string; runId: string; committed: boolean; attempts: number; next: number; processing?: Promise<void> }
+const terminal = (phase: PanePhase): phase is PaneTerminalPhase => phase === "completed" || phase === "failed" || phase === "stopped";
+const key = (agentId: string, runId: string) => JSON.stringify([agentId, runId]);
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const positive = (value: number | undefined, fallback: number): number => value !== undefined && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+
+function outcome(phase: PaneTerminalPhase, text: string): RunOutcome {
+	return { status: phase === "stopped" ? "killed" : phase, classification: phase === "stopped" ? "killed" : phase,
+		resultText: text, ...(phase === "stopped" ? { killedBy: "parent" as const } : {}),
+		usage: { billable: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 }, latestFootprint: 0, liveMetric: 0, modelTransitions: [] },
+		toolStats: { toolUses: 0, byTool: {} }, durationMs: 0 };
+}
+
+/** Owns pane execution, immutable run identities and receipt retries across transport generations. */
+export class HerdrRuns {
+	private port?: HerdrRunsPort;
+	private unsubscribe?: () => void;
+	private readonly runs = new Map<string, LiveRun>();
+	private readonly byHerdr = new Map<string, LiveRun>();
+	private readonly notices = new Map<string, PendingNotice>();
+	private readonly acks = new Map<string, PendingAck>();
+	private readonly committed = new Set<string>();
+	private readonly handled = new Set<string>();
+	private readonly now: () => number;
+	private readonly schedule: NonNullable<HerdrRunsOptions["schedule"]>;
+	private readonly maxAttempts: number;
+	private readonly backoff: number;
+	private readonly maxBackoff: number;
+	private timer?: { cancel(): void };
+	private disposed = false;
+	private generation = 0;
+
+	constructor(privateHost: HerdrRunsHost, options: HerdrRunsOptions = {}) {
+		this.host = privateHost;
+		this.now = options.now ?? Date.now;
+		this.maxAttempts = Math.min(100, positive(options.maxAttempts, 5));
+		this.backoff = positive(options.backoffMs, 100);
+		this.maxBackoff = Math.max(this.backoff, positive(options.maxBackoffMs, 5000));
+		this.schedule = options.schedule ?? ((callback, delay) => {
+			const timer = setTimeout(callback, delay); timer.unref(); return { cancel: () => clearTimeout(timer) };
+		});
+	}
+	private readonly host: HerdrRunsHost;
+
+	/** Seed every identity before subscribing. Old surviving handles dereference this port at call time. */
+	rebind(port: HerdrRunsPort): () => void {
+		if (this.disposed) throw new Error("HerdrRuns is disposed");
+		for (const run of this.runs.values()) port.proxy(run.meta, { agentId: run.identity.herdrAgentId, runId: run.identity.herdrRunId, machine: run.meta.herdr?.machine });
+		// A subscription may synchronously replay notices or throw. Stage it
+		// without disturbing the working transport, then publish one generation.
+		const buffered: PaneNotice[] = [];
+		let active = false;
+		const generation = this.generation + 1;
+		const unsubscribe = port.onNotice((notice) => {
+			if (!active) buffered.push(notice);
+			else if (this.generation === generation) this.receive(notice);
+		});
+		this.unsubscribe?.();
+		this.port = port;
+		this.generation = generation;
+		this.unsubscribe = unsubscribe;
+		active = true;
+		for (const notice of buffered) this.receive(notice);
+		for (const pending of [...this.notices.values(), ...this.acks.values()]) { pending.attempts = 0; pending.next = this.now(); }
+		void this.retryPending();
+		return () => { if (this.generation === generation) { this.generation++; this.unsubscribe?.(); this.unsubscribe = undefined; this.port = undefined; } };
+	}
+	available(): boolean { return Boolean(this.port) && !this.disposed; }
+	pendingAcknowledgements(): number { return this.acks.size; }
+	getHandle(runId: string): HerdrRunHandle | undefined { return this.runs.get(runId)?.handle; }
+	/** Release completed snapshot/result payloads only after all source receipts finish. */
+	evict(agentId: string): boolean {
+		const owned = [...this.runs.values()].filter((run) => run.identity.agentId === agentId);
+		if (owned.some((run) => !run.outcome || !run.sourceAcknowledged) || [...this.acks.values()].some((ack) => ack.agentId === agentId)) return false;
+		if ([...this.notices.values()].some((pending) => this.byHerdr.get(key(pending.notice.herdrAgentId, pending.notice.runId))?.identity.agentId === agentId)) return false;
+		for (const run of owned) {
+			this.runs.delete(run.identity.runId);
+			this.byHerdr.delete(key(run.identity.herdrAgentId, run.identity.herdrRunId));
+			this.committed.delete(key(agentId, run.identity.runId));
+		}
+		return true;
+	}
+
+	async spawn(meta: AgentMeta, runId: string, request: PaneRequest, ctx: ExtensionContext, options: { background: boolean; signal?: AbortSignal }): Promise<PaneToolResult> {
+		let registered = false;
+		try {
+			const launched = await this.transport().spawn({ ...request, runInBackground: true }, ctx, meta, options.signal);
+			meta.backend = "herdr"; meta.herdr = launched.meta.herdr;
+			if (!meta.herdr) throw new Error("Herdr spawn did not return run identity");
+			this.host.persist(meta);
+			const run = this.register(meta, runId, options.background);
+			registered = true;
+			await this.host.forwardPendingStop(meta.agentId, runId, run.handle);
+			this.host.emit({ type: "spawned", agentId: meta.agentId, runId, meta });
+			void this.retryPending();
+			if (options.background) return { text: launchResultText({ agentId: meta.agentId, name: meta.name, description: meta.description, background: true }), details: { agentId: meta.agentId, runId, status: "running", background: true, herdr: meta.herdr } };
+			const read = await this.readCaptured(run, { wait: true, signal: options.signal });
+			if (terminal(read.phase)) await this.finish(run, read.phase, read.resultText);
+			else {
+				this.host.backgroundRun(meta.agentId, runId);
+				this.emit(run, { type: read.phase === "blocked" ? "blocked" : "started" });
+			}
+			return { text: this.render(meta.agentId, read), isError: read.phase === "failed" || undefined, details: { agentId: meta.agentId, runId, status: read.phase, resultText: read.resultText } };
+		} catch (error) {
+			if (registered) { this.host.diagnostic(`Pane operation failed: ${errorText(error)}`); throw error; }
+			this.host.settle(meta.agentId, runId, outcome("failed", errorText(error)));
+			return { text: `Could not start the pane agent: ${errorText(error)}`, isError: true, details: { agentId: meta.agentId, runId } };
+		}
+	}
+
+	async resume(meta: AgentMeta, runId: string, prompt: string, ctx: ExtensionContext, envelopeIds: string[] = []): Promise<void> {
+		let registered = false;
+		try {
+			const resumed = await this.transport().resume(meta, prompt, ctx);
+			meta.herdr = resumed.meta.herdr;
+			if (!meta.herdr) throw new Error("Herdr resume did not return run identity");
+			this.host.persist(meta);
+			const run = this.register(meta, runId, true);
+			registered = true;
+			await this.host.forwardPendingStop(meta.agentId, runId, run.handle);
+			this.host.includeEnvelopes(meta.agentId, runId, envelopeIds);
+			this.emit(run, { type: "started" });
+			void this.retryPending();
+		} catch (error) {
+			if (registered) { this.host.diagnostic(`Pane continuation control failed: ${errorText(error)}`); throw error; }
+			this.host.settle(meta.agentId, runId, outcome("failed", errorText(error)));
+		}
+	}
+
+	/** Host calls this only after destination persistence (or a deliberate no-report parked handback). */
+	acknowledgeDestination(agentId: string, runId: string): void {
+		this.committed.add(key(agentId, runId));
+		for (const pending of this.acks.values()) if (pending.agentId === agentId && pending.runId === runId) pending.committed = true;
+		void this.retryPending();
+	}
+
+	async retryPending(): Promise<void> {
+		if (!this.available()) return;
+		await Promise.all([...this.notices.values()].map((pending) => this.processNotice(pending)));
+		await Promise.all([...this.acks].map(([id, pending]) => this.processAck(id, pending)));
+		this.arm();
+	}
+	dispose(): void { this.disposed = true; this.timer?.cancel(); this.unsubscribe?.(); this.port = undefined; }
+
+	private register(meta: AgentMeta, runId: string, background: boolean): LiveRun {
+		if (this.runs.has(runId)) throw new Error(`Duplicate pane engine run ${runId}`);
+		const snapshot = structuredClone(meta);
+		const ref = snapshot.herdr;
+		if (!ref?.runId) throw new Error("Pane run requires a captured Herdr run ID");
+		this.transport().proxy(snapshot, { ...ref, runId: ref.runId });
+		let resolve!: (value: RunOutcome) => void;
+		const execution = new Promise<RunOutcome>((done) => { resolve = done; });
+		const identity = Object.freeze({ agentId: meta.agentId, runId, herdrAgentId: ref.agentId, herdrRunId: ref.runId });
+		const run: LiveRun = { identity, meta: snapshot, resolve, accepted: new Set(), deliveries: new Set(), handle: undefined! };
+		run.handle = {
+			runId, started: Promise.resolve(), execution,
+			deliver: (envelope) => {
+				const delivery = (async () => {
+					if (run.outcome) return { ok: false as const, reason: "not-running" as const, message: "This captured pane run has finished." };
+					const result = await this.transport().deliver(run.meta, envelope);
+					if (result.ok) {
+						run.accepted.add(envelope.id);
+						this.host.includeEnvelopes(identity.agentId, runId, [envelope.id]);
+					}
+					return result;
+				})();
+				run.deliveries.add(delivery);
+				void delivery.then(() => run.deliveries.delete(delivery), () => run.deliveries.delete(delivery));
+				return delivery;
+			},
+			cancel: async (source) => {
+				if (run.outcome) return;
+				run.cancelSource = source;
+				try {
+					const reply = await this.transport().cancel(run.meta);
+					if (reply.acknowledged) this.emit(run, { type: "cancel-acknowledged" });
+				} catch (error) { this.host.diagnostic(`Pane cancellation failed (${identity.agentId}/${runId}): ${errorText(error)}`); throw error; }
+			},
+			subscribe: () => () => undefined,
+		};
+		this.runs.set(runId, run);
+		this.byHerdr.set(key(ref.agentId, ref.runId), run);
+		this.host.trackRun(meta.agentId, runId, run.handle, background);
+		return run;
+	}
+	private transport(): HerdrRunsPort {
+		if (!this.available()) throw new Error("Herdr pane transport is unavailable");
+		return this.port!;
+	}
+	private receive(notice: PaneNotice): void {
+		if (this.handled.has(notice.noticeId)) return;
+		const ack = this.acks.get(notice.noticeId);
+		if (ack) {
+			// A new backend can replay only after its notice routing is ready.
+			// This is fresh recovery evidence, not a polling-based retry loop.
+			if (ack.attempts >= this.maxAttempts) { ack.attempts = 0; ack.next = this.now(); }
+			void this.retryPending();
+			return;
+		}
+		if (this.notices.has(notice.noticeId)) return;
+		this.notices.set(notice.noticeId, { notice, attempts: 0, next: this.now() });
+		void this.retryPending();
+	}
+	private async processNotice(pending: PendingNotice): Promise<void> {
+		if (pending.processing) return pending.processing;
+		if (pending.attempts >= this.maxAttempts || pending.next > this.now()) return;
+		const run = this.byHerdr.get(key(pending.notice.herdrAgentId, pending.notice.runId));
+		if (!run) return; // Early/unknown source identity: retain it, never acknowledge speculation.
+		const work = (async () => {
+			try {
+				if (!run.outcome) {
+					const captured = await this.readCaptured(run);
+					if (!terminal(captured.phase)) throw new Error(`Terminal pane notice has nonterminal captured result: ${captured.phase}`);
+					await this.finish(run, captured.phase, captured.resultText);
+				}
+				const { agentId, runId } = run.identity;
+				this.acks.set(pending.notice.noticeId, { agentId, runId, committed: this.committed.has(key(agentId, runId)), attempts: 0, next: this.now() });
+				this.notices.delete(pending.notice.noticeId);
+			} catch (error) { this.failed(pending, `Pane result read (${run.identity.agentId}/${run.identity.runId})`, error); }
+		})();
+		pending.processing = work;
+		try { await work; } finally { pending.processing = undefined; }
+	}
+	private async readCaptured(run: LiveRun, options: { wait?: boolean; signal?: AbortSignal } = {}): Promise<PaneRead> {
+		const port = this.transport();
+		try {
+			const value = await port.read(run.meta, { ...options, runId: run.identity.herdrRunId });
+			if (value.runId !== undefined && value.runId !== run.identity.herdrRunId) throw new Error("Herdr returned another run's result");
+			if (!["queued", "starting", "running", "blocked", "completed", "failed", "stopped"].includes(value.phase) || typeof value.resultText !== "string") throw new Error("Herdr must return a typed phase and a full resultText");
+			return value;
+		} catch (error) {
+			if (this.port !== port && this.available() && !options.signal?.aborted) return this.readCaptured(run, options);
+			throw error;
+		}
+	}
+	private async finish(run: LiveRun, phase: PaneTerminalPhase, text: string): Promise<void> {
+		if (run.outcome) return;
+		if (run.processing) return run.processing;
+		const work = (async () => {
+			await Promise.allSettled([...run.deliveries]);
+			this.host.includeEnvelopes(run.identity.agentId, run.identity.runId, [...run.accepted]);
+			run.outcome = outcome(phase, text);
+			if (phase === "stopped" && run.cancelSource) run.outcome.killedBy = run.cancelSource;
+			run.resolve(run.outcome);
+		})();
+		run.processing = work;
+		await work;
+	}
+	private async processAck(id: string, pending: PendingAck): Promise<void> {
+		if (pending.processing) return pending.processing;
+		if (!pending.committed || pending.attempts >= this.maxAttempts || pending.next > this.now()) return;
+		const work = (async () => {
+			try {
+				await this.transport().acknowledge(id);
+				this.acks.delete(id); this.handled.add(id);
+				const run = this.runs.get(pending.runId);
+				if (run?.identity.agentId === pending.agentId) run.sourceAcknowledged = true;
+			}
+			catch (error) { this.failed(pending, `Pane acknowledgement (${id})`, error); }
+		})();
+		pending.processing = work;
+		try { await work; } finally { pending.processing = undefined; }
+	}
+	private failed(pending: { attempts: number; next: number }, label: string, error: unknown): void {
+		pending.attempts++;
+		pending.next = this.now() + Math.min(this.maxBackoff, this.backoff * 2 ** (pending.attempts - 1));
+		this.host.diagnostic(`${label} failed: ${errorText(error)}; ${pending.attempts >= this.maxAttempts ? "automatic retries exhausted; reference retained until rebind" : `retry ${pending.attempts}/${this.maxAttempts} scheduled`}.`);
+	}
+	private arm(): void {
+		this.timer?.cancel(); this.timer = undefined;
+		if (!this.available()) return;
+		const due = [...this.acks.values()].filter((pending) => pending.committed && !pending.processing && pending.attempts < this.maxAttempts).map((pending) => pending.next);
+		for (const pending of this.notices.values()) if (!pending.processing && pending.attempts < this.maxAttempts && this.byHerdr.has(key(pending.notice.herdrAgentId, pending.notice.runId))) due.push(pending.next);
+		if (due.length) this.timer = this.schedule(() => { this.timer = undefined; void this.retryPending(); }, Math.max(1, Math.min(...due) - this.now()));
+	}
+	private emit(run: LiveRun, event: BackendEvent): void { this.host.emit({ type: "run-event", agentId: run.identity.agentId, runId: run.identity.runId, event }); }
+	private render(agentId: string, read: PaneRead): string {
+		return `${read.resultText || (read.phase === "blocked" ? "The pane needs attention before it can continue." : "No report text.")}\n\nagentId: ${agentId}; use SendMessage to continue this agent. ${terminal(read.phase) ? "Verify actual changes before reporting completion." : "You will be notified when it finishes."}`;
+	}
+}

@@ -18,13 +18,15 @@ Requirements: Herdr, Pi **1.1.0+** with model credentials, and Node **22.18+ on 
 
 ### With Grok styling
 
-Grok's existing `integrations/subagents.ts` entrypoint imports this runner and decorates its tool rendering. Continue using that entrypoint for the existing combined setup; no settings migration is required. It still selects Pi Subagents outside Herdr.
+Grok's `integrations/subagents.ts` always installs the bundled subagent engine, with in-process Pi sessions by default. Inside Herdr it embeds this runner in **headless backend mode**, without registering a second set of tools. The engine's `Agent` selects panes only for `backend: "pane"`, a saved `machine`, or `runtime: "claude-code"`. The combined setup uses the engine's tool schema and `/grok-style autonomy` guidance; it does not use the standalone runner's tool policy.
 
-Load exactly one runner. Do not also enable this package's standalone extension while the Grok integration is enabled. If keeping this package installed alongside the integration, disable its automatic extension with `{"source":"/path/to/herdr-subagents","extensions":[]}`. Alternatively, use this plugin with Grok's direct `extensions/index.ts` entrypoint for Grok chrome but native subagent tool rendering.
+Load exactly one top-level subagent entrypoint. Do not also enable this package's standalone extension while the Grok integration is enabled. If keeping this package installed alongside the integration, disable its automatic extension with `{"source":"/path/to/herdr-subagents","extensions":[]}`. Alternatively, use this plugin with Grok's direct `extensions/index.ts` entrypoint for Grok chrome but native subagent tool rendering.
 
-The Grok activity panel continues tracking shell commands and in-process Pi Subagents, not the Herdr pane runner.
+The combined activity panel observes engine-managed in-process and pane agents through public engine snapshots/events. Herdr still owns pane execution, identities and its outbox. The engine routes backend notices to the owner/root and acknowledges Herdr after the destination receipt; queueing, reading or rendering is not acknowledgement. Standalone notices use `herdr-subagent-notification`, while engine-routed notices use `subagent-notification`.
 
-## Tools
+## Standalone tools
+
+These schemas and the explicit-request policy apply to this package's standalone entrypoint, not the combined engine integration.
 
 - `Agent` starts a separate Pi process in a Herdr pane. It defaults to background execution; `run_in_background: false` waits for completion or a blocked child.
 - `get_subagent_result` reads a captured run's status and result. `wait: true` waits until it finishes or blocks; optional `run_id` retrieves an earlier retained run.
@@ -109,7 +111,7 @@ New Pi children inherit the parent's project-trust decision on the same machine.
 
 Children attach using both pane and Pi session identity. A new conversation in the same pane does not inherit another child's restrictions. Reload reconstructs queued commands and execution. An uncertain dispatch is interrupted, never blindly replayed; saved execution checkpoints may repair interrupted database writes.
 
-Completion notices use Pi's steering queue: a busy parent receives them after its current tool batch, before its next model call, without interrupting tools; an idle parent starts a new turn. Completion notices have stable run-scoped IDs. Queueing is not delivery: a receipt is stored only after Pi saves the message. Reload retries unacknowledged delivery. SQLite and Pi session files do not form one atomic transaction, so a crash may produce a duplicate with the same notice ID.
+In standalone mode, completion notices use Pi's steering queue: a busy parent receives them after its current tool batch, before its next model call, without interrupting tools; an idle parent starts a new turn. Completion notices have stable run-scoped IDs. Queueing is not delivery: a receipt is stored only after Pi saves the message. Reload retries unacknowledged delivery. SQLite and Pi session files do not form one atomic transaction, so a crash may produce a duplicate with the same notice ID.
 
 Protocol 2 remains incompatible with the older per-agent-file coordinator. Finish or stop legacy runs and close or reload every legacy Pi process before using this runner. Do not run old and new coordinators together. Legacy results remain untouched, but those agents cannot resume. Close a crashed legacy process before archiving its per-agent state directory and obsolete `panes/` index; never delete control files used by a live runner.
 
@@ -123,3 +125,13 @@ npm test
 The package's strict typecheck and runner tests are independent of Grok sources. Tests use real SQLite workers and separate processes for concurrency, cancellation, reload, launch recovery, SSH transport, and notification delivery; Herdr pane operations are mocked. Grok's root `npm test` also runs these tests and checks the styling adapter. No live model requests are needed.
 
 For embedding, the package exports `createHerdrSubagents(overrides?)`, a Pi extension factory with injectable runner dependencies. A caller may decorate tool registration without changing execution. Load the standalone entrypoint or embed the factory once per Pi session.
+
+### Headless backend mode
+
+An orchestrator can embed `createHerdrSubagents({ mode: "backend", onBackend(handle) { /* retain handle */ } })` instead of installing the standalone tools. This mode registers no `Agent`, `get_subagent_result`, or `steer_subagent` tools and never delivers completion notices through `pi.sendMessage`. It still installs child input authorization, tool restrictions, execution lifecycle handlers, and local/remote maintenance polling.
+
+The handle exposes `spawn`, `read`, `steer`, `resume`, `cancel`, `capabilities`, `onNotice`, and `acknowledge`. Spawn receives the normal camel-case runner request plus optional `machine`/`machineCwd`; the extension supplies pane/session identity, agent directory, and the caller's project-trust decision. Reads pin an optional run ID, and waiting stops at either a terminal outcome or a blocked pane. Read results carry a typed `phase` and full, unformatted `resultText`; notices also carry a typed terminal `phase`. Never infer status from a notice title or treat its 500-character preview as the complete result. Steering and cancellation accept an optional captured run ID so a surviving handle cannot accidentally target a newer run. These are additive backend API fields; stored protocols and notice presentation remain unchanged. Aborting a wait does not cancel execution. Resume keeps the original runtime and settings. Cancellation reports `acknowledged: true` only after Herdr records the stopped phase, not merely after accepting a stop request.
+
+Subscribe with `handle.onNotice(listener)` and commit the notice to its destination before awaiting `handle.acknowledge(noticeId)`. Reads and listener callbacks do not acknowledge notices. Unacknowledged notices survive reload and may be delivered again with the same ID. The backend does not infer receipts from Pi history: the orchestrator owns that decision. Grok's engine maps pane identities and routes `subagent-notification` through its delivery outbox, then bridges the destination receipt back to Herdr acknowledgement. This replaces direct standalone `herdr-subagent-notification` delivery; it must not run alongside a second publisher for the same pane notices.
+
+Capabilities distinguish local Pi, remote Pi, and Claude Code. Pi supports live delivery and turn limits; only local Pi panes share the local task store. Claude Code does not support live steering or turn limits. Fork is unsupported in both pane runtimes. Unknown/restored IDs conservatively report no capabilities until a read or other asynchronous operation resolves their runtime. Loading backend mode does not itself launch a pane; the embedding orchestrator decides when a pane backend is requested.

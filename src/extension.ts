@@ -1,3 +1,4 @@
+import { inChildContext } from "../packages/subagent-engine/src/child-context.ts";
 import { VisualPreparation } from "./rendering/visual-preparation.ts";
 import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { defaultFeatures } from "./extension/features.ts";
@@ -12,6 +13,7 @@ import type { ExtensionApiLike, GrokStyleDeps, GrokStyleRuntime, SessionContext 
 export type { SessionUi, SessionContext, ExtensionApiLike, CustomEditorCtor, GrokStyleDeps, GrokStyleRuntime } from "./extension/types.ts";
 
 export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDeps): GrokStyleRuntime {
+	if (inChildContext()) return { styleTool: <T>(tool: T): T => tool };
 	const features = { ...defaultFeatures, ...deps.features };
 	const preparation = new VisualPreparation();
 	let started = false;

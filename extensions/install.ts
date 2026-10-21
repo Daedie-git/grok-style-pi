@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { loadFeatures, installFeatureSettings, type Features } from "../src/extension/features.ts";
+import { inChildContext } from "../packages/subagent-engine/src/child-context.ts";
+import { defaultFeatures, loadFeatures, installFeatureSettings, type Features } from "../src/extension/features.ts";
 import { loadStyleColors, useStyleColors } from "../src/chrome/style-colors.ts";
 import { createGrokStyleExtension } from "../src/extension.ts";
 import { loadToolOptions } from "../src/tools/settings.ts";
@@ -10,10 +11,11 @@ import { installFastMode } from "../src/extension/fast-mode.ts";
 import { installToolGuard } from "../src/extension/tool-guard.ts";
 
 type PiObjects = Pick<typeof import("@earendil-works/pi-coding-agent"), "CustomEditor" | "createReadToolDefinition" | "createBashToolDefinition" | "createPowerShellToolDefinition" | "createEditToolDefinition" | "createWriteToolDefinition" | "createGrepToolDefinition" | "createFindToolDefinition" | "createLsToolDefinition"> & { createCodemodeExtension?: () => ExtensionFactory };
-type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features };
+export type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features };
 
 /** Each alternative entrypoint installs one core runtime and shares its rendering hooks. */
 export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {}) {
+	if (inChildContext()) return { runtime: { styleTool: <T>(tool: T): T => tool }, features: { ...defaultFeatures }, activity: undefined };
 	const agent = await (deps.loadAgent ?? (() => import("@earendil-works/pi-coding-agent")))();
 	const features = deps.features ?? loadFeatures();
 	useStyleColors(loadStyleColors());
@@ -41,5 +43,5 @@ export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {})
 	// Older Pi releases have no codemode factory. Do not construct it when styling is off.
 	const codemode = (agent as PiObjects).createCodemodeExtension;
 	if (features.toolStyling && codemode) await registerStyledCodemode(pi, codemode(), true, runtime.styleTool);
-	return { runtime, features };
+	return { runtime, features, activity };
 }

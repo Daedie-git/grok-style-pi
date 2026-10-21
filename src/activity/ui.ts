@@ -2,7 +2,7 @@ import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrap
 
 export type Activity = {
 	id: string;
-	kind: "command" | "agent";
+	kind: "command" | "agent" | "workflow";
 	title: string;
 	status: string;
 	startedAt: number;
@@ -40,7 +40,7 @@ export class ActivityPanel {
 		const entries = this.entries().filter(isActive);
 		if (!entries.length) return [];
 		const lines: string[] = [];
-		for (const [kind, heading] of [["agent", "Active subagents"], ["command", "Active tasks"]] as const) {
+		for (const [kind, heading] of [["workflow", "Active workflows"], ["agent", "Active subagents"], ["command", "Active tasks"]] as const) {
 			const group = entries.filter((entry) => entry.kind === kind);
 			if (!group.length) continue;
 			this.hits.push({ y: lines.length, x: 0, end: width, action: this.all });

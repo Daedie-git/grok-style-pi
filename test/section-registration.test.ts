@@ -112,7 +112,8 @@ test("either runner shares the installed core, with one chrome lifecycle and opt
 			assert.equal(h.tools.has("codemode"), enabled);
 			assert.equal(h.tools.get("Agent").renderShell, enabled ? "self" : undefined);
 			assert.equal(h.tools.get("steer_subagent").renderShell, enabled ? "self" : undefined);
-			assert.match(h.tools.get("Agent").description, /explicitly asked/);
+			if (env.HERDR_ENV) assert.match(h.tools.get("Agent").description, /explicitly asked/);
+			else assert.equal(h.tools.get("Agent").description, "Agent");
 			if (enabled) assert.equal(h.tools.get("codemode").execute, codemode.execute);
 			for (const handler of h.handlers.get("session_shutdown") ?? []) handler({}, { ui: { setStatus() {} } });
 		}

@@ -10,9 +10,10 @@ export const featureLabels = {
 	activity: "Active subagents and tasks panel",
 	terminalColors: "Terminal background, text and cursor colors",
 	communication: "Communication style and clickable file references",
+	autonomy: "Autonomous in-process subagent delegation",
 } as const;
 export type Features = Record<keyof typeof featureLabels, boolean>;
-export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true };
+export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true };
 
 export function loadFeatures(path = featureSettingsPath()): Features {
 	const values = readSettingsObject(path);

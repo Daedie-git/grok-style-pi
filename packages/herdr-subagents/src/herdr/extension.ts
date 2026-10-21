@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHerdrCli, findHerdrMachine, listHerdrMachines, type HerdrAgentRef, type HerdrClient, type HerdrMachine } from "./client.ts";
 import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
+import { createBackendController, type HerdrBackendHandle } from "./backend.ts";
+export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "./backend.ts";
 import type { ExecutionEvent, RunRef } from "./state.ts";
 import {
 	completionNotice,
@@ -59,7 +61,12 @@ export function remoteWorkerEntry(env: NodeJS.ProcessEnv): string {
 
 const POLL_MS = 200;
 
-export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {}): ExtensionFactory {
+export interface HerdrSubagentOptions extends Partial<HerdrSubagentDeps> {
+	mode?: "backend";
+	onBackend?: (handle: HerdrBackendHandle) => void;
+}
+
+export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): ExtensionFactory {
 	const env = overrides.env ?? process.env;
 	const deps: HerdrSubagentDeps = {
 		env,
@@ -135,7 +142,8 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			}
 			return pending;
 		};
-		const dropMachine = async (machine: string) => {
+		const dropMachine = async (machine: string, expected?: HerdrRunner) => {
+			if (expected && machineRunners.get(machine) !== expected) return;
 			const connected = connecting.get(machine);
 			const stale = machineRunners.get(machine);
 			machines.delete(machine);
@@ -190,6 +198,42 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			checkpoint(ref: RunRef, event: ExecutionEvent) { pi.appendEntry("herdr-execution-checkpoint", { ref, event }); },
 		};
 
+		const backend = overrides.mode === "backend" ? createBackendController({
+			assertActive() { if (stopped) throw new Error("Herdr backend is shut down"); },
+			async route(agentId) {
+				if (stopped) throw new Error("Herdr backend is shut down");
+				let target = await route(agentId);
+				if (target.runner.machine) {
+					remember(target.runner.machine);
+					if (target.runner.store.failed) {
+						await dropMachine(target.runner.machine, target.runner);
+						if (stopped) throw new Error("Herdr backend is shut down");
+						target = await route(agentId);
+					}
+				}
+				return target;
+			},
+			async spawn(request, ctx, signal) {
+				if (!request.resume && request.runtime === "claude-code" && request.machine?.trim()) throw new Error("Claude Code subagents currently support local Herdr panes only.");
+				const target = request.resume ? await route(request.resume) : undefined;
+				const machine = target ? target.runner.machine : request.machine?.trim() || undefined;
+				if (machine && request.inheritContext) throw new Error("inherit_context cannot clone this session onto another machine.");
+				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
+				const cwd = machine ? request.machineCwd?.trim() || machineDefaultCwd(machine, profiles, settings) || ctx.cwd : request.cwd || ctx.cwd;
+				if (machine) remember(machine);
+				const ref = target ? await current.resume(target.id, request.prompt, signal, request.runInBackground) : await current.spawn({
+					...request, cwd, definitionsCwd: ctx.cwd, paneId: parentKey(machine),
+					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
+					workspaceId: machine ? await remoteWorkspace(machine, current, cwd) : deps.env.HERDR_WORKSPACE_ID,
+					sessionFile: ctx.sessionManager.getSessionFile(), agentDir: deps.agentDir,
+					projectTrusted: ctx.isProjectTrusted(),
+				}, signal);
+				return { ...ref, runner: current };
+			},
+			content: completionNotice,
+		}) : undefined;
+
+		if (!backend) {
 		pi.registerTool(defineTool({
 			name: "Agent",
 			label: "Agent",
@@ -281,8 +325,11 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			},
 		}));
 
+		}
+
 		pi.on("session_start", async (_event, ctx) => {
 			stopped = false;
+			backend?.reset();
 			streaming = !ctx.isIdle();
 			queuedNotices.clear();
 			recordedMachines.clear();
@@ -317,6 +364,8 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				lastErrors.set(source, message);
 			};
 			const deliver = async (source: HerdrRunner) => {
+				if (stopped) return;
+				if (backend) return backend.deliver(source, parentKey(source.machine));
 				for (const notice of await source.store.notices(parentKey(source.machine))) {
 					if (stopped || queuedNotices.has(notice.id)) continue;
 					pi.sendMessage({
@@ -342,7 +391,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 				}
 				// A sendMessage call may only queue a message. Acknowledge only evidence actually in Pi's session.
 				const saved = ctx.sessionManager.getEntries();
-				for (const entry of saved.slice(receiptCursor)) {
+				for (const entry of backend ? [] : saved.slice(receiptCursor)) {
 					if (entry.type !== "custom_message" || entry.customType !== "herdr-subagent-notification") continue;
 					const details = entry.details as { noticeId?: string; machine?: string } | undefined;
 					if (details?.noticeId) pendingReceipts.set(details.noticeId, details.machine ?? "");
@@ -418,6 +467,7 @@ export function createHerdrSubagents(overrides: Partial<HerdrSubagentDeps> = {})
 			if (!child || child.allows(event.toolName)) return;
 			return { block: true, reason: "This subagent is not allowed to use that tool." };
 		});
+		if (backend) overrides.onBackend?.(backend.handle);
 	};
 }
 

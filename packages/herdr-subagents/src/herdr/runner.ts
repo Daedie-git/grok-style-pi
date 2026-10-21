@@ -678,7 +678,7 @@ function loadAgent(request: SpawnRequest) {
 	return undefined;
 }
 
-function formatStatus(record: AgentRecord, snapshot: RunSnapshot, machine?: string): string {
+export function formatStatus(record: AgentRecord, snapshot: RunSnapshot, machine?: string): string {
 	const pane = paneText(record.paneId, machine);
 	const header = `Agent: ${qualifiedAgentId(record.id, machine)}\nRun: ${snapshot.runId}\nRuntime: ${record.runtime ?? "pi"}\nType: ${record.type} | Status: ${snapshot.phase}\nDescription: ${record.description}\nPane: ${pane}\n`;
 	if (snapshot.cancelRequested && !isTerminal(snapshot.phase)) return `${header}\nCancellation requested; waiting for the child to stop.`;

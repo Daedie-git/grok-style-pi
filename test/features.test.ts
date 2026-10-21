@@ -45,6 +45,11 @@ test("settings command supports menu toggles, all-off, validation and cancellati
 	assert.ok(Object.values(loadFeatures(path)).every((value) => value === false));
 	await command.handler("activity on", ctx);
 	assert.equal(loadFeatures(path).activity, true);
+	assert.equal(loadFeatures(path).autonomy, false);
+	await command.handler("autonomy on", ctx);
+	assert.equal(loadFeatures(path).autonomy, true);
+	await command.handler("autonomy off", ctx);
+	assert.equal(loadFeatures(path).autonomy, false);
 	assert.equal(loadFeatures(path).toolStyling, false);
 	await command.handler("activity maybe", ctx);
 	assert.match(notices.at(-1)!, /Usage/);

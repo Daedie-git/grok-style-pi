@@ -1,0 +1,147 @@
+{
+  "kind": "analyst-generated Workflow replay vectors",
+  "warning": "No target functions executed; these test this independent algorithm port, not live Claude Code or a complete harness.",
+  "algorithm": "v2:sha256(previousKey + NUL + prompt + NUL + JS-sorted-whitelisted-options-JSON)",
+  "vectors": [
+    {
+      "name": "empty-options",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{}",
+      "canonicalUtf8Hex": "7b7d",
+      "preimageUtf8Hex": "00496e73706563742041007b7d",
+      "key": "v2:4d07721546b8db38543944b6b3fa98a7332de8e50a790be97646e1c0ad8f87e6"
+    },
+    {
+      "name": "positional-repeat",
+      "construction": "Plain JSON intake options",
+      "previousKey": "v2:4d07721546b8db38543944b6b3fa98a7332de8e50a790be97646e1c0ad8f87e6",
+      "prompt": "Inspect A",
+      "canonical": "{}",
+      "canonicalUtf8Hex": "7b7d",
+      "preimageUtf8Hex": "76323a3464303737323135343662386462333835343339343462366233666139386137333332646538653530613739306265393736343665316330616438663837653600496e73706563742041007b7d",
+      "key": "v2:cf0738b82ab088f18756735973f865892a64da334c711828147fce09705349ce"
+    },
+    {
+      "name": "nested-key-order-A",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"model\":\"sonnet\",\"schema\":{\"properties\":{\"a\":{\"type\":\"string\"},\"z\":{\"type\":\"number\"}},\"required\":[\"z\",\"a\"],\"type\":\"object\"}}",
+      "canonicalUtf8Hex": "7b226d6f64656c223a22736f6e6e6574222c22736368656d61223a7b2270726f70657274696573223a7b2261223a7b2274797065223a22737472696e67227d2c227a223a7b2274797065223a226e756d626572227d7d2c227265717569726564223a5b227a222c2261225d2c2274797065223a226f626a656374227d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b226d6f64656c223a22736f6e6e6574222c22736368656d61223a7b2270726f70657274696573223a7b2261223a7b2274797065223a22737472696e67227d2c227a223a7b2274797065223a226e756d626572227d7d2c227265717569726564223a5b227a222c2261225d2c2274797065223a226f626a656374227d7d",
+      "key": "v2:5d700ba803507c05938a657b6312a3c7b36490008287318a2635ebaebc1477e3"
+    },
+    {
+      "name": "nested-key-order-B",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"model\":\"sonnet\",\"schema\":{\"properties\":{\"a\":{\"type\":\"string\"},\"z\":{\"type\":\"number\"}},\"required\":[\"z\",\"a\"],\"type\":\"object\"}}",
+      "canonicalUtf8Hex": "7b226d6f64656c223a22736f6e6e6574222c22736368656d61223a7b2270726f70657274696573223a7b2261223a7b2274797065223a22737472696e67227d2c227a223a7b2274797065223a226e756d626572227d7d2c227265717569726564223a5b227a222c2261225d2c2274797065223a226f626a656374227d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b226d6f64656c223a22736f6e6e6574222c22736368656d61223a7b2270726f70657274696573223a7b2261223a7b2274797065223a22737472696e67227d2c227a223a7b2274797065223a226e756d626572227d7d2c227265717569726564223a5b227a222c2261225d2c2274797065223a226f626a656374227d7d",
+      "key": "v2:5d700ba803507c05938a657b6312a3c7b36490008287318a2635ebaebc1477e3"
+    },
+    {
+      "name": "array-order-changes-key",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"model\":\"sonnet\",\"schema\":{\"properties\":{\"a\":{\"type\":\"string\"},\"z\":{\"type\":\"number\"}},\"required\":[\"a\",\"z\"],\"type\":\"object\"}}",
+      "canonicalUtf8Hex": "7b226d6f64656c223a22736f6e6e6574222c22736368656d61223a7b2270726f70657274696573223a7b2261223a7b2274797065223a22737472696e67227d2c227a223a7b2274797065223a226e756d626572227d7d2c227265717569726564223a5b2261222c227a225d2c2274797065223a226f626a656374227d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b226d6f64656c223a22736f6e6e6574222c22736368656d61223a7b2270726f70657274696573223a7b2261223a7b2274797065223a22737472696e67227d2c227a223a7b2274797065223a226e756d626572227d7d2c227265717569726564223a5b2261222c227a225d2c2274797065223a226f626a656374227d7d",
+      "key": "v2:74de7150db02775141eda3a92cb04cd1c658b4d6c1bdafd728ff10d3e61affea"
+    },
+    {
+      "name": "omitted-members",
+      "construction": "JavaScript undefined/functions omitted in objects; holes/undefined/functions become null in JSON arrays; label/phase/stallMs not whitelisted",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"schema\":{\"type\":\"object\",\"values\":[null,null,null,null]}}",
+      "canonicalUtf8Hex": "7b22736368656d61223a7b2274797065223a226f626a656374222c2276616c756573223a5b6e756c6c2c6e756c6c2c6e756c6c2c6e756c6c5d7d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b22736368656d61223a7b2274797065223a226f626a656374222c2276616c756573223a5b6e756c6c2c6e756c6c2c6e756c6c2c6e756c6c5d7d7d",
+      "key": "v2:f036b92ce52e77261c1570eacac2250702616dbe66b404245a56f40ed6ef1f37"
+    },
+    {
+      "name": "integer-like-object-keys",
+      "construction": "Sorted assignment still uses JavaScript integer-key enumeration in JSON.stringify; __proto__ is omitted",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"schema\":{\"2\":\"two\",\"10\":\"ten\",\"01\":\"leading\",\"a\":\"last\"}}",
+      "canonicalUtf8Hex": "7b22736368656d61223a7b2232223a2274776f222c223130223a2274656e222c223031223a226c656164696e67222c2261223a226c617374227d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b22736368656d61223a7b2232223a2274776f222c223130223a2274656e222c223031223a226c656164696e67222c2261223a226c617374227d7d",
+      "key": "v2:c83b7b4dd97ce844a0d2e6fc52aef94bbd3153633c7389d0b29755042299a84f"
+    },
+    {
+      "name": "raw-effort-med",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"effort\":\"med\"}",
+      "canonicalUtf8Hex": "7b226566666f7274223a226d6564227d",
+      "preimageUtf8Hex": "00496e73706563742041007b226566666f7274223a226d6564227d",
+      "key": "v2:7b9ff0cf3c3d8f224717b23765ad2d24184f363c8d8fc68117e5b3d7a10e5258"
+    },
+    {
+      "name": "raw-effort-medium",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"effort\":\"medium\"}",
+      "canonicalUtf8Hex": "7b226566666f7274223a226d656469756d227d",
+      "preimageUtf8Hex": "00496e73706563742041007b226566666f7274223a226d656469756d227d",
+      "key": "v2:47aeac16fd2be1050223a8629cfff0053977237b21dfbed59f749a0b56ed2c9e"
+    },
+    {
+      "name": "unicode-utf8",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect α\nfile",
+      "canonical": "{\"agentType\":\"Explore\",\"schema\":{\"description\":\"é\",\"type\":\"object\"}}",
+      "canonicalUtf8Hex": "7b226167656e7454797065223a224578706c6f7265222c22736368656d61223a7b226465736372697074696f6e223a22c3a9222c2274797065223a226f626a656374227d7d",
+      "preimageUtf8Hex": "00496e737065637420ceb10a66696c65007b226167656e7454797065223a224578706c6f7265222c22736368656d61223a7b226465736372697074696f6e223a22c3a9222c2274797065223a226f626a656374227d7d",
+      "key": "v2:9cc9d87cbd13ee09fd0ae2319ae408e982ec19d01333b62247c3fd7ee23ae8a2"
+    },
+    {
+      "name": "label-phase-timeout-not-key",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{}",
+      "canonicalUtf8Hex": "7b7d",
+      "preimageUtf8Hex": "00496e73706563742041007b7d",
+      "key": "v2:4d07721546b8db38543944b6b3fa98a7332de8e50a790be97646e1c0ad8f87e6"
+    },
+    {
+      "name": "normalized-denies-clamps-A",
+      "construction": "Host intake rejects padded/empty entries, then deduplicates/sorts valid strings BEFORE hashing; no silent trimming",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"bashCommandClamp\":[\"Bash(ls)\",\"Bash(pwd)\"],\"disallowedTools\":[\"Grep\",\"Read\"]}",
+      "canonicalUtf8Hex": "7b2262617368436f6d6d616e64436c616d70223a5b2242617368286c7329222c22426173682870776429225d2c22646973616c6c6f776564546f6f6c73223a5b2247726570222c2252656164225d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b2262617368436f6d6d616e64436c616d70223a5b2242617368286c7329222c22426173682870776429225d2c22646973616c6c6f776564546f6f6c73223a5b2247726570222c2252656164225d7d",
+      "key": "v2:35de2a7ac5013ea43a3c2cb340a09be99c9270c57328a12cdfaf4a49fafee9ac"
+    },
+    {
+      "name": "normalized-denies-clamps-B",
+      "construction": "Plain JSON intake options",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"bashCommandClamp\":[\"Bash(ls)\",\"Bash(pwd)\"],\"disallowedTools\":[\"Grep\",\"Read\"]}",
+      "canonicalUtf8Hex": "7b2262617368436f6d6d616e64436c616d70223a5b2242617368286c7329222c22426173682870776429225d2c22646973616c6c6f776564546f6f6c73223a5b2247726570222c2252656164225d7d",
+      "preimageUtf8Hex": "00496e73706563742041007b2262617368436f6d6d616e64436c616d70223a5b2242617368286c7329222c22426173682870776429225d2c22646973616c6c6f776564546f6f6c73223a5b2247726570222c2252656164225d7d",
+      "key": "v2:35de2a7ac5013ea43a3c2cb340a09be99c9270c57328a12cdfaf4a49fafee9ac"
+    },
+    {
+      "name": "force-suppressed-model",
+      "construction": "Selected policy suppresses per-call model before key; this fixture hashes post-policy intake, not live environment",
+      "previousKey": "",
+      "prompt": "Inspect A",
+      "canonical": "{\"effort\":\"high\"}",
+      "canonicalUtf8Hex": "7b226566666f7274223a2268696768227d",
+      "preimageUtf8Hex": "00496e73706563742041007b226566666f7274223a2268696768227d",
+      "key": "v2:6c9b7d89ed07fc3f6de3420b93c23bb295c9be37e0a0b518581459ad84d05c83"
+    }
+  ]
+}

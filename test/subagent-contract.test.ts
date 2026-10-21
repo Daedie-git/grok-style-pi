@@ -1,179 +1,169 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { EventEmitter } from "node:events";
-import { AgentManager } from "@tintinweb/pi-subagents/dist/agent-manager.js";
-import type { AgentRecord as NativeRecord } from "@tintinweb/pi-subagents/dist/types.js";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream, getModel, type AssistantMessage } from "@earendil-works/pi-ai/compat";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getModel } from "@earendil-works/pi-ai/compat";
+import subagents, { createGrokSubagents } from "../integrations/subagents.ts";
+import grok from "../extensions/index.ts";
+import { createGrokStyleExtension } from "../src/extension.ts";
+import { defaultFeatures } from "../src/extension/features.ts";
 import { SubagentAdapter } from "../src/subagents/adapter.ts";
+import { runInChildScope } from "../packages/subagent-engine/src/child-context.ts";
+import type { Engine } from "../packages/subagent-engine/src/engine.ts";
 import type { Activity } from "../src/activity/ui.ts";
+import { scripted, until, type Script } from "../packages/subagent-engine/test/fixtures/harness.ts";
+import { FakeEngine } from "./fixtures/engine-activity.ts";
 
-// Real manager, resume runner, AgentSession, agent loop and cancellation.
-// Only model transport is replaced, so tests need no credentials or network.
-async function fixture(t: TestContext) {
-	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden in contract tests"); });
-	const dir = mkdtempSync(join(tmpdir(), "grok-contract-"));
-	const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, modelsStorePath: join(dir, "models"), refreshOnCreate: false });
-	await runtime.setRuntimeApiKey("anthropic", "local-test-only");
+async function fixture(t: TestContext, parent: Script, child: Script, autonomy = true) {
+	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
+	mkdirSync(resolve("captures"), { recursive: true });
+	const root = mkdtempSync(join(resolve("captures"), "grok-engine-"));
+	const agentDir = join(root, "agent"); mkdirSync(agentDir);
+	// Real child discovery loads the actual file entrypoint; its child-context guard must make it inert.
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: [fileURLToPath(new URL("../integrations/subagents.ts", import.meta.url))] }));
+	const runtime = await ModelRuntime.create({ authPath: join(root, "auth.json"), modelsPath: null, modelsStorePath: join(root, "models"), refreshOnCreate: false });
+	await runtime.setRuntimeApiKey("anthropic", "offline-test");
 	const settings = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
-	const loader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
+	let engine!: Engine;
+	const children: AgentSession[] = [];
+	const activity: Activity[] = [];
+	let adapter!: SubagentAdapter;
+	const features = { ...Object.fromEntries(Object.keys(defaultFeatures).map((key) => [key, false])), toolStyling: true, autonomy } as typeof defaultFeatures;
+	const loader = new DefaultResourceLoader({
+		cwd: root, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+		extensionFactories: [createGrokSubagents({ env: {}, style: { features }, engine: {
+			env: {}, agentDir, homeDir: root, modelRuntime: async () => runtime,
+			onEngine(created) { engine = created; adapter?.dispose(); adapter = new SubagentAdapter(created, (entry) => { if (!activity.includes(entry)) activity.push(entry); }); },
+			onSessionCreated(session) { children.push(session); session.agent.streamFunction = scripted(child, () => {}) as never; },
+		} })],
+	});
+	const oldSteer = process.env.GROK_STEER_DIR; process.env.GROK_STEER_DIR = join(root, "steer");
 	await loader.reload();
-	const { session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: getModel("anthropic", "claude-sonnet-4-5"), settingsManager: settings, sessionManager: SessionManager.inMemory(dir), resourceLoader: loader, tools: [] });
-	let mode: "success" | "failure" | "wait" = "success";
-	let entered = () => {};
-	let aborted = false;
-	session.agent.streamFunction = (model, _context, options) => {
-		const stream = createAssistantMessageEventStream();
-		const finish = (reason: "stop" | "error" | "aborted") => {
-			const message: AssistantMessage = { role: "assistant", content: reason === "stop" ? [{ type: "text", text: "fresh result" }] : [], api: model.api, provider: model.provider, model: model.id,
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: reason, timestamp: Date.now(),
-				...(reason === "error" ? { errorMessage: "429 Too Many Requests" } : {}) };
-			if (reason === "stop") stream.push({ type: "done", reason, message });
-			else stream.push({ type: "error", reason, error: message });
-			stream.end();
-		};
-		queueMicrotask(() => {
-			if (mode === "wait") {
-				const abort = () => { aborted = true; finish("aborted"); };
-				if (options?.signal?.aborted) abort(); else options?.signal?.addEventListener("abort", abort, { once: true });
-			} else finish(mode === "success" ? "stop" : "error");
-			entered();
-		});
-		return stream;
-	};
-	let lifecycleEvents = 0;
-	const manager = new AgentManager(() => lifecycleEvents++, 5, () => lifecycleEvents++);
-	// Seed an existing session: spawn setup is outside this resume contract.
-	// This is the only private test seam; all exercised operations are the real public methods.
-	const record = { id: "contract", type: "Explore", description: "contract", status: "completed", startedAt: 1, completedAt: 2,
-		result: "old result", session, abortController: new AbortController(), toolUses: 0, compactionCount: 0,
-		lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 } } as NativeRecord;
-	(manager as unknown as { agents: Map<string, NativeRecord> }).agents.set(record.id, record);
-	const emitter = new EventEmitter();
-	const bus = { on(name: string, fn: (data: unknown) => void) { emitter.on(name, fn); return () => { emitter.off(name, fn); }; }, emit(name: string, data: unknown) { emitter.emit(name, data); } } as ExtensionAPI["events"];
-	let activity: Activity;
-	const adapter = new SubagentAdapter(bus, (id) => manager.getRecord(id), (entry) => { activity = entry; });
-	bus.emit("subagents:completed", { id: record.id });
-	t.after(async () => { adapter.dispose(); await session.abort(); await manager.dispose(); rmSync(dir, { recursive: true, force: true }); });
-	let clock = Date.now();
-	t.mock.method(Date, "now", () => ++clock);
-	return { manager, adapter, record, session, activity: () => activity!, aborted: () => aborted, lifecycleEvents: () => lifecycleEvents,
-		setMode(value: typeof mode) { mode = value; }, entered() { return new Promise<void>((resolve) => { entered = resolve; }); } };
+	const { session } = await createAgentSession({ cwd: root, agentDir, modelRuntime: runtime, model: getModel("anthropic", "claude-sonnet-4-5"), settingsManager: settings, sessionManager: SessionManager.inMemory(root), resourceLoader: loader });
+	let modelInput: unknown;
+	const transport = scripted(parent, () => {});
+	session.agent.streamFunction = ((model: any, context: any, options: any) => {
+		modelInput = context;
+		return transport(model, context, options);
+	}) as never;
+	const extensionErrors: unknown[] = [];
+	await session.bindExtensions({ mode: "json", onError: (error) => { extensionErrors.push(error); } });
+	t.after(async () => {
+		adapter.dispose();
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		session.dispose();
+		if (oldSteer === undefined) delete process.env.GROK_STEER_DIR; else process.env.GROK_STEER_DIR = oldSteer;
+		rmSync(root, { recursive: true, force: true });
+	});
+	return { session, get engine() { return engine; }, get adapter() { return adapter; }, activity, children, features, extensionErrors, modelInput: () => modelInput };
 }
 
-test("contract: real foreground resumes succeed and fail between polls without lifecycle events", async (t) => {
-	const h = await fixture(t);
-	const first = h.adapter.identity("contract");
-	await h.manager.resume("contract", "succeed");
-	h.adapter.poll();
-	assert.equal(h.activity().status, "completed", h.record.error);
-	assert.match(h.activity().output, /fresh result/);
-	assert.notEqual(h.adapter.identity("contract"), first);
-	const second = h.adapter.identity("contract");
-	h.setMode("failure");
-	await h.manager.resume("contract", "fail immediately");
-	h.adapter.poll();
-	assert.equal(h.activity().status, "error");
-	assert.match(h.activity().output, /429 Too Many Requests/);
-	assert.notEqual(h.adapter.identity("contract"), second);
-	assert.equal(h.lifecycleEvents(), 0);
+test("real Grok integration dispatches Agent in a Pi tool loop and records completion", { timeout: 15000 }, async (t) => {
+	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { subagent_type: "general-purpose", description: "contract work", prompt: "finish this assignment", run_in_background: false } }] } : { text: "Parent handback" }, () => ({ text: "Child report" }));
+	await h.session.prompt("Perform the contract assignment");
+	assert.match(JSON.stringify(h.session.messages), /Child report/);
+	assert.equal(h.children.length, 1);
+	assert.equal(h.activity[0].status, "completed");
+	assert.equal(h.activity[0].title, "general-purpose: contract work");
+	assert.match(h.activity[0].output, /Child report/);
+	assert.match(h.activity[0].model!, /claude-sonnet/);
+	assert.equal(h.activity[0].stop, undefined);
+	for (const name of ["Agent", "SendMessage", "TaskStop", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "get_subagent_result", "steer_subagent"]) assert.ok(h.session.getAllTools().some((tool) => tool.name === name));
+	assert.equal(h.children[0].getAllTools().some((tool) => tool.name === "show_image"), false, "Grok user extension stays inert in a real engine child");
 });
 
-test("contract: Stop aborts a real foreground resumed session and preserves its parent signal", { timeout: 10000 }, async (t) => {
-	const h = await fixture(t);
-	h.setMode("wait");
-	const entered = h.entered();
-	const parent = new AbortController();
-	const pending = h.manager.resume("contract", "wait until stopped", parent.signal);
-	await entered;
-	h.adapter.poll();
-	assert.equal(h.activity().status, "running");
-	await h.activity().stop!();
-	await pending;
-	h.adapter.poll();
-	assert.equal(h.aborted(), true);
+test("autonomy feature controls the engine's actual system guidance", { timeout: 15000 }, async (t) => {
+	for (const autonomy of [true, false]) {
+		await t.test(String(autonomy), async (inner) => {
+			const h = await fixture(inner, () => ({ text: "done" }), () => ({ text: "unused" }), autonomy);
+			await h.session.prompt("Inspect guidance");
+			const system = (h.modelInput() as { messages: { role: string; content: unknown }[] }).messages.filter((message) => message.role === "system").map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content)).join("\n");
+			if (autonomy) { assert.match(system, /proactive use without a separate user request/); assert.doesNotMatch(system, /Delegate only when the user explicitly requests/); }
+			else { assert.match(system, /Delegate only when the user explicitly requests/); assert.doesNotMatch(system, /proactive use without a separate user request/); }
+		});
+	}
+});
+
+test("real background activity Stop uses engine user cancellation without aborting the parent", { timeout: 15000 }, async (t) => {
+	let entered!: () => void; const ready = new Promise<void>((resolve) => { entered = resolve; });
+	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { subagent_type: "general-purpose", description: "wait", prompt: "wait", run_in_background: true } }] } : { text: "Parent remains usable" }, () => { entered(); return { wait: new Promise<void>(() => {}), then: { text: "unused" } }; });
+	await h.session.prompt("Start an independent assignment"); await ready;
+	const stop = h.activity[0].stop!;
+	await stop();
+	await until(() => h.activity[0].status === "stopped");
 	assert.equal(h.session.isStreaming, false);
-	assert.equal(parent.signal.aborted, false);
-	assert.equal(h.activity().status, "stopped");
-	assert.equal(h.record.abortController!.signal.aborted, false, "old controller was not used");
-});
-
-test("contract: a Stop closure from an earlier run cannot cancel the next real resume", { timeout: 10000 }, async (t) => {
-	const h = await fixture(t);
-	h.setMode("wait");
-	let entered = h.entered();
-	let pending = h.manager.resume("contract", "first");
-	await entered; h.adapter.poll();
-	const oldStop = h.activity().stop!;
-	await oldStop(); await pending; h.adapter.poll();
-	entered = h.entered(); pending = h.manager.resume("contract", "second");
-	await entered; h.adapter.poll();
-	await assert.rejects(async () => { await oldStop(); }, /run has ended/);
-	assert.equal(h.session.isStreaming, true);
-	await h.activity().stop!(); await pending;
-});
-
-test("contract: same-millisecond completed resumes still get distinct identities", async (t) => {
-	const h = await fixture(t);
-	t.mock.method(Date, "now", () => 1000);
-	await h.manager.resume("contract", "first"); h.adapter.poll();
-	const first = h.adapter.identity("contract");
-	await h.manager.resume("contract", "second"); h.adapter.poll();
-	assert.notEqual(h.adapter.identity("contract"), first);
-	assert.equal(h.activity().status, "completed");
-});
-
-test("contract: disposing the adapter makes an outstanding Stop closure inert", async (t) => {
-	const h = await fixture(t);
-	h.setMode("wait");
-	const entered = h.entered();
-	const pending = h.manager.resume("contract", "keep running");
-	await entered; h.adapter.poll();
-	const stop = h.activity().stop!;
-	h.adapter.dispose();
+	assert.match(JSON.stringify(h.session.messages), /Parent remains usable/);
+	assert.equal(h.engine.control.get(h.activity[0].id.slice(6))?.meta.stoppedByUser, true);
 	await assert.rejects(async () => { await stop(); }, /run has ended/);
-	assert.equal(h.session.isStreaming, true);
-	await h.session.abort(); await pending;
 });
 
-test("contract: steered completion leaves active state and removes Stop", async (t) => {
-	const h = await fixture(t);
-	h.setMode("wait");
-	const entered = h.entered();
-	const pending = h.manager.resume("contract", "steered run");
-	await entered; h.adapter.poll();
-	assert.equal(h.activity().status, "running");
-	await h.session.abort(); await pending;
-	// The manager assigns this terminal status when a spawned run settles after steering.
-	h.record.status = "steered";
-	h.adapter.poll();
-	assert.equal(h.activity().status, "completed");
-	assert.equal(h.activity().stop, undefined);
-	assert.equal(h.activity().transcript, undefined);
+test("real session reload adopts the live engine and restores cancellable activity", { timeout: 15000 }, async (t) => {
+	let entered!: () => void; const ready = new Promise<void>((resolve) => { entered = resolve; });
+	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { subagent_type: "general-purpose", description: "survive reload", prompt: "wait", run_in_background: true } }] } : { text: "Parent ready" }, () => { entered(); return { wait: new Promise<void>(() => {}), then: { text: "unused" } }; });
+	await h.session.prompt("Start work that survives reload"); await ready;
+	const engine = h.engine;
+	const adapter = h.adapter;
+	const original = h.activity[0];
+	const snapshot = engine.agentSnapshots().find((agent) => agent.agentId === original.id.slice(6))!;
+	assert.equal(snapshot.running, true);
+	assert.equal(snapshot.runId, adapter.identity(snapshot.agentId)?.runId);
+	assert.equal(snapshot.backend, "in-process");
+	assert.equal(snapshot.startedAt, original.startedAt);
+	snapshot.description = "Detached UI copy";
+	assert.equal(engine.agentSnapshots().find((agent) => agent.agentId === snapshot.agentId)?.description, "survive reload");
+	const oldStop = original.stop!;
+	await h.session.reload();
+	assert.ok(h.engine === engine, "the broker's original engine is adopted");
+	assert.ok(h.adapter !== adapter, "onEngine rebinds observation after adoption");
+	assert.deepEqual(h.extensionErrors, []);
+	assert.equal(h.children.length, 1, "reload does not recreate the child");
+	assert.equal(h.children[0].isStreaming, true);
+	const restored = h.activity.at(-1)!;
+	assert.notEqual(restored, original);
+	assert.equal(restored.id, original.id);
+	assert.equal(restored.title, "general-purpose: survive reload");
+	assert.equal(restored.status, "running");
+	await assert.rejects(async () => { await oldStop(); }, /run has ended/);
+	await restored.stop!();
+	await until(() => restored.status === "stopped");
+	assert.equal(engine.control.get(restored.id.slice(6))?.meta.stoppedByUser, true);
 });
 
-test("contract: completion snapshots are bounded, cached and release child-session references", async (t) => {
-	const h = await fixture(t);
-	await h.manager.resume("contract", "snapshot");
-	const message = h.session.state.messages.at(-1)!;
-	let contentReads = 0;
-	Object.defineProperty(message, "content", { configurable: true, get() { contentReads++; return [{ type: "text", text: "x".repeat(80000) }]; } });
-	h.record.result = "r".repeat(90000);
-	h.adapter.poll();
-	assert.equal(h.activity().output.length, 64000);
-	const initialReads = contentReads;
-	for (let i = 0; i < 10; i++) assert.equal(h.adapter.poll(), false);
-	assert.equal(contentReads, initialReads, "unchanged completions are not rendered again");
-	// Inspect ownership, not GC timing: completed state must not own the child session.
-	const stored = (h.adapter as unknown as { runs: Map<string, { session?: unknown; result?: string; lastUser?: WeakRef<object> }> }).runs.get("contract")!;
-	assert.equal(stored.session, undefined);
-	assert.ok((stored.result?.length ?? 0) <= 64000);
-	assert.ok(stored.lastUser instanceof WeakRef);
-	await h.manager.dispose();
-	h.adapter.poll();
-	assert.equal(stored.session, undefined);
-	assert.equal(h.activity().output.length, 64000, "registry eviction preserves only the completion snapshot");
+test("autonomy changes on reload reach newly created child tool policy", { timeout: 15000 }, async (t) => {
+	const h = await fixture(t, ({ index }) => index === 1 ? { tools: [{ name: "Agent", args: { subagent_type: "general-purpose", description: "after reload", prompt: "finish", run_in_background: false } }] } : { text: "done" }, () => ({ text: "child done" }));
+	await h.session.prompt("Prepare reload");
+	h.features.autonomy = false;
+	await h.session.reload();
+	await h.session.prompt("Explicitly launch an agent after the setting change");
+	assert.equal(h.children.length, 1);
+	const description = h.children[0].getAllTools().find((tool) => tool.name === "Agent")?.description ?? "";
+	assert.match(description, /Delegate only when the user explicitly requests/);
+	assert.doesNotMatch(description, /proactive use without a separate user request/);
+});
+
+test("adapter run identity fences late events and old Stop closures across continuations", async () => {
+	const engine = new FakeEngine(); let activity!: Activity;
+	const adapter = new SubagentAdapter(engine, (entry) => { activity = entry; });
+	engine.spawn(); const original = adapter.identity("one"); const oldStop = activity.stop!;
+	engine.settle(); engine.emit({ type: "run-event", agentId: "one", runId: "r2", event: { type: "started" } });
+	assert.notEqual(adapter.identity("one"), original);
+	await assert.rejects(async () => { await oldStop(); }, /run has ended/);
+	engine.text("stale", "one", "r1"); engine.settle("failed", "one", "r1");
+	engine.emit({ type: "run-event", agentId: "one", runId: "r1", event: { type: "started" } });
+	assert.equal(activity.status, "running"); assert.doesNotMatch(activity.output, /stale/);
+	const currentStop = activity.stop!; adapter.dispose();
+	await assert.rejects(async () => { await currentStop(); }, /run has ended/);
+	assert.equal(engine.listeners.size, 0);
+});
+
+test("all full Grok entrypoints are inert in child context", async () => {
+	const pi = new Proxy({}, { get(_target, name) { throw new Error(`Unexpected child registration: ${String(name)}`); } }) as ExtensionAPI;
+	await runInChildScope({ agentId: "child", depth: 1 }, async () => {
+		await subagents(pi); await grok(pi);
+		const runtime = createGrokStyleExtension(pi, {} as never);
+		const tool = { name: "custom" };
+		assert.equal(runtime.styleTool(tool as never), tool);
+	});
 });

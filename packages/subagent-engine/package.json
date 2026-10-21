@@ -1,0 +1,54 @@
+{
+  "name": "subagent-engine",
+  "version": "0.1.0",
+  "description": "Claude Code-style in-process subagents for Pi: Agent, SendMessage, TaskStop and shared tasks, with fork, worktree isolation, hooks and durable notifications.",
+  "type": "module",
+  "engines": {
+    "node": "^22.18.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Daedie-git/grok-style-pi.git",
+    "directory": "packages/subagent-engine"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "LICENSE",
+    "skills"
+  ],
+  "exports": {
+    ".": "./src/extension.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "acorn": "^8.19.0"
+  }
+}

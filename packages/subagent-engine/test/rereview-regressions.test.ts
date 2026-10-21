@@ -6,7 +6,9 @@ import test from "node:test";
 import { setImmediate as tick } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Engine, ROOT_CALLER } from "../src/engine.ts";
-import type { HerdrRunsPort, PaneNotice, PanePhase } from "../src/backends/herdr-runs.ts";
+import type { HerdrCapturedSummary, HerdrRuns, HerdrRunsPort, PaneNotice, PanePhase } from "../src/backends/herdr-runs.ts";
+import { listMetas } from "../src/store/meta.ts";
+import { Outbox } from "../src/store/outbox.ts";
 import type { AgentMeta } from "../src/types.ts";
 import { createHarness, toolResultText, until } from "./fixtures/harness.ts";
 
@@ -66,6 +68,7 @@ class PanePort implements HerdrRunsPort {
 	}
 	async deliver() { return { ok: true as const, state: "submitted" as const }; }
 	onNotice(listener: (notice: PaneNotice) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+	replay(notice: PaneNotice) { for (const listener of this.listeners) listener(notice); }
 	async acknowledge() {}
 }
 
@@ -262,19 +265,123 @@ test("RR10: acknowledged running-stop and parked-stop sessions evict after grace
 		await h.engine.userStop(owner.meta.agentId);
 		await until(() => h.engine.control.activeRuns() === 0);
 		assert.equal(owner.disposition, "stopped");
-		assert.equal(owner.notified, false);
-		owner.notified = true;
-		assert.ok(!h.engine.control.evictable().includes(owner), "even an acknowledged stop must wait for grace");
-		owner.notified = false;
-		now += 60_000;
-		assert.ok(!h.engine.control.evictable().includes(owner), "unacknowledged stop must retain its resources");
-		// Grant the destination receipt explicitly: parked owners do not emit a new report on Stop.
-		owner.notified = true;
-		assert.ok(h.engine.control.evictable().includes(owner), "acknowledged stopped owner is eligible after grace");
+		if (mode === "parked") {
+			// Stopping a parked owner cancels its withheld report: nothing is left to acknowledge.
+			assert.equal(owner.notified, true);
+			assert.ok(!h.engine.control.evictable().includes(owner), "a stopped parked owner still waits for grace");
+			now += 60_000;
+		} else {
+			assert.equal(owner.notified, false);
+			owner.notified = true;
+			assert.ok(!h.engine.control.evictable().includes(owner), "even an acknowledged stop must wait for grace");
+			owner.notified = false;
+			now += 60_000;
+			assert.ok(!h.engine.control.evictable().includes(owner), "unacknowledged stop must retain its resources");
+			// The stopped run's report receipt (granted explicitly here) makes it eligible.
+			owner.notified = true;
+		}
+		assert.ok(h.engine.control.evictable().includes(owner), "stopped owner is eligible after grace");
 		// Exercise maintenance resource release as well as its eligibility predicate.
 		await (h.engine as unknown as { sweep(): Promise<void> }).sweep();
 		assert.equal(owner.evictAt, undefined);
 		assert.equal(owner.disposition, "stopped");
 		assert.equal(owner.meta.stoppedByUser, true);
 	});
+});
+
+test("RR06 follow-up: acknowledged outbox recovers source receipt after destination metadata write failure", { timeout: 20_000 }, async t => {
+	offline(t);
+	const h = await createHarness({ panes: true, parent: paneParent(true), child: () => () => ({ text: "unused" }) });
+	const port = new PanePort(); port.phase = "running";
+	let earlyAcks = 0;
+	t.mock.method(port, "acknowledge", async () => { earlyAcks++; throw new Error("source transport unavailable"); });
+	const detach = h.engine.attachHerdr(port);
+	let restored: Engine | undefined;
+	t.after(async () => { detach(); await restored?.shutdownRoot("quit"); await h.close(); });
+	await h.parent.prompt("go", { source: "extension" });
+	const id = [...h.engine.control.conversations.keys()][0];
+	const meta = h.engine.control.get(id)!.meta;
+	const runId = meta.runs[0].runId;
+	const paneRunId = meta.herdr?.runId;
+	assert.ok(paneRunId);
+	const original = h.engine as unknown as { persistMeta(meta: AgentMeta): void; deps: ConstructorParameters<typeof Engine>[0] };
+	const persist = original.persistMeta.bind(h.engine);
+	let failedWrites = 0;
+	t.mock.method(original, "persistMeta", (value: AgentMeta) => {
+		if (value.runs.some(summary => (summary as HerdrCapturedSummary).herdr?.destinationCommitted)) {
+			failedWrites++;
+			throw new Error("injected destination commitment metadata write failure");
+		}
+		persist(value);
+	});
+	const notice: PaneNotice = { noticeId: "receipt-crash", agentId: id, herdrAgentId: "pane", runId: paneRunId, phase: "completed", text: "pane result" };
+	port.phase = "completed";
+	port.replay(notice);
+	await until(() => !h.engine.control.get(id)?.active && !h.engine.control.get(id)?.exiting);
+	await until(() => h.parent.sessionManager.getEntries().some(entry => entry.type === "custom_message" && entry.customType === "subagent-notification"));
+	h.engine.observeReceipts();
+	await until(() => failedWrites > 0);
+	const dir = join(h.root, "agent", "subagents", h.parent.sessionId);
+	const durable = listMetas(dir).find(item => item.agentId === id)!;
+	assert.equal(durable.runs[0].status, "completed");
+	assert.equal((durable.runs[0] as HerdrCapturedSummary).herdr?.destinationCommitted, undefined);
+	assert.equal(new Outbox(join(dir, "outbox.jsonl")).acknowledgedRun(id, runId), true, "destination receipt is durable independently of the failed metadata write");
+	assert.equal(earlyAcks, 0, "failed commitment persistence cannot acknowledge the source");
+	const root = binding(h.engine);
+	detach();
+	await h.engine.shutdownRoot("reload"); // Stop the old retry machinery; do not let it assist recovery.
+	const healthy = new PanePort(); healthy.phase = "completed";
+	const acknowledgements: string[] = [];
+	t.mock.method(healthy, "acknowledge", async (noticeId: string) => { acknowledgements.push(noticeId); });
+	restored = new Engine(original.deps);
+	await restored.bindRoot(root.pi, root.ctx);
+	restored.attachHerdr(healthy);
+	healthy.replay(notice);
+	const recoveredRuns = (restored as unknown as { paneRuns: HerdrRuns }).paneRuns;
+	await until(() => acknowledgements.length > 0);
+	await recoveredRuns.retryPending();
+	assert.deepEqual(acknowledgements, [notice.noticeId]);
+	assert.equal(recoveredRuns.pendingAcknowledgements(), 0);
+	healthy.replay(notice);
+	await recoveredRuns.retryPending();
+	assert.deepEqual(acknowledgements, [notice.noticeId], "duplicate replay must not acknowledge twice");
+	assert.equal(healthy.resumes, 0, "terminal receipt recovery does not reopen execution");
+	assert.equal(restored.control.activeRuns(), 0);
+	assert.equal((listMetas(dir).find(item => item.agentId === id)!.runs[0] as HerdrCapturedSummary).herdr?.destinationCommitted, true);
+});
+
+test("RR05 follow-up: a blocking SubagentStop hook cannot restart an exhausted schema agent", { timeout: 20_000 }, async t => {
+	offline(t);
+	const script = "export const meta = {name:'schema-hook-cap',description:'Invalid handback stop-hook regression',phases:[]}; return await agent('Return a number',{schema:{type:'number'}});";
+	const h = await createHarness({ env: { PI_WORKFLOW_APPROVE: "1", PI_STOP_HOOK_BLOCK_CAP: "1" },
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Workflow", args: { script } }] } : { text: "root done" },
+		child: () => () => ({ tools: [
+			{ name: "StructuredOutput", args: { result: "invalid" } },
+			{ name: "read", args: { path: join(h.root, "schema-input.txt") } },
+		] }),
+	});
+	t.after(() => h.close());
+	writeFileSync(join(h.root, "schema-input.txt"), "harmless sibling read");
+	const hook = join(h.root, "blocking-stop-hook.mjs"), marker = join(h.root, "stop-hook-ran.txt");
+	writeFileSync(hook, `import { appendFileSync } from 'node:fs'; process.stdin.resume(); process.stdin.on('end', () => { appendFileSync(${JSON.stringify(marker)}, 'blocked\\n'); console.log(JSON.stringify({decision:'block',reason:'Do another pass.'})); });\n`);
+	writeFileSync(join(h.root, "agent", "hooks.json"), JSON.stringify({ hooks: { SubagentStop: [{ matcher: "general-purpose", hooks: [{ type: "command", command: process.execPath, args: [hook] }] }] } }));
+	await h.parent.prompt("Run the schema agent with a blocking stop hook", { source: "extension" });
+	const receipt = h.parent.messages.find(message => message.role === "toolResult" && message.toolName === "Workflow");
+	assert.ok(receipt && receipt.role === "toolResult");
+	assert.equal(receipt.isError, false);
+	const { runId } = receipt.details as { runId: string };
+	assert.ok(runId);
+	const file = join(h.root, "agent", "subagents", h.parent.sessionId, "workflows", `${runId}.json`);
+	await until(() => existsSync(file), 15_000);
+	const snapshot = JSON.parse(readFileSync(file, "utf8"));
+	assert.equal(snapshot.status, "failed");
+	assert.match(snapshot.error ?? "", /5 invalid attempts/);
+	assert.equal(h.children.size, 1);
+	assert.equal([...h.requests.children.values()][0], 5);
+	const child = [...h.children.values()][0];
+	assert.equal(toolResultText(child, "StructuredOutput").length, 5);
+	assert.match(toolResultText(child, "StructuredOutput")[4], /Too many invalid attempts/);
+	assert.equal(toolResultText(child, "read").length, 5);
+	assert.ok(existsSync(marker), "the real project SubagentStop hook ran and returned blocking feedback");
+	assert.ok(readFileSync(marker, "utf8").includes("blocked"));
 });

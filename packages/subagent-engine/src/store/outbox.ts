@@ -58,6 +58,12 @@ export class Outbox {
 		for (const record of changes) this.records.set(record.key, record);
 	}
 
+	/** Whether any notice of this run already reached its destination durably (acknowledged). */
+	acknowledgedRun(agentId: string, runId: string): boolean {
+		for (const record of this.records.values()) if (record.agentId === agentId && record.runId === runId && record.state === "acknowledged") return true;
+		return false;
+	}
+
 	observePersisted(entries: { type: string; customType?: string; details?: unknown }[]): string[] {
 		const keys = new Set<string>();
 		for (const entry of entries) {

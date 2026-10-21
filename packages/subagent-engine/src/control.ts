@@ -296,6 +296,8 @@ export class Control {
 				conversation.meta.stopGeneration++;
 				conversation.wakePending = undefined;
 				if (!conversation.active) {
+					// A parked owner's withheld report is cancelled by the stop, so nothing remains to acknowledge (RR10 follow-up).
+					if (conversation.disposition === "parked") conversation.notified = true;
 					conversation.disposition = "stopped";
 					// A parked or idle stop never finalizes, so it starts its release grace here (re-review RR10).
 					conversation.evictAt ??= this.now() + EVICTION_GRACE_MS;

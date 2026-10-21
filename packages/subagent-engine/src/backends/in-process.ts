@@ -95,9 +95,10 @@ export class InProcessBackend {
 	}
 
 	/** The active run's turn budget, for the stop-hook loop. */
-	budget(agentId: AgentId): { turns: number; maxTurns?: number } | undefined {
-		const state = this.live.get(agentId)?.current;
-		return state ? { turns: state.turns, maxTurns: state.maxTurns } : undefined;
+	budget(agentId: AgentId): { turns: number; maxTurns?: number; ended: boolean } | undefined {
+		const child = this.live.get(agentId);
+		const state = child?.current;
+		return state ? { turns: state.turns, maxTurns: state.maxTurns, ended: child!.spec.shouldEndTurn?.() ?? false } : undefined;
 	}
 
 	/** Drop queued steering/follow-up input; callers reconcile their durable inbox by identity (plan §17.2a). */

@@ -237,6 +237,8 @@ export class Engine {
 					if (summary.status === "running") continue;
 					try {
 						this.paneRuns.restoreTerminal(meta, summary.runId);
+						// A destination commitment whose metadata write failed is still durable in the outbox (RR06 follow-up).
+						if (this.outbox?.acknowledgedRun(meta.agentId, summary.runId)) this.paneRuns.acknowledgeDestination(meta.agentId, summary.runId);
 					} catch (receiptError) {
 						this.reportDiagnostics(meta.agentId, [`Could not restore the receipt of pane run ${summary.runId}: ${(receiptError as Error).message}`]);
 					}
@@ -905,6 +907,8 @@ export class Engine {
 	/** Whether the child's active run may take another model turn (checked before a stop-hook retry). */
 	turnAllowed(agentId: AgentId): boolean {
 		const budget = this.backend?.budget(agentId);
+		// A host-ended run (exhausted workflow handbacks) admits no stop-hook retry either (rereview follow-up, RR05).
+		if (budget?.ended) return false;
 		return !budget?.maxTurns || budget.turns < budget.maxTurns;
 	}
 

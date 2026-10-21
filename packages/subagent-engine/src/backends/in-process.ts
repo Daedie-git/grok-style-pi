@@ -72,6 +72,8 @@ interface RunState {
 	prompt: string;
 	/** Whether the first provider request still carried the prompt after every context transform. */
 	promptIncluded?: boolean;
+	/** Wall-clock start of the run: only user messages from here on can be this run's prompt instance. */
+	promptAfter: number;
 }
 
 export class InProcessBackend {
@@ -111,7 +113,7 @@ export class InProcessBackend {
 		const state: RunState = {
 			runId: run.runId, listeners: new Set(), tracker: new UsageTracker(), turns: 0, maxTurns: run.maxTurns,
 			maxTurnsReached: false, toolsInFlight: 0, lastProgress: this.now(), pendingEnvelopes: new Map(), dispatched: false,
-			prompt: run.prompt,
+			prompt: run.prompt, promptAfter: Date.now(),
 		};
 		const emit = (event: BackendEvent) => { for (const listener of state.listeners) listener(event); };
 		let resolveStarted!: () => void;
@@ -246,7 +248,7 @@ export class InProcessBackend {
 		const stream = agent.streamFunction;
 		agent.streamFunction = (model, context, options) => {
 			const state = child.current;
-			if (state && state.promptIncluded === undefined) state.promptIncluded = requestCarries(context.messages, state.prompt);
+			if (state && state.promptIncluded === undefined) state.promptIncluded = requestCarries(context.messages, state.prompt, state.promptAfter);
 			return stream(model, context, options);
 		};
 	}
@@ -369,12 +371,13 @@ export function formatEnvelope(envelope: Envelope): string {
 }
 
 /** Whether a user message of the projected request contains the prompt text (transforms may wrap it, not drop it). */
-function requestCarries(messages: readonly { role: string; content?: unknown }[], prompt: string): boolean {
+function requestCarries(messages: readonly { role: string; content?: unknown; timestamp?: number }[], prompt: string, after: number): boolean {
 	const needle = prompt.trim();
 	if (!needle) return true;
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
-		if (message.role !== "user") continue;
+		// Equal text from an earlier run proves nothing about this run's input instance (re-review 2, RR03).
+		if (message.role !== "user" || (message.timestamp !== undefined && message.timestamp < after)) continue;
 		const content = message.content;
 		const text = typeof content === "string" ? content
 			: Array.isArray(content) ? content.map((part) => (part as { type?: string; text?: string }).type === "text" ? (part as { text?: string }).text ?? "" : "").join("\n") : "";

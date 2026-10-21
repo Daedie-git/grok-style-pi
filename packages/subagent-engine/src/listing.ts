@@ -73,6 +73,19 @@ export function installListingBridge(pi: ExtensionAPI, offered: (ctx: ExtensionC
 			pi.sendMessage({ customType: LISTING_TYPE, content: pending.text, display: false, details: { listingId: pending.id, offered: pending.offered } satisfies ListingDetails }, { triggerTurn: false });
 		}
 		const projected = { role: "custom", customType: LISTING_TYPE, content: pending.text, display: false, details: { listingId: pending.id }, timestamp: Date.now() };
-		return { messages: [...event.messages, projected as never] };
+		return { messages: insertBeforeInput(event.messages, projected) };
 	});
+}
+
+/**
+ * Place the listing ahead of the input that started the current turn. Appended last, it becomes the newest message the
+ * model reads and can displace the actual request: models answer the listing with nothing (seen after compaction).
+ */
+function insertBeforeInput<T extends { role?: string; customType?: string }>(messages: readonly T[], listing: unknown): T[] {
+	const isInput = (message: T) => (message.role === "user" || message.role === "custom") && message.customType !== LISTING_TYPE;
+	let at = messages.length;
+	while (at > 0 && !isInput(messages[at - 1])) at--;
+	if (at === 0) return [...messages, listing as T];
+	while (at > 0 && isInput(messages[at - 1])) at--;
+	return [...messages.slice(0, at), listing as T, ...messages.slice(at)];
 }

@@ -5,6 +5,7 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { runInChildScope } from "../child-context.ts";
+import { createAssistantMessageEventStream, type AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { extractOutcome, retryableApiError, UsageTracker } from "../results.ts";
 import type { AgentId, BackendCapabilities, BackendEvent, DeliveryResult, Envelope, KilledBy, RunHandle, RunId, RunOutcome } from "../types.ts";
 
@@ -48,6 +49,8 @@ export interface InProcessDeps {
 	setTimer?: (fn: () => void, ms: number) => { cancel(): void };
 	/** Called when the turn budget ends a run, so queued input can return to the durable inbox. */
 	onBudgetExhausted?: (agentId: AgentId) => void;
+	/** The host ended the run for good (shouldEndTurn): queued input can no longer run in it. */
+	onHostEnded?: (agentId: AgentId) => void;
 }
 
 interface LiveChild {
@@ -249,6 +252,8 @@ export class InProcessBackend {
 		// The provider request after every transform and conversion is the evidence; the first request of a run decides.
 		agent.streamFunction = (model, context, options) => {
 			const state = child.current;
+			// Host exhaustion fences every later request, whatever started it (queued input, another extension's pre-settle turn).
+			if (child.spec.shouldEndTurn?.()) return endedResponse(model);
 			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(context.messages, state);
 			// Provenance is engine-local: no adapter or gateway ever receives it (pi-messages serializes parts as they are).
 			return stream(model, { ...context, messages: withoutInputTags(context.messages) }, options);
@@ -265,7 +270,10 @@ export class InProcessBackend {
 		const previous = agent.finishTurn;
 		agent.finishTurn = async (turn, signal) => {
 			const prior = await previous?.(turn, signal);
-			if (child.spec.shouldEndTurn?.()) return { action: "end" };
+			if (child.spec.shouldEndTurn?.()) {
+				this.deps.onHostEnded?.(child.spec.agentId);
+				return { action: "end" };
+			}
 			const state = child.current;
 			if (prior?.action === "end" || !state?.maxTurns || state.turns < state.maxTurns) return prior ?? undefined;
 			// Tools, a continuation request, or queued steering/follow-up input would all need another provider request.
@@ -337,6 +345,8 @@ export class InProcessBackend {
 		if (!child || child.current !== state || !child.session.isStreaming) {
 			return { ok: false, reason: "not-running", message: "The agent is not running." };
 		}
+		// An exhausted run takes no more input; say so instead of queueing work it will never do (re-review 3, RR05).
+		if (child.spec.shouldEndTurn?.()) return { ok: false, reason: "unsupported", message: "The agent has ended its work and cannot take more messages." };
 		// A literal custom message: no slash-command or template expansion, no input handlers (plan §8, M7).
 		state.pendingEnvelopes.set(envelope.id, "submitted");
 		await child.session.sendCustomMessage(
@@ -371,6 +381,18 @@ interface SessionEvent {
 export function formatEnvelope(envelope: Envelope): string {
 	const sender = envelope.from === "main" ? "the main conversation" : `agent ${envelope.from}`;
 	return `Message from ${sender}:\n\n${envelope.text}`;
+}
+
+/** A provider-free, non-retryable error response for a run the host has ended. */
+function endedResponse(model: { api: string; provider: string; id: string }): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const message = {
+		role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, stopReason: "error",
+		errorMessage: "The agent's host ended this run; no further model requests are made.", timestamp: Date.now(),
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	} as never;
+	queueMicrotask(() => { stream.push({ type: "error", reason: "error", error: message }); stream.end(message); });
+	return stream;
 }
 
 /** Content-part field that carries a run's input provenance; stripped from every provider request (withoutInputTags). */

@@ -7,9 +7,10 @@ import { setImmediate as tick } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Engine, ROOT_CALLER } from "../src/engine.ts";
 import type { HerdrCapturedSummary, HerdrRuns, HerdrRunsPort, PaneNotice, PanePhase } from "../src/backends/herdr-runs.ts";
-import { listMetas } from "../src/store/meta.ts";
+import { listMetas, writeMeta } from "../src/store/meta.ts";
+import { agentFiles } from "../src/store/paths.ts";
 import { Outbox } from "../src/store/outbox.ts";
-import type { AgentMeta } from "../src/types.ts";
+import type { AgentMeta, NoticeState } from "../src/types.ts";
 import { createHarness, toolResultText, until } from "./fixtures/harness.ts";
 
 const foregroundParent = ({ index }: { index: number }) => index === 0
@@ -481,3 +482,164 @@ test("RR05 follow-up: a blocking SubagentStop hook cannot restart an exhausted s
 	assert.ok(existsSync(marker), "the real project SubagentStop hook ran and returned blocking feedback");
 	assert.ok(readFileSync(marker, "utf8").includes("blocked"));
 });
+
+// Re-review 3, receipt recovery: only durable destination evidence can finish a transfer.
+type ReceiptEngine = {
+	deps: ConstructorParameters<typeof Engine>[0];
+	outbox: Outbox;
+	paneRuns: HerdrRuns;
+	reconcileReceipts(): void;
+	ackNotices(keys: string[]): void;
+};
+
+for (const destination of ["root", "owner"] as const) {
+	test(`RR06: restart finishes an interrupted ${destination} acknowledgement`, { timeout: 20_000 }, async t => {
+		offline(t);
+		// The disabled arm is a mutation control: the same recovery assertion must fail
+		// when startup reconciliation is stubbed, without changing production sources.
+		for (const reconcile of [true, false]) await t.test(reconcile ? "reconciles" : "detects missing reconciliation", async t => {
+			const h = await createHarness({ parent: () => ({ text: "unused" }), child: () => () => ({ text: "unused" }) });
+			const root = binding(h.engine), internals = h.engine as unknown as ReceiptEngine;
+			const sessionId = h.parent.sessionId;
+			const files = agentFiles(join(h.root, "agent"), sessionId, "receipt-agent");
+			const summary: HerdrCapturedSummary = { runId: "receipt-run", invocation: "spawn", startedAt: 0, endedAt: 1,
+				status: "completed", resultText: "pane result", herdr: { agentId: "pane", runId: "receipt-pane-run" } };
+			writeMeta(files.metaFile, { agentId: "receipt-agent", agentType: "Explore", description: "Receipt recovery",
+				rootSessionId: sessionId, spawnDepth: 1, cwd: h.root, sessionFile: files.sessionFile, taskListId: sessionId,
+				backend: "herdr", herdr: { agentId: "pane", runId: "receipt-pane-run" }, stopGeneration: 0,
+				definition: { agentType: "Explore", description: "Locate", prompt: "Locate", source: "built-in", skills: [], disallowedTools: [], diagnostics: [] },
+				runs: [summary] });
+			let restored: Engine | undefined;
+			t.after(async () => { await restored?.shutdownRoot("quit"); await h.close(); });
+			const notice = internals.outbox.create({ rootSessionId: sessionId, agentId: "receipt-agent", runId: summary.runId,
+				kind: "terminal_result", destination, passive: false, payload: { agentId: "receipt-agent", description: "Receipt recovery",
+					status: "completed", resultText: "pane result", resultTruncated: false, transcriptPath: files.sessionFile, resumable: true } });
+			// Fault the acknowledged journal append, not the persisted/accepted write.
+			const journal = (internals.outbox as unknown as { journal: { append(records: { state: string }[]): void } }).journal;
+			const append = journal.append.bind(journal);
+			t.mock.method(journal, "append", (records: { state: string }[]) => {
+				if (records.some(record => record.state === "acknowledged")) throw new Error("injected acknowledged append failure");
+				append(records);
+			});
+			if (destination === "root") {
+				h.parent.sessionManager.appendCustomMessageEntry("subagent-notification", "pane result", false, { noticeKeys: [notice.key] });
+				assert.throws(() => h.engine.observeReceipts(), /injected acknowledged append failure/);
+				assert.equal(internals.outbox.get(notice.key)!.state, "persisted");
+			} else {
+				const accepted = h.engine.inbox(destination).accept({ acceptanceKey: `notice:${notice.key}`, from: notice.agentId,
+					to: destination, text: "pane result", noticeKey: notice.key });
+				assert.ok(!("conflict" in accepted));
+				assert.throws(() => internals.ackNotices([notice.key]), /injected acknowledged append failure/);
+				assert.equal(internals.outbox.get(notice.key)!.state, "pending");
+			}
+			await h.engine.shutdownRoot("reload"); // No old retry machinery may assist the fresh engine.
+			restored = new Engine(internals.deps);
+			const recovered = restored as unknown as ReceiptEngine;
+			if (!reconcile) t.mock.method(recovered, "reconcileReceipts", () => {});
+			// Public restart entry point, using the real extension binding and durable agent directory.
+			await restored.bindRoot(root.pi, root.ctx);
+			const port = new PanePort(), acknowledgements: string[] = [];
+			let executionCalls = 0;
+			for (const method of ["spawn", "resume", "read", "deliver", "cancel"] as const) {
+				t.mock.method(port, method, async () => { executionCalls++; throw new Error("Recovery must not execute"); });
+			}
+			t.mock.method(port, "acknowledge", async (id: string) => { acknowledgements.push(id); });
+			restored.attachHerdr(port);
+			const source: PaneNotice = { noticeId: "receipt-source", agentId: notice.agentId, herdrAgentId: "pane",
+				runId: "receipt-pane-run", phase: "completed", text: "pane result" };
+			port.replay(source);
+			await tick();
+			await recovered.paneRuns.retryPending();
+			const assertRecovered = () => assert.equal(recovered.outbox.get(notice.key)!.state, "acknowledged");
+			if (reconcile) {
+				assertRecovered();
+				assert.deepEqual(acknowledgements, [source.noticeId]);
+				assert.equal(recovered.paneRuns.pendingAcknowledgements(), 0);
+				port.replay(source);
+				await tick();
+				await recovered.paneRuns.retryPending();
+				assert.deepEqual(acknowledgements, [source.noticeId], "duplicate replay cannot acknowledge twice");
+				assert.equal((listMetas(join(h.root, "agent", "subagents", sessionId))[0].runs[0] as HerdrCapturedSummary).herdr?.destinationCommitted, true);
+			} else {
+				assert.throws(assertRecovered, { code: "ERR_ASSERTION" });
+				assert.deepEqual(acknowledgements, []);
+				assert.equal(recovered.paneRuns.pendingAcknowledgements(), 1);
+			}
+			assert.equal(restored.control.activeRuns(), 0);
+			assert.equal(executionCalls, 0);
+			assert.equal(h.requests.parent, 0);
+			assert.equal(h.children.size, 0);
+			if (destination === "owner") assert.equal(restored.inbox(destination).all().length, 1, "acceptance survives restart without duplication");
+		});
+	});
+}
+
+test("RR06: restart does not acknowledge unconfirmed root notices", { timeout: 20_000 }, async t => {
+	offline(t);
+	for (const reconcile of [true, false]) await t.test(reconcile ? "reconciles only persisted" : "detects missing reconciliation", async t => {
+		const h = await createHarness({ parent: () => ({ text: "unused" }), child: () => () => ({ text: "unused" }) });
+		const root = binding(h.engine), internals = h.engine as unknown as ReceiptEngine;
+		let restored: Engine | undefined;
+		t.after(async () => { await restored?.shutdownRoot("quit"); await h.close(); });
+		const records = (["pending", "submitted", "persisted"] as const).map(state => {
+			const notice = internals.outbox.create({ rootSessionId: h.parent.sessionId, agentId: "unconfirmed", runId: state,
+				kind: "terminal_result", destination: "root", passive: false, payload: { agentId: "unconfirmed", description: "Unconfirmed receipt",
+					status: "completed", resultText: state, resultTruncated: false, transcriptPath: "unused", resumable: true } });
+			internals.outbox.mark([notice.key], state);
+			assert.equal(internals.outbox.get(notice.key)!.state, state);
+			return { key: notice.key, state };
+		});
+		await h.engine.shutdownRoot("reload");
+		restored = new Engine(internals.deps);
+		const recovered = restored as unknown as ReceiptEngine;
+		if (!reconcile) t.mock.method(recovered, "reconcileReceipts", () => {});
+		// Isolate receipt recovery from ordinary resubmission of pending root notices.
+		// bindRoot still runs its actual restore, reconcile and history-observation paths.
+		t.mock.method(restored as unknown as { deliverRoot(): Promise<void> }, "deliverRoot", async () => {});
+		await restored.bindRoot(root.pi, root.ctx);
+		const states = () => records.map(record => recovered.outbox.get(record.key)!.state);
+		const assertReceipts = () => assert.deepEqual(states(), ["pending", "pending", "acknowledged"] satisfies NoticeState[]);
+		if (reconcile) assertReceipts();
+		else {
+			// The persisted positive control makes this negative test mutation-sensitive.
+			assert.throws(assertReceipts, { code: "ERR_ASSERTION" });
+			assert.deepEqual(states(), ["pending", "pending", "persisted"]);
+		}
+		assert.equal(restored.control.activeRuns(), 0);
+		assert.equal(h.requests.parent, 0);
+		assert.equal(h.children.size, 0);
+	});
+});
+
+// Re-review 3, RR05: host exhaustion fences every later provider request and refuses input it can no longer use.
+for (const entrance of ["engine message", "follow-up"] as const) {
+	test(`RR05: input queued at the fifth invalid handback (${entrance}) runs no further request`, { timeout: 30_000 }, async t => {
+		offline(t);
+		const source = "export const meta={name:'exhaust',description:'review',phases:[]};return await agent('number',{schema:{type:'number'}});";
+		let receipt: { success: boolean; envelopeId?: string } | undefined;
+		const h = await createHarness({ env: { PI_WORKFLOW_APPROVE: "1" }, parent: () => ({ text: "done" }), child: (childId, session) => async ({ index }) => {
+			if (index === 4) {
+				if (entrance === "engine message") receipt = await h.engine.sendMessage({ to: childId, message: "queued at exhaustion" }, ROOT_CALLER, "rr05-fifth-turn") as never;
+				else await session.followUp("queued at exhaustion", undefined, { source: "extension" });
+			}
+			return index < 5
+				? { tools: [{ name: "StructuredOutput", args: { result: "invalid" } }, { name: "read", args: { path: join(h.root, "input.txt") } }] }
+				: { tools: [{ name: "read", args: { path: join(h.root, "input.txt") } }] };
+		} });
+		t.after(() => h.close());
+		writeFileSync(join(h.root, "input.txt"), "owned");
+		const launch = await h.engine.workflows().launch({ script: source }, h.parent.extensionRunner.createContext());
+		assert.notEqual(launch.isError, true);
+		const file = join(h.root, "agent/subagents", h.parent.sessionId, "workflows", `${(launch.details as { runId: string }).runId}.json`);
+		await until(() => existsSync(file));
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).status, "failed");
+		const [id] = [...h.children.keys()];
+		const child = h.children.get(id)!;
+		assert.equal(h.requests.children.get(id), 5, "no provider request after exhaustion");
+		assert.equal(child.messages.filter(message => message.role === "toolResult" && message.toolName === "read").length, 5);
+		if (receipt?.envelopeId) {
+			const envelope = h.engine.inbox(id).all().find(candidate => candidate.id === receipt!.envelopeId)!;
+			assert.equal(envelope.state, "refused", "queued input the exhausted run cannot use is refused, not silently kept");
+		}
+	});
+}

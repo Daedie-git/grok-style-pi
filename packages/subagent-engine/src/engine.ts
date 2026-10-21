@@ -202,6 +202,7 @@ export class Engine {
 			mkdirSync(sessionDir(this.deps.agentDir, sessionId), { recursive: true });
 			this.outbox = new Outbox(join(sessionDir(this.deps.agentDir, sessionId), "outbox.jsonl"));
 			this.restorePersisted(sessionId);
+			this.reconcileReceipts();
 		}
 		this.outbox!.recover();
 		this.receiptCursor = 0;
@@ -209,6 +210,7 @@ export class Engine {
 		this.backend ??= new InProcessBackend({
 			modelRuntime: await this.deps.modelRuntime(), now: this.now, onSessionCreated: this.deps.onSessionCreated,
 			onBudgetExhausted: (agentId) => this.preventContinuation(agentId, "budget"),
+			onHostEnded: (agentId) => this.refuseQueuedInput(agentId, "The agent ended its work before it could use this message."),
 		});
 		this.sweepTimer ??= setInterval(() => void this.sweep(), 5000);
 		this.sweepTimer.unref?.();
@@ -844,6 +846,19 @@ export class Engine {
 		await this.paneRuns.resume(conversation.meta, runId, prompt, this.requireRoot().ctx, envelopes.map((envelope) => envelope.id));
 	}
 
+	/**
+	 * Finish destination handoffs a restart interrupted (re-review 3): a persisted root notice is already in root history, and an
+	 * owner notice whose envelope the owner's inbox accepted is already delivered. Both complete their acknowledgement, which
+	 * also releases a pane source. Unconfirmed records stay as they are; nothing is acknowledged speculatively.
+	 */
+	private reconcileReceipts(): void {
+		const keys: string[] = [];
+		for (const record of this.outbox?.unfinished() ?? []) {
+			if (record.destination === "root" ? record.state === "persisted" : this.inbox(record.destination).hasAcceptance(`notice:${record.key}`)) keys.push(record.key);
+		}
+		if (keys.length > 0) this.ackNotices(keys);
+	}
+
 	/** Mark engine notices acknowledged and release any Herdr notice that was waiting on them (plan §17.6). */
 	private ackNotices(keys: string[]): void {
 		this.outbox?.mark(keys, "acknowledged");
@@ -916,6 +931,15 @@ export class Engine {
 	 * Stop-hook prevention (plan §17.2, §17.2a): clear the child's queue, return every envelope that was submitted but not yet
 	 * included in a request to pending, and fence the run. Finalization then reserves a later continuation for them.
 	 */
+	/** A host-ended run: drop its queue and refuse, explicitly, the input it can no longer use (no continuation). */
+	private refuseQueuedInput(agentId: AgentId, reason: string): void {
+		this.backend?.clearQueue(agentId);
+		const inbox = this.inbox(agentId);
+		for (const envelope of inbox.undelivered()) {
+			if (envelope.state === "submitted" || envelope.state === "persisted" || envelope.state === "prepared") inbox.setState(envelope.id, "refused", { refusedReason: reason });
+		}
+	}
+
 	preventContinuation(agentId: AgentId, cause: "stop-hook" | "budget" = "stop-hook"): void {
 		const runId = this.control.get(agentId)?.active?.runId;
 		// Only a stop hook's continue:false classifies the run as prevented; a budget stop stays partial-max-turns.

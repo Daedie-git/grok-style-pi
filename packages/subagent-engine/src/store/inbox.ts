@@ -47,6 +47,11 @@ export class InboxStore {
 		return { envelope: structuredClone(envelope), duplicate: false };
 	}
 
+	/** Whether an envelope was accepted under this acceptance key (durable, survives restart). */
+	hasAcceptance(acceptanceKey: string): boolean {
+		return this.acceptances.has(acceptanceKey);
+	}
+
 	/** Whether this inbox owns the envelope (a forked session can carry an ancestor root's receipts). */
 	has(id: string): boolean {
 		return this.records.has(id);

@@ -58,6 +58,15 @@ export class Outbox {
 		for (const record of changes) this.records.set(record.key, record);
 	}
 
+	/** Records whose destination handoff may have been interrupted: persisted (root), or not yet acknowledged for an owner. */
+	unfinished(): { key: string; destination: string; state: string }[] {
+		const result: { key: string; destination: string; state: string }[] = [];
+		for (const record of this.records.values()) {
+			if (record.state === "persisted" || (record.destination !== "root" && record.state !== "acknowledged")) result.push({ key: record.key, destination: record.destination, state: record.state });
+		}
+		return result;
+	}
+
 	/** Whether any notice of this run already reached its destination durably (acknowledged). */
 	acknowledgedRun(agentId: string, runId: string): boolean {
 		for (const record of this.records.values()) if (record.agentId === agentId && record.runId === runId && record.state === "acknowledged") return true;

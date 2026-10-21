@@ -212,6 +212,29 @@ test("RR03: a transform that clones and re-times every message does not refuse v
 	assert.equal(h.engine.inbox(id).all()[0].state, "included");
 });
 
+test("RR03: pruning an older equal message does not refuse the surviving new instance", { timeout: 20_000 }, async t => {
+	offline(t);
+	const marker = "PRUNED_HISTORY_RR03";
+	const h = await createHarness({ parent: foregroundParent, child: () => () => ({ text: "child report" }) });
+	t.after(() => h.close());
+	await h.parent.prompt("go", { source: "extension" });
+	const id = [...h.children.keys()][0], child = h.children.get(id)!;
+	const idle = () => !h.engine.control.get(id)?.active && !h.engine.control.get(id)?.exiting;
+	await until(idle);
+	await h.engine.sendMessage({ to: id, message: marker }, ROOT_CALLER, "old-instance");
+	await until(() => h.requests.children.get(id) === 2 && idle());
+	// History pruning drops the oldest copy and keeps the newest.
+	const transform = child.agent.transformContext;
+	child.agent.transformContext = async (messages, signal) => {
+		const projected = transform ? await transform(messages, signal) : messages;
+		const first = projected.findIndex(message => JSON.stringify(message).includes(marker));
+		return projected.filter((_, index) => index !== first);
+	};
+	await h.engine.sendMessage({ to: id, message: marker }, ROOT_CALLER, "new-instance");
+	await until(() => h.requests.children.get(id) === 3 && idle());
+	assert.deepEqual(h.engine.inbox(id).all().map(envelope => envelope.state), ["included", "included"]);
+});
+
 test("RR07: both public stop paths retry failed pane cancellation and emit stop-failed", { timeout: 20_000 }, async t => {
 	offline(t);
 	for (const retry of ["userStop", "stop"] as const) await t.test(retry, async t => {

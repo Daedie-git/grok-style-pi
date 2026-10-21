@@ -72,8 +72,6 @@ interface RunState {
 	prompt: string;
 	/** Whether the first provider request still carried the prompt after every context transform. */
 	promptIncluded?: boolean;
-	/** The user message this run appended for its prompt, by identity (observed when Pi starts it). */
-	inputMessage?: object;
 }
 
 export class InProcessBackend {
@@ -245,12 +243,12 @@ export class InProcessBackend {
 	 */
 	private installInclusionProbe(child: LiveChild): void {
 		const agent = child.session.agent;
-		const convert = agent.convertToLlm;
-		// convertToLlm receives the final transformed context of each request, before provider conversion.
-		agent.convertToLlm = (messages) => {
+		const stream = agent.streamFunction;
+		// The provider request after every transform and conversion is the evidence; the first request of a run decides.
+		agent.streamFunction = (model, context, options) => {
 			const state = child.current;
-			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(messages, agent.state.messages, state);
-			return convert(messages);
+			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(context.messages, state.prompt);
+			return stream(model, context, options);
 		};
 	}
 
@@ -287,7 +285,6 @@ export class InProcessBackend {
 				emit({ type: "turn", turns: state.turns });
 				break;
 			case "message_start":
-				if (event.message?.role === "user" && !state.inputMessage && textOf(event.message as { content?: unknown }).includes(state.prompt.trim())) state.inputMessage = event.message;
 				if (event.message?.role === "assistant") {
 					for (const [id, envelopeState] of state.pendingEnvelopes) {
 						if (envelopeState !== "persisted") continue;
@@ -373,18 +370,17 @@ export function formatEnvelope(envelope: Envelope): string {
 }
 
 /**
- * Whether this run's input instance survived every context transform (re-review RR03, second re-review). Identity first: the
- * appended message object itself. A transform that clones messages loses identity, so the fallback compares how many user
- * messages carry the prompt before and after the transform: equal means nothing carrying it was removed, fewer is treated as
- * a removal of this input (explicit refusal, never a retry). Text of an earlier equal message alone is never proof.
+ * Whether this run's input instance reached the provider (re-review RR03). Pi deep-copies messages for context handlers, so
+ * object identity does not survive; position does. The run's prompt is the turn's newest input and follows the last assistant
+ * message, while every earlier equal message precedes an assistant reply. So only a user message after the last assistant
+ * message proves this instance: an earlier copy left in history does not, and pruning old copies does not count against it.
  */
-function inputSurvived(projected: readonly { role?: string; content?: unknown }[], history: readonly { role?: string; content?: unknown }[], state: { prompt: string; inputMessage?: object }): boolean {
-	const needle = state.prompt.trim();
+function inputSurvived(messages: readonly { role?: string; content?: unknown }[], prompt: string): boolean {
+	const needle = prompt.trim();
 	if (!needle) return true;
-	if (state.inputMessage && projected.includes(state.inputMessage as never)) return true;
-	const carrying = (messages: readonly { role?: string; content?: unknown }[]) => messages.filter((message) => message.role === "user" && textOf(message).includes(needle)).length;
-	const before = carrying(history);
-	return before === 0 ? carrying(projected) > 0 : carrying(projected) >= before;
+	let index = messages.length;
+	while (index > 0 && messages[index - 1].role !== "assistant") index--;
+	return messages.slice(index).some((message) => message.role === "user" && textOf(message).includes(needle));
 }
 
 function textOf(message: { content?: unknown }): string {

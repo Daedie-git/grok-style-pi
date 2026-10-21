@@ -18,7 +18,7 @@ import { buildForkEntries, writeForkSession } from "./context/fork.ts";
 import { WorkflowTasks } from "./workflow-tool.ts";
 import type { WorkflowProgress } from "./workflow/host.ts";
 import type { WorkflowRunResult } from "./workflow/runtime.ts";
-import { HerdrRuns, type HerdrRunsPort } from "./backends/herdr-runs.ts";
+import { HerdrRuns, type HerdrRunsPort, type PaneRequest } from "./backends/herdr-runs.ts";
 import { FORK_DIRECTIVE } from "./definitions/builtins.ts";
 import { runInterruptedStopHooks, runStartHooks, type HookEnvironment } from "./hook-integration.ts";
 import { cleanupWorktree, createWorktree, restoreWorktree, translationNote } from "./worktree.ts";
@@ -104,7 +104,7 @@ export interface EngineDeps {
 	homeDir?: string;
 	/** TaskCreated/TaskCompleted hook adapters (plan §9). */
 	taskHooks?: (engine: Engine) => TaskHooks;
-	/** Root general-purpose launches that name no backend run in a Herdr pane while one is attached. */
+	/** Root launches that name no backend run in a Herdr pane while one is attached, when the pane can apply their definition. */
 	paneDefault?: boolean;
 }
 
@@ -386,9 +386,10 @@ export class Engine {
 		const explicitPane = params.backend === "pane" || Boolean(params.machine?.trim()) || params.runtime === "claude-code";
 		if (explicitPane && !this.paneRuns.available()) return error("Herdr panes are only available when running inside Herdr.");
 		if (explicitPane && (isFork || isolate || invocation.internal || skill)) return error("Forks, worktree isolation, workflow agents and skill agents run in-process; omit backend/machine/runtime.");
-		// Panes apply only their own agent files, so other definitions keep their prompt and tool policy in-process.
+		const unenforceable = paneUnenforceable(definition);
+		if (explicitPane && unenforceable) return error(`A Herdr pane cannot apply ${definition.agentType}'s ${unenforceable}; omit backend/machine/runtime.`);
 		const pane = explicitPane || (params.backend === undefined && this.deps.paneDefault === true && !caller.agentId
-			&& definition.builtIn === "general-purpose" && !isolate && !invocation.internal && !skill && this.paneRuns.defaultsHere());
+			&& !isFork && !unenforceable && !isolate && !invocation.internal && !skill && this.paneRuns.defaultsHere());
 		const name = params.name?.trim();
 		if (name && !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name)) return error("Agent names use letters, digits, underscores and hyphens, starting with a letter.");
 		if (name === "main") return error(`"main" is reserved for the main conversation.`);
@@ -836,14 +837,27 @@ export class Engine {
 		invocation: { toolCallId: string; signal?: AbortSignal; ctx: ExtensionContext }): Promise<ToolText> {
 		const result = await this.paneRuns.spawn(meta, runId, {
 			prompt: params.prompt, description: meta.description, subagentType: definition.agentType, cwd: invocation.ctx.cwd, runInBackground: background,
-			runtime: params.runtime, name: meta.name, projectTrusted: this.projectTrusted,
+			runtime: params.runtime, name: meta.name, projectTrusted: this.projectTrusted, resolved: this.paneDefinition(definition, meta),
+			maxTurns: definition.maxTurns,
 			// A local Pi pane runs the engine's resolved model and effort, as an in-process child would.
 			...(params.runtime === "claude-code" || params.machine?.trim()
-				? { model: params.model, thinking: params.effort }
+				? { model: params.model ?? (definition.model === "inherit" ? undefined : definition.model), thinking: params.effort ?? definition.effort }
 				: { model: meta.model?.effective, thinking: meta.effort?.effective }),
 			definitionsCwd: invocation.ctx.cwd, machine: params.machine?.trim() || undefined, machineCwd: params.machine_cwd,
 		}, invocation.ctx, { background, signal: invocation.signal });
 		return { text: result.text, isError: result.isError, details: result.details };
+	}
+
+	/** The definition as a pane applies it: its prompt and, when restricted, the tool surface compiled against the root's tools. */
+	private paneDefinition(definition: AgentDefinition, meta: AgentMeta): PaneRequest["resolved"] {
+		const instructions = definition.prompt || undefined;
+		if ((definition.tools === undefined || definition.tools.includes("*")) && definition.disallowedTools.length === 0 && !definition.isolated) return { instructions };
+		const surface = compileToolSurface({
+			definition, available: this.requireRoot().pi.getAllTools().map(toolLite), depth: meta.spawnDepth,
+			maxDepth: this.control.limits.maxDepth, background: false, isFork: false,
+		});
+		// A pane cannot limit which agent types its Agent tool launches.
+		return { instructions, allowedTools: surface.allowedAgentTypes ? surface.active.filter((name) => name !== "Agent") : surface.active };
 	}
 
 	private async continueHerdr(conversation: Conversation, runId: RunId): Promise<void> {
@@ -1517,6 +1531,15 @@ function error(text: string): ToolText {
 
 function liteModel(model: Model<any>): ModelLite {
 	return { provider: model.provider, id: model.id, name: model.name };
+}
+
+/** Definition features that only an in-process child applies. */
+function paneUnenforceable(definition: AgentDefinition): string | undefined {
+	if (definition.skills.length > 0) return "preloaded skills";
+	if (definition.memory) return "agent memory";
+	if (definition.hooks && Object.keys(definition.hooks).length > 0) return "hooks";
+	if (definition.mcpServers?.length) return "MCP servers";
+	return undefined;
 }
 
 function toolLite(tool: ToolInfo): ToolLite {

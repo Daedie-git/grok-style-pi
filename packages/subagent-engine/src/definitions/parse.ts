@@ -76,10 +76,12 @@ export function parseDefinitionData(data: unknown, prompt: string, origin: Defin
 		if (typeof data[key] === "boolean") definition[key] = data[key];
 		else diagnostics.push(`${key} must be a boolean`);
 	}
-	if (data.maxTurns !== undefined) {
-		if (typeof data.maxTurns === "number" && Number.isSafeInteger(data.maxTurns) && data.maxTurns > 0) definition.maxTurns = data.maxTurns;
+	const maxTurns = data.maxTurns ?? data.max_turns;
+	if (maxTurns !== undefined) {
+		if (typeof maxTurns === "number" && Number.isSafeInteger(maxTurns) && maxTurns > 0) definition.maxTurns = maxTurns;
 		else diagnostics.push("maxTurns must be a positive integer");
 	}
+	if (data.extensions === false || data.isolated === true) definition.isolated = true;
 	if (data.isolation !== undefined) {
 		if (data.isolation === "worktree") definition.isolation = "worktree";
 		else diagnostics.push(`Unsupported isolation: ${String(data.isolation)}; only worktree is supported`);

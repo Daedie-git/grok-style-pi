@@ -10,6 +10,8 @@ export interface PaneRequest {
 	prompt: string; description: string; subagentType: string; cwd: string; runInBackground: boolean;
 	runtime?: "pi" | "claude-code"; name?: string; model?: string; thinking?: string; maxTurns?: number;
 	projectTrusted?: boolean; definitionsCwd?: string; machine?: string; machineCwd?: string;
+	/** Replaces the pane's own agent-file lookup. `allowedTools` undefined allows every tool. */
+	resolved?: { instructions?: string; allowedTools?: string[] };
 }
 /** Structural engine-owned port; no dependency on Herdr's unpublished package layout. */
 export interface HerdrRunsPort {

@@ -44,6 +44,13 @@ test("tools distinguish inherited, wildcard and explicit empty, preserving Agent
 	assert.deepEqual(parse("disallowedTools: Edit, Agent(a,b)\n").disallowedTools, ["Edit", "Agent(a,b)"]);
 });
 
+test("Herdr agent-file isolation and max_turns carry over", () => {
+	assert.equal(parse("isolated: true\n").isolated, true);
+	assert.equal(parse("extensions: false\n").isolated, true);
+	assert.equal(parse("isolated: false\n").isolated, undefined);
+	assert.equal(parse("max_turns: 4\n").maxTurns, 4);
+});
+
 test("BOM, CRLF, trimmed body and quoted scalars", () => {
 	const result = parseDefinitionFile("\uFEFF" + markdown("'my agent'", '"A: description"', "", "\uFEFF  body  \n\n").replaceAll("\n", "\r\n"), { source: "project", path: "/agent.md" });
 	assert.equal(result.definition?.agentType, "my agent");

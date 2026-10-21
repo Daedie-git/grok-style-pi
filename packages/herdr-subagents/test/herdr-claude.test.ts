@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -198,6 +198,17 @@ test("Claude tool selection maps built-ins without granting permission bypass", 
 			type: "command", command: process.execPath, args: [entry, "/state path/'quoted", "agent"], timeout: 10,
 		}], `${event} must launch Node directly, without a shell or embedded quotes`);
 	}
+});
+
+test("a resolved definition replaces the agent file, keeping only grants Claude can enforce", async (t) => {
+	const f = fixture(t);
+	mkdirSync(join(f.root, ".pi", "agents"), { recursive: true });
+	writeFileSync(join(f.root, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ntools: write\n---\nFile body\n");
+	await f.runner.spawn({ ...f.request, resolved: { instructions: "Resolved body", allowedTools: ["read", "SendMessage", "mcp__docs__search", "find"] } });
+	const record = await f.runner.resolve("reviewer");
+	assert.equal(record.instructions, "Resolved body");
+	assert.deepEqual(record.allowedTools, ["read", "find"]);
+	assert.equal(f.starts[0][f.starts[0].indexOf("--tools") + 1], "Read,Glob");
 });
 
 test("Claude launch arguments carry multiline instructions only through task submission", async (t) => {

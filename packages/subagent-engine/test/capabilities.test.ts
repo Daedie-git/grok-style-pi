@@ -19,6 +19,11 @@ function surface(overrides: Partial<SurfaceInput> = {}, changes: Partial<AgentDe
 		maxDepth: 3, background: false, isFork: false, ...overrides });
 }
 
+test("an isolated definition keeps only built-in tools, even when it grants others", () => {
+	assert.deepEqual(surface({}, { isolated: true }).active.sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
+	assert.deepEqual(surface({}, { isolated: true, tools: ["read", "Agent", "mcp__repo"] }).active, ["read"]);
+});
+
 test("foreground inherits the available non-main-thread pool, with an exact exclusion complement", () => {
 	const result = surface();
 	assert(result.active.includes("TaskCreate"));

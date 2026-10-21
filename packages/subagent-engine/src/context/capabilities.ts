@@ -29,6 +29,8 @@ export const BACKGROUND_ALLOWED: ReadonlySet<string> = new Set([
 	"read", "grep", "find", "ls", "bash", "powershell", "edit", "write",
 	"SendMessage", "TaskList", "TaskStop",
 ]);
+/** An isolated definition may use only these. */
+export const BUILTIN_TOOLS: ReadonlySet<string> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 export const MAIN_THREAD_ONLY: ReadonlySet<string> = new Set([
 	"TaskClaim", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion", "SlashCommand",
 ]);
@@ -50,6 +52,7 @@ export function compileToolSurface(input: SurfaceInput): ToolSurface {
 		return result;
 	}
 	const pool = available.filter((tool) => {
+		if (definition.isolated && !BUILTIN_TOOLS.has(tool.name)) return false;
 		if (tool.name === "Agent") return input.depth < input.maxDepth;
 		if (isMcp(tool)) return true;
 		if (MAIN_THREAD_ONLY.has(tool.name) || tool.name.startsWith("/")) return false;

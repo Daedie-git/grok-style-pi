@@ -7,7 +7,7 @@ import { defaultThinking, parseAgentFile } from "./agent-file.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
-import { claudeArgs, claudePrompt, claudeTools } from "./claude.ts";
+import { claudeArgs, claudeEnforceable, claudePrompt, claudeTools } from "./claude.ts";
 
 export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -33,6 +33,8 @@ export interface SpawnRequest {
 	cwd: string;
 	/** Where agent definitions are read, when `cwd` is on another machine. */
 	definitionsCwd?: string;
+	/** A caller's resolved definition, used instead of an agent file. `allowedTools` undefined allows every tool. */
+	resolved?: { instructions?: string; allowedTools?: string[] };
 	paneId: string;
 	tabId?: string;
 	workspaceId?: string;
@@ -313,11 +315,14 @@ export class HerdrRunner {
 		const depth = (parent?.depth ?? 0) + 1;
 		if (depth > HERDR_MAX_DEPTH) throw new Error(`Subagent depth ${depth} exceeds the Herdr limit of ${HERDR_MAX_DEPTH}.`);
 		if (request.inheritContext && (!request.sessionFile || !existsSync(request.sessionFile))) throw new Error("inherit_context was set, but this session has no file to clone.");
-		const definition = loadAgent(request);
+		const definition = request.resolved ? undefined : loadAgent(request);
 		if (definition?.isolation && definition.isolation !== "off") throw new Error(`Agent-file isolation: ${definition.isolation} is not supported by Herdr subagents. No pane was opened.`);
 		const maxTurns = request.maxTurns ?? definition?.maxTurns;
 		const thinking = request.thinking ?? definition?.thinking ?? defaultThinking(request.subagentType);
-		const tools = allowedTools(definition?.isolated ?? request.isolated, definition?.tools);
+		// Claude Code enforces only its mapped tools, so a resolved policy loses its other grants there.
+		const tools = request.resolved
+			? claude ? request.resolved.allowedTools?.filter(claudeEnforceable) : request.resolved.allowedTools
+			: allowedTools(definition?.isolated ?? request.isolated, definition?.tools);
 		if (claude && maxTurns != null) throw new Error("max_turns is not supported by interactive Claude Code. Omit it.");
 		if (claude && thinking && !["low", "medium", "high", "xhigh", "max"].includes(thinking)) throw new Error("Claude Code thinking maps to --effort: low, medium, high, xhigh, or max.");
 		if (claude && definition?.tools) claudeTools(definition.tools);
@@ -335,7 +340,7 @@ export class HerdrRunner {
 			check(signal);
 			task = {
 				runtime: request.runtime, id, herdrName: id, paneId: "", depth, type: request.subagentType,
-				description: request.description, prompt: request.prompt, instructions: definition?.body || undefined,
+				description: request.description, prompt: request.prompt, instructions: (request.resolved ? request.resolved.instructions : definition?.body) || undefined,
 				allowedTools: tools,
 				projectTrusted: request.projectTrusted === false ? false : this.machine ? undefined : request.projectTrusted,
 				maxTurns, model: request.model ?? definition?.model,

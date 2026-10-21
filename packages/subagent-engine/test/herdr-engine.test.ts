@@ -93,9 +93,9 @@ function firstProxy(harness: Harness) {
 	assert(proxy, "Agent must create an engine proxy");
 	return proxy;
 }
-async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean } = {}) {
+async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean; agentFiles?: Record<string, string> } = {}) {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
-	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, env: options.env, child: () => () => ({ text: "Unexpected in-process child" }) });
+	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, agentFiles: options.agentFiles, env: options.env, child: () => () => ({ text: "Unexpected in-process child" }) });
 	const fake = new FakeHerdr();
 	fake.child = options.paneChild === true;
 	fake.rootHasNotice = () => rootNotices(harness).length > 0;
@@ -237,10 +237,59 @@ test("paneDefault runs a general-purpose Agent in a pane with the resolved model
 	assert.equal(fake.spawns[0].model, proxy.meta.model?.effective);
 	assert.equal(fake.spawns[0].thinking, proxy.meta.effort?.effective);
 	assert.equal(fake.spawns[0].subagentType, "general-purpose");
+	assert.match(fake.spawns[0].resolved?.instructions ?? "", /Complete the assigned scope yourself/);
+	assert.equal(fake.spawns[0].resolved?.allowedTools, undefined, "an unrestricted definition keeps every pane tool");
+});
+
+test("paneDefault sends Explore's prompt and read-only tool surface to its pane", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { description: "Find code", prompt: "Locate pane routing", subagent_type: "Explore" } }] } : { text: "Parent useful work" }, { paneDefault: true });
+	await harness.parent.prompt("Explore by default", { source: "extension" });
+	assert.equal(fake.spawns.length, 1);
+	const resolved = fake.spawns[0].resolved;
+	assert.match(resolved?.instructions ?? "", /Locate code rather than reviewing/);
+	assert.ok(resolved?.allowedTools?.includes("read"));
+	for (const denied of ["edit", "write", "Agent"]) assert.ok(!resolved?.allowedTools?.includes(denied), `${denied} must stay denied in the pane`);
+});
+
+test("a pane keeps an isolated agent file's built-in restriction", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, subagent_type: "sealed" } }] } : { text: "Parent useful work" },
+	{ agentFiles: { "sealed.md": "---\nname: sealed\ndescription: sealed\ntools: [read, Agent]\nisolated: true\n---\nStay sealed." } });
+	await harness.parent.prompt("Pane for an isolated agent", { source: "extension" });
+	assert.deepEqual(fake.spawns[0].resolved?.allowedTools, ["read"]);
+});
+
+test("a Claude Code pane falls back to the definition's native model and effort", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", subagent_type: "native" } }] } : { text: "Parent useful work" },
+	{ agentFiles: { "native.md": "---\nname: native\ndescription: native\nmodel: opus\neffort: high\n---\nReview." } });
+	await harness.parent.prompt("Claude pane", { source: "extension" });
+	assert.equal(fake.spawns[0].model, "opus");
+	assert.equal(fake.spawns[0].thinking, "high");
+});
+
+test("a definition's turn limit reaches a Claude Code pane request, for the runner to refuse", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", subagent_type: "bounded" } }] } : { text: "Parent useful work" },
+	{ agentFiles: { "bounded.md": "---\nname: bounded\ndescription: bounded\nmax_turns: 2\n---\nReview." } });
+	await harness.parent.prompt("Bounded Claude pane", { source: "extension" });
+	assert.equal(fake.spawns[0].maxTurns, 2);
+});
+
+const keeper = { "keeper.md": "---\nname: keeper\ndescription: remembers\nmemory: project\n---\nKeep notes." };
+
+test("an explicit pane is refused for a definition only an in-process child can apply", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, subagent_type: "keeper" } }] } : { text: "Refused" }, { agentFiles: keeper });
+	await harness.parent.prompt("Pane with memory", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /cannot apply keeper's agent memory/);
+	assert.equal(fake.spawns.length, 0);
+	assert.equal(harness.engine.control.conversations.size, 0);
 });
 
 for (const [label, args, options] of [
-	["Explore", { subagent_type: "Explore" }, {}],
+	["agent memory", { subagent_type: "keeper" }, { agentFiles: keeper }],
 	["backend: in-process", { backend: "in-process" }, {}],
 	["no attached backend", {}, { attach: false }],
 	["paneDefault off", {}, { paneDefault: false }],

@@ -49,6 +49,8 @@ export interface AgentDefinition {
 	hooks?: HookConfig;
 	mcpServers?: McpServerSpec[];
 	omitClaudeMd?: boolean;
+	/** Built-in tools only: Herdr agent files' `isolated: true` or legacy `extensions: false`. */
+	isolated?: boolean;
 	color?: string;
 	/** Parsed for diagnostics only; Pi has no permission modes. */
 	permissionMode?: string;

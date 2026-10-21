@@ -42,6 +42,8 @@ const TOOL_NAMES: Record<string, string> = {
 	read: "Read", bash: "Bash", edit: "Edit", write: "Write", grep: "Grep", find: "Glob", ls: "Glob",
 };
 
+export function claudeEnforceable(tool: string): boolean { return Object.hasOwn(TOOL_NAMES, tool); }
+
 export function claudeTools(tools: string[]): string[] {
 	return [...new Set(tools.map((tool) => {
 		const mapped = TOOL_NAMES[tool];

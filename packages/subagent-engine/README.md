@@ -34,7 +34,7 @@ Built-in types:
 - **`Plan`** produces an implementation plan and is read-only.
 - **`fork`** inherits the conversation, system prompt, model and tools. It's off by default; enable it with `PI_SUBAGENT_FORK=1`.
 
-To add your own, write markdown files with frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `effort`, `skills`, `maxTurns`, `background`, `isolation`, `memory`, `hooks`, `mcpServers`, `omitClaudeMd`. Definitions are found in these places, lowest priority first:
+To add your own, write markdown files with frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `effort`, `skills`, `maxTurns`, `background`, `isolation`, `memory`, `hooks`, `mcpServers`, `omitClaudeMd`, and `isolated` (or Herdr's legacy `extensions: false`), which limits the agent to built-in tools; `max_turns` is accepted for `maxTurns`. Definitions are found in these places, lowest priority first:
 
 1. Built-in
 2. Package

@@ -36,7 +36,7 @@ Tests use a fake Herdr and isolated home directories; they never start a real mo
 
 Windows pi sidecars use an in-process file channel instead of Herdr terminal prompt submission and agent-status detection. Herdr on Windows can report a working pi as idle and leave submitted text in the editor. The extension accepts requests directly, records delivery, and reports final settlement (including retries and compaction); the launcher waits for the report while retaining the slot lock. Busy steering uses this same channel and does not create another request. Linux sidecars keep their existing transport.
 
-The launcher verifies the native pi PID and `--session-id` through Herdr's `pane process-info`, then matches the extension's live owner record. It never trusts an agent name alone. Missing/stale receivers fail explicitly, and native jq's CRLF output is normalized. Requests use native Windows paths. Remote Windows pi slots use this adaptation with the Node transport too.
+The launcher verifies the native pi PID and `--session-id` through Herdr's `pane process-info`, then matches the extension's live owner record. It never trusts an agent name alone. Windows pi startup waits for that receiver and its matching heartbeat before reporting success or sending a request: Herdr can detect Pi before asynchronous startup handlers finish. `SIDECAR_STARTUP_TIMEOUT_S` (default 300) bounds this wait; expiry sends nothing and leaves the pane available for inspection or retry. A live foreign owner or an exited pi fails immediately. Status probes remain non-blocking. Native jq's CRLF output is normalized. Requests use native Windows paths. Remote Windows pi slots use this adaptation with the Node transport too.
 
 An aborted turn can discard a message that Windows pi accepted but had not yet delivered. Its waiter exits 6 (delivery unconfirmed; inspect the pane before resending), and that message no longer keeps the slot busy. Cancelling the launcher stops its local waiting client and releases the slot lock; it does not abort the sidecar's model turn. A fully published report takes precedence over a subsequent runtime shutdown or reload.
 
@@ -57,7 +57,7 @@ Select Codex on a fresh slot:
 
 Codex CLI must be on `PATH` and logged in on the machine running the agent. Install Herdr's Codex integration there with `herdr integration install codex`, then enable and trust its hooks in Codex; the launcher needs its session UUID hook. Both roles default to `gpt-6.1-sol` with `ultra` reasoning; set `SIDECAR_CODEX_MODEL` or `SIDECAR_THINKING` before launch to override them. The slot remembers its backend and resumes the same Codex session after a restart. Reports and blocking questions use files, with the same request exit codes as pi and Claude Code. Idle `steer` works like `ask`; `reload` and busy steering are pi-only. Codex runs with `--yolo`: no approval prompts and no sandbox.
 
-Add `--machine NAME` to launch on a saved Herdr machine.
+Add `--machine NAME` to launch on a saved Herdr machine. On Windows, the launcher disables Git Bash path conversion only for remote Herdr invocations, so Linux paths reach the target unchanged; local Herdr path handling and Linux launchers are unchanged.
 
 ## Blocked questions
 

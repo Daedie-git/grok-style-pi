@@ -13,7 +13,7 @@ async function until(predicate) {
   for (let end = Date.now() + 5000; Date.now() < end;) { if (predicate()) return; await sleep(25); }
   assert.fail('Timed out waiting for control delivery');
 }
-function fixture(t) {
+function fixture(t, { start = true } = {}) {
   const home = fs.mkdtempSync(join(tmpdir(), 'sidecar-windows-'));
   const state = join(home, '.cache', 'claude-sidecar');
   const dir = join(state, 'windows', 'cc-test');
@@ -24,13 +24,13 @@ function fixture(t) {
   const ctx = { sessionManager: { getSessionId: () => 'cc-test', getSessionFile: () => 'C:/sessions/cc-test.jsonl' },
     isIdle: () => true, hasPendingMessages: () => false, ui: { notify: () => {} } };
   installWindowsControl(pi, state);
-  handlers.get('session_start')({}, ctx);
+  if (start) handlers.get('session_start')({}, ctx);
   const emit = (event, data = {}) => handlers.get(event)?.(data, ctx);
   const seen = index => emit('message_end', { message: { role: 'custom', ...messages[index].message } });
   const read = file => JSON.parse(fs.readFileSync(join(dir, file), 'utf8'));
   t.after(() => { emit('session_shutdown'); fs.rmSync(home, { recursive: true, force: true }); });
   function run(action, overrides = {}, text = 'request text', beforeClient = '') {
-    const options = { action, session: 'cc-test', pid: process.pid, progress: 0, ...overrides };
+    const options = { action, session: 'cc-test', pid: process.pid, progress: 0, startupTimeout: 1000, ...overrides };
     const source = `const fs=require('node:fs'),path=require('node:path'),os=require('node:os');const args=${JSON.stringify([JSON.stringify(options)])};const text=${JSON.stringify(text)};\n${beforeClient}\n${client}`;
     const child = spawn(process.execPath, ['-e', source], { env: { ...process.env, HOME: home, USERPROFILE: home } });
     let stdout = '', stderr = '';
@@ -42,6 +42,68 @@ function fixture(t) {
   }
   return { home, state, dir, messages, commands, ctx, emit, seen, read, run, pi };
 }
+
+test('Windows readiness waits for session_start without sending any message', async t => {
+  const f = fixture(t, { start: false });
+  const operation = f.run('ready', { startupTimeout: 3000 });
+  await sleep(400);
+  assert.equal(operation.child.exitCode, null);
+  f.emit('session_start');
+  const result = await operation.done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.messages.length, 0);
+  assert.equal(fs.readdirSync(f.dir).some(file => file.endsWith('.inbox')), false);
+});
+
+test('Windows readiness waits for the matching heartbeat after owner publication', async t => {
+  const f = fixture(t), owner = f.read('owner.json');
+  f.emit('session_shutdown');
+  fs.writeFileSync(join(f.dir, 'owner.json'), JSON.stringify(owner));
+  fs.writeFileSync(join(f.dir, 'status.json'), JSON.stringify({ ...owner, updated: 0, status: 'idle' }));
+  const operation = f.run('ready', { startupTimeout: 3000 });
+  await sleep(400);
+  assert.equal(operation.child.exitCode, null);
+  f.emit('session_start');
+  assert.equal((await operation.done).code, 0);
+  assert.equal(f.messages.length, 0);
+});
+
+test('Windows readiness is bounded, sends nothing, and does not slow down status probes', async t => {
+  const f = fixture(t, { start: false });
+  const operation = f.run('ready', { startupTimeout: 500 });
+  assert.equal((await f.run('status').done).code, 1);
+  const result = await operation.done;
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /timed out waiting.*control receiver/);
+  assert.match(result.stderr, /nothing was sent/);
+  assert.equal(fs.existsSync(f.dir), false);
+});
+
+test('Windows readiness rejects a live foreign owner and an exited pane process', async t => {
+  const f = fixture(t);
+  const foreign = await f.run('ready', { pid: process.pid + 12345 }, 'unused',
+    `process.kill=()=>true;require('child_process').execFileSync=()=>{throw Error('no ancestry')};`).done;
+  assert.equal(foreign.code, 1);
+  assert.match(foreign.stderr, /does not match/);
+  const exited = await f.run('ready', {}, 'unused',
+    `process.kill=()=>{throw Object.assign(Error('exited'),{code:'ESRCH'})};`).done;
+  assert.equal(exited.code, 1);
+  assert.match(exited.stderr, /process exited before/);
+  assert.equal(f.messages.length, 0);
+});
+
+test('Windows readiness tolerates a dead previous owner until the new runtime replaces it', async t => {
+  const f = fixture(t), owner = f.read('owner.json');
+  f.emit('session_shutdown');
+  fs.writeFileSync(join(f.dir, 'owner.json'), JSON.stringify({ ...owner, pid: 2147483647 }));
+  const operation = f.run('ready', { startupTimeout: 3000 }, 'unused',
+    `require('child_process').execFileSync=()=>{throw Error('no ancestry')};`);
+  await sleep(400);
+  assert.equal(operation.child.exitCode, null);
+  f.emit('session_start');
+  assert.equal((await operation.done).code, 0);
+  assert.equal(f.messages.length, 0);
+});
 
 test('Windows requests wait for the report despite false idle, agent_end, retries and compaction gaps', async t => {
   const f = fixture(t);
@@ -281,13 +343,14 @@ test('Windows atomic records retry transient sharing violations without exposing
   assert.equal(f.read('status.json').status, 'working');
 });
 
-function nativeLauncherFixture(t) {
+function nativeLauncherFixture(t, { start = true } = {}) {
   const bash = 'C:/Program Files/Git/bin/bash.exe';
   if (!fs.existsSync(bash) || spawnSync(bash, ['-c', 'type -P jq >/dev/null && type -P flock >/dev/null']).status !== 0) {
     t.skip('Git Bash with jq and flock is required for the launcher integration test');
     return;
   }
-  const f = fixture(t);
+  const f = fixture(t, { start });
+  fs.mkdirSync(f.state, { recursive: true });
   fs.mkdirSync(join(f.home, 'bin'));
   for (const [suffix, value] of Object.entries({ session: 'cc-test', agent: 'pi', role: 'reviewer', machine: 'local' })) {
     fs.writeFileSync(join(f.state, `sc-windows-test.${suffix}`), `${value}\n`);
@@ -339,6 +402,21 @@ test('native Windows Git Bash launcher completes through the runtime without ter
   assert.equal(await f.done, 0, f.output().stderr);
   assert.match(f.output().stdout, /Native Windows report received/);
   assert.match(f.messages[0].message.content, /Read [A-Za-z]:\//);
+});
+
+test('native Windows launcher waits for delayed receiver initialization in an existing pane', { skip: process.platform !== 'win32' }, async t => {
+  const f = nativeLauncherFixture(t, { start: false });
+  if (!f) return;
+  await until(() => fs.existsSync(join(f.home, 'client.pid')));
+  await sleep(400);
+  assert.equal(f.child.exitCode, null, f.output().stderr);
+  assert.equal(f.messages.length, 0);
+  f.emit('session_start');
+  await f.waitForMessage();
+  f.seen(0);
+  f.publishReport();
+  f.emit('agent_settled');
+  assert.equal(await f.done, 0, f.output().stderr);
 });
 
 test('native Windows SIGTERM cancels the launcher promptly, reaps its client, and releases the slot', { skip: process.platform !== 'win32' }, async t => {

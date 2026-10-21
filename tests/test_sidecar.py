@@ -6,6 +6,7 @@ import re
 import signal
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -143,6 +144,8 @@ elif args[:2] == ['agent', 'start']:
     if kind == 'pi' and os.environ.get('FAKE_WINDOWS_CONTROL'):
         import subprocess
         runtime = pathlib.Path(args[args.index('-e') + 1]).with_name('windows-runtime.mjs')
+        if not runtime.is_absolute():
+            runtime = data_home / runtime
         source = r"""
         const fs=require('node:fs'),path=require('node:path');
         (async()=>{
@@ -164,14 +167,17 @@ elif args[:2] == ['agent', 'start']:
             },0);
           }};
           installWindowsControl(pi,state);
+          await new Promise(resolve=>setTimeout(resolve,Number(process.env.FAKE_WINDOWS_START_DELAY||'0')*1000));
           handlers.get('session_start')({}, {sessionManager:{getSessionId:()=>session,getSessionFile:()=>'/tmp/time_'+session+'.jsonl'},
             isIdle:()=>true,hasPendingMessages:()=>false,ui:{notify:()=>{}}});
           setInterval(()=>{},1000);
         })().catch(e=>{console.error(e);process.exit(1)});
         """
-        child = subprocess.Popen(['node', '-e', source, str(runtime), session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child = subprocess.Popen(['node', '-e', source, str(runtime), session],
+                                 env=dict(os.environ, HOME=str(data_home)), cwd=data_home,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         record['native_pid'] = child.pid
-        for _ in range(100):
+        for _ in range(0 if os.environ.get('FAKE_WINDOWS_START_DELAY') else 100):
             if (data_home / '.cache/claude-sidecar/windows' / session / 'owner.json').exists():
                 break
             time.sleep(.05)
@@ -342,21 +348,54 @@ class LauncherTests(unittest.TestCase):
             file = self.home / 'bin' / name
             file.write_text(source)
             file.chmod(0o755)
-        def stop_runtimes():
-            for file in self.home.glob('*.json'):
-                try:
-                    pid = json.loads(file.read_text()).get('native_pid')
-                    if pid:
-                        os.kill(pid, signal.SIGTERM)
-                except (ValueError, AttributeError, ProcessLookupError):
-                    pass
-        self.addCleanup(stop_runtimes)
+        self.addCleanup(self.stop_runtimes)
         return dict(self.env, FAKE_WINDOWS_CONTROL='1', **extra)
+
+    def stop_runtimes(self):
+        states = list(self.home.glob('*.json')) + list((self.home / 'remote-state').rglob('*.json'))
+        for file in states:
+            try:
+                pid = json.loads(file.read_text()).get('native_pid')
+                if pid:
+                    os.kill(pid, signal.SIGTERM)
+            except (ValueError, AttributeError, ProcessLookupError):
+                pass
+
+    def path_without_agents(self):
+        # NixOS does not put its tools under /usr/bin. Link only dependencies, not real agent CLIs.
+        tools = self.home / 'system-bin'
+        tools.mkdir()
+        for name in ('bash', 'cat', 'dirname', 'env', 'flock', 'head', 'jq', 'mkdir', 'mktemp',
+                     'mv', 'python3', 'rm', 'sed', 'timeout', 'tr', 'uname'):
+            source = shutil.which(name)
+            if source:
+                (tools / name).symlink_to(source)
+        return f'{self.home / "bin"}:{tools}'
 
     def test_windows_request_does_not_use_herdr_prompt_or_wait_and_returns_its_report(self):
         result = self.run_cli('ask', 'Windows task', env=self.windows_env(HERDR_PROMPT_DELAY='0.5'))
         self.assertIn('Windows ship', result.stdout)
         self.assertFalse(any(c[:2] in (['agent', 'prompt'], ['agent', 'wait']) for c in self.calls()))
+
+    def test_windows_start_waits_for_delayed_receiver_before_reporting_success(self):
+        env = self.windows_env(FAKE_WINDOWS_START_DELAY='1.5')
+        self.run_cli('start', env=env)
+        owner = self.home / '.cache/claude-sidecar/windows/cc-pane-pane-1/owner.json'
+        self.assertTrue(owner.exists(), 'start must not succeed before the native receiver is ready')
+        result = self.run_cli('ask', 'Task after delayed startup', env=env)
+        self.assertIn('Windows ship', result.stdout)
+        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
+        self.assertFalse(any(c[:2] in (['agent', 'prompt'], ['agent', 'wait']) for c in self.calls()))
+
+    def test_windows_retry_after_receiver_timeout_reuses_the_same_pi(self):
+        env = self.windows_env(FAKE_WINDOWS_START_DELAY='5', SIDECAR_STARTUP_TIMEOUT_S='1')
+        result = self.run_cli('start', env=env, check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('timed out waiting', result.stderr)
+        self.assertNotIn('started in', result.stdout)
+        result = self.run_cli('ask', 'Retry the same process', env=dict(env, SIDECAR_STARTUP_TIMEOUT_S='10'))
+        self.assertIn('Windows ship', result.stdout)
+        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
 
     def test_windows_request_lock_keeps_busy_steering_on_the_original_request(self):
         env = self.windows_env(HERDR_PROMPT_DELAY='3')
@@ -1032,7 +1071,7 @@ class LauncherTests(unittest.TestCase):
     def test_missing_dependency_hook_is_nonfatal(self):
         (self.home / 'bin/pi').unlink()
         # Do not fall through to a real pi installed beside Node on the developer's PATH.
-        env = dict(self.env, PATH=f'{self.home / "bin"}:/usr/bin:/bin')
+        env = dict(self.env, PATH=self.path_without_agents())
         result = self.run_cli('session-start', input='{}', env=env)
         self.assertIn('pi, claude or codex', result.stderr)
         self.assertEqual(result.stdout, '')
@@ -1042,7 +1081,7 @@ class LauncherTests(unittest.TestCase):
         codex = self.home / 'bin/codex'
         codex.write_text('#!/bin/sh\nexit 0\n')
         codex.chmod(0o755)
-        env = dict(self.env, PATH=f'{self.home / "bin"}:/usr/bin:/bin')
+        env = dict(self.env, PATH=self.path_without_agents())
         result = self.run_cli('session-start', input='{"session_id":"codex-only"}', env=env)
         self.assertIn('claude-sidecar:sidecar-review', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
         self.assertEqual(result.stderr, '')
@@ -2058,8 +2097,10 @@ class LauncherTests(unittest.TestCase):
         self.add_machines()
         config = self.home / 'sidecar-machines.json'
         config.write_text(json.dumps({'laptop': {'transport': 'node'}}))
+        self.addCleanup(self.stop_runtimes)
         self.remote_run('--machine', 'laptop', 'start', env=dict(
-            self.remote_env, SIDECAR_MACHINES_FILE=str(config), FAKE_REMOTE_WINDOWS='1'))
+            self.remote_env, SIDECAR_MACHINES_FILE=str(config), FAKE_REMOTE_WINDOWS='1',
+            FAKE_WINDOWS_CONTROL='1', SIDECAR_STARTUP_TIMEOUT_S='10'))
         runtime = 'C:/' + str(self.plugin.relative_to(self.home)) + '/sidecar'
         start = self.all_starts()[0]
         self.assertEqual(start[start.index('-e') + 1], runtime + '/sidecar.ts')
@@ -2177,7 +2218,8 @@ class LauncherTests(unittest.TestCase):
     def test_same_second_plans_get_distinct_remote_files(self):
         self.add_machines()
         date = self.home / 'bin/date'
-        date.write_text('#!/bin/sh\ncase "$1" in +%Y%m%d-%H%M%S) echo 20260101-000000;; *) exec /usr/bin/date "$@";; esac\n')
+        date.write_text('#!/bin/sh\ncase "$1" in +%Y%m%d-%H%M%S) echo 20260101-000000;; *) exec '
+                        + shlex.quote(shutil.which('date')) + ' "$@";; esac\n')
         date.chmod(0o755)
         for index in (1, 2):
             folder = self.home / ('plans%d' % index)

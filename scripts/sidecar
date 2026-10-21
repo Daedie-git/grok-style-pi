@@ -134,7 +134,15 @@ claude_session_uuid() {
 # The one place herdr is invoked: a remote slot routes every call to its machine's herdr server over SSH. Pane, tab and
 # agent IDs are scoped to that server, so they must never be mixed with local ones.
 hd() {
-  if [[ -n $MACHINE ]]; then herdr --machine "$MACHINE" "$@"; else herdr "$@"; fi
+  if [[ -n $MACHINE && -n $HOST_WINDOWS ]]; then
+    # These arguments belong to the remote OS, not Git Bash's local Windows filesystem.
+    # Scope conversion suppression to this native invocation; local Herdr still needs its usual paths.
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' herdr --machine "$MACHINE" "$@"
+  elif [[ -n $MACHINE ]]; then
+    herdr --machine "$MACHINE" "$@"
+  else
+    herdr "$@"
+  fi
 }
 
 shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
@@ -406,12 +414,16 @@ windows_pid() {
 }
 
 windows_control() {
-  local action=$1 text=${2:-} report=${3:-} request_id=${4:-} pid options
+  local action=$1 text=${2:-} report=${3:-} request_id=${4:-} pid options startup_timeout=0
+  if [[ $action == ready ]]; then
+    startup_timeout=${SIDECAR_STARTUP_TIMEOUT_S:-300}
+    [[ $startup_timeout =~ ^[1-9][0-9]*$ ]] || die "SIDECAR_STARTUP_TIMEOUT_S must be a positive integer"
+  fi
   pid=$(windows_pid "$(herdr_agent)") || die "cannot verify the Windows pi process in this Herdr pane; nothing was sent"
   if [[ -z $MACHINE && -n $report ]]; then report=$(cygpath -m "$report"); fi
   options=$(jq -cn --arg action "$action" --arg session "$(pi_session_id)" --argjson pid "$pid" \
-    --arg report "$report" --arg requestId "$request_id" --argjson progress "$PROGRESS_S" \
-    '{action:$action,session:$session,pid:$pid,report:$report,requestId:$requestId,progress:$progress}')
+    --arg report "$report" --arg requestId "$request_id" --argjson progress "$PROGRESS_S" --argjson startupTimeout "$((startup_timeout * 1000))" \
+    '{action:$action,session:$session,pid:$pid,report:$report,requestId:$requestId,progress:$progress,startupTimeout:$startupTimeout}')
   # Status is a short-lived probe; blocking operations must use Bash's interruptible wait builtin.
   if [[ $action == status ]]; then
     { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } |
@@ -777,6 +789,7 @@ start_unlocked() {
   rm -f -- "$STATE_DIR/$name.stopped"
   if [[ $(agent_status "$hname") != missing ]]; then
     if agent_runs_sidecar_session "$hname"; then
+      if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then windows_control ready >/dev/null || return $?; fi
       echo "$hname already running"
     else
       restart_unlocked
@@ -802,6 +815,8 @@ start_unlocked() {
       --model "$MODEL" --thinking "$THINKING" \
       -e "$AGENT_HOME/sidecar.ts" \
       --append-system-prompt "$AGENT_HOME/reviewer.md" 2>&1 >/dev/null); then
+      # Herdr can detect Pi before asynchronous session_start handlers publish the receiver.
+      if [[ -n $TARGET_WINDOWS ]]; then windows_control ready >/dev/null || return $?; fi
       echo "$hname started in $pane (pi session $session)"
       return
     fi
@@ -980,10 +995,13 @@ machine_guidance() {
 wait_until_ready() {
   local name=$1 status
   if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
-    if [[ $(agent_status "$name") == missing ]]; then cmd_start >&2; fi
+    if [[ $(agent_status "$name") == missing ]]; then
+      cmd_start >&2 || return $?
+    else
+      # Retrying an existing pane must wait too: an earlier caller may have timed out during startup.
+      windows_control ready >/dev/null || return $?
+    fi
     # The request lock serializes requests. The native channel can queue behind an existing turn safely.
-    status=$(windows_control status) || return $?
-    [[ $(jq -r '.status' <<<"$status") != blocked ]] || die "$name is blocked in its pane"
     return
   fi
   status=$(agent_status "$name")

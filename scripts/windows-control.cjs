@@ -21,7 +21,7 @@ let completedReport = () => false;
     if (reportReady()) process.exit(0);
     console.error(`sidecar: ${message}`); process.exit(code);
   };
-  const owner = read(path.join(dir, 'owner.json'));
+  let owner;
   // The pane's foreground process can be the cmd.exe wrapper (pi.cmd) of the node process that owns the receiver.
   const descends = (pid, ancestor) => {
     if (pid === ancestor) return true;
@@ -33,6 +33,35 @@ let completedReport = () => false;
     } catch {}
     return false;
   };
+  const alive = pid => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if (error.code === 'EPERM') return true; if (error.code === 'ESRCH') return false; throw error; }
+  };
+  if (options.action === 'ready') {
+    const timeout = options.startupTimeout ?? 300000;
+    if (!Number.isFinite(timeout) || timeout <= 0) fail('invalid Windows receiver startup timeout (nothing was sent)');
+    const deadline = Date.now() + timeout;
+    for (;;) {
+      if (!alive(options.pid)) fail('Windows pi process exited before its control receiver became ready (nothing was sent)');
+      owner = read(path.join(dir, 'owner.json'));
+      if (owner) {
+        if (!descends(owner.pid, options.pid)) {
+          // A killed process can leave a stale record until the new runtime's session_start replaces it.
+          // A live foreign owner, however, must never be waited out or addressed.
+          if (alive(owner.pid)) fail('Windows control receiver does not match the process in this Herdr pane (nothing was sent)');
+        } else {
+          const state = read(path.join(dir, 'status.json'));
+          if (state?.token === owner.token && Date.now() - state.updated <= 15000) break;
+        }
+      }
+      if (Date.now() >= deadline) {
+        fail('timed out waiting for the Windows sidecar control receiver; inspect the pane or reload its sidecar extension before retrying (nothing was sent)');
+      }
+      await sleep(250);
+    }
+  } else {
+    owner = read(path.join(dir, 'owner.json'));
+  }
   if (!owner || !descends(owner.pid, options.pid)) {
     fail('Windows control receiver does not match the process in this Herdr pane; reload the sidecar extension in its pane before retrying (nothing was sent)');
   }
@@ -55,6 +84,10 @@ let completedReport = () => false;
     if (state.status === 'error') fail('Windows sidecar control failed; inspect its pane');
     return state;
   };
+  if (options.action === 'ready') {
+    if (check().status === 'blocked') fail('sidecar is blocked on an approval or question in its pane', 5);
+    return;
+  }
   if (options.action === 'status') { console.log(JSON.stringify(check())); return; }
   if (options.action === 'wait') {
     for (;;) {

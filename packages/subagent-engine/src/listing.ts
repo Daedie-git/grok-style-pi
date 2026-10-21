@@ -66,26 +66,31 @@ export function installListingBridge(pi: ExtensionAPI, offered: (ctx: ExtensionC
 			const text = listingText(initial ? current : delta.added, initial ? [] : delta.removed, initial);
 			pending = { id, text, offered: current, submitted: false };
 		}
-		if (!pending) return undefined;
-		if (!pending.submitted) {
+		if (pending && !pending.submitted) {
 			pending.submitted = true;
 			// Appended now when idle, or at the end of the current turn while streaming; never starts a turn by itself.
 			pi.sendMessage({ customType: LISTING_TYPE, content: pending.text, display: false, details: { listingId: pending.id, offered: pending.offered } satisfies ListingDetails }, { triggerTurn: false });
 		}
-		const projected = { role: "custom", customType: LISTING_TYPE, content: pending.text, display: false, details: { listingId: pending.id }, timestamp: Date.now() };
-		return { messages: insertBeforeInput(event.messages, projected) };
+		const projected = pending ? { role: "custom", customType: LISTING_TYPE, content: pending.text, display: false, details: { listingId: pending.id }, timestamp: Date.now() } : undefined;
+		const placed = placeListings(event.messages, projected);
+		return placed ? { messages: placed } : undefined;
 	});
 }
 
 /**
- * Place the listing ahead of the input that started the current turn. Appended last, it becomes the newest message the
- * model reads and can displace the actual request: models answer the listing with nothing (seen after compaction).
+ * Listings of the current turn go ahead of the input that started it, in their original order with any pending listing
+ * last. Appended after the input, a listing becomes the newest message the model reads and can displace the request (a
+ * listing committed mid-turn lands after the tool results). Listings of earlier turns stay put, keeping the cached prefix.
  */
-function insertBeforeInput<T extends { role?: string; customType?: string }>(messages: readonly T[], listing: unknown): T[] {
-	const isInput = (message: T) => (message.role === "user" || message.role === "custom") && message.customType !== LISTING_TYPE;
-	let at = messages.length;
-	while (at > 0 && !isInput(messages[at - 1])) at--;
-	if (at === 0) return [...messages, listing as T];
-	while (at > 0 && isInput(messages[at - 1])) at--;
-	return [...messages.slice(0, at), listing as T, ...messages.slice(at)];
+function placeListings<T extends { role?: string; customType?: string }>(messages: readonly T[], pending: unknown): T[] | undefined {
+	const isListing = (message: T) => message.role === "custom" && message.customType === LISTING_TYPE;
+	const isInput = (message: T) => (message.role === "user" || message.role === "custom") && !isListing(message);
+	let start = messages.length;
+	while (start > 0 && !isInput(messages[start - 1])) start--;
+	if (start === 0) return pending ? [...messages, pending as T] : undefined;
+	while (start > 0 && isInput(messages[start - 1])) start--;
+	const turn = messages.slice(start);
+	const listings = turn.filter(isListing);
+	if (listings.length === 0 && !pending) return undefined;
+	return [...messages.slice(0, start), ...listings, ...(pending ? [pending as T] : []), ...turn.filter((message) => !isListing(message))];
 }

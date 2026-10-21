@@ -229,6 +229,18 @@ export class Engine {
 	private restorePersisted(sessionId: string): void {
 		for (const meta of listMetas(sessionDir(this.deps.agentDir, sessionId))) {
 			if (this.control.get(meta.agentId)) continue;
+			// A Herdr pane outlives this process: re-attach its still-running run instead of failing it (pre-push review #3).
+			const paneRun = meta.backend === "herdr" && meta.herdr ? meta.runs.findLast((run) => run.status === "running") : undefined;
+			if (paneRun) {
+				this.control.restoreActive(meta, paneRun.runId);
+				try {
+					this.paneRuns.restore(meta, paneRun.runId);
+					continue;
+				} catch (restoreError) {
+					this.control.rollbackSpawn(meta.agentId, paneRun.runId);
+					this.reportDiagnostics(meta.agentId, [`Could not reattach the pane run: ${(restoreError as Error).message}`]);
+				}
+			}
 			let changed = false;
 			for (const run of meta.runs) {
 				if (run.status !== "running") continue;
@@ -641,6 +653,15 @@ export class Engine {
 		});
 	}
 
+	private readonly extensionSlots = new Map<string, Set<string>>();
+
+	/** Live-launch accounting for one declared extension id, shared across registrations and reload adoption. */
+	extensionAccounting(extensionId: string): Set<string> {
+		let slots = this.extensionSlots.get(extensionId);
+		if (!slots) { slots = new Set(); this.extensionSlots.set(extensionId, slots); }
+		return slots;
+	}
+
 	/** User-source stop of a whole workflow (activity panel). */
 	userStopWorkflow(taskId: string): boolean {
 		const result = this.workflowTasks?.stop(taskId);
@@ -650,6 +671,7 @@ export class Engine {
 	/** User-source stop (activity panel, commands). */
 	async userStop(agentId: AgentId): Promise<void> {
 		for (const id of this.control.requestStop(agentId, "user")) this.cancelRun(id, "user");
+		this.emit({ type: "stopped", agentId });
 	}
 
 	/**
@@ -1119,14 +1141,28 @@ export class Engine {
 		try {
 			let last = first;
 			await new Promise<void>((resolve) => {
+				let done = false;
+				const finish = () => { if (done) return; done = true; unsubscribe(); clearInterval(watch); resolve(); };
+				const check = () => {
+					const conversation = this.control.get(agentId);
+					// A parked owner that is stopped never settles again; its stop ends the wait (pre-push review #2).
+					if (conversation && !conversation.active && (conversation.meta.stoppedByUser || conversation.disposition === "stopped")) {
+						if (last.status !== "killed") last = killedOutcome(conversation.meta.stoppedByUser ? "user" : "parent");
+						finish();
+						return;
+					}
+					if (!pending()) finish();
+				};
 				const unsubscribe = this.subscribe((event) => {
-					if (event.type !== "settled" || event.agentId !== agentId) return;
-					last = event.outcome;
-					onRun(event.outcome);
-					// Settlement routing runs synchronously before this event; recheck on the next tick.
-					setImmediate(() => { if (!pending()) { unsubscribe(); resolve(); } });
+					if (event.type === "settled" && event.agentId === agentId) {
+						last = event.outcome;
+						onRun(event.outcome);
+					}
+					if ((event.type === "settled" || event.type === "stopped") && (event.agentId === agentId || event.type === "settled")) setImmediate(check);
 				});
-				if (!pending()) { unsubscribe(); resolve(); }
+				const watch = setInterval(check, 1000);
+				watch.unref?.();
+				check();
 			});
 			return last;
 		} finally {
@@ -1161,15 +1197,19 @@ export class Engine {
 	 * Live authorization (plan §16.4, review R03): a tool call is checked against the agent's *current* definition, so
 	 * narrowing a definition revokes the grant even for a retained session. Fails closed when the definition disappeared.
 	 */
-	toolRevocation(agentId: AgentId, toolName: string): string | undefined {
+	async toolRevocation(agentId: AgentId, toolName: string): Promise<string | undefined> {
 		const meta = this.control.get(agentId)?.meta;
 		if (!meta || toolName === "StructuredOutput") return undefined;
 		const historical = meta.definition;
 		if (historical.source === "built-in" || meta.isFork || meta.skill || meta.backend !== "in-process") return undefined;
-		const cached = this.definitionCache;
-		if (!cached) return undefined;
-		if (this.now() - cached.at >= 2000) void this.definitions().catch(() => undefined);
-		const current = cached.set.active.get(historical.agentType);
+		// An expired snapshot is refreshed before admission, never evaluated stale (pre-push review #1).
+		let set: DefinitionSet;
+		try {
+			set = await this.definitions();
+		} catch {
+			return "The agent's current definition could not be verified, so the tool call was blocked.";
+		}
+		const current = set.active.get(historical.agentType);
 		if (!current || current.source !== historical.source) return "This agent's definition is no longer available, so it can no longer use tools.";
 		const mcp = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName)?.[1];
 		const surface = compileToolSurface({
@@ -1339,6 +1379,7 @@ export type EngineEvent =
 	| { type: "run-event"; agentId: AgentId; runId: RunId; event: import("./types.ts").BackendEvent }
 	| { type: "settled"; agentId: AgentId; runId: RunId; outcome: RunOutcome }
 	| { type: "diagnostics"; agentId: AgentId; messages: string[] }
+	| { type: "stopped"; agentId: AgentId }
 	| { type: "workflow-progress"; taskId: string; runId: string; event: WorkflowProgress }
 	| { type: "workflow-settled"; taskId: string; runId: string; status: string };
 

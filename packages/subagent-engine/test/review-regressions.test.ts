@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { setImmediate as tick } from "node:timers/promises";
 import { ROOT_CALLER } from "../src/engine.ts";
-import { installSpawnApi } from "../src/spawn-api.ts";
+import { installSpawnApi, type LauncherHandle } from "../src/spawn-api.ts";
 import { createHarness, toolResultText, until } from "./fixtures/harness.ts";
 
 const foregroundParent = ({ index }: { index: number }) => index === 0
@@ -142,7 +142,9 @@ test("R09: concurrent extension launches respect the per-extension cap", async (
 	let register!: (request: unknown) => void;
 	const hooks = new Map<string, (...args: unknown[]) => unknown>();
 	let launches = 0;
+	const slots = new Map<string, Set<string>>();
 	const engine = {
+		extensionAccounting(id: string) { if (!slots.has(id)) slots.set(id, new Set()); return slots.get(id)!; },
 		async spawn() { await Promise.resolve(); return { text: "launched", details: { agentId: `a${++launches}` } }; },
 		subscribe() { return () => {}; },
 	};
@@ -181,4 +183,153 @@ test("R18 and R20: owner-acknowledged children become evictable and receipt chec
 	const outbox = (harness.engine as unknown as { outbox: { observePersisted(entries: unknown[]): string[] } }).outbox;
 	const entries = harness.parent.sessionManager.getEntries();
 	assert.deepEqual(outbox.observePersisted(entries as never), [], "already acknowledged notices are not re-reported");
+});
+
+function barrier() {
+	let release!: () => void;
+	const promise = new Promise<void>(resolve => { release = resolve; });
+	return { promise, release };
+}
+
+test("pre-push: user-stopping a parked foreground owner releases the root Agent call as killed", { timeout: 20_000 }, async t => {
+	offline(t);
+	const descendant = barrier();
+	let count = 0;
+	const harness = await createHarness({
+		parent: foregroundParent,
+		child: () => ++count === 1
+			? ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Nested", prompt: "Wait for stop" } }] } : { text: "intermediate parked-owner report" }
+			: () => ({ wait: descendant.promise, then: { text: "must not complete naturally" } }),
+	});
+	t.after(async () => { descendant.release(); await harness.close(); });
+	let returned = false;
+	const prompt = harness.parent.prompt("Start the foreground owner", { source: "extension" });
+	void prompt.then(() => { returned = true; }, () => { returned = true; });
+	await until(() => [...harness.engine.control.conversations.values()].some(conversation => conversation.disposition === "parked"));
+	const owner = [...harness.engine.control.conversations.values()].find(conversation => conversation.meta.spawnDepth === 1)!;
+	assert.equal(owner.disposition, "parked");
+	assert.equal(returned, false);
+	assert.equal(toolResultText(harness.parent, "Agent").length, 0);
+	await harness.engine.userStop(owner.meta.agentId);
+	// The descendant gate stays closed throughout this assertion. A natural
+	// nested completion cannot accidentally release the foreground waiter.
+	await until(() => returned);
+	await prompt;
+	await until(() => harness.engine.control.activeRuns() === 0);
+	const result = harness.parent.messages.find(message => message.role === "toolResult" && message.toolName === "Agent");
+	assert.ok(result && result.role === "toolResult");
+	assert.equal((result.details as { status: string }).status, "killed");
+	assert.equal((result.details as { classification: string }).classification, "killed");
+	assert.doesNotMatch(JSON.stringify(result.content), /intermediate parked-owner report/);
+	assert.equal(owner.disposition, "stopped");
+	assert.equal(owner.meta.stoppedByUser, true);
+	assert.equal(owner.meta.runs.length, 1, "a stopped parked owner does not run again to settle its caller");
+	assert.equal(harness.parent.isStreaming, false);
+});
+
+test("pre-push: an expired live definition refreshes at the next write without a test-side discovery refresh", { timeout: 20_000 }, async t => {
+	offline(t);
+	let now = 10_000;
+	const entered = barrier(), output = barrier();
+	const harness = await createHarness({
+		now: () => now,
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Live worker", prompt: "Write", subagent_type: "custom", run_in_background: false } }] } : { text: "root done" },
+		agentFiles: { "custom.md": "---\nname: custom\ndescription: custom\ntools: [write]\n---\nWrite." },
+		child: () => ({ index }) => {
+			if (index !== 0) return { text: "live worker done" };
+			entered.release();
+			return { wait: output.promise, then: { tools: [{ name: "write", args: { path: join(harness.root, "LIVE_REVOKED_WRITE.txt"), content: "forbidden after narrowing" } }] } };
+		},
+	});
+	t.after(async () => { output.release(); await harness.close(); });
+	const prompt = harness.parent.prompt("Run the live worker", { source: "extension" });
+	await entered.promise;
+	const id = [...harness.children.keys()][0];
+	assert.equal(harness.engine.control.get(id)!.meta.runs.length, 1);
+	assert.equal(harness.requests.children.get(id), 1);
+	writeFileSync(join(harness.root, "agent", "agents", "custom.md"), "---\nname: custom\ndescription: custom\ntools: [read]\ndisallowedTools: [write]\n---\nRead only.");
+	now += 2_001;
+	// Deliberately do not call engine.definitions() here. The tool admission
+	// boundary must discover the expired snapshot itself while this run is live.
+	output.release();
+	await prompt;
+	const child = harness.children.get(id)!;
+	const blocked = child.messages.find(message => message.role === "toolResult" && message.toolName === "write");
+	assert.ok(blocked && blocked.role === "toolResult");
+	assert.equal(blocked.isError, true);
+	assert.match(JSON.stringify(blocked.content), /current definition.*no longer allows write/i);
+	assert.equal(existsSync(join(harness.root, "LIVE_REVOKED_WRITE.txt")), false);
+	assert.equal(harness.engine.control.get(id)!.meta.runs.length, 1, "revocation was checked in the original run, not a continuation");
+});
+
+test("pre-push: repeated registrations of the same extension id share their running-agent cap", { timeout: 20_000 }, async t => {
+	offline(t);
+	const hold = barrier();
+	const harness = await createHarness({ parent: () => ({ text: "root" }), child: () => () => ({ wait: hold.promise, then: { text: "done" } }) });
+	t.after(async () => { hold.release(); await harness.close(); });
+	let register!: (request: unknown) => void;
+	const hooks = new Map<string, (...args: unknown[]) => unknown>();
+	const pi = {
+		on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, handler); },
+		events: { on(_name: string, handler: (request: unknown) => void) { register = handler; } },
+	};
+	installSpawnApi(pi as never, () => harness.engine);
+	hooks.get("session_start")!({}, harness.parent.extensionRunner.createContext());
+	const registration = (): LauncherHandle => {
+		let handle!: LauncherHandle;
+		register({ extensionId: "same-honest-extension", cap: 1, reply: (created: LauncherHandle) => { handle = created; } });
+		return handle;
+	};
+	const first = registration();
+	const launched = await first.spawn({ description: "first", prompt: "Wait" });
+	assert.notEqual(launched.isError, true, launched.text);
+	const second = registration();
+	const refused = await second.spawn({ description: "second", prompt: "Wait" });
+	assert.equal(refused.isError, true);
+	assert.match(refused.text, /already has 1 agents running/);
+	assert.equal(first.extensionId, second.extensionId);
+	assert.equal(first.running(), 1);
+	assert.equal(second.running(), 1);
+	assert.equal(harness.engine.control.activeRuns(), 1);
+	assert.equal(harness.children.size, 1);
+	hold.release();
+	await until(() => harness.engine.control.activeRuns() === 0 && first.running() === 0 && second.running() === 0);
+});
+
+test("pre-push: a foreground rate-limit cutoff after text and a real tool call returns recovered partial-api", { timeout: 20_000 }, async t => {
+	offline(t);
+	const priorText = "Useful prior partial report";
+	let recovered = false;
+	const harness = await createHarness({
+		parent: foregroundParent,
+		child: (_id, session) => {
+			session.settingsManager.applyOverrides({ retry: { enabled: false } });
+			return ({ index }) => index === 0
+				? { text: priorText, tools: [{ name: "read", args: { path: join(harness.root, "partial-input.txt") } }] }
+				: { error: "rate_limit_error: request cutoff" };
+		},
+	});
+	t.after(() => harness.close());
+	const off = harness.engine.subscribe(event => {
+		if (event.type === "settled" && event.outcome.classification === "partial-api") recovered = "foregroundRecovered" in event.outcome && event.outcome.foregroundRecovered === true;
+	});
+	t.after(off);
+	writeFileSync(join(harness.root, "partial-input.txt"), "real tool input");
+	await harness.parent.prompt("Run the foreground partial-result regression", { source: "extension" });
+	const id = [...harness.children.keys()][0], child = harness.children.get(id)!;
+	assert.equal(harness.requests.children.get(id), 2);
+	const read = child.messages.find(message => message.role === "toolResult" && message.toolName === "read");
+	assert.ok(read && read.role === "toolResult");
+	assert.equal(read.isError, false, JSON.stringify(read.content));
+	const result = harness.parent.messages.find(message => message.role === "toolResult" && message.toolName === "Agent");
+	assert.ok(result && result.role === "toolResult");
+	assert.equal(result.isError, false);
+	assert.match(JSON.stringify(result.content), /Useful prior partial report/);
+	assert.equal((result.details as { classification: string }).classification, "partial-api");
+	assert.equal((result.details as { status: string }).status, "failed", "foreground recovery does not upgrade the run to completed");
+	assert.equal(recovered, true);
+	const summary = harness.engine.control.get(id)!.meta.runs[0];
+	assert.equal(summary.classification, "partial-api");
+	assert.equal(summary.status, "failed");
+	assert.equal(summary.resultText, priorText);
 });

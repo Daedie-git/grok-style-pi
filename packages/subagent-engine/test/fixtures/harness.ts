@@ -9,7 +9,7 @@ import type { Engine } from "../../src/engine.ts";
 
 export type Step =
 	| { text: string }
-	| { tools: { name: string; args: Record<string, unknown>; id?: string }[] }
+	| { tools: { name: string; args: Record<string, unknown>; id?: string }[]; text?: string }
 	| { error: string }
 	| { wait: Promise<void>; then: Step };
 
@@ -48,7 +48,7 @@ export function scripted(script: Script, counter: (count: number) => void) {
 			if (step === "aborted" || signal?.aborted) message = { ...base, role: "assistant", content: [], stopReason: "aborted", errorMessage: "Request was aborted" } as AssistantMessage;
 			else if ("error" in step) message = { ...base, role: "assistant", content: [], stopReason: "error", errorMessage: step.error } as AssistantMessage;
 			else if ("tools" in step) message = { ...base, role: "assistant", stopReason: "toolUse",
-				content: step.tools.map((tool, i) => ({ type: "toolCall", id: tool.id ?? `call-${current}-${i}`, name: tool.name, arguments: tool.args })) } as AssistantMessage;
+				content: [...(step.text === undefined ? [] : [{ type: "text", text: step.text }]), ...step.tools.map((tool, i) => ({ type: "toolCall", id: tool.id ?? `call-${current}-${i}`, name: tool.name, arguments: tool.args }))] } as AssistantMessage;
 			else message = { ...base, role: "assistant", stopReason: "stop", content: [{ type: "text", text: step.text }] } as AssistantMessage;
 			if (message.stopReason === "error" || message.stopReason === "aborted") stream.push({ type: "error", reason: message.stopReason, error: message } as never);
 			else stream.push({ type: "done", reason: message.stopReason as "stop", message } as never);

@@ -76,6 +76,8 @@ export class SubagentAdapter {
 			this.publish(run.activity, false);
 			return;
 		}
+		// Stops are reported through the run's own settlement; the stop signal itself needs no projection.
+		if (event.type === "stopped") return;
 		if (event.type === "run-event" && event.event.type === "started") run = this.begin(event.agentId, event.runId);
 		if (!run || run.identity.runId !== event.runId) return;
 		if (event.type === "settled") {

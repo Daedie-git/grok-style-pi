@@ -132,6 +132,20 @@ export class Control {
 		return conversation;
 	}
 
+	/**
+	 * Re-register a persisted conversation whose run is still executing elsewhere (a Herdr pane that outlived this process).
+	 * The run keeps its id and counts toward admission again.
+	 */
+	restoreActive(meta: AgentMeta, runId: RunId): Conversation {
+		const conversation = this.restore(meta);
+		const summary = meta.runs.find((run) => run.runId === runId);
+		conversation.active = { runId, phase: "reserved", invocation: summary?.invocation ?? "spawn", startedAt: summary?.startedAt ?? this.now(), background: true, envelopeIds: [] };
+		conversation.disposition = "active";
+		conversation.notified = false;
+		this.running++;
+		return conversation;
+	}
+
 	/** Early, side-effect-free admission check; reserveSpawn rechecks. */
 	admissionError(input: { spawnDepth: number; ownerAgentId?: AgentId; uncapped?: boolean }): string | undefined {
 		if (input.spawnDepth > this.limits.maxDepth) return `Subagent depth limit reached (${this.limits.maxDepth}).`;

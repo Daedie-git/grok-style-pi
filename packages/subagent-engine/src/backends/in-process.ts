@@ -5,7 +5,7 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { runInChildScope } from "../child-context.ts";
-import { extractOutcome, UsageTracker } from "../results.ts";
+import { extractOutcome, retryableApiError, UsageTracker } from "../results.ts";
 import type { AgentId, BackendCapabilities, BackendEvent, DeliveryResult, Envelope, KilledBy, RunHandle, RunId, RunOutcome } from "../types.ts";
 
 export const IN_PROCESS_CAPABILITIES: BackendCapabilities = {
@@ -153,7 +153,8 @@ export class InProcessBackend {
 			const outcome = extractOutcome({
 				messages, maxTurnsReached: state.maxTurnsReached, background: run.background,
 				aborted: state.killedBy ? { killedBy: state.killedBy } : undefined,
-				error: errorMessage && !state.killedBy ? { message: errorMessage, retryable: false } : undefined,
+				// Only an API error message can be a retryable cutoff; thrown setup errors never are (pre-push review #5).
+				error: errorMessage && !state.killedBy ? { message: errorMessage, retryable: !thrown && retryableApiError(errorMessage) } : undefined,
 				durationMs: this.now() - startedAt, usage: state.tracker.snapshot(),
 			});
 			if (state.killedBy === "watchdog") Object.assign(outcome, { classification: "stalled", status: "failed" });

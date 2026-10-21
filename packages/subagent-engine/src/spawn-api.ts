@@ -44,7 +44,8 @@ interface ExtensionContextRef {
 }
 
 function createHandle(extensionId: string, cap: number, engine: () => Engine, context: () => ExtensionContextRef | undefined): LauncherHandle {
-	const live = new Set<string>();
+	// Shared by every handle registered under this id, so re-registering never resets the cap (pre-push review #4).
+	const live = engine().extensionAccounting(extensionId);
 	let sequence = 0;
 	return {
 		extensionId,

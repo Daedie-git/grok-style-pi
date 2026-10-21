@@ -121,6 +121,21 @@ export class HerdrRuns {
 	available(): boolean { return Boolean(this.port) && !this.disposed; }
 	pendingAcknowledgements(): number { return this.acks.size; }
 	getHandle(runId: string): HerdrRunHandle | undefined { return this.runs.get(runId)?.handle; }
+
+	/** Reattach a saved, already-reserved engine run without launching or resuming its surviving pane. */
+	restore(meta: AgentMeta, runId: string): void {
+		if (this.disposed) throw new Error("HerdrRuns is disposed");
+		if (meta.backend !== "herdr" || !meta.herdr?.agentId || !meta.herdr.runId) throw new Error("Restoring a pane requires saved Herdr agent and run identities");
+		if (!meta.runs.some((run) => run.runId === runId && run.status === "running")) throw new Error("Restoring a pane requires a running engine run");
+		const existing = this.runs.get(runId);
+		if (existing) {
+			if (existing.identity.agentId !== meta.agentId || existing.identity.herdrAgentId !== meta.herdr.agentId || existing.identity.herdrRunId !== meta.herdr.runId || existing.meta.herdr?.machine !== meta.herdr.machine) throw new Error(`Conflicting restored pane engine run ${runId}`);
+			return;
+		}
+		this.register(meta, runId, true);
+		void this.retryPending();
+	}
+
 	/** Release completed snapshot/result payloads only after all source receipts finish. */
 	evict(agentId: string): boolean {
 		const owned = [...this.runs.values()].filter((run) => run.identity.agentId === agentId);
@@ -196,11 +211,14 @@ export class HerdrRuns {
 	dispose(): void { this.disposed = true; this.timer?.cancel(); this.unsubscribe?.(); this.port = undefined; }
 
 	private register(meta: AgentMeta, runId: string, background: boolean): LiveRun {
+		if (this.disposed) throw new Error("HerdrRuns is disposed");
 		if (this.runs.has(runId)) throw new Error(`Duplicate pane engine run ${runId}`);
 		const snapshot = structuredClone(meta);
 		const ref = snapshot.herdr;
 		if (!ref?.runId) throw new Error("Pane run requires a captured Herdr run ID");
-		this.transport().proxy(snapshot, { ...ref, runId: ref.runId });
+		// Reconstruction may precede transport attachment. rebind() seeds all
+		// captured identities before subscribing when no port exists yet.
+		this.port?.proxy(snapshot, { ...ref, runId: ref.runId });
 		let resolve!: (value: RunOutcome) => void;
 		const execution = new Promise<RunOutcome>((done) => { resolve = done; });
 		const identity = Object.freeze({ agentId: meta.agentId, runId, herdrAgentId: ref.agentId, herdrRunId: ref.runId });

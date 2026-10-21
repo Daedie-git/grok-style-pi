@@ -44,11 +44,11 @@ export function childInstaller(policy: () => PolicyInput) {
 			runSignal: (runId) => engine.runSignal(runId),
 			diagnostics: (messages) => engine.reportDiagnostics(agentId, messages),
 		});
-		pi.on("tool_call", (event) => {
+		pi.on("tool_call", async (event) => {
 			if (caller.allowedTools && !caller.allowedTools.has(event.toolName)) {
 				return { block: true, reason: "This agent is not allowed to use that tool." };
 			}
-			const revoked = engine.toolRevocation(caller.agentId!, event.toolName);
+			const revoked = await engine.toolRevocation(caller.agentId!, event.toolName);
 			if (revoked) return { block: true, reason: revoked };
 			if (caller.memoryScoped?.includes(event.toolName) && caller.memoryGuard) {
 				const reason = caller.memoryGuard(event.toolName, event.input as Record<string, unknown>);

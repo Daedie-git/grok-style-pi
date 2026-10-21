@@ -81,6 +81,94 @@ function fixture() {
 	};
 }
 
+for (const order of ["before", "after"] as const) test(`restore reconstructs a saved live pane ${order} rebind without spawning it again`, async (t) => {
+	const original = fixture();
+	await original.spawn();
+	const saved: AgentMeta = JSON.parse(JSON.stringify(original.meta));
+	saved.herdr!.machine = "saved-machine";
+	const captured = structuredClone(saved.herdr!);
+	original.runs.dispose();
+	original.transport.retired = true;
+	const transport = new Transport(original.transport.data);
+	class RecordingAdapter extends HerdrBackendAdapter {
+		readonly registeredProxies: AgentMeta[] = [];
+		override proxy(meta: AgentMeta, ref: Parameters<HerdrBackendAdapter["proxy"]>[1]): AgentMeta {
+			const result = super.proxy(meta, ref); this.registeredProxies.push(result); return result;
+		}
+	}
+	const adapter = new RecordingAdapter(transport);
+	const tracked: { agentId: string; runId: string; handle: HerdrRunHandle; background: boolean }[] = [];
+	const settled = new Map<string, RunOutcome>();
+	const diagnostics: string[] = [];
+	const host: HerdrRunsHost = {
+		trackRun(agentId, runId, handle, background) {
+			tracked.push({ agentId, runId, handle, background });
+			void handle.execution.then((value) => host.settle(agentId, runId, value));
+		},
+		settle(_agentId, runId, value) { settled.set(runId, value); },
+		persist() {}, forwardPendingStop() {}, backgroundRun() {}, includeEnvelopes() {}, emit() {},
+		diagnostic(message) { diagnostics.push(message); },
+	};
+	const restored = new HerdrRuns(host, { schedule: () => ({ cancel() {} }) });
+	t.after(() => restored.dispose());
+	const flush = async () => { for (let i = 0; i < 4; i++) { await restored.retryPending(); await Promise.resolve(); } };
+	if (order === "after") restored.rebind(adapter);
+	const unchanged = structuredClone(saved);
+	restored.restore(saved, original.runId);
+	assert.deepEqual(saved, unchanged, "restoration must not mutate persisted metadata");
+	assert.equal(tracked.length, 1);
+	assert.equal(tracked[0].agentId, saved.agentId);
+	assert.equal(tracked[0].runId, original.runId);
+	assert.equal(tracked[0].background, true);
+	assert.equal(transport.data.sequence, 1, "restoration must not create another Herdr run");
+	assert.equal(restored.getHandle(original.runId), tracked[0].handle);
+	if (order === "before") {
+		assert.equal(adapter.registeredProxies.length, 0, "restoration without a port must not require transport access");
+		restored.rebind(adapter);
+	}
+	assert.deepEqual(adapter.registeredProxies[0].herdr, captured, "agent, run and machine identities are restored together");
+	restored.restore(saved, original.runId);
+	assert.equal(tracked.length, 1, "repeated restoration of the same identity is idempotent");
+	// A later caller mutation cannot change the restored handle's captured run.
+	saved.herdr!.runId = "different-run";
+	await tracked[0].handle.cancel("user");
+	assert.deepEqual(transport.cancels, [captured.runId]);
+	assert.deepEqual(original.transport.cancels, []);
+	const full = "x".repeat(750) + "IMPORTANT_TAIL!";
+	let mappedAgent = "";
+	adapter.onNotice((notice) => { mappedAgent = notice.agentId; });
+	transport.complete(captured.runId!, full);
+	await flush();
+	assert.equal(mappedAgent, unchanged.agentId);
+	assert.deepEqual(transport.reads, [captured.runId]);
+	assert.equal(settled.get(original.runId)?.status, "completed");
+	assert.equal(settled.get(original.runId)?.resultText, full, "settlement must fetch the full captured run, not the preview");
+	assert.deepEqual(transport.acks, []);
+	assert.equal(restored.pendingAcknowledgements(), 1);
+	restored.acknowledgeDestination(unchanged.agentId, original.runId);
+	await flush();
+	assert.deepEqual(transport.acks, [`notice-${captured.runId}`]);
+	assert.equal(restored.pendingAcknowledgements(), 0);
+	assert.deepEqual(diagnostics, []);
+});
+
+test("restore rejects invalid or conflicting saved identities without replacing a tracked handle", (t) => {
+	const f = fixture(); t.after(() => f.runs.dispose());
+	const saved = structuredClone(f.meta);
+	saved.herdr = { agentId: "pane", runId: "pane-run-1" };
+	assert.throws(() => f.runs.restore({ ...saved, backend: "in-process" }, f.runId), /saved Herdr/);
+	assert.throws(() => f.runs.restore({ ...saved, herdr: { agentId: "pane" } }, f.runId), /saved Herdr/);
+	assert.throws(() => f.runs.restore(saved, "missing-engine-run"), /running engine run/);
+	assert.throws(() => f.runs.restore({ ...saved, runs: [{ ...saved.runs[0], status: "completed" }] }, f.runId), /running engine run/);
+	assert.equal(f.runs.getHandle(f.runId), undefined);
+	f.runs.restore(saved, f.runId);
+	const handle = f.runs.getHandle(f.runId);
+	assert.throws(() => f.runs.restore({ ...saved, herdr: { agentId: "other-pane", runId: "other-run" } }, f.runId), /Conflicting restored/);
+	assert.equal(f.runs.getHandle(f.runId), handle);
+	f.runs.dispose();
+	assert.throws(() => f.runs.restore(saved, f.runId), /disposed/);
+});
+
 test("public pane lifecycle settles through real Control, retains full captured output and uses only engine follow-up ids", async (t) => {
 	const f = fixture(); t.after(() => f.runs.dispose());
 	const launched = await f.spawn();

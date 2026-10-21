@@ -72,6 +72,8 @@ interface RunState {
 	prompt: string;
 	/** Whether the first provider request still carried the prompt after every context transform. */
 	promptIncluded?: boolean;
+	/** Set once this run's prompt message carries its provenance tag. */
+	inputTagged?: boolean;
 }
 
 export class InProcessBackend {
@@ -247,7 +249,7 @@ export class InProcessBackend {
 		// The provider request after every transform and conversion is the evidence; the first request of a run decides.
 		agent.streamFunction = (model, context, options) => {
 			const state = child.current;
-			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(context.messages, state.prompt);
+			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(context.messages, state);
 			return stream(model, context, options);
 		};
 	}
@@ -285,6 +287,7 @@ export class InProcessBackend {
 				emit({ type: "turn", turns: state.turns });
 				break;
 			case "message_start":
+				if (event.message?.role === "user" && !state.inputTagged) state.inputTagged = tagInput(event.message as { content?: unknown }, state);
 				if (event.message?.role === "assistant") {
 					for (const [id, envelopeState] of state.pendingEnvelopes) {
 						if (envelopeState !== "persisted") continue;
@@ -369,18 +372,36 @@ export function formatEnvelope(envelope: Envelope): string {
 	return `Message from ${sender}:\n\n${envelope.text}`;
 }
 
+/** Content-part field that carries a run's input provenance. Provider adapters rebuild text parts, so it is never sent. */
+const INPUT_TAG = "subagentInputRun";
+
 /**
- * Whether this run's input instance reached the provider (re-review RR03). Pi deep-copies messages for context handlers, so
- * object identity does not survive; position does. The run's prompt is the turn's newest input and follows the last assistant
- * message, while every earlier equal message precedes an assistant reply. So only a user message after the last assistant
- * message proves this instance: an earlier copy left in history does not, and pruning old copies does not count against it.
+ * Tag the text part of the run's prompt message (the object Pi keeps in agent state) with the run id. Plain data survives
+ * Pi's structured cloning for context handlers, transforms that keep or re-wrap content parts, and conversion.
  */
-function inputSurvived(messages: readonly { role?: string; content?: unknown }[], prompt: string): boolean {
-	const needle = prompt.trim();
+function tagInput(message: { content?: unknown }, state: { runId: string; prompt: string }): boolean {
+	const needle = state.prompt.trim();
+	if (!needle || !textOf(message).includes(needle)) return false;
+	if (typeof message.content === "string") {
+		message.content = [{ type: "text", text: message.content, [INPUT_TAG]: state.runId }];
+		return true;
+	}
+	const part = (message.content as Array<{ type?: string; text?: string; [INPUT_TAG]?: string }>).find((candidate) => candidate.type === "text" && candidate.text?.includes(needle));
+	if (!part) return false;
+	part[INPUT_TAG] = state.runId;
+	return true;
+}
+
+/**
+ * Whether this run's input instance reached the provider (re-review RR03): a text part tagged with this run, still carrying
+ * the prompt, in the converted request. Equal text elsewhere (earlier copies, summaries, listings) is never evidence, and
+ * inserted or pruned messages around it do not matter.
+ */
+function inputSurvived(messages: readonly { role?: string; content?: unknown }[], state: { runId: string; prompt: string }): boolean {
+	const needle = state.prompt.trim();
 	if (!needle) return true;
-	let index = messages.length;
-	while (index > 0 && messages[index - 1].role !== "assistant") index--;
-	return messages.slice(index).some((message) => message.role === "user" && textOf(message).includes(needle));
+	return messages.some((message) => Array.isArray(message.content) && message.content.some((part) =>
+		(part as Record<string, unknown>)[INPUT_TAG] === state.runId && String((part as { text?: unknown }).text ?? "").includes(needle)));
 }
 
 function textOf(message: { content?: unknown }): string {

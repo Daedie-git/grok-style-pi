@@ -14,6 +14,8 @@ export const IN_PROCESS_CAPABILITIES: BackendCapabilities = {
 
 export interface SessionSpec {
 	agentId: AgentId;
+	/** Host predicate checked at every turn boundary; true ends the run (workflow handback exhaustion). */
+	shouldEndTurn?: () => boolean;
 	cwd: string;
 	agentDir: string;
 	sessionFile: string;
@@ -67,6 +69,9 @@ interface RunState {
 	lastProgress: number;
 	pendingEnvelopes: Map<string, "submitted" | "persisted">;
 	dispatched: boolean;
+	prompt: string;
+	/** Whether the first provider request still carried the prompt after every context transform. */
+	promptIncluded?: boolean;
 }
 
 export class InProcessBackend {
@@ -105,6 +110,7 @@ export class InProcessBackend {
 		const state: RunState = {
 			runId: run.runId, listeners: new Set(), tracker: new UsageTracker(), turns: 0, maxTurns: run.maxTurns,
 			maxTurnsReached: false, toolsInFlight: 0, lastProgress: this.now(), pendingEnvelopes: new Map(), dispatched: false,
+			prompt: run.prompt,
 		};
 		const emit = (event: BackendEvent) => { for (const listener of state.listeners) listener(event); };
 		let resolveStarted!: () => void;
@@ -224,9 +230,24 @@ export class InProcessBackend {
 		session.setActiveToolsByName(spec.selectTools(session.getAllTools()));
 		const child: LiveChild = { session, spec, unsubscribe: () => {} };
 		this.installTurnBudget(child);
+		this.installInclusionProbe(child);
 		child.unsubscribe = session.subscribe((event) => this.observe(child, event as unknown as SessionEvent));
 		this.live.set(spec.agentId, child);
 		return child;
+	}
+
+	/**
+	 * Inclusion evidence (re-review RR03): the final projected request, after every context transform, is what the provider
+	 * sees. The first request of a run records whether the run's prompt is still in it.
+	 */
+	private installInclusionProbe(child: LiveChild): void {
+		const agent = child.session.agent;
+		const stream = agent.streamFunction;
+		agent.streamFunction = (model, context, options) => {
+			const state = child.current;
+			if (state && state.promptIncluded === undefined) state.promptIncluded = requestCarries(context.messages, state.prompt);
+			return stream(model, context, options);
+		};
 	}
 
 	/**
@@ -239,6 +260,7 @@ export class InProcessBackend {
 		const previous = agent.finishTurn;
 		agent.finishTurn = async (turn, signal) => {
 			const prior = await previous?.(turn, signal);
+			if (child.spec.shouldEndTurn?.()) return { action: "end" };
 			const state = child.current;
 			if (prior?.action === "end" || !state?.maxTurns || state.turns < state.maxTurns) return prior ?? undefined;
 			// Tools, a continuation request, or queued steering/follow-up input would all need another provider request.
@@ -282,7 +304,7 @@ export class InProcessBackend {
 				if (message?.role === "assistant" && !state.dispatched) {
 					const ended = message as { stopReason?: string; usage?: { input?: number; output?: number } };
 					const used = (ended.usage?.input ?? 0) + (ended.usage?.output ?? 0) > 0;
-					if (ended.stopReason !== "error" || used) { state.dispatched = true; emit({ type: "dispatched" }); }
+					if (ended.stopReason !== "error" || used) { state.dispatched = true; emit({ type: "dispatched", promptIncluded: state.promptIncluded }); }
 				}
 				const envelopeId = (message as { details?: { envelopeId?: string } } | undefined)?.details?.envelopeId;
 				if (envelopeId && state.pendingEnvelopes.has(envelopeId)) {
@@ -343,4 +365,19 @@ interface SessionEvent {
 export function formatEnvelope(envelope: Envelope): string {
 	const sender = envelope.from === "main" ? "the main conversation" : `agent ${envelope.from}`;
 	return `Message from ${sender}:\n\n${envelope.text}`;
+}
+
+/** Whether a user message of the projected request contains the prompt text (transforms may wrap it, not drop it). */
+function requestCarries(messages: readonly { role: string; content?: unknown }[], prompt: string): boolean {
+	const needle = prompt.trim();
+	if (!needle) return true;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "user") continue;
+		const content = message.content;
+		const text = typeof content === "string" ? content
+			: Array.isArray(content) ? content.map((part) => (part as { type?: string; text?: string }).type === "text" ? (part as { text?: string }).text ?? "" : "").join("\n") : "";
+		if (text.includes(needle)) return true;
+	}
+	return false;
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { readMeta, writeMeta } from "../src/store/meta.ts";
 import { join, resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, getModel, type AssistantMessage } from "@earendil-works/pi-ai/compat";
@@ -8,7 +9,7 @@ import { Type } from "typebox";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "../../herdr-subagents/src/herdr/backend.ts";
 import { HerdrBackendAdapter } from "../src/backends/herdr.ts";
-import { HerdrRuns, type HerdrRunsHost, type HerdrRunHandle } from "../src/backends/herdr-runs.ts";
+import { HerdrRuns, type HerdrRunsHost, type HerdrRunHandle, type HerdrCapturedSummary } from "../src/backends/herdr-runs.ts";
 import { Control } from "../src/control.ts";
 import type { AgentMeta, Envelope, RunOutcome } from "../src/types.ts";
 
@@ -86,6 +87,7 @@ for (const order of ["before", "after"] as const) test(`restore reconstructs a s
 	await original.spawn();
 	const saved: AgentMeta = JSON.parse(JSON.stringify(original.meta));
 	saved.herdr!.machine = "saved-machine";
+	(saved.runs[0] as HerdrCapturedSummary).herdr!.machine = "saved-machine";
 	const captured = structuredClone(saved.herdr!);
 	original.runs.dispose();
 	original.transport.retired = true;
@@ -244,6 +246,123 @@ test("completion waits for an already accepted steering reply before deciding wh
 	await Promise.resolve(); assert.equal(f.outcomes.size, 0);
 	release(); await delivery; await f.flush();
 	assert.deepEqual(f.continuations, []); assert.equal(e.state, "included"); assert.equal(f.control.activeRuns(), 0);
+});
+
+test("settlement closes delivery admission before awaiting the accepted-delivery snapshot", async (t) => {
+	const f = fixture(); t.after(() => f.runs.dispose()); await f.spawn();
+	let release!: () => void; f.transport.steerGate = new Promise<void>((done) => { release = done; });
+	const accepted = envelope("accepted-before-settlement"); f.inbox.set(accepted.id, accepted);
+	const handle = f.runs.getHandle(f.runId)!;
+	const delivery = handle.deliver(accepted);
+	assert.equal(f.transport.steers.length, 1);
+	f.transport.complete("pane-run-1", "Terminal result while a transport reply is pending");
+	await Promise.resolve(); await Promise.resolve();
+	const late = envelope("arrived-after-settlement-start"); f.inbox.set(late.id, late);
+	const refused = await handle.deliver(late);
+	assert.deepEqual(refused, { ok: false, reason: "not-running", settling: true, message: "This captured pane run is settling; queue this message for continuation." });
+	assert.equal(f.transport.steers.length, 1, "late input must never reach the finishing transport run");
+	assert.equal(late.state, "pending"); assert.equal(f.outcomes.size, 0);
+	release(); await delivery; await f.flush();
+	assert.equal(accepted.state, "included"); assert.equal(late.state, "pending");
+	assert.equal(f.meta.runs[0].status, "completed");
+	assert.equal(f.continuations.length, 1, "only the late pending message should reserve a continuation");
+	assert.equal(f.transport.data.sequence, 1, "no transport resume is manufactured by the finishing run");
+	assert.equal((await handle.deliver(late)).ok, false); assert.equal(f.transport.steers.length, 1);
+});
+
+for (const order of ["before", "after"] as const) test(`terminal receipt recovery ${order} rebind survives disk round-trip without reopening earlier resumed runs`, async (t) => {
+	const captures = resolve("captures"); mkdirSync(captures, { recursive: true });
+	const root = mkdtempSync(join(captures, "herdr-terminal-receipts-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const file = join(root, "agent.meta.json");
+	const f = fixture();
+	f.host.persist = (meta) => writeMeta(file, meta);
+	const settle = f.host.settle;
+	f.host.settle = (agentId, runId, value) => { settle(agentId, runId, value); writeMeta(file, f.meta); };
+	await f.spawn(); f.transport.ackFailures = 99;
+	f.transport.complete("pane-run-1", "First terminal result"); await f.flush();
+	f.runs.acknowledgeDestination(f.meta.agentId, f.runId); await f.flush();
+	assert.equal(f.runs.pendingAcknowledgements(), 1);
+	const reservation = f.control.reserveContinuation(f.meta.agentId, "continue", []);
+	assert.equal(reservation.kind, "reserved"); if (reservation.kind !== "reserved") return;
+	await f.runs.resume(f.meta, reservation.runId, "Second assignment", f.ctx);
+	f.transport.complete("pane-run-2", "Second terminal result"); await f.flush();
+	const saved = readMeta(file)!;
+	assert.deepEqual(saved.runs.map((run) => run.status), ["completed", "completed"]);
+	assert.equal(saved.herdr?.runId, "pane-run-2");
+	assert.equal((saved.runs[0] as HerdrCapturedSummary).herdr?.runId, "pane-run-1");
+	assert.equal((saved.runs[0] as HerdrCapturedSummary).herdr?.destinationCommitted, true);
+	assert.notEqual((saved.runs[1] as HerdrCapturedSummary).herdr?.destinationCommitted, true);
+	f.runs.dispose(); f.transport.retired = true;
+	const transport = new Transport(f.transport.data);
+	const noExecution = () => assert.fail("terminal receipt recovery must not reserve, track, settle, or emit execution");
+	const diagnostics: string[] = [];
+	const host: HerdrRunsHost = { trackRun: noExecution, settle: noExecution, forwardPendingStop: noExecution,
+		backgroundRun: noExecution, includeEnvelopes: noExecution, emit: noExecution,
+		persist(meta) { writeMeta(file, meta); }, diagnostic(message) { diagnostics.push(message); } };
+	const recovered = new HerdrRuns(host, { schedule: () => ({ cancel() {} }) });
+	t.after(() => recovered.dispose());
+	const flush = async () => { for (let i = 0; i < 4; i++) { await recovered.retryPending(); await Promise.resolve(); } };
+	const port = new HerdrBackendAdapter(transport);
+	if (order === "after") {
+		recovered.rebind(port);
+		transport.complete("pane-run-1", "Replayed first preview");
+		await flush(); assert.deepEqual(transport.acks, [], "an unknown replay must not be acknowledged speculatively");
+	}
+	recovered.restoreTerminal(saved, f.runId);
+	recovered.restoreTerminal(saved, reservation.runId);
+	recovered.restoreTerminal(saved, f.runId);
+	assert.equal(recovered.getHandle(f.runId), undefined); assert.equal(recovered.getHandle(reservation.runId), undefined);
+	if (order === "before") recovered.rebind(port);
+	transport.complete("pane-run-1", "Replayed first preview");
+	transport.complete("pane-run-2", "Replayed second preview");
+	await flush();
+	assert.deepEqual(transport.acks, ["notice-pane-run-1"], "the earlier run uses its own durable receipt, not the latest agent pointer");
+	assert.equal(recovered.pendingAcknowledgements(), 1);
+	assert.deepEqual(transport.reads, [], "terminal recovery must not rerun settlement or replace its saved result");
+	assert.deepEqual(transport.cancels, []); assert.equal(transport.data.sequence, 2);
+	recovered.acknowledgeDestination(saved.agentId, reservation.runId); await flush();
+	assert.deepEqual(transport.acks, ["notice-pane-run-1", "notice-pane-run-2"]);
+	assert.equal(recovered.pendingAcknowledgements(), 0);
+	const committed = readMeta(file)!;
+	assert.equal(committed.herdr?.runId, "pane-run-2");
+	assert(committed.runs.every((run) => (run as HerdrCapturedSummary).herdr?.destinationCommitted === true));
+	assert.deepEqual(committed.runs.map((run) => run.resultText), ["First terminal result", "Second terminal result"]);
+	transport.complete("unowned-source-run", "Unrelated terminal output");
+	recovered.acknowledgeDestination(saved.agentId, "unknown-engine-run"); await flush();
+	assert.equal(transport.acks.length, 2); assert.deepEqual(diagnostics, []);
+});
+
+test("source acknowledgement waits for a durable destination receipt write and retries failed writes", async (t) => {
+	const f = fixture(); t.after(() => f.runs.dispose()); await f.spawn();
+	let failures = 1, durableWrites = 0;
+	f.host.persist = (meta) => {
+		if ((meta.runs[0] as HerdrCapturedSummary).herdr?.destinationCommitted) {
+			if (failures-- > 0) throw new Error("Injected metadata write failure");
+			durableWrites++;
+		}
+	};
+	f.transport.complete("pane-run-1", "Finished"); await f.flush();
+	f.runs.acknowledgeDestination(f.meta.agentId, f.runId); await f.flush();
+	assert.equal(durableWrites, 0); assert.deepEqual(f.transport.acks, []);
+	assert.equal(f.runs.pendingAcknowledgements(), 1);
+	f.advance(10); await f.flush();
+	assert.equal(durableWrites, 1); assert.deepEqual(f.transport.acks, ["notice-pane-run-1"]);
+	assert.match(f.diagnostics[0], /destination receipt.*metadata write failure/);
+});
+
+test("terminal recovery refuses historical identity guesses, live runs and conflicting associations", async (t) => {
+	const f = fixture(); t.after(() => f.runs.dispose());
+	const saved = structuredClone(f.meta);
+	saved.herdr = { agentId: "pane", runId: "latest-pane-run" };
+	saved.runs = [{ runId: "older", invocation: "spawn", startedAt: 0, status: "completed" }, { runId: "latest", invocation: "continue", startedAt: 1, status: "completed" }];
+	assert.throws(() => f.runs.restoreTerminal(saved, "older"), /No captured Herdr identity/);
+	assert.throws(() => f.runs.restoreTerminal(f.meta, f.runId), /terminal Herdr run/);
+	f.runs.restoreTerminal(saved, "latest");
+	assert.equal(f.runs.getHandle("latest"), undefined);
+	assert.equal((saved.runs[1] as HerdrCapturedSummary).herdr?.runId, "latest-pane-run", "the latest unambiguous legacy pointer is migrated durably");
+	const conflicting = structuredClone(saved); (conflicting.runs[1] as HerdrCapturedSummary).herdr!.runId = "another-pane-run";
+	assert.throws(() => f.runs.restoreTerminal(conflicting, "latest"), /Conflicting restored pane receipt/);
 });
 
 test("ack references survive failures, honor bounded exponential backoff and disappear only on success", async (t) => {

@@ -259,7 +259,8 @@ export interface BackendCapabilities {
 export type BackendEvent =
 	| { type: "started" }
 	/** The run dispatched its first provider request (its prompt reached the model). */
-	| { type: "dispatched" }
+	/** promptIncluded: whether the run's prompt survived context transforms into the first request (re-review RR03). */
+	| { type: "dispatched"; promptIncluded?: boolean }
 	| { type: "progress"; at: number; kind: string }
 	| { type: "blocked" }
 	| { type: "unblocked" }

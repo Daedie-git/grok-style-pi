@@ -6,6 +6,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { SubagentAdapter } from "../src/subagents/adapter.ts";
+import { WorkflowActivities } from "../src/subagents/workflow-activity.ts";
 import type { Activity } from "../src/activity/ui.ts";
 import { ActivityPanel, ActivityViewer } from "../src/activity/ui.ts";
 import { registerStyledSubagents } from "../src/subagents/result-style.ts";
@@ -221,4 +222,81 @@ test("real Grok Workflow tool events populate one panel entry and its viewer; St
 	const result = session.messages.find((message) => message.role === "toolResult" && message.toolName === "Workflow") as unknown as { details: { taskId: string } };
 	assert.ok(result.details.taskId); assert.equal(engine.workflows().has(result.details.taskId), true);
 	assert.deepEqual(errors, []);
+});
+
+test("RR11: unchanged child progress visits no historical slots and text tails reuse the cached outline", t => {
+	let builds = 0, slotVisits = 0, publishes = 0;
+	let latest!: Activity;
+	const activities = new WorkflowActivities(undefined, entry => { publishes++; latest = entry; }, {
+		outlineBuilt(slots) { builds++; slotVisits += slots; },
+	});
+	t.after(() => activities.dispose());
+	activities.receipt(receipt);
+	const progress = (event: WorkflowProgress) => activities.observe({ type: "workflow-progress", taskId: "task-1", runId: "run-1", event });
+	for (let index = 1; index <= 999; index++) progress({ type: "agent", logicalIndex: index, label: `worker ${index}`, state: "done" });
+	progress({ type: "phase", index: 1, title: "Inspect" });
+	activities.child({ agentId: "active-child", workflow: { taskId: "task-1", runId: "run-1", logicalIndex: 1000, label: "Active", phase: "Inspect" } }, "child-run");
+	assert.equal(latest.detail, "999/1000 done · 0 cached · 0 failed");
+	const before = latest.output;
+	builds = slotVisits = publishes = 0;
+	for (let index = 0; index < 500; index++) activities.observe({ type: "run-event", agentId: "active-child", runId: "child-run", event: { type: "progress", at: index, kind: "stream" } });
+	assert.equal(builds, 0);
+	assert.equal(slotVisits, 0);
+	assert.equal(publishes, 0);
+	assert.equal(latest.output, before);
+	progress({ type: "agent", logicalIndex: 1000, label: "Active", phase: "Inspect", state: "start", agentId: "active-child" });
+	progress({ type: "phase", index: 1, title: "Inspect" });
+	activities.receipt(receipt);
+	activities.observe({ type: "run-event", agentId: "active-child", runId: "child-run", event: { type: "text", delta: "" } });
+	assert.equal(publishes, 0, "duplicate slots, phases, receipts and empty text have no projected change");
+	for (let index = 0; index < 500; index++) {
+		activities.observe({ type: "run-event", agentId: "active-child", runId: "child-run", event: { type: "text", delta: index === 499 ? "FINAL LIVE TAIL" : "x" } });
+		activities.observe({ type: "run-event", agentId: "active-child", runId: "child-run", event: { type: "progress", at: index, kind: "stream" } });
+	}
+	assert.equal(builds, 0, "text changes do not rebuild the outline");
+	assert.equal(slotVisits, 0);
+	assert.equal(publishes, 500, "each text update publishes once; its redundant backend progress does not");
+	assert.equal(latest.detail, "999/1000 done · 0 cached · 0 failed");
+	assert.match(latest.output, /FINAL LIVE TAIL/);
+	assert.ok(latest.output.length < 64000);
+	progress({ type: "log", message: "Latest workflow log" });
+	assert.equal(builds, 0);
+	assert.match(latest.output, /Latest workflow log/);
+	progress({ type: "agent", logicalIndex: 1000, state: "done" });
+	assert.equal(builds, 1);
+	assert.equal(slotVisits, 1000);
+	assert.equal(latest.detail, "1000/1000 done · 0 cached · 0 failed");
+	progress({ type: "phase", index: 2, title: "Inspect" });
+	assert.equal(builds, 2, "a real phase change invalidates the outline");
+	assert.equal(slotVisits, 2000);
+	assert.match(latest.output, /Phase 2 · Inspect/);
+});
+
+test("RR11: stop and terminal controls publish immediately without rebuilding an unchanged outline", async t => {
+	let release!: () => void;
+	const hold = new Promise<void>(resolve => { release = resolve; });
+	let builds = 0;
+	const updates: string[] = [];
+	let latest!: Activity;
+	const activities = new WorkflowActivities(async () => { await hold; return true; }, entry => { latest = entry; updates.push(entry.status); }, { outlineBuilt() { builds++; } });
+	t.after(() => { release(); activities.dispose(); });
+	activities.receipt(receipt);
+	activities.observe({ type: "workflow-progress", taskId: "task-1", runId: "run-1", event: { type: "agent", logicalIndex: 1, state: "start" } });
+	builds = 0; updates.length = 0;
+	const stopping = latest.stop!();
+	assert.equal(latest.status, "stopping");
+	assert.deepEqual(updates, ["stopping"]);
+	assert.equal(builds, 0);
+	activities.observe({ type: "workflow-settled", taskId: "task-1", runId: "run-1", status: "killed" });
+	assert.equal(latest.status, "stopped");
+	assert.equal(latest.stop, undefined);
+	assert.deepEqual(updates, ["stopping", "stopped"]);
+	assert.equal(builds, 0);
+	release(); await stopping;
+	activities.observe({ type: "workflow-settled", taskId: "task-1", runId: "run-1", status: "killed" });
+	assert.deepEqual(updates, ["stopping", "stopped"], "duplicate terminal notifications are no-ops");
+	activities.receipt({ ...receipt, workflowName: "Updated terminal name" });
+	assert.match(latest.title, /Updated terminal name/);
+	assert.equal(latest.status, "stopped");
+	assert.equal(builds, 0, "receipt titles do not invalidate the historical outline");
 });

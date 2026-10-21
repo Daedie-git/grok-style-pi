@@ -233,7 +233,11 @@ export class Control {
 			this.persist(conversation.meta);
 			return { disposition, report, continuation, wakes, summary };
 		};
-		if (conversation.meta.stoppedByUser) return finish("stopped", "stopped");
+		if (conversation.meta.stoppedByUser) {
+			// Stopped keeps its durable tombstone but releases its live session after the normal grace (re-review RR10).
+			conversation.evictAt = this.now() + EVICTION_GRACE_MS;
+			return finish("stopped", "stopped");
+		}
 		const report = outcome.status === "killed" ? "stopped" : outcome.status === "failed" ? "terminal_failure" : "terminal_result";
 		// A run that failed without delivering the messages it was started for must not relaunch for them at once (that would
 		// repeat a permanent failure forever); they stay pending until a new message or wake arrives. Newer arrivals still continue.
@@ -291,7 +295,11 @@ export class Control {
 				conversation.meta.stoppedByUser = true;
 				conversation.meta.stopGeneration++;
 				conversation.wakePending = undefined;
-				if (!conversation.active) conversation.disposition = "stopped";
+				if (!conversation.active) {
+					conversation.disposition = "stopped";
+					// A parked or idle stop never finalizes, so it starts its release grace here (re-review RR10).
+					conversation.evictAt ??= this.now() + EVICTION_GRACE_MS;
+				}
 				this.persist(conversation.meta);
 			}
 			if (conversation.active && !conversation.active.cancelRequested) {
@@ -396,7 +404,7 @@ export class Control {
 	evictable(): Conversation[] {
 		const now = this.now();
 		return [...this.conversations.values()].filter((conversation) =>
-			conversation.disposition === "evictable" && conversation.notified && !conversation.meta.retain && !conversation.meta.pinned
+			(conversation.disposition === "evictable" || conversation.disposition === "stopped") && conversation.notified && !conversation.meta.retain && !conversation.meta.pinned
 			&& conversation.evictAt !== undefined && conversation.evictAt <= now && this.heldEdges(conversation).length === 0);
 	}
 

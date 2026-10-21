@@ -122,6 +122,8 @@ export interface InternalSpawn {
 	installers: import("@earendil-works/pi-coding-agent").ExtensionFactory[];
 	/** Tools the installers register that must stay in the child's policy regardless of its definition's tool list. */
 	extraTools?: string[];
+	/** Ends the child at the next turn boundary when true, whatever its sibling tools decided (re-review RR05). */
+	shouldEndTurn?: () => boolean;
 }
 
 interface ParentContext {
@@ -229,6 +231,17 @@ export class Engine {
 	private restorePersisted(sessionId: string): void {
 		for (const meta of listMetas(sessionDir(this.deps.agentDir, sessionId))) {
 			if (this.control.get(meta.agentId)) continue;
+			// Finished pane runs keep only their receipt routing, so a replayed notice can still release its source (re-review RR06).
+			if (meta.backend === "herdr") {
+				for (const summary of meta.runs) {
+					if (summary.status === "running") continue;
+					try {
+						this.paneRuns.restoreTerminal(meta, summary.runId);
+					} catch (receiptError) {
+						this.reportDiagnostics(meta.agentId, [`Could not restore the receipt of pane run ${summary.runId}: ${(receiptError as Error).message}`]);
+					}
+				}
+			}
 			// A Herdr pane outlives this process: re-attach its still-running run instead of failing it (pre-push review #3).
 			const paneRun = meta.backend === "herdr" && meta.herdr ? meta.runs.findLast((run) => run.status === "running") : undefined;
 			if (paneRun) {
@@ -349,6 +362,14 @@ export class Engine {
 		if (caller.allowedAgentTypes && !caller.allowedAgentTypes.includes(definition.agentType)) {
 			return error(`This agent may only launch: ${caller.allowedAgentTypes.join(", ")}.`);
 		}
+		// The caller's current definition can only narrow the subtypes it launched with (re-review RR02).
+		if (caller.agentId) {
+			const decision = await this.currentCapability(caller.agentId, "Agent");
+			if (decision && "error" in decision) return error(decision.error);
+			if (decision && !decision.surface.active.includes("Agent")) return error(`The current definition of "${decision.agentType}" no longer allows Agent.`);
+			const current = decision?.surface.allowedAgentTypes;
+			if (current && !current.includes(definition.agentType)) return error(`This agent may only launch: ${current.join(", ") || "no agent types"}.`);
+		}
 		const isFork = definition.builtIn === "fork";
 		if (isFork && caller.isFork) return error("A fork cannot start another fork.");
 		if (params.isolation && params.isolation !== "worktree") return error(`Isolation "${params.isolation}" is not supported. Use "worktree" or omit it.`);
@@ -431,7 +452,10 @@ export class Engine {
 				prompt = [taskMessage({ prompt: params.prompt, preloadedSkills: skills }), ...notes, ...start.contextMessages.map((text) => `Additional context from a start hook:\n${text}`)].join("\n\n");
 			}
 			const sessionSpec = this.sessionSpec(meta, definition, model, thinking, background, parent, invocation.internal?.extraTools);
-			if (invocation.internal) sessionSpec.installers.push(...invocation.internal.installers);
+			if (invocation.internal) {
+				sessionSpec.installers.push(...invocation.internal.installers);
+				sessionSpec.shouldEndTurn = invocation.internal.shouldEndTurn;
+			}
 			// A stop that arrived during setup (start hooks, worktree) must not be lost before a handle exists.
 			const pendingStop = this.control.get(agentId)?.active?.cancelRequested;
 			if (pendingStop || invocation.signal?.aborted) {
@@ -546,6 +570,7 @@ export class Engine {
 		}
 		const cancelled = this.control.requestStop(resolved.agentId, source);
 		for (const agentId of cancelled) this.cancelRun(agentId, agentId === resolved.agentId ? source : source === "user" ? "user" : "parent");
+		this.resendFailedStops(resolved.agentId, cancelled);
 		return { text: `Stopping ${resolved.agentId}${cancelled.length > 1 ? ` and ${cancelled.length - 1} of its subagents` : ""}.`, details: { agentId: resolved.agentId, stopped: cancelled } };
 	}
 
@@ -657,6 +682,7 @@ export class Engine {
 	}
 
 	private readonly extensionSlots = new Map<string, Set<string>>();
+	private readonly cancelFailed = new Set<RunId>();
 
 	/** Live-launch accounting for one declared extension id, shared across registrations and reload adoption. */
 	extensionAccounting(extensionId: string): Set<string> {
@@ -673,7 +699,9 @@ export class Engine {
 
 	/** User-source stop (activity panel, commands). */
 	async userStop(agentId: AgentId): Promise<void> {
-		for (const id of this.control.requestStop(agentId, "user")) this.cancelRun(id, "user");
+		const fresh = this.control.requestStop(agentId, "user");
+		for (const id of fresh) this.cancelRun(id, "user");
+		this.resendFailedStops(agentId, fresh);
 		this.emit({ type: "stopped", agentId });
 	}
 
@@ -751,7 +779,14 @@ export class Engine {
 	private readonly paneRuns: HerdrRuns = new HerdrRuns({
 		trackRun: (agentId, runId, handle, background) => {
 			// Engine run handles cancel synchronously; pane cancellation failures surface as diagnostics instead of vanishing.
-			const tracked: RunHandle = { ...handle, cancel: (source) => { void handle.cancel(source).catch((cancelError: unknown) => this.reportDiagnostics(agentId, [`Pane cancellation failed: ${(cancelError as Error).message}`])); } };
+			// A failed send keeps the stop intent and marks the run so the next public Stop re-sends it (re-review RR07).
+			const tracked: RunHandle = { ...handle, cancel: (source) => {
+				void handle.cancel(source).then(() => { this.cancelFailed.delete(runId); }, (cancelError: unknown) => {
+					this.cancelFailed.add(runId);
+					this.reportDiagnostics(agentId, [`Pane cancellation failed: ${(cancelError as Error).message}`]);
+					this.emit({ type: "stop-failed", agentId, runId });
+				});
+			} };
 			this.trackRun(agentId, runId, tracked, background);
 		},
 		settle: (agentId, runId, outcome) => this.settle(agentId, runId, outcome),
@@ -944,6 +979,7 @@ export class Engine {
 	}
 
 	private settle(agentId: AgentId, runId: RunId, outcome: RunOutcome): void {
+		this.cancelFailed.delete(runId);
 		try {
 			this.settleRun(agentId, runId, outcome);
 		} catch (settleError) {
@@ -1079,6 +1115,8 @@ export class Engine {
 		await this.bound;
 		const conversation = this.control.get(agentId);
 		if (!conversation?.active || conversation.active.runId !== runId) return;
+		// A stop that arrived while waiting for the root fences every backend before anything launches (re-review RR01).
+		if (this.stopFenced(agentId, runId)) return;
 		if (conversation.meta.backend === "herdr") {
 			await this.continueHerdr(conversation, runId);
 			return;
@@ -1128,6 +1166,12 @@ export class Engine {
 		// Inclusion is acknowledged only once a provider request carrying the prompt was dispatched (review R05, plan §17.3).
 		handle.subscribe((event) => {
 			if (event.type !== "dispatched") return;
+			// A context transform that removed the input is an explicit refusal, never a silent inclusion and never a retry loop.
+			if (event.promptIncluded === false) {
+				for (const envelope of envelopes) this.inbox(agentId).setState(envelope.id, "refused", { runId, refusedReason: "The message was removed from the agent's request by a context transform." });
+				this.reportDiagnostics(agentId, ["A context transform removed the continuation message from the request; it was not delivered."]);
+				return;
+			}
 			for (const envelope of envelopes) this.inbox(agentId).setState(envelope.id, "included", { runId });
 		});
 		handle.started.catch((startError) => this.settle(agentId, runId, failedOutcome(String((startError as Error).message))));
@@ -1207,8 +1251,21 @@ export class Engine {
 	 * narrowing a definition revokes the grant even for a retained session. Fails closed when the definition disappeared.
 	 */
 	async toolRevocation(agentId: AgentId, toolName: string): Promise<string | undefined> {
+		if (toolName === "StructuredOutput") return undefined;
+		const decision = await this.currentCapability(agentId, toolName);
+		if (!decision) return undefined;
+		if ("error" in decision) return decision.error;
+		return decision.surface.active.includes(toolName) ? undefined : `The current definition of "${decision.agentType}" no longer allows ${toolName}.`;
+	}
+
+	/**
+	 * The current capability decision for one tool of a user-defined agent, compiled from the same inputs as its launch
+	 * (scoped memory included), so live admission and spawn-time grants agree (re-review RR02, RR08). Undefined when the
+	 * agent's capabilities are fixed for its lifetime (built-in, fork, skill, pane).
+	 */
+	private async currentCapability(agentId: AgentId, toolName: string): Promise<{ surface: ReturnType<typeof compileToolSurface>; agentType: string } | { error: string } | undefined> {
 		const meta = this.control.get(agentId)?.meta;
-		if (!meta || toolName === "StructuredOutput") return undefined;
+		if (!meta) return undefined;
 		const historical = meta.definition;
 		if (historical.source === "built-in" || meta.isFork || meta.skill || meta.backend !== "in-process") return undefined;
 		// An expired snapshot is refreshed before admission, never evaluated stale (pre-push review #1).
@@ -1216,21 +1273,31 @@ export class Engine {
 		try {
 			set = await this.definitions();
 		} catch {
-			return "The agent's current definition could not be verified, so the tool call was blocked.";
+			return { error: "The agent's current definition could not be verified, so the tool call was blocked." };
 		}
 		const current = set.active.get(historical.agentType);
-		if (!current || current.source !== historical.source) return "This agent's definition is no longer available, so it can no longer use tools.";
+		if (!current || current.source !== historical.source) return { error: "This agent's definition is no longer available, so it can no longer use tools." };
 		const mcp = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName)?.[1];
 		const surface = compileToolSurface({
 			definition: current, available: [{ name: toolName, mcpServer: mcp }], depth: meta.spawnDepth, maxDepth: this.control.limits.maxDepth, background: false, isFork: false,
+			memoryTools: current.memory ? ["read", "write", "edit"] : undefined,
 		});
-		return surface.active.includes(toolName) ? undefined : `The current definition of "${historical.agentType}" no longer allows ${toolName}.`;
+		return { surface, agentType: historical.agentType };
 	}
 
 	private wake(agentId: AgentId): void {
 		const pending = this.inbox(agentId).undelivered();
 		const reservation = this.control.reserveContinuation(agentId, "wake", pending.map((envelope) => envelope.id));
 		if (reservation.kind === "reserved") this.startContinuation(agentId, reservation.runId);
+	}
+
+	/** Re-signal runs under agentId whose earlier cancellation never reached them; the stop intent is already durable (re-review RR07). */
+	private resendFailedStops(agentId: AgentId, fresh: readonly AgentId[]): void {
+		for (const id of [...this.control.descendants(agentId), agentId]) {
+			const active = this.control.get(id)?.active;
+			if (!active || fresh.includes(id) || !this.cancelFailed.delete(active.runId)) continue;
+			this.cancelRun(id, active.cancelRequested ?? "user");
+		}
 	}
 
 	private cancelRun(agentId: AgentId, source: KilledBy): void {
@@ -1290,7 +1357,8 @@ export class Engine {
 		for (const entry of entries) {
 			if (entry.type !== "custom_message" || entry.customType !== MAIN_MESSAGE_TYPE) continue;
 			const id = (entry.details as { envelopeId?: unknown } | undefined)?.envelopeId;
-			if (typeof id === "string") this.mainInbox().setState(id, "included");
+			// Receipts inherited from another root (a branched or forked session) belong to that root's inbox (re-review RR09).
+			if (typeof id === "string" && this.mainInbox().has(id)) this.mainInbox().setState(id, "included");
 		}
 	}
 
@@ -1310,7 +1378,8 @@ export class Engine {
 
 	private async sweep(): Promise<void> {
 		for (const conversation of this.control.evictable()) {
-			conversation.disposition = "evictable";
+			// A stopped conversation stays stopped; only its live resources go.
+			if (conversation.disposition !== "stopped") conversation.disposition = "evictable";
 			conversation.evictAt = undefined;
 			await this.backend?.dispose(conversation.meta.agentId);
 			this.paneRuns.evict(conversation.meta.agentId);
@@ -1389,6 +1458,7 @@ export type EngineEvent =
 	| { type: "settled"; agentId: AgentId; runId: RunId; outcome: RunOutcome }
 	| { type: "diagnostics"; agentId: AgentId; messages: string[] }
 	| { type: "stopped"; agentId: AgentId }
+	| { type: "stop-failed"; agentId: AgentId; runId: RunId }
 	| { type: "workflow-progress"; taskId: string; runId: string; event: WorkflowProgress }
 	| { type: "workflow-settled"; taskId: string; runId: string; status: string };
 

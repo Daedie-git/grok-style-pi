@@ -28,6 +28,7 @@ function structuredOutputInstaller(schema: Record<string, unknown>, capture: Str
 			// so missing or schema-invalid handbacks reach our bounded accounting.
 			parameters: Type.Object({ result: Type.Optional(Type.Unknown()) }),
 			execute: async (_toolCallId, params) => {
+				if (capture.invalid >= MAX_INVALID_STRUCTURED) throw new Error("StructuredOutput is exhausted; no further handbacks are accepted.");
 				const value = (params as { result: unknown }).result;
 				if (!Value.Check(schema, value)) {
 					capture.invalid++;
@@ -99,6 +100,9 @@ export async function runWorkflowAgent(engine: Engine, ctx: ExtensionContext, re
 		subagent_type: request.agentType, model: request.model, effort: request.effort, isolation: request.isolation, run_in_background: false,
 	}, ROOT_CALLER, { toolCallId: `wf:${request.runId}:${request.logicalIndex}:${request.attempt}`, signal: request.signal, ctx, origin: "model", internal: {
 		extraDenied, installers, extraTools: request.schema ? [STRUCTURED_OUTPUT_TOOL] : [],
+		// Pi ends a batch on terminate only when every sibling agrees; exhaustion ends the agent at the turn boundary
+		// regardless of an ordinary sibling such as read (re-review RR05).
+		shouldEndTurn: () => capture.invalid >= MAX_INVALID_STRUCTURED,
 		workflow: { taskId: request.taskId, runId: request.runId, logicalIndex: request.logicalIndex, label: request.label, phase: request.phase },
 	} });
 	// Hold the workflow's permit/obligation until the child's own cleanup (stop hooks, worktree) finishes (plan §18.1 H1, M1).

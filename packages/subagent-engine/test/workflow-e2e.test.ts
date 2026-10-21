@@ -456,14 +456,18 @@ test("long inline scripts are refused before confirmation instead of approving a
 	assert.equal(existsSync(join(harness.root, "agent", "subagents", harness.parent.sessionId, "workflows")), false);
 });
 
-test("repeated invalid StructuredOutput reaches execute and stops the real child at five attempts", { timeout: 15_000 }, async t => {
+for (const mixed of [false, true]) test(`repeated invalid StructuredOutput ${mixed ? "with a read sibling" : "without siblings"} stops the real child at five attempts`, { timeout: 15_000 }, async t => {
 	noNetwork(t);
 	const script = source("return await agent('Return a count',{schema:{type:'object',properties:{count:{type:'integer'}},required:['count'],additionalProperties:false}});");
 	const harness = await createHarness({
 		env: { PI_WORKFLOW_APPROVE: "1" }, parent: ({ index }) => index === 0 ? launch(script) : { text: "done" },
-		child: () => ({ index }) => index < 8 ? { tools: [{ name: "StructuredOutput", args: index % 2 ? {} : { result: "wrong type" } }] } : { text: "escaped the invalid cap" },
+		child: () => ({ index }) => index < 8 ? { tools: [
+			{ name: "StructuredOutput", args: index % 2 ? {} : { result: "wrong type" } },
+			...(mixed ? [{ name: "read", args: { path: join(harness.root, "schema-input.txt") } }] : []),
+		] } : { text: "escaped the invalid cap" },
 	});
 	t.after(() => harness.close());
+	writeFileSync(join(harness.root, "schema-input.txt"), "Harmless sibling read");
 	await harness.parent.prompt("Run the invalid schema regression", { source: "extension" });
 	const receipt = receiptFrom(harness.parent.messages), { snapshot } = await completion(harness, receipt);
 	assert.equal(snapshot.status, "failed");
@@ -475,6 +479,9 @@ test("repeated invalid StructuredOutput reaches execute and stops the real child
 	assert.equal([...harness.requests.children.values()][0], 5);
 	for (const result of results.slice(0, 4)) { assert.equal(result.isError, true); assert.match(text(result), /Invalid structured output/); }
 	assert.match(text(results[4]), /Too many invalid attempts/);
+	const reads = toolResults(child.messages, "read");
+	assert.equal(reads.length, mixed ? 5 : 0);
+	assert.ok(reads.every(result => result.isError === false));
 	assert.match(child.getAllTools().find(tool => tool.name === "StructuredOutput")!.description, /Expected result JSON schema.*\n.*count/s);
 });
 
@@ -500,4 +507,30 @@ test("Bash prefix clamps block compound/substitution syntax at the actual tool b
 	assert.equal(existsSync(join(harness.root, "CLAMP_TAIL")), false);
 	const journal = readFileSync(join(receipt.transcriptDir, "journal.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
 	assert.ok(journal.some(event => event.type === "result" && event.key === chainKey("", "shell checks", { bashCommandClamp: [...rules].sort() })));
+});
+
+test("RR05: an exhausted StructuredOutput rejects a later valid handback in the same mixed batch", { timeout: 15_000 }, async t => {
+	noNetwork(t);
+	const script = source("return await agent('Return a count',{schema:{type:'object',properties:{count:{type:'integer'}},required:['count']}});");
+	const harness = await createHarness({
+		env: { PI_WORKFLOW_APPROVE: "1" }, parent: ({ index }) => index === 0 ? launch(script) : { text: "done" },
+		child: () => ({ index }) => index < 8 ? { tools: [
+			{ name: "StructuredOutput", args: { result: "invalid" } },
+			{ name: "read", args: { path: join(harness.root, "schema-input.txt") } },
+			...(index === 4 ? [{ name: "StructuredOutput", args: { result: { count: 42 } } }] : []),
+		] } : { text: "must not reach another turn" },
+	});
+	t.after(() => harness.close());
+	writeFileSync(join(harness.root, "schema-input.txt"), "Harmless sibling read");
+	await harness.parent.prompt("Verify exhausted mixed handbacks", { source: "extension" });
+	const { snapshot } = await completion(harness, receiptFrom(harness.parent.messages));
+	assert.equal(snapshot.status, "failed");
+	assert.match(snapshot.error ?? "", /5 invalid attempts/);
+	assert.equal(harness.children.size, 1);
+	assert.equal([...harness.requests.children.values()][0], 5);
+	const handbacks = toolResults([...harness.children.values()][0].messages, "StructuredOutput");
+	assert.equal(handbacks.length, 6, "five invalid handbacks plus the explicitly rejected late valid one");
+	assert.equal(handbacks[5].isError, true);
+	assert.match(text(handbacks[5]), /exhausted.*no further handbacks/i);
+	assert.notDeepEqual(snapshot.result, { count: 42 });
 });

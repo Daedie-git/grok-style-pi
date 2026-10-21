@@ -47,6 +47,11 @@ export class InboxStore {
 		return { envelope: structuredClone(envelope), duplicate: false };
 	}
 
+	/** Whether this inbox owns the envelope (a forked session can carry an ancestor root's receipts). */
+	has(id: string): boolean {
+		return this.records.has(id);
+	}
+
 	setState(id: string, state: EnvelopeState, extra?: { runId?: string; refusedReason?: string }): void {
 		if (!states.includes(state)) throw new Error(`Invalid envelope state: ${state}`);
 		const record = this.records.get(id);

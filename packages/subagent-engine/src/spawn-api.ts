@@ -5,6 +5,7 @@
 // The reply carries an engine-issued launcher handle; every launch goes through it, which stamps its origin. The extension id
 // is self-declared, so the per-extension cap is cooperative accounting between trusted in-process extensions, not a security
 // boundary. Ordinary admission (the global cap and depth) still applies to every launch.
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ROOT_CALLER, type AgentParams, type Engine, type ToolText } from "./engine.ts";
 
@@ -45,17 +46,19 @@ interface ExtensionContextRef {
 
 function createHandle(extensionId: string, cap: number, engine: () => Engine, context: () => ExtensionContextRef | undefined): LauncherHandle {
 	// Shared by every handle registered under this id, so re-registering never resets the cap (pre-push review #4).
-	const live = engine().extensionAccounting(extensionId);
-	let sequence = 0;
+	// Accounting is resolved from the current engine at each call (it changes on reload adoption, review recheck #2).
+	const accounting = () => engine().extensionAccounting(extensionId);
 	return {
 		extensionId,
-		running: () => live.size,
+		running: () => accounting().size,
 		async spawn(params) {
 			const ref = context();
 			if (!ref) return { text: "The session is not ready.", isError: true };
+			const live = accounting();
 			if (live.size >= cap) return { text: `${extensionId} already has ${cap} agents running.`, isError: true };
 			// Reserve the slot synchronously so concurrent launches cannot both pass the cap (review R09).
-			const slot = `pending:${(sequence++).toString(36)}`;
+			// Globally unique reservation token: handles of the same extension share one accounting set (recheck #1).
+			const slot = `pending:${randomUUID()}`;
 			live.add(slot);
 			// Observe settlement before launching, so a child that finishes during spawn is not counted forever.
 			const settledEarly = new Set<string>();

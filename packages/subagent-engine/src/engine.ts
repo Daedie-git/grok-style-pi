@@ -1147,7 +1147,8 @@ export class Engine {
 					const conversation = this.control.get(agentId);
 					// A parked owner that is stopped never settles again; its stop ends the wait (pre-push review #2).
 					if (conversation && !conversation.active && (conversation.meta.stoppedByUser || conversation.disposition === "stopped")) {
-						if (last.status !== "killed") last = killedOutcome(conversation.meta.stoppedByUser ? "user" : "parent");
+						// Keep the usage the conversation already incurred (recheck #3).
+						if (last.status !== "killed") last = { ...killedOutcome(conversation.meta.stoppedByUser ? "user" : "parent"), usage: last.usage };
 						finish();
 						return;
 					}

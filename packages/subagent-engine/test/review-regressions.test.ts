@@ -225,6 +225,30 @@ test("pre-push: user-stopping a parked foreground owner releases the root Agent 
 	assert.equal(owner.meta.stoppedByUser, true);
 	assert.equal(owner.meta.runs.length, 1, "a stopped parked owner does not run again to settle its caller");
 	assert.equal(harness.parent.isStreaming, false);
+	// The usage the owner already incurred is still attributed to the caller.
+	const attributed = (result as { usage?: { totalTokens?: number } }).usage;
+	assert.ok(attributed && (attributed.totalTokens ?? 0) > 0, "parked-stop keeps incurred usage");
+});
+
+test("recheck: concurrent launches from separate handles of one extension share a unique-token cap", { timeout: 20_000 }, async t => {
+	offline(t);
+	const hold = barrier();
+	const harness = await createHarness({ parent: () => ({ text: "root" }), child: () => () => ({ wait: hold.promise, then: { text: "done" } }) });
+	t.after(async () => { hold.release(); await harness.close(); });
+	let register!: (request: unknown) => void;
+	const hooks = new Map<string, (...args: unknown[]) => unknown>();
+	const pi = {
+		on(name: string, handler: (...args: unknown[]) => unknown) { hooks.set(name, handler); },
+		events: { on(_name: string, handler: (request: unknown) => void) { register = handler; } },
+	};
+	installSpawnApi(pi as never, () => harness.engine);
+	hooks.get("session_start")!({}, harness.parent.extensionRunner.createContext());
+	const handles: LauncherHandle[] = [];
+	for (let i = 0; i < 3; i++) register({ extensionId: "shared", cap: 2, reply: (created: LauncherHandle) => { handles.push(created); } });
+	const results = await Promise.all(handles.map((handle, i) => handle.spawn({ description: `launch ${i}`, prompt: "Wait" })));
+	assert.equal(results.filter((result) => !result.isError).length, 2);
+	assert.equal(harness.engine.control.activeRuns(), 2);
+	hold.release();
 });
 
 test("pre-push: an expired live definition refreshes at the next write without a test-side discovery refresh", { timeout: 20_000 }, async t => {

@@ -5,7 +5,7 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { runInChildScope } from "../child-context.ts";
-import { createAssistantMessageEventStream, type AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+import { createAssistantMessageEventStream, type AssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
 import { extractOutcome, retryableApiError, UsageTracker } from "../results.ts";
 import type { AgentId, BackendCapabilities, BackendEvent, DeliveryResult, Envelope, KilledBy, RunHandle, RunId, RunOutcome } from "../types.ts";
 

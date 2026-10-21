@@ -232,9 +232,12 @@ export class Engine {
 			// A Herdr pane outlives this process: re-attach its still-running run instead of failing it (pre-push review #3).
 			const paneRun = meta.backend === "herdr" && meta.herdr ? meta.runs.findLast((run) => run.status === "running") : undefined;
 			if (paneRun) {
-				this.control.restoreActive(meta, paneRun.runId);
+				const restored = this.control.restoreActive(meta, paneRun.runId);
+				// A durable user stop whose cancellation never reached the pane is carried over and re-sent on attach.
+				if (meta.stoppedByUser && restored.active) restored.active.cancelRequested = "user";
 				try {
 					this.paneRuns.restore(meta, paneRun.runId);
+					if (restored.active?.cancelRequested) this.cancelRun(meta.agentId, restored.active.cancelRequested);
 					continue;
 				} catch (restoreError) {
 					this.control.rollbackSpawn(meta.agentId, paneRun.runId);
@@ -771,7 +774,12 @@ export class Engine {
 
 	/** Attach (or, after a reload, re-attach) the Herdr transport; identity routing is restored before notices flow. */
 	attachHerdr(port: HerdrRunsPort): () => void {
-		return this.paneRuns.rebind(port);
+		const detach = this.paneRuns.rebind(port);
+		// Re-send stops that were requested while no transport could carry them (restore, reload handover).
+		for (const conversation of this.control.conversations.values()) {
+			if (conversation.meta.backend === "herdr" && conversation.active?.cancelRequested) this.cancelRun(conversation.meta.agentId, conversation.active.cancelRequested);
+		}
+		return detach;
 	}
 
 	herdrAvailable(): boolean {

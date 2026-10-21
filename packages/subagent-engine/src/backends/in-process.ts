@@ -250,7 +250,8 @@ export class InProcessBackend {
 		agent.streamFunction = (model, context, options) => {
 			const state = child.current;
 			if (state && state.promptIncluded === undefined) state.promptIncluded = inputSurvived(context.messages, state);
-			return stream(model, context, options);
+			// Provenance is engine-local: no adapter or gateway ever receives it (pi-messages serializes parts as they are).
+			return stream(model, { ...context, messages: withoutInputTags(context.messages) }, options);
 		};
 	}
 
@@ -372,7 +373,7 @@ export function formatEnvelope(envelope: Envelope): string {
 	return `Message from ${sender}:\n\n${envelope.text}`;
 }
 
-/** Content-part field that carries a run's input provenance. Provider adapters rebuild text parts, so it is never sent. */
+/** Content-part field that carries a run's input provenance; stripped from every provider request (withoutInputTags). */
 const INPUT_TAG = "subagentInputRun";
 
 /**
@@ -393,15 +394,33 @@ function tagInput(message: { content?: unknown }, state: { runId: string; prompt
 }
 
 /**
- * Whether this run's input instance reached the provider (re-review RR03): a text part tagged with this run, still carrying
- * the prompt, in the converted request. Equal text elsewhere (earlier copies, summaries, listings) is never evidence, and
- * inserted or pruned messages around it do not matter.
+ * Whether this run's input instance reached the provider (re-review RR03): the text of every part tagged with this run, taken
+ * together, still carries the prompt (whitespace-insensitive, so splitting it across parts is fine). Equal text elsewhere
+ * (earlier copies, summaries, listings) is never evidence. A transform that rebuilds the input's parts without the tag is
+ * indistinguishable from one that removed it, so it is treated as unconfirmed: fail closed with an honest reason.
  */
 function inputSurvived(messages: readonly { role?: string; content?: unknown }[], state: { runId: string; prompt: string }): boolean {
-	const needle = state.prompt.trim();
+	const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
+	const needle = normalize(state.prompt);
 	if (!needle) return true;
-	return messages.some((message) => Array.isArray(message.content) && message.content.some((part) =>
-		(part as Record<string, unknown>)[INPUT_TAG] === state.runId && String((part as { text?: unknown }).text ?? "").includes(needle)));
+	const tagged: string[] = [];
+	for (const message of messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const part of message.content as Record<string, unknown>[]) if (part[INPUT_TAG] === state.runId) tagged.push(String(part.text ?? ""));
+	}
+	return tagged.length > 0 && normalize(tagged.join(" ")).includes(needle);
+}
+
+/** A request-local copy without provenance fields; untagged messages are shared unchanged. */
+function withoutInputTags<T extends { content?: unknown }>(messages: readonly T[]): T[] {
+	return messages.map((message) => {
+		if (!Array.isArray(message.content) || !message.content.some((part) => part && typeof part === "object" && INPUT_TAG in part)) return message;
+		return { ...message, content: message.content.map((part) => {
+			if (!part || typeof part !== "object" || !(INPUT_TAG in part)) return part;
+			const { [INPUT_TAG]: _tag, ...rest } = part as Record<string, unknown>;
+			return rest;
+		}) };
+	});
 }
 
 function textOf(message: { content?: unknown }): string {

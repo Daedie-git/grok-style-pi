@@ -1172,8 +1172,8 @@ export class Engine {
 			if (event.type !== "dispatched") return;
 			// A context transform that removed the input is an explicit refusal, never a silent inclusion and never a retry loop.
 			if (event.promptIncluded === false) {
-				for (const envelope of envelopes) this.inbox(agentId).setState(envelope.id, "refused", { runId, refusedReason: "The message was removed from the agent's request by a context transform." });
-				this.reportDiagnostics(agentId, ["A context transform removed the continuation message from the request; it was not delivered."]);
+				for (const envelope of envelopes) this.inbox(agentId).setState(envelope.id, "refused", { runId, refusedReason: "The message could not be confirmed in the agent's request (a context transform removed or rewrote it); send it again if it is still needed." });
+				this.reportDiagnostics(agentId, ["The continuation message could not be confirmed in the agent's request after context transforms; it was not marked delivered."]);
 				return;
 			}
 			for (const envelope of envelopes) this.inbox(agentId).setState(envelope.id, "included", { runId });

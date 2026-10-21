@@ -235,6 +235,34 @@ test("RR03: pruning an older equal message does not refuse the surviving new ins
 	assert.deepEqual(h.engine.inbox(id).all().map(envelope => envelope.state), ["included", "included"]);
 });
 
+test("RR03: input split across tagged parts is included and provenance never reaches the provider", { timeout: 20_000 }, async t => {
+	offline(t);
+	const marker = "SPLIT_FIRST_LINE\nSPLIT_SECOND_LINE";
+	let leaked = false;
+	const h = await createHarness({ parent: foregroundParent, child: () => ({ messages }) => {
+		leaked ||= JSON.stringify(messages).includes("subagentInputRun");
+		return { text: "child report" };
+	} });
+	t.after(() => h.close());
+	await h.parent.prompt("go", { source: "extension" });
+	const id = [...h.children.keys()][0], child = h.children.get(id)!;
+	const idle = () => !h.engine.control.get(id)?.active && !h.engine.control.get(id)?.exiting;
+	await until(idle);
+	const transform = child.agent.transformContext;
+	child.agent.transformContext = async (messages, signal) => {
+		const projected = transform ? await transform(messages, signal) : messages;
+		return projected.map(message => !Array.isArray((message as { content?: unknown }).content) ? message : ({
+			...message,
+			content: ((message as { content: { type: string; text?: string }[] }).content).flatMap(part =>
+				part.type === "text" && part.text?.includes("\n") ? part.text.split("\n").map(text => ({ ...part, text })) : [part]),
+		}) as typeof message);
+	};
+	await h.engine.sendMessage({ to: id, message: marker }, ROOT_CALLER, "split");
+	await until(() => h.requests.children.get(id) === 2 && idle());
+	assert.equal(h.engine.inbox(id).all()[0].state, "included");
+	assert.equal(leaked, false, "the provenance field is stripped from every provider request");
+});
+
 test("RR07: both public stop paths retry failed pane cancellation and emit stop-failed", { timeout: 20_000 }, async t => {
 	offline(t);
 	for (const retry of ["userStop", "stop"] as const) await t.test(retry, async t => {

@@ -426,6 +426,9 @@ export class Control {
 		conversation.evictAt = undefined;
 		conversation.notified = false;
 		conversation.meta.finished = false;
+		// An explicit retry also owns older undelivered input. Otherwise two failed messages can alternate forever:
+		// each finalizer mistakes the other message for a new arrival and reserves another continuation.
+		envelopeIds = [...new Set([...this.inboxOf(conversation.meta.agentId).undelivered().map((envelope) => envelope.id), ...envelopeIds])];
 		conversation.active = { runId, phase: "reserved", invocation, startedAt: this.now(), background: true, envelopeIds };
 		conversation.meta.runs.push({ runId, invocation, startedAt: conversation.active.startedAt, status: "running" });
 		this.running++;

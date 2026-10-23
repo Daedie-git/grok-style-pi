@@ -208,6 +208,38 @@ test("SendMessage resumes a finished pane with the same identity and a fresh Her
 	assert.match(proxy.meta.runs[1].resultText!, /Resumed pane report/);
 });
 
+test("repeated missing-pane failures retain input without alternating automatic retries", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, launchScript);
+	await harness.parent.prompt("Launch a pane", { source: "extension" });
+	const proxy = firstProxy(harness);
+	fake.notice("pane-1");
+	await until(() => !proxy.active && !proxy.exiting);
+	const resume = fake.resume.bind(fake);
+	let attempts = 0;
+	t.mock.method(fake, "resume", async (agentId: string, prompt: string) => {
+		// Bound a broken implementation: a third attempt launches instead of spinning forever.
+		if (++attempts <= 2) throw new Error("Agent worker is no longer running in Herdr pane missing.");
+		return resume(agentId, prompt);
+	});
+	await harness.engine.sendMessage({ to: "worker", message: "Continue the investigation" }, ROOT_CALLER, "missing-pane");
+	await until(() => !proxy.active && !proxy.exiting && proxy.meta.runs.at(-1)?.status === "failed");
+	await harness.engine.sendMessage({ to: "worker", message: "Retry if the pane is available" }, ROOT_CALLER, "missing-pane-retry");
+	await until(() => proxy.meta.runs.filter((run) => run.status === "failed").length === 2);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(attempts, 2, "older unread input must not retry a failed pane resume");
+	assert.equal(proxy.meta.runs.length, 3);
+	assert.equal(proxy.active, undefined);
+	const [envelope] = harness.engine.inbox(proxy.meta.agentId).all();
+	assert.notEqual(envelope.state, "included", "failed transport did not deliver the message");
+	assert.equal(harness.engine.inbox(proxy.meta.agentId).undelivered().length, 2, "retain input for an explicit retry");
+	await until(() => !proxy.exiting);
+	await harness.engine.sendMessage({ to: "worker", message: "Try again now" }, ROOT_CALLER, "pane-restored");
+	await until(() => fake.resumes.length === 1 && harness.engine.inbox(proxy.meta.agentId).undelivered().length === 0);
+	assert.equal(attempts, 3, "a new explicit message may retry the failed conversation");
+	assert.equal(fake.resumes[0].prompt, "Continue the investigation\n\n---\n\nRetry if the pane is available\n\n---\n\nTry again now");
+	assert.equal(harness.engine.inbox(proxy.meta.agentId).undelivered().length, 0);
+});
+
 test("TaskStop cancels the active pane, without pretending the cancellation request settled it", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => {
 		if (index === 0) return { tools: [{ name: "Agent", args: assignment }] };

@@ -55,6 +55,7 @@ Skills whose frontmatter sets `context: fork` run as their own agents. The model
   - At most 20 agents run at once (`PI_MAX_CONCURRENT_SUBAGENTS`), and agents nest at most 3 levels deep (`PI_MAX_SUBAGENT_SPAWN_DEPTH`). A launch over a limit is refused, not queued.
   - Background agents keep `Agent` while below the depth limit. They don't get `TaskCreate`, `TaskGet` or `TaskUpdate`.
   - `maxTurns` ends an agent after its last allowed turn without another model request.
+- **Failed continuations.** If a continuation fails before delivering its messages, those messages remain unread without repeatedly retrying themselves. A new message or wake can retry the conversation with all input already waiting.
 - **Parking.** An agent whose own children are still running waits for them, and its report waits too. A child's report wakes the waiting parent agent.
 - **Worktrees.** `isolation: "worktree"` gives the agent its own git worktree on branch `agent-<id>`. When the agent finishes with no changes, the worktree is removed. If it changed anything, the worktree and branch are kept for you to inspect. Nothing is committed on the agent's behalf. A worktree is not a security sandbox.
 - **Hooks.** `~/.pi/agent/hooks.json`, `.pi/hooks.json` (trusted projects only) and a definition's `hooks` use Claude's command-hook format. Supported events:

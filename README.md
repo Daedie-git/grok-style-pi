@@ -9,7 +9,7 @@ This package uses only documented Pi extension APIs (`setFooter`, `setEditorComp
 From a clone:
 
 ```bash
-pi install /home/aim/git/grok-style-pi
+pi install /path/to/grok-style-pi
 ```
 
 From GitHub:
@@ -140,6 +140,14 @@ Mouse input needs Pi's fullscreen mode. Every diamond follows one table, defined
 | Double-click a source line | n/a | Insert `path:line` at the message cursor (read, edit, write) |
 
 File targets: `read`, `edit`, and `write` open their file at the offset, change line, or line 1; `grep`, `find`, and `ls` open their `path` argument (a directory opens as a folder); `show_image`, `show_video`, and `show_html` open their file. Source-tool targets always open in Cursor, preserving source-line locations even for HTML. Media-tool targets open in the desktop's default app, matching image, video, and HTML file links in replies. `bash`, `Agent`, `codemode`, and notices have no target, so Ctrl+click does nothing there. Ctrl+click always takes precedence over a plain click and never toggles, and every click a diamond ignores is consumed so Pi does not toggle it instead. Ctrl+O resets every diamond to the global state. In the activity bar, clicking anywhere on an entry's row opens its viewer; View, Stop, and Close keep their own targets.
+
+## Shared workflow guidance
+
+Both entrypoints load `src/extension/workflow.ts` into Pi's system prompt on every agent run through the existing `before_agent_start` instruction hook. This applies in normal package use, including outside this repository, independently of the communication or chrome toggles. It keeps one accountable Pi/Claude lead per branch/topic, preserves authorized isolated work and explicit reasoning choices, and covers task briefs, responsive delegation, concrete blockers, validation, and measurement discipline. It is workflow guidance, not additional permission to publish, destroy, or communicate externally.
+
+MEDIUM is an explicit launch preference in the guidance, not a runtime override: this package does not change an existing session's thinking level, launch arguments, user settings, tools, skills, extensions, or theme.
+
+To pick this up on another Linux or Windows device, update its local clone to the reviewed revision, or update its configured Git package with `pi update --extensions`, then run `/reload` or restart Pi. A Git source pinned to a branch/tag/commit follows that configured ref; change the pin deliberately when adopting a different revision. Load exactly one entrypoint, as before. A device with this extension disabled does not receive the guidance. Confirm the `workflow` section in that device's next saved system prompt before claiming rollout; a PR or one updated clone does not synchronize devices automatically.
 
 ## Feature settings
 

@@ -12,9 +12,10 @@ export const featureLabels = {
 	communication: "Communication style and clickable file references",
 	autonomy: "Autonomous in-process subagent delegation",
 	panes: "Subagents in Herdr panes",
+	memory: "Persistent project memory (opt-in)",
 } as const;
 export type Features = Record<keyof typeof featureLabels, boolean>;
-export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true, panes: true };
+export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true, panes: true, memory: false };
 
 export function loadFeatures(path = featureSettingsPath()): Features {
 	const values = readSettingsObject(path);

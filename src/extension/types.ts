@@ -47,6 +47,8 @@ export type GrokStyleDeps = {
 	getToolOptions?: (ctx: SessionContext) => ToolsOptions;
 	wrapTool?: (tool: OriginalTool) => OriginalTool;
 	features?: Partial<Features>;
+	/** Private project-memory storage; required only when the memory feature is enabled. */
+	projectMemoryRoot?: string;
 	openCursor?: (target: OpenTarget) => Promise<void>;
 	refreshCompileCommands?: CursorWorkspaceDeps["refresh"];
 	hyperlinks?: () => boolean;

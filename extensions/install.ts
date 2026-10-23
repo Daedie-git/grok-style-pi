@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { inChildContext } from "../packages/subagent-engine/src/child-context.ts";
 import { defaultFeatures, loadFeatures, installFeatureSettings, type Features } from "../src/extension/features.ts";
 import { loadStyleColors, useStyleColors } from "../src/chrome/style-colors.ts";
@@ -11,7 +12,7 @@ import { installFastMode } from "../src/extension/fast-mode.ts";
 import { installToolGuard } from "../src/extension/tool-guard.ts";
 
 type PiObjects = Pick<typeof import("@earendil-works/pi-coding-agent"), "CustomEditor" | "createReadToolDefinition" | "createBashToolDefinition" | "createPowerShellToolDefinition" | "createEditToolDefinition" | "createWriteToolDefinition" | "createGrepToolDefinition" | "createFindToolDefinition" | "createLsToolDefinition"> & { createCodemodeExtension?: () => ExtensionFactory };
-export type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features };
+export type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features; projectMemoryRoot?: string };
 
 /** Each alternative entrypoint installs one core runtime and shares its rendering hooks. */
 export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {}) {
@@ -26,6 +27,7 @@ export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {})
 	const activity = features.activity ? installActivityPanel(pi) : undefined;
 	const runtime = createGrokStyleExtension(pi, {
 		features,
+		projectMemoryRoot: deps.projectMemoryRoot ?? join(getAgentDir(), "grok-memory", "projects"),
 		wrapTool: activity?.wrapTool,
 		CustomEditor: agent.CustomEditor,
 		getToolOptions: loadToolOptions,

@@ -121,6 +121,27 @@ Use `/fast on` to request priority processing, `/fast off` to stop requesting it
 
 Fast mode adds `service_tier: "priority"` only to GPT requests on the `openai` and `openai-codex` providers. It does not change the model or transport, and other providers and model families are unaffected. Switching away from a supported model hides the footer indicator without forgetting the setting. Priority service is requested, not guaranteed, and may increase cost or usage. `/fast off` leaves the provider's normal request defaults unchanged.
 
+## Project memory
+
+Persistent project memory is **off by default**. Both full entrypoints include it independently of visual styling:
+
+```text
+/grok-style memory on
+/reload
+```
+
+Turn it off with `/grok-style memory off`, then `/reload`. The `/grok-style` menu also exposes the toggle; `all on` explicitly enables it and `all off` disables it. The media-only entrypoint stays memory-free.
+
+When enabled, the extension supplies a memory policy and a bounded `MEMORY.md` index before each submitted run. The model decides when a memory is relevant and reads its linked topic files with the existing file tools. Relevant, attributable saved preferences and collaboration guidance can shape later replies without being repeated, unless current instructions or verified evidence contradict them; saved notes do not authorize arbitrary commands, permission changes, or instruction overrides. The policy includes both corrections and positive confirmations of useful, non-obvious approaches, durable user preferences, non-code project context, and external references. It asks the model to verify stale claims and update or remove outdated notes. It must not store secrets, credentials, temporary task state, or information already available in code, Git, or instruction files. These are model instructions, not a deterministic extraction guarantee.
+
+Saving uses normal `write`/`edit` calls: update a topic Markdown file, then add a short pointer in `MEMORY.md`. Topic frontmatter carries `name`, `description`, and `metadata.type` (`user`, `feedback`, `project`, or `reference`). Feedback/project bodies record the rule or fact, `Why`, and `How to apply`, with dated provenance where relevant. Relative dates become absolute only when their reference date and relevant time zone are known; otherwise the model must ask or preserve uncertainty, not invent dates. The index contains links and short relevance hints rather than the full memories. Leading and trailing whitespace is trimmed before the escaped index preview is capped at 200 lines and 25,000 UTF-16 code units, with a warning if truncated; topic files are not eagerly loaded. Index files over 100,000 bytes, special files, and symlinked storage roots, project folders, or index files are refused with a warning rather than loaded. An empty index is fine, and subsequent runs pick up changes without reloading the extension. There are no background model requests, automatic transcript scans, or separate memory tools, and existing file-tool restrictions remain unchanged.
+
+Notes live outside the repository under `<agent-dir>/grok-memory/projects/<project-name>-<path-hash>/` (normally `~/.pi/agent/grok-memory/projects/`). Git subdirectories share their nearest repository's project memory; linked worktrees and submodules keep separate memory. The resolver does not trust `.git` pointers to share another root's notes. Non-Git directories use their canonical working directory. The path-derived key separates unrelated projects with the same name. Even `user` memories are scoped to this project, not automatically shared across all repositories. The integration neither imports Claude Code memories nor modifies instruction files.
+
+Disabling memory stops this feature's index reads, directory initialization, and new prompt injection after reload; it preserves saved files. Shutdown, session replacement, and superseding requests cancel pending loads before further filesystem operations begin. An operation already submitted to the operating system may finish; opened handles are still closed. Disabling cannot erase notes already seen in conversation or tool results, and does not prohibit explicit access through ordinary file tools. Start a new session if prior memory contents must not remain in the conversation. Engine child sessions do not install this root-session feature; definition-level agent memory is separate and unchanged.
+
+Programmatic callers of `createGrokStyleExtension` that enable `features.memory` also supply `projectMemoryRoot`; the bundled full entrypoints configure it automatically. The memory module owns its session lifecycle and prompt cleanup separately from disk loading and policy rendering, keeping the central factory limited to wiring.
+
 ## Tool guard
 
 Both full entrypoints enforce two rules on Linux and macOS:
@@ -143,9 +164,9 @@ File targets: `read`, `edit`, and `write` open their file at the offset, change 
 
 ## Feature settings
 
-Use `/grok-style` to toggle the footer, composer frame, tool styling, activity panel, terminal colors, communication style, in-process subagent autonomy, and Herdr pane routing independently. Choices are saved in `~/.pi/agent/grok-style.json` (or your configured Pi agent directory). Run `/reload` after changing them. All settings default to on.
+Use `/grok-style` to toggle the footer, composer frame, tool styling, activity panel, terminal colors, communication style, in-process subagent autonomy, Herdr pane routing, and project memory independently. Choices are saved in `~/.pi/agent/grok-style.json` (or your configured Pi agent directory). Run `/reload` after changing them. Project memory defaults to off; the other features default to on.
 
-Use `/grok-style autonomy off` to require an explicit user request before in-process delegation, or `autonomy on` to enable the engine's positive-delegation guidance. This changes model guidance, not automatic host-side launching. You can also use `/grok-style activity off`, `/grok-style terminalColors off`, or `/grok-style all off`. Keys are `footer`, `composer`, `toolStyling`, `activity`, `terminalColors`, `communication`, `autonomy`, and `panes`. Tool styling and activity tracking remain independently configurable. Choose a theme through Pi's `/theme` menu.
+Use `/grok-style autonomy off` to require an explicit user request before in-process delegation, or `autonomy on` to enable the engine's positive-delegation guidance. This changes model guidance, not automatic host-side launching. You can also use `/grok-style activity off`, `/grok-style terminalColors off`, or `/grok-style all off`. Keys are `footer`, `composer`, `toolStyling`, `activity`, `terminalColors`, `communication`, `autonomy`, `panes`, and `memory`. Tool styling and activity tracking remain independently configurable. Choose a theme through Pi's `/theme` menu.
 
 Diff and comment colors are optional `#rrggbb` values under `colors` in the same file. The keys are `diffInsert` (`#063806`), `diffDelete` (`#420e14`), `diffInsertChar` (`#0c5b10`), `diffDeleteChar` (`#6c1a22`), `comment` (`#a0a8b8`), `commentDoc` (`#aab4c6`), and `commentDocEmphasized` (`#b4bed4`). Set one with `/grok-style color diffInsertChar #0c5b10`, or `/grok-style color comment reset` to restore its default. Comment colors apply when `bat` is available. Run `/reload` after changing them.
 
@@ -202,7 +223,7 @@ Both full Grok entrypoints call `extensions/install.ts` once to wire Pi's editor
 
 | Module | Owns |
 |---|---|
-| `src/extension.ts`, `src/extension/` | Factory, session lifecycle, feature settings, communication, and usage tracking |
+| `src/extension.ts`, `src/extension/` | Factory, session lifecycle, feature settings, opt-in project memory, communication, and usage tracking |
 | `src/tools/` | Shared diamond section state/layout, rendering-only section decoration, specialized file/shell rendering, write previews, and tool settings |
 | `src/tools/sections/` | Unstyled summary/body adapters for codemode, subagent rows, and ordinary text tools |
 | `src/rendering/` | Cached layouts, diffs, syntax colors, palette data, and background visual workers |

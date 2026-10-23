@@ -14,15 +14,18 @@ function settingsFile(t: any) {
 	return join(dir, "grok-style.json");
 }
 
-test("feature preferences default on, persist and reject malformed values", (t) => {
+test("visual preferences default on, project memory is opt-in, and settings persist", (t) => {
 	const path = settingsFile(t);
 	assert.deepEqual(loadFeatures(path), defaultFeatures);
+	assert.equal(loadFeatures(path).memory, false);
 	saveFeatures({ ...defaultFeatures, activity: false, footer: false }, path);
 	assert.equal(loadFeatures(path).activity, false);
 	assert.equal(loadFeatures(path).composer, true);
 	writeFileSync(path, '{"composer":false}');
 	assert.deepEqual(loadFeatures(path), { ...defaultFeatures, composer: false });
 	writeFileSync(path, '{"activity":"false"}');
+	assert.throws(() => loadFeatures(path), /must be true or false/);
+	writeFileSync(path, '{"memory":"true"}');
 	assert.throws(() => loadFeatures(path), /must be true or false/);
 	writeFileSync(path, '{"footer":true,"colors":{"diffInsert":"#112233"}}');
 	saveFeatures({ ...defaultFeatures, composer: false }, path);
@@ -58,6 +61,15 @@ test("settings command supports menu toggles, all-off, validation and cancellati
 	await command.handler("", ctx);
 	assert.deepEqual(loadFeatures(path), before);
 	assert.ok(notices.some((message) => message.includes("/reload")));
+	await command.handler("memory on", ctx);
+	assert.equal(loadFeatures(path).memory, true);
+	await command.handler("memory off", ctx);
+	assert.equal(loadFeatures(path).memory, false);
+	await command.handler("all on", ctx);
+	assert.ok(Object.values(loadFeatures(path)).every((value) => value === true));
+	await command.handler("all off", ctx);
+	assert.equal(loadFeatures(path).memory, false);
+	await command.handler("activity on", ctx);
 	await command.handler("color comment #a0a8b8", ctx);
 	assert.equal(loadStyleColors(path).comment, "#a0a8b8");
 	assert.equal(loadFeatures(path).activity, true);

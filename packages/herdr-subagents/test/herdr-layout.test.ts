@@ -65,7 +65,9 @@ test("pane layout rejects missing rectangles and nonfinite or invalid dimensions
 	}
 });
 
-test("pane layout CLI routes the command, environment, and cancellation", async () => {
+test("pane layout CLI routes the command, environment, and cancellation", {
+	skip: process.platform === "win32" ? "Fixture requires executable shebang scripts" : false,
+}, async () => {
 	const dir = mkdtempSync(join(tmpdir(), "herdr-layout-"));
 	const bin = join(dir, "herdr");
 	const trace = join(dir, "trace.json");

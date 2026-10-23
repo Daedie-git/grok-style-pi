@@ -576,14 +576,149 @@ test("the caller's tab fills to four physical panes before opening another tab",
 	assert.equal(rightDown.paneId, right.createdPaneId);
 });
 
+test("an unknown caller layout never repeatedly splits the caller downward", async (t) => {
+	const f = fixture(t);
+	f.panes.set("w1:unrelated", "w1:t1");
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.splits.length, 0);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
 test("caller-tab capacity includes unrelated physical panes", async (t) => {
 	const f = fixture(t);
 	f.panes.set("w1:unrelated", "w1:t1");
 	for (let index = 0; index < 3; index++) await f.runner.spawn(request({ tabId: "w1:t1" }));
 	assert.equal(f.splits.length, 2);
 	assert.equal(f.events.filter((event) => event === "tab").length, 1);
-	assert.deepEqual(f.splits.map((split) => split.direction), ["down", "down"]);
+	assert.deepEqual(f.splits.map((split) => split.direction), ["right", "down"]);
+	assert.ok(f.splits.every((split) => split.paneId !== "w1:p1" && split.paneId !== "w1:unrelated"));
 });
+
+test("live geometry preserves right, left-down, right-down, then a new tab", async (t) => {
+	const f = fixture(t);
+	const geometry = new Map([["w1:p1", { paneId: "w1:p1", x: 0, y: 0, width: 200, height: 200 }]]);
+	const split = f.client.split;
+	f.client.split = async (options) => {
+		const created = await split(options);
+		const original = geometry.get(options.paneId)!;
+		const dimension = options.direction === "right" ? "width" : "height";
+		const position = options.direction === "right" ? "x" : "y";
+		original[dimension] /= 2;
+		geometry.set(created.paneId, { ...original, paneId: created.paneId, [position]: original[position] + original[dimension] });
+		return created;
+	};
+	f.client.paneLayout = async () => ({ tabId: "w1:t1", panes: [...geometry.values()] });
+	for (let index = 0; index < 4; index++) await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.deepEqual(f.splits.map(({ paneId, direction }) => ({ paneId, direction })), [
+		{ paneId: "w1:p1", direction: "right" },
+		{ paneId: "w1:p1", direction: "down" },
+		{ paneId: f.splits[0].createdPaneId, direction: "down" },
+	]);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+test("live geometry restores the split order for an existing untracked two-column layout", async (t) => {
+	const f = fixture(t);
+	f.panes.set("w1:unrelated", "w1:t1");
+	f.client.paneLayout = async () => {
+		const panes = ["w1:p1", "w1:unrelated"].flatMap((paneId, column) => {
+			const split = f.splits.find((item) => item.paneId === paneId);
+			const x = column * 100;
+			return [
+				{ paneId, x, y: 0, width: 100, height: split ? 50 : 100 },
+				...(split ? [{ paneId: split.createdPaneId, x, y: 50, width: 100, height: 50 }] : []),
+			];
+		});
+		return { tabId: "w1:t1", panes };
+	};
+	for (let index = 0; index < 3; index++) await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.deepEqual(f.splits.map(({ paneId, direction }) => ({ paneId, direction })), [
+		{ paneId: "w1:p1", direction: "down" },
+		{ paneId: "w1:unrelated", direction: "down" },
+	]);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+test("managed tabs also complete existing untracked panes using live geometry", async (t) => {
+	const f = fixture(t);
+	const ref = await f.runner.spawn(request());
+	const seed = await f.runner.resolve(ref.agentId);
+	const tabId = f.panes.get(seed.paneId)!;
+	f.panes.set("w1:unrelated", tabId);
+	f.client.paneLayout = async () => ({ tabId, panes: [
+		{ paneId: seed.paneId, x: 0, y: 0, width: 100, height: 100 },
+		{ paneId: "w1:unrelated", x: 100, y: 0, width: 100, height: 100 },
+	] });
+	await f.runner.spawn(request());
+	assert.deepEqual(f.splits.map(({ paneId, direction }) => ({ paneId, direction })), [{ paneId: seed.paneId, direction: "down" }]);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+test("an existing pair of stacked panes fills the top and bottom rows into quadrants", async (t) => {
+	const f = fixture(t);
+	f.panes.set("w1:bottom", "w1:t1");
+	f.client.paneLayout = async () => ({ tabId: "w1:t1", panes: ["w1:p1", "w1:bottom"].flatMap((paneId, row) => {
+		const split = f.splits.find((item) => item.paneId === paneId);
+		return [
+			{ paneId, x: 0, y: row * 50, width: split ? 50 : 100, height: 50 },
+			...(split ? [{ paneId: split.createdPaneId, x: 50, y: row * 50, width: 50, height: 50 }] : []),
+		];
+	}) });
+	for (let index = 0; index < 3; index++) await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.deepEqual(f.splits.map(({ paneId, direction }) => ({ paneId, direction })), [
+		{ paneId: "w1:p1", direction: "right" },
+		{ paneId: "w1:bottom", direction: "right" },
+	]);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+for (const axis of ["rows", "columns"]) {
+	test(`three existing ${axis} are preserved rather than adding a fourth strip`, async (t) => {
+		const f = fixture(t);
+		const paneIds = ["w1:p1", "w1:unrelated0", "w1:unrelated1"];
+		for (const paneId of paneIds.slice(1)) f.panes.set(paneId, "w1:t1");
+		f.client.paneLayout = async () => ({ tabId: "w1:t1", panes: paneIds.map((paneId, index) => ({ paneId, x: axis === "columns" ? index * 50 : 0, y: axis === "rows" ? index * 50 : 0, width: 50, height: 50 })) });
+		await f.runner.spawn(request({ tabId: "w1:t1" }));
+		assert.equal(f.splits.length, 0);
+		assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	});
+}
+
+test("live geometry overrides stale recorded columns to fill a manually changed layout", async (t) => {
+	const f = fixture(t);
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	const right = f.splits[0].createdPaneId;
+	f.client.paneLayout = async () => ({ tabId: "w1:t1", panes: [
+		{ paneId: "w1:p1", x: 0, y: 0, width: 100, height: 50 },
+		{ paneId: right, x: 0, y: 50, width: 100, height: 50 },
+	] });
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.splits.length, 2);
+	assert.deepEqual({ paneId: f.splits[1].paneId, direction: f.splits[1].direction }, { paneId: "w1:p1", direction: "right" });
+	assert.equal(f.events.filter((event) => event === "tab").length, 0);
+	// The old column history no longer describes this tab. A failed query must not revive it.
+	f.client.paneLayout = async () => { throw new Error("layout unavailable"); };
+	await f.runner.spawn(request({ tabId: "w1:t1" }));
+	assert.equal(f.splits.length, 2);
+	assert.equal(f.events.filter((event) => event === "tab").length, 1);
+});
+
+for (const mismatch of ["tab", "panes", "failed"] as const) {
+	test(`unknown caller geometry stays safe with a ${mismatch} layout response`, async (t) => {
+		const f = fixture(t);
+		f.panes.set("w1:unrelated", "w1:t1");
+		f.client.paneLayout = async () => {
+			if (mismatch === "failed") throw new Error("layout unavailable");
+			return { tabId: mismatch === "tab" ? "w1:other" : "w1:t1", panes: [
+				{ paneId: "w1:p1", x: 0, y: 0, width: 100, height: 100 },
+				{ paneId: mismatch === "panes" ? "w1:other" : "w1:unrelated", x: 100, y: 0, width: 100, height: 100 },
+			] };
+		};
+		await f.runner.spawn(request({ tabId: "w1:t1" }));
+		assert.equal(f.splits.length, 0);
+		assert.equal(f.events.filter((event) => event === "tab").length, 1);
+	});
+}
 
 test("concurrent caller-tab placement counts reservations not yet visible in Herdr", async (t) => {
 	const f = fixture(t, { listPanes: async () => [{ paneId: "w1:p1", tabId: "w1:t1" }] });

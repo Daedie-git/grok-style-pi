@@ -19,6 +19,11 @@ export interface HerdrMachine {
 	enabled: boolean;
 }
 
+export interface HerdrPaneLayout {
+	tabId: string;
+	panes: { paneId: string; x: number; y: number; width: number; height: number }[];
+}
+
 export interface HerdrClient {
 	split(options: { paneId: string; direction: "right" | "down"; cwd: string }): Promise<{ paneId: string }>;
 	startPi(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
@@ -31,6 +36,8 @@ export interface HerdrClient {
 	getAgent(name: string, signal?: AbortSignal): Promise<HerdrAgentRef | undefined>;
 	showLabel(paneId: string, label: string): Promise<void>;
 	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
+	/** Live geometry for every pane in the target pane's tab. */
+	paneLayout?(paneId: string, signal?: AbortSignal): Promise<HerdrPaneLayout>;
 	/** Every physical pane, including shells whose agent has exited. */
 	listPanes(options?: { workspaceId?: string; signal?: AbortSignal }): Promise<HerdrAgentRef[]>;
 	createTab(options: { cwd: string; label?: string; workspaceId?: string }): Promise<{ tabId: string; paneId: string; workspaceId?: string }>;
@@ -53,6 +60,36 @@ export function tabFromCreate(payload: unknown): { tabId: string; paneId: string
 		throw new Error("Herdr tab create did not return a tab and root pane");
 	}
 	return { tabId, paneId, ...(typeof workspaceId === "string" ? { workspaceId } : {}) };
+}
+
+export function paneLayoutFromPayload(payload: unknown): HerdrPaneLayout {
+	const result = object(object(payload)?.result) ?? object(payload);
+	const layout = object(result?.layout);
+	const tabId = layout?.tab_id;
+	if (typeof tabId !== "string" || !tabId.trim() || !Array.isArray(layout?.panes) || !layout.panes.length) {
+		throw new Error("Herdr pane layout did not return a tab and nonempty panes array");
+	}
+	const paneIds = new Set<string>();
+	const panes = layout.panes.map((item: unknown) => {
+		const pane = object(item);
+		const paneId = pane?.pane_id;
+		const rect = object(pane?.rect);
+		const x = rect?.x;
+		const y = rect?.y;
+		const width = rect?.width;
+		const height = rect?.height;
+		if (typeof paneId !== "string" || !paneId.trim()
+			|| typeof x !== "number" || !Number.isFinite(x)
+			|| typeof y !== "number" || !Number.isFinite(y)
+			|| typeof width !== "number" || !Number.isFinite(width) || width <= 0
+			|| typeof height !== "number" || !Number.isFinite(height) || height <= 0) {
+			throw new Error("Herdr pane layout returned an invalid pane id or rectangle");
+		}
+		if (paneIds.has(paneId)) throw new Error("Herdr pane layout returned duplicate pane ids");
+		paneIds.add(paneId);
+		return { paneId, x, y, width, height };
+	});
+	return { tabId, panes };
 }
 
 export function agentsFromList(payload: unknown): HerdrAgentRef[] {
@@ -186,6 +223,9 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 		},
 		async listAgents(signal) {
 			return agentsFromList(await routed(bin, ["agent", "list"], env, listTimeout, signal));
+		},
+		async paneLayout(paneId, signal) {
+			return paneLayoutFromPayload(await routed(bin, ["pane", "layout", "--pane", paneId], env, listTimeout, signal));
 		},
 		async listPanes(options = {}) {
 			const args = ["pane", "list"];

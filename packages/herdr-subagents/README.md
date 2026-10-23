@@ -42,7 +42,9 @@ Results include stable agent IDs and immutable run IDs. Tool output is limited t
 
 Children first fill the caller's tab up to four physical panes, including the parent. From a single-pane tab, the first three children share that tab; the fourth opens another tab. The first split is rightward, followed by downward splits in each column to form a balanced 2×2 layout. Later spawns fill available managed tabs in the same Herdr workspace before opening another.
 
-Occupancy includes unrelated panes and shells left behind by exited children. After a pane closes, the runner splits the shorter known column. For an unknown caller layout, it splits the caller's pane downward while respecting the cap. Other managed tabs containing an unknown pane or only one stacked column are not refilled. Unknown occupancy, or a caller without `HERDR_WORKSPACE_ID`, opens a new tab. Unrelated Herdr clients can still exceed the cap.
+Occupancy includes unrelated panes and shells left behind by exited children. The runner inspects live pane geometry, including existing panes it did not create, and completes two columns with downward splits or two rows with rightward splits into four quadrants. It fills the shorter column or row first, preferring left or top on ties. This also applies when refilling managed tabs. Recorded placement is used only for reservations not yet visible in Herdr or clients without geometry support; a failed geometry query opens a new tab rather than risking stale placement history.
+
+A layout already containing three straight rows or columns cannot become four quadrants through splitting alone. The runner preserves those terminals and opens a new grid tab instead of adding another strip; it never replaces a tab's layout, which would destroy its running terminals. Unknown layouts without usable placement history, unknown occupancy, or a caller without `HERDR_WORKSPACE_ID` also open a new tab. Unrelated Herdr clients can still exceed the cap.
 
 Sidebar names drop a leading `herdr-` and append the model and reasoning level, for example `review · gpt-6-astra-xhigh`.
 

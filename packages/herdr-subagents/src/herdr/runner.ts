@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
-import type { HerdrClient, HerdrAgentRef } from "./client.ts";
+import type { HerdrClient, HerdrAgentRef, HerdrPaneLayout } from "./client.ts";
 import { defaultThinking, parseAgentFile } from "./agent-file.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
@@ -85,6 +85,34 @@ function refill(live: { paneId?: string; column?: "left" | "right" }[]): Pick<Pl
 	}
 	const shorter = left.length <= right.length ? left : right;
 	return { paneId: shorter[0].paneId, direction: "down", column: shorter[0].column! };
+}
+
+/** Complete either two columns or two rows without adding a third strip. */
+function refillLayout(layout: HerdrPaneLayout): Pick<Placement, "paneId" | "direction" | "column"> | undefined {
+	const panes = layout.panes;
+	if (panes.length === 1) return { paneId: panes[0].paneId, direction: "right", column: "right" };
+	for (const axis of ["columns", "rows"] as const) {
+		const primary = axis === "columns" ? "x" : "y";
+		const extent = axis === "columns" ? "width" : "height";
+		const secondary = axis === "columns" ? "y" : "x";
+		const crossExtent = axis === "columns" ? "height" : "width";
+		const positions = [...new Set(panes.map((pane) => pane[primary]))].sort((a, b) => a - b);
+		if (positions.length !== 2) continue;
+		const groups = positions.map((position) => panes.filter((pane) => pane[primary] === position).sort((a, b) => a[secondary] - b[secondary]));
+		if (groups.some((group) => group.length > 2 || group.some((pane) => pane[extent] !== group[0][extent])
+			|| (group.length === 2 && group[0][secondary] + group[0][crossExtent] > group[1][secondary]))) continue;
+		const [first, second] = groups;
+		if (first[0][primary] + first[0][extent] > second[0][primary] || first[0][secondary] !== second[0][secondary]) continue;
+		if (first.at(-1)![secondary] + first.at(-1)![crossExtent] !== second.at(-1)![secondary] + second.at(-1)![crossExtent]) continue;
+		const index = first.length <= second.length ? 0 : 1;
+		if (groups[index].length >= 2) return undefined;
+		return {
+			paneId: groups[index][0].paneId,
+			direction: axis === "columns" ? "down" : "right",
+			column: axis === "columns" && index === 0 ? "left" : "right",
+		};
+	}
+	return undefined;
 }
 
 export type Presence = "alive" | "dead" | "unknown";
@@ -468,6 +496,18 @@ export class HerdrRunner {
 		finally { await this.store.releasePlacementLock(token); }
 	}
 
+	private async observedPlacement(tabId: string, physical: HerdrAgentRef[], live: LaunchRecord[], fallback: ReturnType<typeof refill>, signal: AbortSignal): Promise<ReturnType<typeof refill>> {
+		// A reservation not yet visible in Herdr must keep its recorded column until it appears.
+		if (!this.deps.client.paneLayout || !physical.length || !live.every((launch) => physical.some((pane) => pane.paneId === launch.paneId))) return fallback;
+		try {
+			const layout = await this.deps.client.paneLayout(physical[0].paneId!, signal);
+			check(signal);
+			const consistent = layout.tabId === tabId && layout.panes.length === physical.length
+				&& physical.every((pane) => layout.panes.some((item) => item.paneId === pane.paneId));
+			return consistent ? refillLayout(layout) : undefined;
+		} catch { check(signal); return undefined; }
+	}
+
 	private async choosePlacement(request: SpawnRequest, signal: AbortSignal): Promise<Placement> {
 		const fresh: Placement = { newTab: true, column: "left" };
 		// Without the caller's workspace, a managed tab could belong to another project.
@@ -497,12 +537,9 @@ export class HerdrRunner {
 			if (!unknown && !needsNewTab(live.length + untracked.length)) {
 				// A single untracked pane is the original root of this tab's grid.
 				const grid = [...live, ...untracked.map((pane) => ({ paneId: pane.paneId, column: "left" as const }))];
-				const target = untracked.length <= 1 ? refill(grid) : undefined;
-				// Existing unrelated panes still count toward the cap, even when their layout is unknown.
-				return { newTab: false, tabId: request.tabId, ...(target ?? {
-					paneId: request.paneId, direction: physical.length === 1 ? "right" : "down",
-					column: live.find((launch) => launch.paneId === request.paneId)?.column ?? "left",
-				}) };
+				const target = await this.observedPlacement(request.tabId, physical, live, untracked.length <= 1 ? refill(grid) : undefined, signal);
+				// Never guess a downward split: that repeatedly stacks panes in an unknown layout.
+				if (target) return { newTab: false, tabId: request.tabId, ...target };
 			}
 		}
 		// After the caller's tab fills, reuse grid tabs this fleet created in the same workspace.
@@ -522,10 +559,10 @@ export class HerdrRunner {
 				if (pending.paneId && pending.column && pending.stage !== "cleanup") live.push(pending);
 				else unknown = true;
 			}
-			// A pane this runner did not place, or no longer tracks, leaves the grid shape unknown.
-			const foreign = panes.some((item) => item.tabId === tabId && !live.some((launch) => launch.paneId === item.paneId));
-			if (unknown || foreign || !live.length || needsNewTab(live.length)) continue;
-			const target = refill(live);
+			const physical = panes.filter((item) => item.tabId === tabId);
+			const untracked = physical.filter((pane) => !live.some((launch) => launch.paneId === pane.paneId));
+			if (unknown || needsNewTab(live.length + untracked.length)) continue;
+			const target = await this.observedPlacement(tabId, physical, live, untracked.length ? undefined : refill(live), signal);
 			if (target) return { newTab: false, tabId, ...target };
 		}
 		return fresh;

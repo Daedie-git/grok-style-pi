@@ -49,6 +49,7 @@ Skills whose frontmatter sets `context: fork` run as their own agents. The model
 
 ## Behavior worth knowing
 
+- **Reasoning defaults.** General-purpose, explore and implementer roles default to `medium`; review, research and plan roles default to `high`. Explicit invocation or definition effort overrides these defaults, and `PI_SUBAGENT_EFFORT` overrides all three. Other roles inherit the parent's effort; forks always inherit it.
 - **Delegation policy.** The engine adds delegation guidance to the system prompt, and the list of available agent types is recorded in the session as `agent-listing` entries that show only what changed. Set `PI_SUBAGENT_AUTONOMY=explicit`, or use the Grok setting, if agents should launch only when you ask.
 - **Limits.**
   - At most 20 agents run at once (`PI_MAX_CONCURRENT_SUBAGENTS`), and agents nest at most 3 levels deep (`PI_MAX_SUBAGENT_SPAWN_DEPTH`). A launch over a limit is refused, not queued.

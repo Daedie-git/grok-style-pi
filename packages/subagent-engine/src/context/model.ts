@@ -101,7 +101,8 @@ export function resolveEffort(input: EffortInput): EffortResolution {
 
 export function roleDefaultEffort(agentType: string): string | undefined {
 	const words = agentType.toLowerCase().split(/[^a-z]+/);
-	if (words.some((word) => ["review", "reviewer", "reviewing"].includes(word))) return "high";
+	if (words.some((word) => ["review", "reviewer", "reviewing", "research", "researcher", "researching", "plan", "planner", "planning"].includes(word))) return "high";
+	if (words.some((word, index) => word === "general" && words[index + 1] === "purpose")) return "medium";
 	if (words.some((word) => ["explore", "explorer", "exploration", "exploring", "implement", "implementer", "implementation", "implementing"].includes(word))) return "medium";
 	return undefined;
 }

@@ -103,8 +103,18 @@ test("numeric, auto, unset and invalid efforts are ignored with a note and lower
 	assert.equal(resolveEffort({ env: { PI_SUBAGENT_EFFORT: " " }, invocation: " high ", isFork: false }).effort, "high");
 });
 
-test("role defaults match whole role words, review before explore and implement", () => {
-	for (const role of ["review", "reviewer", "reviewing", "CODE-REVIEWER", "implement-review"]) assert.equal(roleDefaultEffort(role), "high");
-	for (const role of ["explore", "explorer", "exploration", "exploring", "implement", "implementer", "implementation", "implementing", "plugin:EXPLORER"]) assert.equal(roleDefaultEffort(role), "medium");
-	for (const role of ["preview", "reviewable", "general-purpose", "explorers", ""]) assert.equal(roleDefaultEffort(role), undefined);
+test("role defaults match whole role words, high reasoning roles before medium roles", () => {
+	for (const role of ["review", "reviewer", "reviewing", "CODE-REVIEWER", "implement-review", "research", "researcher", "researching", "Plan", "planner", "planning", "general-purpose-research", "implement-plan"]) assert.equal(roleDefaultEffort(role), "high");
+	for (const role of ["general-purpose", "plugin:GENERAL-PURPOSE", "explore", "explorer", "exploration", "exploring", "implement", "implementer", "implementation", "implementing", "plugin:EXPLORER"]) assert.equal(roleDefaultEffort(role), "medium");
+	for (const role of ["preview", "reviewable", "general-purposeful", "researchable", "planet", "explorers", ""]) assert.equal(roleDefaultEffort(role), undefined);
+});
+
+test("role defaults override inherited high effort without overriding explicit settings", () => {
+	for (const role of ["general-purpose", "implementer", "review", "research", "Plan"]) {
+		const input = { roleDefault: roleDefaultEffort(role), parent: "high", env: {}, isFork: false };
+		assert.equal(resolveEffort(input).effort, ["general-purpose", "implementer"].includes(role) ? "medium" : "high");
+		assert.equal(resolveEffort({ ...input, definition: "low" }).effort, "low");
+		assert.equal(resolveEffort({ ...input, invocation: "max" }).effort, "max");
+		assert.equal(resolveEffort({ ...input, env: { PI_SUBAGENT_EFFORT: "xhigh" } }).effort, "xhigh");
+	}
 });

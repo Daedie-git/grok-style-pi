@@ -61,7 +61,7 @@ test("memory coexists with communication, refreshes its index, and uses the hook
 	await h.before({ systemPrompt: "base", systemPromptOptions: { sections } }, cwd);
 	assert.match(sections.communication, /Lead with the answer/);
 	assert.equal(sections.unrelated, "unchanged");
-	assert.ok(sections.grok_project_memory.includes(memory.directory));
+	assert.ok(sections.grok_project_memory.includes(JSON.stringify(memory.directory)));
 	assert.match(sections.grok_project_memory, /use real databases/);
 	assert.doesNotMatch(sections.grok_project_memory, /TOPIC_BODY_NOT_EAGERLY_LOADED/);
 	assert.deepEqual(h.registered, [...BUILTIN_TOOL_NAMES]);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
 	createAgentSession, createBashToolDefinition, createEditToolDefinition, createFindToolDefinition,
@@ -115,8 +115,8 @@ test("real offline Pi sessions recall only a fresh index, use ordinary file tool
 	const firstSystem = systemText(enabled.requests[0]);
 	assert.match(firstSystem, /Recall-index-fresh-v2/);
 	assert.doesNotMatch(firstSystem, /Recall-index-original-v1/);
-	assert.ok(firstSystem.includes(memory.directory));
-	assert.ok(firstSystem.includes(memory.indexPath));
+	assert.ok(firstSystem.includes(JSON.stringify(memory.directory)));
+	assert.ok(firstSystem.includes(JSON.stringify(memory.indexPath)));
 	assert.match(firstSystem, /Read only topic Markdown files relevant to the current request/);
 	assert.match(firstSystem, /Save information likely to remain useful/);
 	assert.match(firstSystem, /Do not store secrets/);
@@ -161,7 +161,7 @@ test("real offline Pi sessions recall only a fresh index, use ordinary file tool
 	await disabled.session.prompt("Answer briefly.");
 	assert.equal(disabled.requests.length, 1);
 	const disabledInput = JSON.stringify(disabled.requests[0]);
-	for (const forbidden of ["Recall-index", "Project memory is enabled", "fallible historical reference", "Save information likely", memory.directory, TOPIC_BODY, UPDATED_TOPIC_BODY.trim()]) {
+	for (const forbidden of ["Recall-index", "Project memory is enabled", "fallible historical reference", "Save information likely", basename(memory.directory), TOPIC_BODY, UPDATED_TOPIC_BODY.trim()]) {
 		assert.ok(!disabledInput.includes(forbidden), `disabled sessions must not auto-load memory content or policy: ${forbidden}`);
 	}
 	assert.deepEqual(toolNames(disabled.requests[0]), BUILTINS);

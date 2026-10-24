@@ -343,6 +343,79 @@ test('Windows atomic records retry transient sharing violations without exposing
   assert.equal(f.read('status.json').status, 'working');
 });
 
+test('Windows heartbeat survives exhausted status retries and recovers without changing agent state', async t => {
+  let tick;
+  t.mock.method(globalThis, 'setInterval', callback => {
+    tick = callback;
+    return { unref() {} };
+  });
+  const f = fixture(t), previous = f.read('status.json');
+  const notifications = [];
+  f.ctx.ui.notify = (...args) => notifications.push(args);
+  // Leave a stale but complete record: failed writes must not fake a healthy heartbeat.
+  previous.updated = Date.now() - 20000;
+  fs.writeFileSync(join(f.dir, 'status.json'), JSON.stringify(previous));
+  const rename = fs.renameSync;
+  let locked = true, denied = 0;
+  t.mock.method(fs, 'renameSync', (...args) => {
+    if (locked && args[1] === join(f.dir, 'status.json')) {
+      denied++;
+      throw Object.assign(Error('sharing violation'), { code: 'EPERM' });
+    }
+    return rename(...args);
+  });
+  assert.doesNotThrow(() => tick());
+  assert.doesNotThrow(() => tick());
+  assert.equal(denied, 52);
+  assert.deepEqual(f.read('status.json'), previous);
+  assert.equal(fs.readdirSync(f.dir).some(file => file.endsWith('.tmp')), false);
+  assert.equal(notifications.length, 1, 'persistent locks must not flood the pane');
+  assert.match(notifications[0][0], /EPERM|sharing violation/);
+  const stale = await f.run('status').done;
+  assert.equal(stale.code, 1);
+  assert.match(stale.stderr, /heartbeat is missing or stale/);
+  locked = false;
+  tick();
+  assert.equal(f.read('status.json').status, 'idle');
+  assert.ok(f.read('status.json').updated > previous.updated);
+  locked = true;
+  assert.doesNotThrow(() => tick());
+  assert.equal(notifications.length, 2, 'a new outage must be reported after recovery');
+});
+
+test('Windows status locks do not interrupt startup or agent and approval transitions', t => {
+  let tick;
+  t.mock.method(globalThis, 'setInterval', callback => {
+    tick = callback;
+    return { unref() {} };
+  });
+  const f = fixture(t, { start: false });
+  const rename = fs.renameSync;
+  let locked = true;
+  t.mock.method(fs, 'renameSync', (...args) => {
+    if (locked && args[1] === join(f.dir, 'status.json')) {
+      throw Object.assign(Error('sharing violation'), { code: 'EPERM' });
+    }
+    return rename(...args);
+  });
+  assert.doesNotThrow(() => f.emit('session_start'));
+  assert.doesNotThrow(() => f.emit('agent_start'));
+  assert.doesNotThrow(() => f.emit('ui_prompt_start'));
+  locked = false;
+  tick();
+  assert.equal(f.read('status.json').status, 'blocked');
+  locked = true;
+  assert.doesNotThrow(() => f.emit('agent_settled'));
+  locked = false;
+  tick();
+  assert.equal(f.read('status.json').status, 'idle');
+  locked = true;
+  assert.doesNotThrow(() => f.emit('agent_start'));
+  locked = false;
+  tick();
+  assert.equal(f.read('status.json').status, 'working');
+});
+
 function nativeLauncherFixture(t, { start = true } = {}) {
   const bash = 'C:/Program Files/Git/bin/bash.exe';
   if (!fs.existsSync(bash) || spawnSync(bash, ['-c', 'type -P jq >/dev/null && type -P flock >/dev/null']).status !== 0) {

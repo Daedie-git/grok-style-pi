@@ -29,11 +29,24 @@ const publish = (file, value) => {
 };
 
 export function installWindowsControl(pi, stateDir) {
-  let dir, owner, timer, ctx, status = 'idle';
+  let dir, owner, timer, ctx, status = 'idle', snapshotFailed = false;
   const pending = new Map();
   const owns = () => owner && read(join(dir, 'owner.json'))?.token === owner.token;
   const snapshot = () => {
-    if (owns()) publish(join(dir, 'status.json'), { ...owner, status, updated: Date.now() });
+    try {
+      if (!owns()) return;
+      publish(join(dir, 'status.json'), { ...owner, status, updated: Date.now() });
+      snapshotFailed = false;
+    } catch (error) {
+      // Heartbeat publication is best-effort, including from the poll error handler.
+      // Keep the last complete record (clients reject stale heartbeats) and retry next tick.
+      // Do not replace the actual agent/approval state with a publication error.
+      if (!snapshotFailed) {
+        snapshotFailed = true;
+        try { ctx.ui.notify(`Windows sidecar status publication failed; will retry: ${error}`, 'error'); }
+        catch { /* Reporting a heartbeat failure must not terminate the host either. */ }
+      }
+    }
   };
   const receipt = (id, value) => publish(join(dir, `${id}.ack`), { token: owner.token, ...value });
   const close = () => {
@@ -44,6 +57,7 @@ export function installWindowsControl(pi, stateDir) {
       fs.rmSync(join(dir, 'status.json'), { force: true });
     }
     owner = undefined;
+    snapshotFailed = false;
     pending.clear();
   };
   const poll = () => {

@@ -32,11 +32,31 @@ These schemas and the explicit-request policy apply to this package's standalone
 - `get_subagent_result` reads a captured run's status and result. `wait: true` waits until it finishes or blocks; optional `run_id` retrieves an earlier retained run.
 - `steer_subagent` sends a message to a running Pi child after its current tool execution.
 
-The tools retain their existing names and parameter schemas. Agent instructions require an explicit user request before spawning. Reuse the same agent for follow-up work: steer while running, or pass its ID as `Agent.resume` after completion. A resume creates a distinct run with its own result and completion notice. Reading an earlier run cannot suppress a later notice.
+The tools retain their existing names. Agent instructions require an explicit user request before spawning. Reuse the same agent for follow-up work: steer while running, or pass its ID as `Agent.resume` after completion. A resume creates a distinct run with its own result and completion notice. Reading an earlier run cannot suppress a later notice.
 
 A `.pi/agents/<subagent_type>.md` file, or the same file under Pi's user agent directory, supplies the child prompt and tool allow-list. A backend caller's `resolved` definition replaces that lookup; Claude Code drops grants it cannot enforce. Thinking defaults to `medium` for exploration and implementation roles, and `high` for review roles, based on words in `subagent_type` (for example, `Explore`, `implementer`, or `code-review`). Other types keep the runtime's default. An explicit `thinking` parameter takes precedence over agent-file `thinking`, which takes precedence over the role default. Model overrides remain supported. These defaults apply to both Pi and Claude Code; resumed agents retain their original settings. `isolated: true` restricts the child to built-in tools; agent-file `isolated: true` or `false` overrides the caller, and legacy `extensions: false` still enforces the restriction. This limits tool access, not extension loading or operating-system access. Disallowed tools are removed from the model's active declarations before each prompt and blocked on execution, including nested calls from other tools; allowed deferred tools are not automatically activated. `max_turns` bounds a Pi child's turns. Keep `inherit_context` false and provide context in the task prompt. Scheduling and worktree isolation are not offered. An agent file requesting `isolation: worktree` (or another non-`off` value) fails before opening a pane rather than running in the main checkout.
 
-Results include stable agent IDs and immutable run IDs. Tool output is limited to 2,000 lines or 50 KB; the full conversation remains in the pane. Blocked children return immediately and leave their panes open for you to answer. Finished panes also stay open. Cancelling a tool requests cancellation of its captured run and reports pending cancellation until the child acknowledges it.
+Results include stable agent IDs and immutable run IDs. Tool output is limited to 2,000 lines or 50 KB; the full conversation remains in the pane. Blocked children return immediately and leave their panes open for you to answer. Finished panes can close after the idle timeout without losing their conversation or result; see Pane lifecycle. Cancelling a tool requests cancellation of its captured run and reports pending cancellation until the child acknowledges it.
+
+## Pane lifecycle
+
+Finished agents remain readable and resumable even after their panes close. An intentionally closed finished pane is `parked`, not failed; results and `/activity` still treat its run as finished. Resume opens a new pane on the saved Pi or Claude conversation with the original directory, model, thinking and tool restrictions, falling back to the caller's placement if the historical workspace disappeared. A successful explicit resume makes the current caller the owner in the same transaction that accepts its follow-up run; a rejected caller cannot retarget another run's notice. Managed child ownership and completion destinations follow the parent's conversation when its pane changes. Unknown process identity, an existing process on the same session, or an unresolved earlier launch refuses resume; a cancelled Claude agent cannot resume. A pane that dies during a run still fails that run.
+
+Idle cleanup defaults to 900 seconds. Configure `idleCloseSeconds` in `~/.pi/agent/herdr-subagents.json` (or your `PI_CODING_AGENT_DIR`), alongside optional `machines` settings:
+
+```json
+{
+  "idleCloseSeconds": 900
+}
+```
+
+Use a nonnegative finite number of seconds; `0` disables idle cleanup. Run `/reload` after changes. New agents record the launching parent's timeout, including on saved machines; resumes retain it, and another runner cannot override it. Configuration changes affect new launches. Existing machine-only configuration remains valid.
+
+Idle cleanup requires a finished current run, an expired idle timeout, and matching live session identity. Acknowledged runs use the configured timeout; unacknowledged runs use four times that timeout (normally one hour), so an unreachable owner cannot retain finished panes forever. Results and pending notices remain durable after closure. Herdr must freshly report the agent idle/done and its pane unfocused immediately before closing; manual follow-ups still working remain open. Uncertain liveness, status, focus, session identity or saved-session loadability never authorizes cleanup.
+
+When a local owner's session demonstrably ends, eligible child panes close and running Pi children are cancelled, even if pinned, focused or idle cleanup is disabled. Parent moves resolve through Herdr's pane aliases; a parked parent conversation still owns its children. Remote owner termination cannot yet be verified and does not trigger cleanup. Active Claude children also stay open: cancelling them would violate cold-resume safety. Both cleanup paths require a valid saved conversation and an existing working directory; cancelled or otherwise non-resumable Claude conversations are excluded. Older records without the saved directory or session evidence are not automatically closed.
+
+In standalone or combined mode, set `Agent.keep: true` to pin a pane against idle cleanup, or put `keep: true` in the agent file's frontmatter. An explicit `keep: false` overrides the file default. Pinning persists across resumes; passing `keep` with standalone `resume` does not change it. In the combined integration, `keep` does not select a pane backend and has no effect on in-process agents.
 
 ## Pane placement
 
@@ -101,7 +121,15 @@ Both apply to every machine. The old `GROK_HERDR_REMOTE_PACKAGE` and `GROK_HERDR
 
 ## Coordination and upgrades
 
-The extraction preserves protocol versions, database formats, session entry names, Claude hook markers, and the state root: `$XDG_STATE_HOME/grok-style-pi/herdr-subagents`, defaulting to `~/.local/state/grok-style-pi/herdr-subagents`. The legacy directory name is intentional; existing agents and retained results remain usable. Grok also retains `src/herdr/claude-hook-entry.mjs` as a forwarding entry for hook commands saved in already-open Claude conversations. This packaging change does not require a database migration or deleting state. Keep the original Grok checkout in place while existing Claude panes still reference its hook entry.
+Pane lifecycle maintenance uses remote wire protocol 2; update the runner on both machines before remote launches. The coordination database remains protocol 2 and needs no migration. The extraction preserves database formats, session entry names, Claude hook markers, and the state root: `$XDG_STATE_HOME/grok-style-pi/herdr-subagents`, defaulting to `~/.local/state/grok-style-pi/herdr-subagents`. The legacy directory name is intentional; existing agents and retained results remain usable. Grok also retains `src/herdr/claude-hook-entry.mjs` as a forwarding entry for hook commands saved in already-open Claude conversations. This packaging change does not require a database migration or deleting state. Keep the original Grok checkout in place while existing Claude panes still reference its hook entry.
+
+Existing databases pause automatic pane lifecycle effects and cold resume during upgrades; old processes can keep executing commands and saving results. Warm resumes still work while the pane is live; a gone pane refuses resume with a `lifecycle-upgrade.mjs` diagnostic until activation. No quiet period or new-worker heartbeat proves that an old idle worker exited. After **every** old parent, child and remote stdio worker sharing that database has exited or reloaded, run this on each machine (optionally add `--root PATH`):
+
+```bash
+node /path/to/herdr-subagents/src/herdr/lifecycle-upgrade.mjs --confirm-old-workers-stopped
+```
+
+Use `--status` instead to inspect the gate without writes. Do not confirm while any old worker remains or restart an old installation afterward: activation is an explicit drain attestation, not automatic detection. Fresh all-new databases start enabled; observed legacy SQL writes pause them again. Updating files alone never re-enables a quarantined database.
 
 `control.sqlite` stores agents, immutable runs, commands, launches, and notification receipts. `placement.sqlite` provides a separate cross-process write lock; process death releases it without timestamp-based takeover. SQLite and lock contention run in a `jiti`-loaded worker, including npm installations. Experimental SQLite and Undici startup notices are suppressed only in that worker. Other diagnostics and host warnings remain visible. Database errors include `[herdr-db]`, operation, SQLite codes, Node version, process ID, and worker thread ID, but not task contents. No coordinator daemon is required.
 

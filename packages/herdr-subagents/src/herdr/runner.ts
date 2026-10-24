@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
-import type { HerdrClient, HerdrAgentRef, HerdrPaneLayout } from "./client.ts";
+import { paneCreationRejected, type HerdrClient, type HerdrAgentRef, type HerdrPaneLayout } from "./client.ts";
 import { defaultThinking, parseAgentFile } from "./agent-file.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
@@ -27,6 +27,7 @@ export interface SpawnRequest {
 	runInBackground: boolean;
 	resume?: string;
 	isolated?: boolean;
+	keep?: boolean;
 	/** Parent decision; remote projects still resolve their own trust when the parent is trusted. */
 	projectTrusted?: boolean;
 	inheritContext?: boolean;
@@ -42,6 +43,9 @@ export interface SpawnRequest {
 	agentDir?: string;
 }
 
+/** Placement and ownership of the invocation, not the saved child's execution directory. */
+export type ResumeCaller = Pick<SpawnRequest, "paneId" | "tabId" | "workspaceId" | "sessionFile">;
+
 export interface RunnerDeps {
 	client: HerdrClient;
 	root: string;
@@ -54,6 +58,8 @@ export interface RunnerDeps {
 	runner?: HerdrRunner;
 	/** Saved Herdr machine whose panes and store this runner uses. Omitted for the local server. */
 	machine?: string;
+	/** Finished unfocused panes expire at 1x after acknowledgement, otherwise 4x; zero disables both. */
+	idleCloseSeconds?: number;
 }
 
 export interface ToolText {
@@ -133,6 +139,11 @@ function sameSession(reported: string, record: Pick<AgentRecord, "sessionFile" |
 	return file(reported) === file(record.sessionFile) || (!!record.sessionId && reported.includes(record.sessionId));
 }
 
+/** Native shells have no agent session; missing or malformed occupant evidence is not a proven shell. */
+function uncertainSession(pane: HerdrAgentRef): boolean {
+	return !pane.paneId || ((!pane.session || !pane.session.trim()) && pane.plainShell !== true);
+}
+
 /** Remote agent IDs carry their machine so later tool calls route back to it. Agent names never contain `@`. */
 export function qualifiedAgentId(id: string, machine?: string): string {
 	return machine ? `${id}@${machine}` : id;
@@ -164,6 +175,8 @@ export function herdrAgentName(preferred: string | undefined, fallback: string):
 export class HerdrRunner {
 	readonly store: HerdrStore;
 	readonly machine?: string;
+	/** Stable local identity used by remote stores to scope caller-session notice routes. */
+	readonly machineId = MACHINE;
 	/** The machine part lets a runner on another machine sharing this store tell that it cannot probe the PID. */
 	readonly owner = `${process.pid}:${randomUUID()}:${MACHINE}`;
 	private stopping = new AbortController();
@@ -186,18 +199,51 @@ export class HerdrRunner {
 		return this.track(this.launch(request, this.signal(signal)));
 	}
 
-	resume(agentId: string, prompt: string, signal?: AbortSignal, notify = true): Promise<RunRef> {
+	resume(agentId: string, prompt: string, signal?: AbortSignal, notify = true, caller?: ResumeCaller): Promise<RunRef> {
 		return this.track((async () => {
 			const combined = this.signal(signal);
 			check(combined);
 			await this.store.assertProtocolReady();
 			check(combined);
-			const record = await this.resolve(agentId);
-			check(combined);
-			const previous = record.currentRunId;
-			await this.locate(record, combined);
-			check(combined);
-			const ref = await this.store.beginRun(record.id, previous, prompt, notify, this.now());
+			const ref = await this.withPlacement(async () => {
+				let record = await this.resolve(agentId);
+				check(combined);
+				if (record.paneClose) {
+					await this.recoverPaneClose(record, undefined, combined);
+					record = await this.resolve(agentId);
+					check(combined);
+					if (record.paneClose) {
+						if (!(await this.store.lifecycleAllowed())) throw new Error(`Agent ${record.id} has a pending pane close while lifecycle is quarantined. After old workers drain, use lifecycle-upgrade.mjs before resuming.`);
+						throw new Error(`Agent ${record.id} has a pending pane close whose outcome Herdr cannot confirm. The pane will not be reopened without proof of its session's departure.`);
+					}
+				}
+				const parent = caller ? await this.managedCaller(caller) : undefined;
+				if (parent?.id === record.id) throw new Error("An agent cannot adopt its own conversation.");
+				const previous = record.currentRunId;
+				const value = await this.read({ agentId: record.id, runId: previous });
+				if (!isTerminal(value.phase)) throw new Error(`Agent ${record.id} is still running. Use steer_subagent or get_subagent_result.`);
+				if (record.runtime === "claude-code" && (record.nonResumable || value.phase === "stopped" || value.cancelRequested)) throw new Error(`Claude Code agent ${record.id} is no longer running: its cancelled conversation cannot resume.`);
+				// An unpublished cold launch still owns its pane. Recovery must never kill a newly accepted run.
+				if ((await this.store.launches()).some((launch) => launch.agentId === record.id && !["published", "closed"].includes(launch.stage))) {
+					throw new Error(`Cannot resume ${record.id}: an earlier pane launch is unresolved. Inspect Herdr before retrying.`);
+				}
+				const named = await this.deps.client.getAgent(record.herdrName, combined);
+				const presence = agentPresence(record, named);
+				if (presence === "unknown") await this.locate(record, combined);
+				if (presence === "dead") {
+					await this.assertColdResumeAllowed(record.id);
+					await this.assertDeparted(record, combined);
+					await this.coldResume(record, combined, caller);
+				}
+				check(combined);
+				const ownership = caller ? {
+					parentPaneId: caller.paneId, parentSessionFile: caller.sessionFile, parentAgentId: parent?.id,
+					parentTabId: caller.tabId, parentWorkspaceId: caller.workspaceId, parentMachine: this.machine ? MACHINE : undefined,
+				} : undefined;
+				// Adoption and the previous-run CAS must commit together, including against legacy callers.
+				return this.store.beginRun(record.id, previous, prompt, notify, this.now(), ownership);
+			}, combined);
+			const record = await this.resolve(ref.agentId);
 			try {
 				if (combined.aborted) await this.cancel(ref);
 				else if (record.runtime === "claude-code") await this.serviceClaude(record.id, combined);
@@ -248,17 +294,23 @@ export class HerdrRunner {
 			if (!(await this.store.claimMaintenance(token, this.now()))) return;
 			try {
 				const runs = await this.store.activeRuns();
-				const agents = runs.length ? await this.deps.client.listAgents(this.stopping.signal) : [];
+				const candidates = await this.store.lifecycleCandidates();
+				const agents = runs.length || candidates.length ? await this.deps.client.listAgents(this.stopping.signal) : [];
 				check(this.stopping.signal);
 				if (agents.some((agent) => !agent.paneId)) throw new Error("Herdr returned an incomplete agent listing");
 				const named = new Map(agents.flatMap((agent) => agent.name ? [[agent.name, agent] as const] : []));
 				const unnamedPanes = new Set(agents.filter((agent) => !agent.name).map((agent) => agent.paneId));
 				const observations = runs.flatMap(({ agent, run }) => {
-					const presence = agentPresence(agent, named.get(agent.herdrName));
+					// A durable close intent owns settlement, including when closePane killed its caller.
+					if (agent.paneClose) return [];
+					// A live conversation can move and be renamed without losing its run or binding.
+					const presence = agents.some((item) => item.session !== undefined && sameSession(item.session, agent))
+						? "alive" : agentPresence(agent, named.get(agent.herdrName));
 					// An older/incomplete listing at the right pane is unknown, not proof of death.
 					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) return [];
 					return [{ ref: { agentId: run.agentId, runId: run.runId }, alive: presence === "alive" }];
 				});
+				if (candidates.length) await this.reap(token);
 				await this.store.finishMaintenance(token, observations, this.now());
 				for (const { agent } of runs) if (agent.runtime === "claude-code") await this.serviceClaude(agent.id, this.stopping.signal);
 				if (await this.store.tryPlacementLock(token)) {
@@ -300,8 +352,11 @@ export class HerdrRunner {
 		const value = await this.read(ref);
 		if (isTerminal(value.phase) || !value.deadline) return;
 		const record = await this.resolve(ref.agentId);
+		if (record.paneClose) return;
 		// Unknown liveness is not proof of pane death. The CLI adapter throws for transport errors.
-		if (agentPresence(record, await this.deps.client.getAgent(record.herdrName)) === "dead") await this.store.recordPaneClosed(ref, this.now());
+		const namedPresence = agentPresence(record, await this.deps.client.getAgent(record.herdrName));
+		const sessionAlive = namedPresence === "dead" && (await this.deps.client.listAgents()).some((item) => item.paneId && item.session !== undefined && sameSession(item.session, record));
+		if (namedPresence === "dead" && !sessionAlive) await this.store.recordPaneClosed(ref, this.now());
 		else await this.store.expireUnacceptedRun(ref, this.now());
 	}
 
@@ -338,7 +393,7 @@ export class HerdrRunner {
 		if (!request.paneId) throw new Error("Not inside a Herdr pane, so no subagent pane can be opened.");
 		await this.store.assertProtocolReady();
 		check(signal);
-		const parent = request.sessionFile ? await this.store.agentForSession(request.paneId, request.sessionFile) : undefined;
+		const parent = await this.managedCaller(request);
 		check(signal);
 		const depth = (parent?.depth ?? 0) + 1;
 		if (depth > HERDR_MAX_DEPTH) throw new Error(`Subagent depth ${depth} exceeds the Herdr limit of ${HERDR_MAX_DEPTH}.`);
@@ -372,7 +427,12 @@ export class HerdrRunner {
 				allowedTools: tools,
 				projectTrusted: request.projectTrusted === false ? false : this.machine ? undefined : request.projectTrusted,
 				maxTurns, model: request.model ?? definition?.model,
-				thinking, parentPaneId: request.paneId,
+				thinking, parentPaneId: request.paneId, parentAgentId: parent?.id,
+				cwd: request.cwd, parentSessionFile: request.sessionFile,
+				parentTabId: request.tabId, parentWorkspaceId: request.workspaceId,
+				parentMachine: this.machine ? MACHINE : undefined,
+				idleCloseSeconds: this.deps.idleCloseSeconds ?? 900,
+				keep: request.keep ?? definition?.keep,
 				createdAt: new Date(this.now()).toISOString(),
 			};
 			// The store creates the file on its own machine. A failed reservation leaves only an unused empty session.
@@ -425,12 +485,264 @@ export class HerdrRunner {
 			return ref;
 		} catch (error) {
 			if (published) { await this.cancel(ref); throw error; }
+			if (!paneId && paneCreationRejected(error)) creationIssued = false;
 			// Closing a pane changes the grid, so it must not interleave with another placement.
 			const failure = paneId
 				? await this.withPlacement(() => this.cleanup(ref!, paneId, message(error), signal.aborted, creationIssued), new AbortController().signal)
 				: await this.cleanup(ref, paneId, message(error), signal.aborted, creationIssued);
 			throw new Error(failure);
 		}
+	}
+
+	/** Placement lock covers the terminal-run CAS, pane effects, and publication of the follow-up run. */
+	private async coldResume(record: AgentRecord, signal: AbortSignal, caller?: ResumeCaller): Promise<void> {
+		await this.assertColdResumeAllowed(record.id);
+		if (!(await this.store.coldResumeReady(record.id))) throw new Error(`Agent ${record.id} is no longer running and cannot resume cold: its saved session or working directory is unavailable, or this conversation was stopped.`);
+		if (record.runtime === "claude-code" && !this.deps.client.startClaude) throw new Error("The Herdr client does not support Claude Code launches.");
+		const previous = { agentId: record.id, runId: record.currentRunId };
+		await this.recoverLaunches();
+		const launches = await this.store.launches();
+		let launch = launches.find((item) => item.agentId === record.id && item.stage !== "closed")
+			?? launches.find((item) => item.agentId === record.id);
+		if (!launch || !["published", "closed"].includes(launch.stage)) throw new Error(`Cannot reopen ${record.id}: an earlier pane launch is unresolved. Inspect Herdr before retrying.`);
+		const request: SpawnRequest = {
+			prompt: "", description: record.description, subagentType: record.type, runInBackground: true,
+			cwd: record.cwd!, paneId: caller?.paneId ?? record.parentPaneId ?? "", tabId: caller ? caller.tabId : record.parentTabId,
+			workspaceId: caller ? caller.workspaceId : record.parentWorkspaceId,
+		};
+		let herdrName = record.herdrName;
+		for (let attempt = 0; await this.deps.client.isAlive(herdrName); attempt++) {
+			check(signal);
+			if (attempt >= 100) throw new Error(`Could not reserve a Herdr name to reopen ${record.id}`);
+			const suffix = `-r${attempt + 1}`;
+			herdrName = `${record.id.slice(0, 31 - suffix.length)}${suffix}`;
+		}
+		const target = await this.choosePlacement(request, signal);
+		check(signal);
+		let paneId: string | undefined;
+		let rebound = false;
+		let creationIssued = false;
+		let startupIssued = false;
+		try {
+			// The original launch retains this fleet's grid history across all of its runs.
+			if (launch) {
+				await this.store.recordLaunch(launch, launch.owner, "creating", {
+					paneId: undefined, tabId: target.tabId, direction: target.direction, column: target.column, workspaceId: request.workspaceId,
+				}, this.now());
+				// Transfer the now-unpublished launch before issuing any external effect, so this attempt is recoverable.
+				if (!(await this.store.claimLaunchRecovery(launch, launch.owner, this.owner, this.now()))) throw new Error("Cold resume launch ownership changed");
+				launch = { ...launch, owner: this.owner };
+			}
+			await this.assertColdResumeAllowed(record.id);
+			creationIssued = true;
+			const created = target.newTab
+				? await this.deps.client.createTab({ cwd: request.cwd, label: record.description, workspaceId: request.workspaceId })
+				: await this.deps.client.split({ paneId: target.paneId!, direction: target.direction!, cwd: request.cwd });
+			paneId = created.paneId;
+			check(signal);
+			await this.store.rebindPane(record.id, record.currentRunId, paneId, herdrName);
+			rebound = true;
+			if (launch) await this.store.recordLaunch(launch, launch.owner, "pane-created", {
+				paneId, tabId: (created as { tabId?: string }).tabId ?? target.tabId,
+				workspaceId: request.workspaceId ?? (created as { workspaceId?: string }).workspaceId,
+			}, this.now());
+			check(signal);
+			if (record.runtime === "claude-code") {
+				await this.store.attach(paneId, record.sessionFile, record.sessionId!);
+				const args = claudeArgs(record, record.sessionId!, this.deps.root);
+				args[0] = "--resume";
+				startupIssued = true;
+				await this.deps.client.startClaude!({ name: herdrName, paneId, args }, signal);
+			} else {
+				startupIssued = true;
+				await this.deps.client.startPi({ name: herdrName, paneId, args: piArgs(record, record.sessionFile) }, signal);
+			}
+			check(signal);
+			if (launch) await this.store.recordLaunch(launch, launch.owner, "published", {}, this.now());
+			await this.deps.client.showLabel(paneId, paneLabel(record.id, record.model, record.thinking)).catch(() => undefined);
+		} catch (error) {
+			if (paneId) {
+				// A live cold-start process may accept legacy work after any run-ID check. Only a proven empty
+				// shell is safe to close once startup was issued; a lost response is not a failed launch.
+				let cleanupUnsafe: string | undefined;
+				if (startupIssued) {
+					let shell: HerdrAgentRef | undefined;
+					try { shell = await this.deps.client.getPane?.(paneId); } catch {}
+					if (shell?.paneId !== paneId || shell.plainShell !== true || shell.session !== undefined) cleanupUnsafe = "startup may still host the saved session";
+				}
+				const current = await this.resolve(record.id);
+				const currentRun = await this.read({ agentId: current.id, runId: current.currentRunId });
+				if (current.currentRunId !== previous.runId || !isTerminal(currentRun.phase) || current.paneClose
+					|| (rebound && (current.paneId !== paneId || current.herdrName !== herdrName))) cleanupUnsafe = "execution ownership changed";
+				if (cleanupUnsafe) {
+					const failure = `${message(error)}. Cold resume cleanup withheld for pane ${paneId}: ${cleanupUnsafe}. The unresolved launch reservation is retained.`;
+					if (launch) await this.store.recordLaunch(launch, launch.owner, "ambiguous", { paneId, error: failure }, this.now());
+					throw new Error(failure);
+				}
+				// This pane is still owned by this attempt, not inferred from a stale agent name.
+				try { await this.deps.client.closePane(paneId); }
+				catch (closeError) { throw new Error(`${message(error)}. Cold resume cleanup failed for pane ${paneId}: ${message(closeError)}`); }
+				if (rebound) await this.store.parkAgent(previous, paneId, this.now());
+				if (launch) await this.store.recordLaunch(launch, launch.owner, "closed", {}, this.now());
+			} else if (launch) await this.store.recordLaunch(launch, launch.owner, creationIssued && !paneCreationRejected(error) ? "ambiguous" : "closed", { error: message(error) }, this.now());
+			throw error;
+		}
+	}
+
+	private async assertColdResumeAllowed(agentId: string): Promise<void> {
+		if (!(await this.store.lifecycleAllowed())) throw new Error(`Cannot cold-resume ${agentId} while lifecycle upgrades are quarantined. Drain old workers and use lifecycle-upgrade.mjs to confirm the upgrade before retrying. Warm resume remains available.`);
+	}
+
+	/** External closes stay inside both the placement lock and the maintenance lease. */
+	private async reap(token: string): Promise<void> {
+		await this.withPlacement(async () => {
+			if (!(await this.store.lifecycleAllowed())) return;
+			if (!(await this.store.maintenanceValid(token, this.now()))) return;
+			const panes = await this.deps.client.listPanes({ signal: this.stopping.signal });
+			if (panes.some((pane) => !pane.paneId)) throw new Error("Herdr returned an incomplete pane listing");
+			const records = await this.store.listAgents();
+			for (const { agent, run, acknowledged } of await this.store.lifecycleCandidates()) {
+				check(this.stopping.signal);
+				if (agent.paneClose && !(await this.recoverPaneClose(agent, token))) continue;
+				const idleSeconds = agent.idleCloseSeconds ?? this.deps.idleCloseSeconds ?? 900;
+				if (agent.paneState === "parked" || !agent.cwd) continue;
+				const ownerGone = await this.ownerDeparted(agent, records, this.stopping.signal);
+				// Closing active Claude is cancellation, which permanently destroys resumability. Preserve it.
+				if (ownerGone && agent.runtime === "claude-code" && !isTerminal(run.phase)) continue;
+				if (!ownerGone && !isTerminal(run.phase)) continue;
+				const named = await this.deps.client.getAgent(agent.herdrName, this.stopping.signal);
+				// An explicit matching session is required for destructive effects; same-pane inference is insufficient.
+				if (!named?.paneId || named.session === undefined || agentPresence(agent, named) !== "alive") continue;
+				const pane = panes.find((item) => item.paneId === named.paneId);
+				if (!pane) continue;
+				if (pane.focused === true || ["working", "blocked"].includes(named.status ?? "")) {
+					await this.store.notePaneActivity({ agentId: agent.id, runId: run.runId }, this.now());
+					if (!ownerGone) continue;
+				}
+				const idleMs = idleSeconds * 1000 * (acknowledged ? 1 : 4);
+				if (!ownerGone && (agent.keep || idleSeconds <= 0 || pane.focused !== false || !["idle", "done"].includes(named.status ?? "")
+					|| this.now() - Math.max(run.updatedAt, agent.lastActivityAt ?? 0) < idleMs)) continue;
+				const current = await this.resolve(agent.id);
+				if (current.currentRunId !== run.runId || current.paneState === "parked") continue;
+				const ref = { agentId: agent.id, runId: run.runId };
+				if (!ownerGone && !isTerminal((await this.read(ref)).phase)) continue;
+				if (!(await this.store.maintenanceValid(token, this.now()))) return;
+				if (!(await this.store.preparePaneClose(ref, agent.paneId, ownerGone, this.now()))) continue;
+				try {
+					if (ownerGone && !(await this.ownerDeparted(agent, records, this.stopping.signal))) {
+						if (!(await this.store.lifecycleAllowed())) return;
+						await this.store.abortPaneClose(ref, agent.paneId);
+						continue;
+					}
+					// Readiness may read large transcripts. Refresh physical evidence after it, not before it.
+					const live = await this.deps.client.getAgent(agent.herdrName, this.stopping.signal);
+					const freshPanes = await this.deps.client.listPanes({ signal: this.stopping.signal });
+					const fresh = freshPanes.find((item) => item.paneId === live?.paneId);
+					const ownerSession = agent.parentSessionFile;
+					// This is newer than ownerDeparted's inventory: never ignore a returned or uncertain owner here.
+					const ownerMayBePresent = ownerGone && (!ownerSession || freshPanes.some((item) => uncertainSession(item)
+						|| (item.session !== undefined && sameSession(item.session, { sessionFile: ownerSession }))));
+					if (ownerMayBePresent || !live?.paneId || live.paneId !== named.paneId || live.session === undefined || agentPresence(agent, live) !== "alive"
+						|| !fresh || fresh.session === undefined || !sameSession(fresh.session, agent)
+						|| (!ownerGone && (fresh.focused !== false || !["idle", "done"].includes(live.status ?? "") || !["idle", "done"].includes(fresh.status ?? "")))) {
+						if (!(await this.store.lifecycleAllowed())) return;
+						await this.store.abortPaneClose(ref, agent.paneId);
+						if (!ownerGone) await this.store.notePaneActivity(ref, this.now());
+						continue;
+					}
+					if (!(await this.store.maintenanceValid(token, this.now()))) {
+						if (!(await this.store.lifecycleAllowed())) return;
+						await this.store.abortPaneClose(ref, agent.paneId);
+						return;
+					}
+					// A newly quarantined database retains its durable intent for explicit upgrade recovery.
+					if (!(await this.store.lifecycleAllowed())) return;
+					await this.deps.client.closePane(live.paneId);
+					// Closing this runner's own pane may kill it here. The intent survives in the store.
+					check(this.stopping.signal);
+					if (ownerGone) await this.store.closeOwnedAgent(ref, agent.paneId, this.now());
+					else await this.store.parkAgent(ref, agent.paneId, this.now());
+				} catch (error) {
+					// A failed reply is not proof of failed closure. Roll back only after positive live-session evidence.
+					if (!this.stopping.signal.aborted) await this.recoverPaneClose(await this.resolve(agent.id), token);
+					throw error;
+				}
+			}
+		}, this.stopping.signal);
+	}
+
+	private async managedCaller(caller: ResumeCaller): Promise<AgentRecord | undefined> {
+		if (!caller.sessionFile || this.machine) return undefined;
+		return await this.store.agentForSession(caller.paneId, caller.sessionFile)
+			?? (await this.store.listAgents()).find((record) => sameSession(caller.sessionFile!, record));
+	}
+
+	/** Managed conversations own children independently of their current pane address. */
+	private async ownerDeparted(agent: AgentRecord, records: AgentRecord[], signal: AbortSignal): Promise<boolean> {
+		if (this.machine || agent.parentMachine || agent.parentPaneId?.includes("/") || !agent.parentSessionFile) return false;
+		const saved = records.find((record) => agent.parentAgentId ? record.id === agent.parentAgentId : record.sessionFile === agent.parentSessionFile);
+		const managed = saved ? await this.resolve(saved.id) : undefined;
+		if (managed?.paneState === "parked" || managed?.paneClose) return false;
+		if (managed) {
+			const named = await this.deps.client.getAgent(managed.herdrName, signal);
+			if (agentPresence(managed, named) !== "dead") return false;
+		}
+		const paneId = managed?.paneId ?? agent.parentPaneId;
+		if (!paneId || !this.deps.client.getPane) return false;
+		const parentSession = { sessionFile: agent.parentSessionFile };
+		const parent = await this.deps.client.getPane(paneId, signal);
+		if (parent && (uncertainSession(parent) || (parent.session !== undefined && sameSession(parent.session, parentSession)))) return false;
+		// Losing the old alias or replacing its occupant does not prove the conversation departed.
+		const panes = await this.deps.client.listPanes({ signal });
+		const agents = await this.deps.client.listAgents(signal);
+		check(signal);
+		if ([...panes, ...agents].some((item) => uncertainSession(item)
+			|| (item.session !== undefined && sameSession(item.session, parentSession)))) return false;
+		// An absent alias that still appears in the inventory is inconsistent, not proof of departure.
+		return parent !== undefined || !panes.some((pane) => pane.paneId === paneId);
+	}
+
+	/** A lost/reused name alone never authorizes a second process on the saved conversation. */
+	private async assertDeparted(record: AgentRecord, signal: AbortSignal): Promise<void> {
+		if (!this.deps.client.getPane) throw new Error(`Agent ${record.id} is no longer running under its saved Herdr name; cannot reopen because Herdr cannot verify the original pane's departure.`);
+		if (await this.sessionPresence(record, signal) !== "dead") {
+			throw new Error(`Cannot reopen ${record.id}: the original session may still be live; Herdr's session inventory does not prove departure.`);
+		}
+	}
+
+	/** Shared departure evidence for reopening and settlement: a lost name or alias is never enough. */
+	private async sessionPresence(record: AgentRecord, signal: AbortSignal): Promise<Presence> {
+		if (!this.deps.client.getPane) return "unknown";
+		const pane = await this.deps.client.getPane(record.paneId, signal);
+		const agents = await this.deps.client.listAgents(signal);
+		const panes = await this.deps.client.listPanes({ signal });
+		check(signal);
+		const inventory = [...(pane ? [pane] : []), ...agents, ...panes];
+		if (inventory.some((item) => item.paneId && item.session !== undefined && sameSession(item.session, record))) return "alive";
+		return inventory.some(uncertainSession) ? "unknown" : "dead";
+	}
+
+	/** Returns true only when an interrupted close was rolled back with positive live-session evidence. */
+	private async recoverPaneClose(agent: AgentRecord, token?: string, signal = this.stopping.signal): Promise<boolean> {
+		const intent = agent.paneClose;
+		if (!intent) return true;
+		if (!(await this.store.lifecycleAllowed())) return false;
+		if (intent.runId !== agent.currentRunId) return false;
+		const named = await this.deps.client.getAgent(agent.herdrName, signal);
+		check(signal);
+		const namedLive = named?.paneId && named.session !== undefined && agentPresence(agent, named) === "alive";
+		const presence = namedLive ? "alive" : await this.sessionPresence(agent, signal);
+		if (presence === "unknown") return false;
+		if (token && !(await this.store.maintenanceValid(token, this.now()))) return false;
+		if (!(await this.store.lifecycleAllowed())) return false;
+		const ref = { agentId: agent.id, runId: intent.runId };
+		if (presence === "alive") {
+			await this.store.abortPaneClose(ref, intent.paneId);
+			return true;
+		}
+		if (intent.ownerGone) await this.store.closeOwnedAgent(ref, intent.paneId, this.now());
+		else await this.store.parkAgent(ref, intent.paneId, this.now());
+		return false;
 	}
 
 	/** Claims each prompt durably before terminal submission; an uncertain dispatch is never replayed. */
@@ -569,10 +881,12 @@ export class HerdrRunner {
 	}
 
 	private async recoverLaunches(): Promise<void> {
+		if (!(await this.store.lifecycleAllowed())) return;
 		for (const pending of await this.store.recoverableLaunches()) {
 			if (pending.owner === this.owner || pending.stage === "published" || pending.stage === "closed" || pending.stage === "ambiguous") continue;
 			if (ownerAlive(pending.owner) && !(await this.store.ownerRetired(pending.owner))) continue;
 			if (!(await this.store.claimLaunchRecovery(pending, pending.owner, this.owner, this.now()))) continue;
+			if (!(await this.store.lifecycleAllowed())) return;
 			await this.cleanup(pending, pending.paneId, "Launch interrupted before task publication", false);
 		}
 	}
@@ -626,7 +940,7 @@ function ownerAlive(owner: string): boolean {
 export async function spawnHerdrAgent(request: SpawnRequest, deps: RunnerDeps): Promise<ToolText> {
 	return usingRunner(deps, async (runner) => {
 		const ref = request.resume
-			? await runner.resume(request.resume, request.prompt, deps.signal, request.runInBackground)
+			? await runner.resume(request.resume, request.prompt, deps.signal, request.runInBackground, request)
 			: await runner.spawn(request, deps.signal);
 		const record = await runner.resolve(ref.agentId);
 		let snapshot = await runner.read(ref);

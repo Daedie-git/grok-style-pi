@@ -44,6 +44,8 @@ export interface AgentDefinition {
 	skills: string[];
 	maxTurns?: number;
 	background?: boolean;
+	/** Default idle-cleanup exemption for Herdr panes; ignored in-process. */
+	keep?: boolean;
 	isolation?: "worktree";
 	memory?: MemoryScope;
 	hooks?: HookConfig;

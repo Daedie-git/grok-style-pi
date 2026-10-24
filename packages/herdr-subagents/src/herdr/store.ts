@@ -26,14 +26,33 @@ export interface HerdrTask {
 	model?: string;
 	thinking?: string;
 	parentPaneId?: string;
+	/** Stable local managed ownership; pane IDs are only the current delivery address. */
+	parentAgentId?: string;
+	parentSessionFile?: string;
+	parentTabId?: string;
+	parentWorkspaceId?: string;
+	/** Set when the owning parent lives on another machine, regardless of which runner observes this record. */
+	parentMachine?: string;
+	/** The owner's idle policy, retained across target-host maintenance and cold resumes. */
+	idleCloseSeconds?: number;
+	cwd?: string;
+	keep?: boolean;
 	createdAt: string;
 }
+
+export type AgentOwnership = Pick<HerdrTask, "parentPaneId" | "parentSessionFile" | "parentTabId" | "parentWorkspaceId" | "parentMachine" | "parentAgentId">;
 
 export interface AgentRecord extends HerdrTask {
 	currentRunId: string;
 	/** A pane alone is not an execution identity. Only this session may attach. */
 	sessionFile: string;
 	sessionId?: string;
+	claudeTranscript?: string;
+	paneState?: "parked";
+	/** Durable intent survives a runner closing its own pane before it can settle the run. */
+	paneClose?: { runId: string; paneId: string; ownerGone: boolean };
+	lastActivityAt?: number;
+	nonResumable?: boolean;
 }
 
 export type LaunchStage = "reserved" | "creating" | "pane-created" | "starting-pi" | "published" | "cleanup" | "closed" | "ambiguous";
@@ -74,7 +93,7 @@ export interface CompletionNotice extends RunRef {
 }
 
 /** Raised whenever the parent and a remote worker would disagree on store operations; both ends must match. */
-export const HERDR_REMOTE_PROTOCOL = 1;
+export const HERDR_REMOTE_PROTOCOL = 2;
 
 export function herdrSubagentRoot(env: NodeJS.ProcessEnv = process.env): string {
 	return join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "grok-style-pi", "herdr-subagents");
@@ -215,10 +234,23 @@ export class HerdrStore {
 	agentForSession(paneId: string, sessionFile: string) { return this.call("agentForSession", paneId, sessionFile); }
 	claimMaintenance(token: string, now: number) { return this.call("claimMaintenance", token, now); }
 	activeRuns() { return this.call("activeRuns"); }
+	lifecycleAllowed() { return this.call("lifecycleAllowed"); }
+	lifecycleStatus() { return this.call("lifecycleStatus"); }
+	confirmLifecycleUpgrade(confirmation: string) { return this.call("confirmLifecycleUpgrade", confirmation); }
+	lifecycleCandidates() { return this.call("lifecycleCandidates"); }
+	coldResumeReady(agentId: string) { return this.call("coldResumeReady", agentId); }
+	rebindPane(agentId: string, previousRunId: string, paneId: string, herdrName: string) { return this.call("rebindPane", agentId, previousRunId, paneId, herdrName); }
+	adoptAgent(agentId: string, previousRunId: string, ownership: AgentOwnership, now: number) { return this.call("adoptAgent", agentId, previousRunId, ownership, now); }
+	preparePaneClose(ref: RunRef, paneId: string, ownerGone: boolean, now: number) { return this.call("preparePaneClose", ref, paneId, ownerGone, now); }
+	abortPaneClose(ref: RunRef, paneId: string) { return this.call("abortPaneClose", ref, paneId); }
+	notePaneActivity(ref: RunRef, now: number) { return this.call("notePaneActivity", ref, now); }
+	parkAgent(ref: RunRef, paneId: string, now: number) { return this.call("parkAgent", ref, paneId, now); }
+	closeOwnedAgent(ref: RunRef, paneId: string, now: number) { return this.call("closeOwnedAgent", ref, paneId, now); }
+	maintenanceValid(token: string, now: number) { return this.call("maintenanceValid", token, now); }
 	finishMaintenance(token: string, observations: Array<{ ref: RunRef; alive: boolean }>, now: number) { return this.call("finishMaintenance", token, observations, now); }
 	listAgents() { return this.call("listAgents"); }
 	read(ref: RunRef) { return this.call("read", ref); }
-	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now); }
+	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now, ownership); }
 	publish(ref: RunRef, prompt: string, notify: boolean, now: number) { return this.call("publish", ref, prompt, notify, now); }
 	steer(ref: RunRef, text: string) { return this.call("steer", ref, text); }
 	requestCancellation(ref: RunRef, now: number) { return this.call("requestCancellation", ref, now); }
@@ -236,7 +268,7 @@ export class HerdrStore {
 	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: LaunchFacts, now: number) { return this.call("recordLaunch", ref, owner, stage, facts, now); }
 	claimLaunchRecovery(ref: RunRef, previousOwner: string, owner: string, now: number) { return this.call("claimLaunchRecovery", ref, previousOwner, owner, now); }
 	failLaunch(ref: RunRef, owner: string, error: string, stopped: boolean, now: number) { return this.call("failLaunch", ref, owner, error, stopped, now); }
-	notices(parentPaneId: string) { return this.call("notices", parentPaneId); }
+	notices(parentPaneId: string, parentSessionFile?: string, parentMachine?: string) { return this.call("notices", parentPaneId, parentSessionFile, parentMachine); }
 	acknowledgeNotice(runId: string) { return this.call("acknowledgeNotice", runId); }
 	retireOwner(owner: string) { return this.call("retireOwner", owner); }
 	ownerRetired(owner: string) { return this.call("ownerRetired", owner); }

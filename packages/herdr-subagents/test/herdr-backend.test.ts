@@ -301,3 +301,24 @@ test("backend remote notices keep qualified IDs and acknowledge only the machine
 	assert.equal(opens, 2, "acknowledgement reconnects instead of retaining a dead runner");
 	assert.equal((await remote.store.notices("test-host/parent")).length, 0);
 });
+
+for (const surface of ["resume", "spawn"] as const) {
+	test(`backend ${surface} forwards current caller ownership and placement on follow-up`, { timeout: 15_000 }, async (t) => {
+		const f = fixture(t);
+		const original = await install(f);
+		await original.start();
+		const launched = await original.backend.spawn(request(f.root), original.ctx);
+		await execute(f, launched.agentId);
+		const current = await install(f, "new-parent", "/new-parent/session.jsonl", "new-parent", {
+			env: { HERDR_PANE_ID: "new-parent", HERDR_TAB_ID: "current-tab", HERDR_WORKSPACE_ID: "current-workspace" },
+		});
+		await current.start();
+		if (surface === "resume") await current.backend.resume(launched.agentId, "Continue here", current.ctx);
+		else await current.backend.spawn({ ...request(f.root), resume: launched.agentId }, current.ctx);
+		const record = await f.observer.resolve(launched.agentId);
+		assert.equal(record.parentPaneId, "new-parent");
+		assert.equal(record.parentSessionFile, "/new-parent/session.jsonl");
+		assert.equal(record.parentTabId, "current-tab");
+		assert.equal(record.parentWorkspaceId, "current-workspace");
+	});
+}

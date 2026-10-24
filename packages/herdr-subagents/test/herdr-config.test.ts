@@ -3,7 +3,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { machineDefaultCwd, readMachineSettings } from "../src/herdr/config.ts";
+import { machineDefaultCwd, readHerdrSettings, readMachineSettings } from "../src/herdr/config.ts";
+import { parseAgentFile } from "../src/herdr/agent-file.ts";
+import { createHerdrSubagents, type HerdrBackendHandle } from "../src/herdr/extension.ts";
+import { HerdrRunner, type SpawnRequest } from "../src/herdr/runner.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const profiles = [{ id: "m1", label: "lappy", target: "aim-laptop", enabled: true }];
 
@@ -26,5 +30,77 @@ test("machine defaults accept Windows paths and resolve both labels and IDs", (t
 	for (const value of ["{", "null", '{"machines":[]}', '{"machines":{"lappy":{"cwd":""}}}']) {
 		writeFileSync(path, value);
 		assert.throws(() => readMachineSettings(dir), /Invalid .*herdr-subagents\.json/);
+	}
+});
+
+test("idle pane cleanup settings default to 900 seconds and accept zero without machines", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-config-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	assert.deepEqual(readHerdrSettings(dir), { machines: {}, idleCloseSeconds: 900 });
+	const path = join(dir, "herdr-subagents.json");
+	for (const value of [{}, { machines: {} }, { idleCloseSeconds: 0 }, { idleCloseSeconds: 30.5 }, { idleCloseSeconds: 900, machines: { lappy: { cwd: "C:/git" } } }]) {
+		writeFileSync(path, JSON.stringify(value));
+		assert.equal(readHerdrSettings(dir).idleCloseSeconds, "idleCloseSeconds" in value ? value.idleCloseSeconds : 900);
+		assert.deepEqual(readMachineSettings(dir), readHerdrSettings(dir).machines);
+	}
+	for (const value of [-1, "900", null, false, {}, []]) {
+		writeFileSync(path, JSON.stringify({ idleCloseSeconds: value }));
+		assert.throws(() => readHerdrSettings(dir), /idleCloseSeconds must be a nonnegative finite number/);
+	}
+	writeFileSync(path, '{"idleCloseSeconds":1e400}');
+	assert.throws(() => readHerdrSettings(dir), /idleCloseSeconds must be a nonnegative finite number/);
+});
+
+test("agent-file keep distinguishes pinned, explicitly unpinned and absent defaults", () => {
+	assert.equal(parseAgentFile("---\nkeep: true\n---\nTask").keep, true);
+	assert.equal(parseAgentFile("---\nkeep: false\n---\nTask").keep, false);
+	assert.equal(parseAgentFile("Task").keep, undefined);
+	assert.equal(parseAgentFile("---\nkeep: yes\n---\nTask").keep, undefined);
+});
+
+test("standalone Agent forwards keep without replacing an absent agent-file default", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-config-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const tools: any[] = [];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = {
+		registerTool(tool: unknown) { tools.push(tool); },
+		on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI;
+	const requests: SpawnRequest[] = [];
+	t.mock.method(HerdrRunner.prototype, "spawn", async (request: SpawnRequest) => {
+		requests.push(request);
+		throw new Error("captured spawn");
+	});
+	await createHerdrSubagents({ root: dir, agentDir: dir, env: {}, listMachines: async () => [] })(pi);
+	t.after(() => handlers.get("session_shutdown")!({ reason: "reload" }));
+	const agent = tools.find((tool) => tool.name === "Agent");
+	assert.equal(agent.parameters.properties.keep.type, "boolean");
+	const ctx = { cwd: dir, isProjectTrusted: () => true, sessionManager: { getSessionFile: () => undefined } } as unknown as ExtensionContext;
+	for (const keep of [true, false, undefined]) {
+		await assert.rejects(agent.execute("call", { prompt: "Task", description: "Task", subagent_type: "Explore", keep }, undefined, undefined, ctx), /captured spawn/);
+		assert.equal(requests.at(-1)?.keep, keep);
+	}
+});
+
+test("headless entrypoint forwards backend keep requests", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-config-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = {
+		on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI;
+	let backend!: HerdrBackendHandle;
+	let captured: SpawnRequest | undefined;
+	t.mock.method(HerdrRunner.prototype, "spawn", async (request: SpawnRequest) => {
+		captured = request;
+		throw new Error("captured backend spawn");
+	});
+	await createHerdrSubagents({ mode: "backend", onBackend(handle) { backend = handle; }, root: dir, agentDir: dir, env: {}, listMachines: async () => [] })(pi);
+	t.after(() => handlers.get("session_shutdown")!({ reason: "reload" }));
+	const ctx = { cwd: dir, isProjectTrusted: () => true, sessionManager: { getSessionFile: () => undefined } } as unknown as ExtensionContext;
+	for (const keep of [true, false, undefined]) {
+		await assert.rejects(backend.spawn({ prompt: "Task", description: "Task", subagentType: "Explore", runInBackground: true, cwd: dir, keep }, ctx), /captured backend spawn/);
+		assert.equal(captured?.keep, keep);
 	}
 });

@@ -71,7 +71,7 @@ export function parseDefinitionData(data: unknown, prompt: string, origin: Defin
 		if (typeof effort === "string") definition.effort = effort.trim();
 		else diagnostics.push("effort/thinking must be a string");
 	}
-	for (const key of ["background", "omitClaudeMd"] as const) {
+	for (const key of ["background", "omitClaudeMd", "keep"] as const) {
 		if (data[key] === undefined) continue;
 		if (typeof data[key] === "boolean") definition[key] = data[key];
 		else diagnostics.push(`${key} must be a boolean`);

@@ -16,7 +16,7 @@ Grok users get the engine through `integrations/subagents.ts` instead. Load exac
 
 | Tool | Purpose |
 |---|---|
-| `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model`, `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. |
+| `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model`, `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` pins pane agents against idle cleanup; it does not select the pane backend or affect in-process agents. |
 | `SendMessage` | `{to, message, summary?}`. A running agent gets the message after its current tool round. A finished agent resumes the same conversation in a new run. `to: "main"` reaches the root conversation. |
 | `TaskStop` | Stop an agent. The main conversation can stop any agent; an agent can stop only itself. A stop by the user (Grok activity panel) also stops the agent's descendants, and none of them resume automatically. |
 | `TaskCreate` / `TaskGet` / `TaskList` / `TaskUpdate` | A shared task list. Every agent of the root session sees the same list. `owner` is a plain assignment; completed blockers are hidden in `TaskList`. |
@@ -34,7 +34,7 @@ Built-in types:
 - **`Plan`** produces an implementation plan and is read-only.
 - **`fork`** inherits the conversation, system prompt, model and tools. It's off by default; enable it with `PI_SUBAGENT_FORK=1`.
 
-To add your own, write markdown files with frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `effort`, `skills`, `maxTurns`, `background`, `isolation`, `memory`, `hooks`, `mcpServers`, `omitClaudeMd`, and `isolated` (or Herdr's legacy `extensions: false`), which limits the agent to built-in tools; `max_turns` is accepted for `maxTurns`. Definitions are found in these places, lowest priority first:
+To add your own, write markdown files with frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `effort`, `skills`, `maxTurns`, `background`, `keep`, `isolation`, `memory`, `hooks`, `mcpServers`, `omitClaudeMd`, and `isolated` (or Herdr's legacy `extensions: false`), which limits the agent to built-in tools; `max_turns` is accepted for `maxTurns`. Definitions are found in these places, lowest priority first:
 
 1. Built-in
 2. Package
@@ -42,6 +42,8 @@ To add your own, write markdown files with frontmatter: `name`, `description`, `
 4. Project: `.pi/agents`, `.claude/agents` and `.agents/agents` in the project and its parent folders. A deeper folder wins. Untrusted projects are skipped.
 5. Command line: `PI_AGENTS_JSON`
 6. Managed policy: `PI_AGENTS_POLICY_DIR`
+
+For Herdr panes, agent-file `keep: true` defaults to pinning the pane against idle cleanup. An explicit `Agent.keep` overrides this default, including `false`; pinning persists across resumes. Owner-gone cleanup still applies. In-process agents ignore `keep`.
 
 The tool language matches Claude's. `Read`, `Bash`, `Glob` and similar names map to Pi's tools. `Agent(Explore, Plan)` limits which types an agent may launch, and `mcp__server` names a whole MCP server. A deny always wins over an allow.
 

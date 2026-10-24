@@ -4,6 +4,7 @@ import type { HerdrStore, HerdrTask, Command } from "./store.ts";
 
 export interface ClaudeHookInput {
 	session_id: string;
+	transcript_path?: string;
 	/** Native Claude subagents share the session but have their own tool batches. */
 	agent_id?: string;
 	hook_event_name: string;

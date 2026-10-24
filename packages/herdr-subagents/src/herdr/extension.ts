@@ -20,7 +20,7 @@ import {
 	type ToolText,
 } from "./runner.ts";
 import { EXPLICIT_SUBAGENT_REQUEST } from "./policy.ts";
-import { machineDefaultCwd, readMachineSettings } from "./config.ts";
+import { machineDefaultCwd, readHerdrSettings } from "./config.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
 
 export interface HerdrSubagentDeps {
@@ -90,11 +90,11 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 	const parentKey = (machine?: string) => machine && paneId ? `${deps.hostname}/${paneId}` : paneId;
 	return async (pi: ExtensionAPI) => {
 		const profiles = await deps.listMachines().catch(() => []);
-		const settings = readMachineSettings(deps.agentDir);
+		const settings = readHerdrSettings(deps.agentDir);
 		const savedMachines = machineGuidance(profiles);
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
-		const getRunner = () => runner ??= new HerdrRunner(deps);
+		const getRunner = () => runner ??= new HerdrRunner({ ...deps, idleCloseSeconds: settings.idleCloseSeconds });
 		/** One runner, and one SSH store channel, per saved machine used by this session. */
 		const machines = new Map<string, Promise<HerdrRunner>>();
 		const machineRunners = new Map<string, HerdrRunner>();
@@ -110,7 +110,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine }));
+				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine, idleCloseSeconds: settings.idleCloseSeconds }));
 				pending = connected.then(async (opened) => {
 					// Refuse a mismatched package before any launch or owner retirement runs on that store.
 					// An unverified store is closed without retiring anything: its operations are not established.
@@ -214,15 +214,26 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				}
 				return target;
 			},
+			async caller(ctx, current, cwd) {
+				return {
+					paneId: parentKey(current.machine), tabId: current.machine ? undefined : deps.env.HERDR_TAB_ID,
+					workspaceId: current.machine ? await remoteWorkspace(current.machine, current, cwd) : deps.env.HERDR_WORKSPACE_ID,
+					sessionFile: ctx.sessionManager.getSessionFile(),
+				};
+			},
 			async spawn(request, ctx, signal) {
 				if (!request.resume && request.runtime === "claude-code" && request.machine?.trim()) throw new Error("Claude Code subagents currently support local Herdr panes only.");
 				const target = request.resume ? await route(request.resume) : undefined;
 				const machine = target ? target.runner.machine : request.machine?.trim() || undefined;
 				if (machine && request.inheritContext) throw new Error("inherit_context cannot clone this session onto another machine.");
 				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
-				const cwd = machine ? request.machineCwd?.trim() || machineDefaultCwd(machine, profiles, settings) || ctx.cwd : request.cwd || ctx.cwd;
+				const cwd = machine ? request.machineCwd?.trim() || machineDefaultCwd(machine, profiles, settings.machines) || ctx.cwd : request.cwd || ctx.cwd;
 				if (machine) remember(machine);
-				const ref = target ? await current.resume(target.id, request.prompt, signal, request.runInBackground) : await current.spawn({
+				const ref = target ? await current.resume(target.id, request.prompt, signal, request.runInBackground, {
+					paneId: parentKey(machine), tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
+					workspaceId: machine ? await remoteWorkspace(machine, current, (await current.resolve(target.id)).cwd ?? cwd) : deps.env.HERDR_WORKSPACE_ID,
+					sessionFile: ctx.sessionManager.getSessionFile(),
+				}) : await current.spawn({
 					...request, cwd, definitionsCwd: ctx.cwd, paneId: parentKey(machine),
 					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
 					workspaceId: machine ? await remoteWorkspace(machine, current, cwd) : deps.env.HERDR_WORKSPACE_ID,
@@ -251,6 +262,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				run_in_background: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false to wait for the result, or for blocked." })),
 				resume: Type.Optional(Type.String({ description: "Agent ID to resume after its current run has finished." })),
 				isolated: Type.Optional(Type.Boolean({ description: "If true, the child may use only built-in tools." })),
+				keep: Type.Optional(Type.Boolean({ description: "Pin this agent's pane against idle cleanup. Overrides agent-file keep; preserved on resume. Owner disappearance still closes it." })),
 				inherit_context: Type.Optional(Type.Boolean({ description: "Must remain false. The orchestrating agent provides all needed context in the prompt." })),
 				machine: Type.Optional(Type.String({ description: "Saved Herdr SSH machine (label or profile ID) to run on. Only when the user asks. Ignored with resume; the agent ID names its machine." })),
 				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine, such as C:/git/project on Windows. Overrides the per-machine cwd in the user agent directory's herdr-subagents.json; otherwise defaults to this session's directory." })),
@@ -261,7 +273,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				const machine = target ? target.runner.machine : params.machine?.trim() || undefined;
 				if (machine && params.inherit_context) throw new Error("inherit_context cannot clone this session onto another machine.");
 				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
-				const cwd = machine ? params.machine_cwd?.trim() || machineDefaultCwd(machine, profiles, settings) || ctx.cwd : ctx.cwd;
+				const cwd = machine ? params.machine_cwd?.trim() || machineDefaultCwd(machine, profiles, settings.machines) || ctx.cwd : ctx.cwd;
 				const request: SpawnRequest = {
 					runtime: params.runtime,
 					prompt: params.prompt,
@@ -274,6 +286,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 					runInBackground: params.run_in_background !== false,
 					resume: target?.id,
 					isolated: params.isolated,
+					keep: params.keep,
 					projectTrusted: ctx.isProjectTrusted(),
 					inheritContext: params.inherit_context,
 					cwd,
@@ -281,7 +294,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 					paneId: parentKey(machine),
 					// The caller's tab and workspace are local; remote agents fill grid tabs on that machine.
 					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
-					workspaceId: !machine ? deps.env.HERDR_WORKSPACE_ID : target ? undefined : await remoteWorkspace(machine, current, cwd),
+					workspaceId: !machine ? deps.env.HERDR_WORKSPACE_ID : await remoteWorkspace(machine, current, target ? (await current.resolve(target.id)).cwd ?? cwd : cwd),
 					sessionFile: ctx.sessionManager.getSessionFile(),
 					agentDir: deps.agentDir,
 				};
@@ -366,8 +379,10 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 			};
 			const deliver = async (source: HerdrRunner) => {
 				if (stopped) return;
-				if (backend) return backend.deliver(source, parentKey(source.machine));
-				for (const notice of await source.store.notices(parentKey(source.machine))) {
+				const ownerSession = ctx.sessionManager.getSessionFile();
+				const ownerMachine = source.machine ? current.machineId : undefined;
+				if (backend) return backend.deliver(source, parentKey(source.machine), ownerSession, ownerMachine);
+				for (const notice of await source.store.notices(parentKey(source.machine), ownerSession, ownerMachine)) {
 					if (stopped || queuedNotices.has(notice.id)) continue;
 					pi.sendMessage({
 						customType: "herdr-subagent-notification", content: completionNotice(notice, source.machine), display: true,

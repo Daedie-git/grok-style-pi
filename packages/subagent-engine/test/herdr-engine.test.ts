@@ -131,6 +131,35 @@ test("background pane Agent settles from a Herdr notice, persists a root notice,
 	await until(() => harness.requests.parent >= 3);
 });
 
+for (const scenario of [
+	{ name: "absent", explicit: undefined, file: undefined, expected: undefined },
+	{ name: "explicit true", explicit: true, file: undefined, expected: true },
+	{ name: "explicit false", explicit: false, file: undefined, expected: false },
+	{ name: "agent-file true", explicit: undefined, file: true, expected: true },
+	{ name: "agent-file false", explicit: undefined, file: false, expected: false },
+	{ name: "explicit false overrides file true", explicit: false, file: true, expected: false },
+	{ name: "explicit true overrides file false", explicit: true, file: false, expected: true },
+]) test(`public Agent tool forwards pane keep: ${scenario.name}`, { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, subagent_type: "pinned-worker", ...(scenario.explicit === undefined ? {} : { keep: scenario.explicit }) } }] }
+		: { text: "Parent continues" }, {
+		agentFiles: { "pinned-worker.md": `---\nname: pinned-worker\ndescription: Inspect panes\n${scenario.file === undefined ? "" : `keep: ${scenario.file}\n`}---\nInspect the pane code.` },
+	});
+	await harness.parent.prompt("Launch the configured pane agent", { source: "extension" });
+	assert.equal(fake.spawns.length, 1, toolResultText(harness.parent, "Agent").join("\n"));
+	assert.equal(fake.spawns[0].keep, scenario.expected);
+	assert.equal(harness.children.size, 0);
+});
+
+test("keep does not select the pane backend for an in-process Agent", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { description: "Local task", prompt: "Inspect locally", keep: true, run_in_background: false } }] }
+		: { text: "Parent continues" }, { paneDefault: false });
+	await harness.parent.prompt("Launch an in-process agent", { source: "extension" });
+	assert.equal(fake.spawns.length, 0);
+	assert.equal(harness.children.size, 1);
+});
+
 test("foreground pane Agent waits on the captured Herdr run and returns its report", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => index === 0
 		? { tools: [{ name: "Agent", args: { ...assignment, run_in_background: false } }] } : { text: "Parent consumed report" });

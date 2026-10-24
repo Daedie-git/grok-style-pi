@@ -5,6 +5,7 @@ export interface ParsedAgentFile {
 	thinking?: string;
 	model?: string;
 	isolated?: boolean;
+	keep?: boolean;
 	isolation?: string;
 }
 
@@ -56,6 +57,7 @@ export function parseAgentFile(text: string): ParsedAgentFile {
 		thinking: scalar(front, "thinking"),
 		model: scalar(front, "model"),
 		isolation: scalar(front, "isolation"),
+		keep: scalar(front, "keep") === "true" ? true : scalar(front, "keep") === "false" ? false : undefined,
 		isolated: scalar(front, "extensions") === "false" ? true
 			: scalar(front, "isolated") === "true" ? true
 			: scalar(front, "isolated") === "false" ? false : undefined,

@@ -9,7 +9,7 @@ export interface PaneNotice { noticeId: string; agentId: string; herdrAgentId: s
 export interface PaneRequest {
 	prompt: string; description: string; subagentType: string; cwd: string; runInBackground: boolean;
 	runtime?: "pi" | "claude-code"; name?: string; model?: string; thinking?: string; maxTurns?: number;
-	projectTrusted?: boolean; definitionsCwd?: string; machine?: string; machineCwd?: string;
+	projectTrusted?: boolean; definitionsCwd?: string; machine?: string; machineCwd?: string; keep?: boolean;
 	/** Replaces the pane's own agent-file lookup. `allowedTools` undefined allows every tool. */
 	resolved?: { instructions?: string; allowedTools?: string[] };
 }

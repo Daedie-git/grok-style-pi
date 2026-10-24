@@ -2,12 +2,13 @@ import { DatabaseSync } from "node:sqlite";
 import { parentPort, threadId, workerData } from "node:worker_threads";
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot } from "./store.ts";
 import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
-import type { AgentRecord, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
+import type { AgentRecord, AgentOwnership, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
+import { piSessionReady } from "./session-ready.ts";
 
 // A worker thread receives its root; a remote stdio process takes an optional root argument.
 const root = (workerData as { root?: string } | null)?.root ?? process.argv[2] ?? herdrSubagentRoot();
@@ -49,6 +50,7 @@ const placement = databaseDiagnostics("initialize placement.sqlite", () => datab
 // The placement lock is retried asynchronously by the caller. Control operations use another connection.
 placement.exec("PRAGMA busy_timeout=0");
 let placementOwner: string | undefined;
+let protocolContextReady = false;
 
 function isBusy(error: unknown): boolean {
 	return (error as { errcode?: number } | null)?.errcode === 5;
@@ -57,7 +59,9 @@ function isBusy(error: unknown): boolean {
 function transaction<T>(body: () => T): T {
 	db.exec("BEGIN IMMEDIATE");
 	try {
+		if (protocolContextReady) db.exec("INSERT OR IGNORE INTO lifecycle_writer(id) VALUES(1)");
 		const result = body();
+		if (protocolContextReady) db.exec("DELETE FROM lifecycle_writer WHERE id=1");
 		db.exec("COMMIT");
 		return result;
 	} catch (error) {
@@ -69,6 +73,11 @@ function transaction<T>(body: () => T): T {
 databaseDiagnostics("initialize control.sqlite schema", () => transaction(() => {
 	const version = Number(db.prepare("PRAGMA user_version").get()?.user_version);
 	if (version !== 0 && version !== 2) throw new Error(`Unsupported Herdr protocol version ${version}`);
+	const inherited = version !== 0 || !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agents'").get();
+	if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='lifecycle_writer'").get()) {
+		protocolContextReady = true;
+		db.exec("INSERT OR IGNORE INTO lifecycle_writer(id) VALUES(1)");
+	}
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, pane TEXT, session_file TEXT NOT NULL, binding TEXT, data TEXT NOT NULL);
 		CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, agent TEXT NOT NULL REFERENCES agents(id), data TEXT NOT NULL);
@@ -85,7 +94,33 @@ databaseDiagnostics("initialize control.sqlite schema", () => transaction(() => 
 		CREATE INDEX IF NOT EXISTS recoverable_launches ON launches(run) WHERE json_extract(data,'$.stage') NOT IN ('published','closed','ambiguous');
 		CREATE INDEX IF NOT EXISTS pending_notices ON notices(run) WHERE acknowledged=0;
 		PRAGMA user_version=2;
+		CREATE TABLE IF NOT EXISTS lifecycle_guard (id INTEGER PRIMARY KEY CHECK(id=1), allowed INTEGER NOT NULL, reason TEXT NOT NULL);
+		CREATE TABLE IF NOT EXISTS lifecycle_writer (id INTEGER PRIMARY KEY CHECK(id=1));
 	`);
+	db.prepare("INSERT OR IGNORE INTO lifecycle_guard(id,allowed,reason) VALUES(1,?,?)").run(inherited ? 0 : 1,
+		inherited ? "Upgrade paused: confirm all old workers have stopped or reloaded" : "Fresh database");
+	protocolContextReady = true;
+	db.exec("INSERT OR IGNORE INTO lifecycle_writer(id) VALUES(1)");
+	// Connection-local transactions publish this marker only until commit. Unmodified workers never set it.
+	// Old SQL keeps working; any observed old write permanently pauses lifecycle again, never just for a TTL.
+	for (const table of ["agents", "runs", "commands", "launches", "notices", "retired_owners", "claude_turns", "claude_approvals", "maintenance"]) {
+		for (const action of ["INSERT", "UPDATE", "DELETE"]) db.exec(`
+			CREATE TRIGGER IF NOT EXISTS lifecycle_legacy_${table}_${action.toLowerCase()} BEFORE ${action} ON ${table}
+			WHEN NOT EXISTS (SELECT 1 FROM lifecycle_writer WHERE id=1)
+			BEGIN UPDATE lifecycle_guard SET allowed=0,reason='Legacy worker activity: lifecycle paused until old workers drain' WHERE id=1; END;
+		`);
+	}
+	// An old maintainer must not overwrite a pending intentional close with its generic pane-death failure.
+	// IGNORE is deliberately non-throwing: old command polling, results and coordination remain usable.
+	db.exec(`CREATE TRIGGER IF NOT EXISTS lifecycle_preserve_close_intent BEFORE UPDATE ON runs
+		WHEN NOT EXISTS (SELECT 1 FROM lifecycle_writer WHERE id=1)
+		AND json_extract(OLD.data,'$.phase') NOT IN ('completed','failed','stopped')
+		AND json_extract(NEW.data,'$.error')='The Herdr pane closed before the agent finished.'
+		AND EXISTS (SELECT 1 FROM agents WHERE id=OLD.agent AND json_extract(data,'$.paneClose') IS NOT NULL)
+		BEGIN
+			UPDATE lifecycle_guard SET allowed=0,reason='Legacy worker activity: lifecycle paused until old workers drain' WHERE id=1;
+			SELECT RAISE(IGNORE);
+		END;`);
 }));
 
 function decode<T>(row: Record<string, unknown> | undefined): T | undefined {
@@ -105,6 +140,13 @@ function saveRun(value: RunSnapshot): RunSnapshot {
 }
 function saveAgent(value: AgentRecord) {
 	db.prepare("UPDATE agents SET pane=?, session_file=?, data=? WHERE id=?").run(value.paneId, resolve(value.sessionFile), JSON.stringify(value), value.id);
+}
+function withOwnership(record: AgentRecord, ownership: AgentOwnership): AgentRecord {
+	return { ...record,
+		parentPaneId: ownership.parentPaneId, parentSessionFile: ownership.parentSessionFile,
+		parentTabId: ownership.parentTabId, parentWorkspaceId: ownership.parentWorkspaceId,
+		parentMachine: ownership.parentMachine, parentAgentId: ownership.parentAgentId,
+	};
 }
 function current(ref: RunRef): boolean {
 	return agent(ref.agentId)?.currentRunId === ref.runId;
@@ -155,7 +197,27 @@ function nextCommand(agentId: string, token: string, streaming: boolean): { valu
 	return command && { value, command };
 }
 
+function lifecycleStatus(): { allowed: boolean; reason: string } {
+	const value = db.prepare("SELECT allowed,reason FROM lifecycle_guard WHERE id=1").get()!;
+	return { allowed: Number(value.allowed) === 1, reason: String(value.reason) };
+}
+function lifecycleAllowed(): boolean { return lifecycleStatus().allowed; }
+
 const operations = {
+	lifecycleAllowed,
+	lifecycleStatus,
+	confirmLifecycleUpgrade(confirmation: string): { allowed: boolean; reason: string } {
+		if (confirmation !== "all-old-workers-stopped") throw new Error("Confirm all old workers have stopped or reloaded before enabling lifecycle maintenance");
+		return transaction(() => {
+			db.prepare("UPDATE lifecycle_guard SET allowed=1,reason=? WHERE id=1").run("All old workers confirmed stopped or reloaded");
+			// An old warm resume can carry an earlier run's unknown paneClose field into a new run.
+			// After the asserted drain, discard only that obsolete metadata; never settle the newer execution.
+			db.exec(`UPDATE agents SET data=json_remove(data,'$.paneClose')
+				WHERE json_type(data,'$.paneClose.runId')='text' AND json_type(data,'$.currentRunId')='text'
+				AND json_extract(data,'$.paneClose.runId')<>json_extract(data,'$.currentRunId')`);
+			return lifecycleStatus();
+		});
+	},
 	assertProtocolReady(): void {
 		// Never silently mix the shared-status protocol with run-scoped control. Legacy files remain untouched.
 		for (const entry of readdirSync(root, { withFileTypes: true })) {
@@ -211,7 +273,7 @@ const operations = {
 		if (Number(lease.expires) > now || Number(lease.next_at) > now) return false;
 		// Maintenance is best-effort and retried every tick, so a busy database only means another pane is writing.
 		db.exec(`PRAGMA busy_timeout=${MAINTENANCE_BUSY_MS}`);
-		try { return Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + 5000, now, now).changes) === 1; }
+		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + 5000, now, now).changes) === 1); }
 		catch (error) { if (isBusy(error)) return false; throw error; }
 		finally { db.exec(`PRAGMA busy_timeout=${BUSY_MS}`); }
 	},
@@ -226,7 +288,7 @@ const operations = {
 			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
 			if (lease.token !== token || Number(lease.expires) <= now) return false;
 			for (const { ref, alive } of observations) {
-				if (!current(ref)) continue;
+				if (!current(ref) || agent(ref.agentId)?.paneClose) continue;
 				const value = run(ref);
 				if (isTerminal(value.phase)) continue;
 				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: "The Herdr pane closed before the agent finished." }, now);
@@ -236,19 +298,124 @@ const operations = {
 			return true;
 		});
 	},
+	maintenanceValid(token: string, now: number): boolean {
+		const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
+		return lifecycleAllowed() && lease.token === token && Number(lease.expires) > now;
+	},
+	lifecycleCandidates(): Array<{ agent: AgentRecord; run: RunSnapshot; acknowledged: boolean }> {
+		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data,n.acknowledged FROM agents a
+			JOIN runs r ON r.id=json_extract(a.data,'$.currentRunId') LEFT JOIN notices n ON n.run=r.id
+			WHERE json_extract(r.data,'$.deadline')>0`).all().map((row) => ({
+			agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)),
+			// Foreground runs have no notice to deliver.
+			acknowledged: row.acknowledged == null || Number(row.acknowledged) === 1,
+		}));
+	},
+	coldResumeReady(agentId: string): boolean {
+		const record = agent(agentId);
+		if (!record?.cwd || record.nonResumable) return false;
+		try {
+			if (!statSync(record.cwd).isDirectory()) return false;
+			if (record.runtime === "claude-code") {
+				if (!record.sessionId || !record.claudeTranscript || run({ agentId, runId: record.currentRunId }).phase === "stopped") return false;
+				if (basename(record.claudeTranscript) !== `${record.sessionId}.jsonl` || !statSync(record.claudeTranscript).isFile()) return false;
+				const entries = readFileSync(record.claudeTranscript, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+				return entries.some((entry) => entry && entry.sessionId === record.sessionId && entry.cwd === record.cwd
+					&& entry.isSidechain !== true && typeof entry.uuid === "string"
+					&& ["user", "assistant"].includes(entry.type) && entry.message?.role === entry.type
+					&& (typeof entry.message.content === "string" || Array.isArray(entry.message.content)));
+			}
+			return piSessionReady(readFileSync(record.sessionFile, "utf8"), { sessionId: record.sessionId, cwd: record.cwd });
+		} catch { return false; }
+	},
+	rebindPane(agentId: string, previousRunId: string, paneId: string, herdrName: string): void {
+		transaction(() => {
+			const record = agent(agentId);
+			if (!record || record.paneClose || record.currentRunId !== previousRunId || !isTerminal(run({ agentId, runId: previousRunId }).phase)) throw new Error("Agent changed while reopening its pane");
+			saveAgent({ ...record, paneId, herdrName, paneState: undefined });
+			// Notice destinations follow the parent's conversation, not the disposable pane it used before.
+			for (const child of operations.listAgents()) {
+				if (!child.parentMachine && !child.parentPaneId?.includes("/")
+					&& (child.parentAgentId === record.id || child.parentSessionFile === record.sessionFile)) {
+					saveAgent({ ...child, parentAgentId: record.id, parentPaneId: paneId });
+				}
+			}
+			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(agentId);
+		});
+	},
+	adoptAgent(agentId: string, previousRunId: string, ownership: AgentOwnership, _now: number): boolean {
+		return transaction(() => {
+			const record = agent(agentId);
+			if (!record || record.paneClose || record.currentRunId !== previousRunId || !isTerminal(run({ agentId, runId: previousRunId }).phase)) return false;
+			saveAgent(withOwnership(record, ownership));
+			return true;
+		});
+	},
+	preparePaneClose(ref: RunRef, paneId: string, ownerGone: boolean, _now: number): boolean {
+		return transaction(() => {
+			if (!lifecycleAllowed()) return false;
+			const record = agent(ref.agentId);
+			if (!record || !current(ref) || record.paneId !== paneId || record.paneState === "parked" || record.paneClose) return false;
+			const value = run(ref);
+			if ((!ownerGone && !isTerminal(value.phase)) || (record.runtime === "claude-code" && !isTerminal(value.phase))
+				|| !operations.coldResumeReady(record.id)) return false;
+			// Keep the binding and execution state intact until closure is proved. The process may survive a failed close.
+			saveAgent({ ...record, paneClose: { runId: ref.runId, paneId, ownerGone } });
+			return true;
+		});
+	},
+	abortPaneClose(ref: RunRef, paneId: string): void {
+		transaction(() => {
+			if (!lifecycleAllowed()) return;
+			const record = agent(ref.agentId);
+			if (record && current(ref) && record.paneId === paneId && record.paneClose?.runId === ref.runId && record.paneClose.paneId === paneId) {
+				saveAgent({ ...record, paneClose: undefined });
+			}
+		});
+	},
+	notePaneActivity(ref: RunRef, now: number): void {
+		transaction(() => {
+			const record = agent(ref.agentId);
+			if (record && current(ref) && record.paneState !== "parked") saveAgent({ ...record, lastActivityAt: Math.max(record.lastActivityAt ?? 0, now) });
+		});
+	},
+	parkAgent(ref: RunRef, paneId: string, now: number): boolean {
+		return transaction(() => {
+			const record = agent(ref.agentId);
+			if (!record || !current(ref) || record.paneId !== paneId || !isTerminal(run(ref).phase)
+				|| (record.paneClose && !lifecycleAllowed())) return false;
+			saveAgent({ ...record, paneState: "parked", paneClose: undefined });
+			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(ref.agentId);
+			for (const item of operations.launches()) if (item.agentId === ref.agentId && item.paneId === paneId) saveLaunch({ ...item, stage: "closed", updatedAt: now });
+			return true;
+		});
+	},
+	closeOwnedAgent(ref: RunRef, paneId: string, now: number): void {
+		transaction(() => {
+			if (!lifecycleAllowed()) return;
+			const record = agent(ref.agentId);
+			if (!record || !current(ref) || record.paneId !== paneId) return;
+			const value = run(ref);
+			if (!isTerminal(value.phase)) saveRun({ ...value, phase: "stopped", cancelRequested: true, error: "Owner session ended", updatedAt: now });
+			saveAgent({ ...record, paneState: "parked", paneClose: undefined, nonResumable: record.nonResumable || (record.runtime === "claude-code" && !isTerminal(value.phase)) });
+			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(ref.agentId);
+			for (const item of operations.launches()) if (item.agentId === ref.agentId && item.paneId === paneId) saveLaunch({ ...item, stage: "closed", updatedAt: now });
+		});
+	},
 	listAgents(): AgentRecord[] {
 		return db.prepare("SELECT data FROM agents").all().map((row) => decode<AgentRecord>(row)!);
 	},
 	read: run,
-	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number): RunRef {
+	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership): RunRef {
 		return transaction(() => {
 			const record = agent(agentId);
-			if (!record || record.currentRunId !== previousRunId || !isTerminal(run({ agentId, runId: previousRunId }).phase)) {
+			if (!record || record.paneClose || record.currentRunId !== previousRunId || !isTerminal(run({ agentId, runId: previousRunId }).phase)) {
 				throw new Error(`Agent ${agentId} is still running or already being resumed. Use steer_subagent or get_subagent_result.`);
 			}
 			const next = newRun(agentId, now);
 			insertRun(next);
-			saveAgent({ ...record, currentRunId: next.runId });
+			// Ownership and publication share the run CAS: a losing caller cannot retarget another run's notice.
+			saveAgent({ ...(ownership ? withOwnership(record, ownership) : record), currentRunId: next.runId, paneState: undefined });
 			publish(next, prompt, notify, now);
 			return { agentId, runId: next.runId };
 		});
@@ -280,15 +447,15 @@ const operations = {
 		});
 	},
 	expireUnacceptedRun(ref: RunRef, now: number): RunSnapshot {
-		return transaction(() => saveRun(expireUnaccepted(run(ref), now)));
+		return transaction(() => agent(ref.agentId)?.paneClose ? run(ref) : saveRun(expireUnaccepted(run(ref), now)));
 	},
 	recordPaneClosed(ref: RunRef, now: number): RunSnapshot {
-		return transaction(() => saveRun(transition(run(ref), { type: "failed", error: "The Herdr pane closed before the agent finished." }, now)));
+		return transaction(() => agent(ref.agentId)?.paneClose ? run(ref) : saveRun(transition(run(ref), { type: "failed", error: "The Herdr pane closed before the agent finished." }, now)));
 	},
 	attach(paneId: string, sessionFile: string, sessionId: string): ChildBinding | undefined {
 		return transaction(() => {
 			const record = operations.agentForSession(paneId, sessionFile);
-			if (!record || (record.sessionId && record.sessionId !== sessionId)) return undefined;
+			if (!record || record.paneState === "parked" || (record.sessionId && record.sessionId !== sessionId)) return undefined;
 			const token = randomUUID();
 			saveAgent({ ...record, sessionId });
 			db.prepare("UPDATE agents SET binding=? WHERE id=?").run(token, record.id);
@@ -308,6 +475,7 @@ const operations = {
 		return transaction(() => {
 			const binding = operations.claudeBinding(agentId);
 			if (!binding || binding.agent.sessionId !== input.session_id) return false;
+			if (input.transcript_path) saveAgent({ ...binding.agent, claudeTranscript: input.transcript_path });
 			if (input.hook_event_name === "UserPromptSubmit") {
 				const marker = CLAUDE_MARKER.exec(input.prompt ?? "");
 				if (!marker) return false; // Human follow-ups never create or retarget managed runs.
@@ -435,19 +603,32 @@ const operations = {
 			return saveRun(transition(run(ref), { type: stopped ? "stopped" : "failed", error }, now));
 		});
 	},
-	notices(parentPaneId: string): CompletionNotice[] {
+	notices(parentPaneId: string, parentSessionFile?: string, parentMachine?: string): CompletionNotice[] {
 		return db.prepare(`SELECT r.data,a.data AS agent_data FROM notices n JOIN runs r ON r.id=n.run JOIN agents a ON a.id=r.agent
-			WHERE n.acknowledged=0 AND json_extract(a.data,'$.parentPaneId')=? AND json_extract(r.data,'$.phase') IN ('completed','failed','stopped')`).all(parentPaneId).map((row) => {
+			WHERE n.acknowledged=0 AND (json_extract(a.data,'$.parentPaneId')=? OR json_extract(a.data,'$.parentSessionFile')=?)
+			AND json_extract(r.data,'$.phase') IN ('completed','failed','stopped')`).all(parentPaneId, parentSessionFile ?? null).flatMap((row) => {
 			const value = decode<RunSnapshot>(row)!;
 			const record = JSON.parse(String(row.agent_data)) as AgentRecord;
-			return { agentId: value.agentId, runId: value.runId, id: value.runId, agent: record, run: value };
+			if (parentSessionFile && record.parentSessionFile && parentSessionFile !== record.parentSessionFile) return [];
+			if (parentMachine && record.parentMachine && parentMachine !== record.parentMachine) return [];
+			if (record.parentPaneId !== parentPaneId) {
+				if (!parentSessionFile || record.parentSessionFile !== parentSessionFile) return [];
+				if (record.parentMachine) {
+					if (record.parentMachine !== parentMachine) return [];
+				} else {
+					// Legacy remote keys are host/pane; never match a local or another host's same-named session.
+					const host = (pane: string) => pane.includes("/") ? pane.slice(0, pane.lastIndexOf("/")) : undefined;
+					if (host(record.parentPaneId ?? "") !== host(parentPaneId)) return [];
+				}
+			}
+			return [{ agentId: value.agentId, runId: value.runId, id: value.runId, agent: record, run: value }];
 		});
 	},
 	acknowledgeNotice(runId: string): void {
-		db.prepare("UPDATE notices SET acknowledged=1 WHERE run=?").run(runId);
+		transaction(() => { db.prepare("UPDATE notices SET acknowledged=1 WHERE run=?").run(runId); });
 	},
 	retireOwner(owner: string): void {
-		db.prepare("INSERT OR IGNORE INTO retired_owners(id) VALUES(?)").run(owner);
+		transaction(() => { db.prepare("INSERT OR IGNORE INTO retired_owners(id) VALUES(?)").run(owner); });
 	},
 	ownerRetired(owner: string): boolean {
 		return !!db.prepare("SELECT id FROM retired_owners WHERE id=?").get(owner);

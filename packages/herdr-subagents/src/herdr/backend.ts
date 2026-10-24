@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { formatStatus, qualifiedAgentId, type HerdrRunner, type SpawnRequest } from "./runner.ts";
+import { formatStatus, qualifiedAgentId, type HerdrRunner, type SpawnRequest, type ResumeCaller } from "./runner.ts";
 import type { CompletionNotice } from "./store.ts";
 import type { RunPhase } from "./state.ts";
 export type HerdrTerminalPhase = "completed" | "failed" | "stopped";
@@ -22,6 +22,7 @@ export interface HerdrBackendHandle {
 interface BackendHost {
 	route(agentId: string): Promise<{ id: string; runner: HerdrRunner }>;
 	spawn(request: HerdrBackendRequest, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ runner: HerdrRunner; agentId: string; runId: string }>;
+	caller?(ctx: ExtensionContext, runner: HerdrRunner, cwd: string): Promise<ResumeCaller>;
 	content(notice: CompletionNotice, machine?: string): string;
 	assertActive(): void;
 	paneChild(): boolean;
@@ -68,9 +69,10 @@ export function createBackendController(host: BackendHost) {
 			try { await runner.steer({ agentId: id, runId: options?.runId ?? record.currentRunId }, message); return { ok: true, message: "Queued for the agent's next tool round." }; }
 			catch (error) { return { ok: false, message: error instanceof Error ? error.message : String(error) }; }
 		},
-		async resume(agentId, prompt, _ctx) {
-			const { id, runner } = await resolve(agentId);
-			const ref = await runner.resume(id, prompt);
+		async resume(agentId, prompt, ctx) {
+			const { id, runner, record } = await resolve(agentId);
+			const caller = await host.caller?.(ctx, runner, record.cwd ?? ctx.cwd);
+			const ref = await runner.resume(id, prompt, undefined, true, caller);
 			return { runId: ref.runId, text: formatStatus(await runner.resolve(id), await runner.read(ref), runner.machine) };
 		},
 		async cancel(agentId, options) {
@@ -104,8 +106,8 @@ export function createBackendController(host: BackendHost) {
 	return {
 		handle,
 		reset() { queued.clear(); sources.clear(); },
-		async deliver(source: HerdrRunner, parentPaneId: string) {
-			for (const notice of await source.store.notices(parentPaneId)) {
+		async deliver(source: HerdrRunner, parentPaneId: string, parentSessionFile?: string, parentMachine?: string) {
+			for (const notice of await source.store.notices(parentPaneId, parentSessionFile, parentMachine)) {
 				if (!listeners.size || queued.has(notice.id)) continue;
 				const phase = notice.run.phase;
 				if (phase !== "completed" && phase !== "failed" && phase !== "stopped") continue;

@@ -60,6 +60,8 @@ export interface AgentParams {
 	runtime?: "pi" | "claude-code";
 	machine?: string;
 	machine_cwd?: string;
+	/** Herdr pane idle-cleanup exemption; ignored for in-process agents. */
+	keep?: boolean;
 	subagent_type?: string;
 	model?: string;
 	effort?: string;
@@ -838,7 +840,7 @@ export class Engine {
 		const result = await this.paneRuns.spawn(meta, runId, {
 			prompt: params.prompt, description: meta.description, subagentType: definition.agentType, cwd: invocation.ctx.cwd, runInBackground: background,
 			runtime: params.runtime, name: meta.name, projectTrusted: this.projectTrusted, resolved: this.paneDefinition(definition, meta),
-			maxTurns: definition.maxTurns,
+			maxTurns: definition.maxTurns, keep: params.keep ?? definition.keep,
 			// A local Pi pane runs the engine's resolved model and effort, as an in-process child would.
 			...(params.runtime === "claude-code" || params.machine?.trim()
 				? { model: params.model ?? (definition.model === "inherit" ? undefined : definition.model), thinking: params.effort ?? definition.effort }

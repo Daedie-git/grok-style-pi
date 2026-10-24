@@ -72,7 +72,7 @@ function fixture(t: TestContext, partial: Partial<HerdrClient> = {}) {
 	let clock = Date.now();
 	const runner = new HerdrRunner({ root, client: fake.client, now: () => clock });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
-	return { root, runner, ...fake, advance: (ms: number) => { clock += ms; } };
+	return { root, runner, ...fake, now: () => clock, advance: (ms: number) => { clock += ms; } };
 }
 
 async function attach(runner: HerdrRunner, ref: RunRef, options: { streaming?: boolean; checkpoint?: ChildIdentity["checkpoint"] } = {}) {
@@ -1088,10 +1088,12 @@ test("the worker loads from an installed package path without Node TypeScript st
 	const pkg = join(dir, "node_modules", "herdr-subagents");
 	mkdirSync(join(pkg, "src", "herdr"), { recursive: true });
 	writeFileSync(join(pkg, "package.json"), '{"type":"module"}');
-	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs", "claude.ts"]) {
+	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs", "claude.ts", "session-ready.ts"]) {
 		copyFileSync(fileURLToPath(new URL(`../src/herdr/${name}`, import.meta.url)), join(pkg, "src", "herdr", name));
 	}
 	symlinkSync(fileURLToPath(new URL(".", import.meta.resolve("jiti/package.json"))), join(dir, "node_modules", "jiti"), "dir");
+	mkdirSync(join(dir, "node_modules", "@earendil-works"));
+	symlinkSync(fileURLToPath(new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))), join(dir, "node_modules", "@earendil-works", "pi-coding-agent"), "dir");
 	try {
 		const loaded = await createJiti(import.meta.url).import<{ HerdrStore: typeof HerdrStore }>(join(pkg, "src", "herdr", "store.ts"));
 		const store = new loaded.HerdrStore(join(dir, "state"));
@@ -1361,7 +1363,7 @@ test("slow Herdr maintenance does not block child cancellation polling", { timeo
 test("background maintenance batches the fleet and shares its interval across runners", async (t) => {
 	const f = fixture(t);
 	const refs = await Promise.all([f.runner.spawn(request()), f.runner.spawn(request()), f.runner.spawn(request())]);
-	const peer = new HerdrRunner({ root: f.root, client: f.client });
+	const peer = new HerdrRunner({ root: f.root, client: f.client, now: f.now });
 	t.after(() => peer.close());
 	let lists = 0;
 	const list = f.client.listAgents;

@@ -7,8 +7,13 @@ export interface HerdrAgentRef {
 	paneId?: string;
 	workspaceId?: string;
 	cwd?: string;
+	/** Missing focus metadata must never be treated as proof that a pane is unfocused. */
+	focused?: boolean;
+	status?: string;
 	/** Herdr's session identity for the agent, such as Pi's session file. */
 	session?: string;
+	/** Positive native shell evidence; absent means the occupant's classification is not established. */
+	plainShell?: true;
 }
 
 /** A saved SSH machine from `herdr machine list --json`. */
@@ -34,6 +39,8 @@ export interface HerdrClient {
 	isAlive(name: string): Promise<boolean>;
 	/** The live agent holding this name, or undefined when none does. */
 	getAgent(name: string, signal?: AbortSignal): Promise<HerdrAgentRef | undefined>;
+	/** Resolves inherited pane aliases after a workspace move. */
+	getPane?(paneId: string, signal?: AbortSignal): Promise<HerdrAgentRef | undefined>;
 	showLabel(paneId: string, label: string): Promise<void>;
 	listAgents(signal?: AbortSignal): Promise<HerdrAgentRef[]>;
 	/** Live geometry for every pane in the target pane's tab. */
@@ -116,7 +123,12 @@ export function agentRef(item: unknown): HerdrAgentRef {
 		paneId: typeof record?.pane_id === "string" ? record.pane_id : undefined,
 		...(typeof record?.workspace_id === "string" ? { workspaceId: record.workspace_id } : {}),
 		...(typeof record?.cwd === "string" ? { cwd: record.cwd } : {}),
+		...(typeof record?.focused === "boolean" ? { focused: record.focused } : {}),
+		...(typeof record?.agent_status === "string" ? { status: record.agent_status } : {}),
 		...(typeof session === "string" ? { session } : {}),
+		...(record && typeof record.pane_id === "string" && record.pane_id && record.agent_status === "unknown"
+			&& !Object.hasOwn(record, "agent") && !Object.hasOwn(record, "agent_session") && !Object.hasOwn(record, "name")
+			? { plainShell: true as const } : {}),
 	};
 }
 
@@ -213,6 +225,18 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 				throw error;
 			}
 		},
+		async getPane(paneId, signal) {
+			try {
+				const payload = await routed(bin, ["pane", "get", paneId], env, listTimeout, signal);
+				const result = object(object(payload)?.result) ?? object(payload);
+				const pane = agentRef(result?.pane);
+				if (!pane.paneId) throw new Error("Herdr pane get did not return a pane id");
+				return pane;
+			} catch (error) {
+				if (error instanceof HerdrCliError && error.code === "pane_not_found") return undefined;
+				throw error;
+			}
+		},
 		async showLabel(paneId, label) {
 			await routed(bin, [
 				"pane", "report-metadata", paneId,
@@ -259,12 +283,17 @@ function parsePayload(stdout: string): unknown {
 	}
 }
 
-class HerdrCliError extends Error {
+export class HerdrCliError extends Error {
 	code?: string;
 	constructor(message: string, code?: string) {
 		super(message);
 		this.code = code;
 	}
+}
+
+/** Only explicit pre-effect validation failures prove that no pane was created. */
+export function paneCreationRejected(error: unknown): boolean {
+	return error instanceof HerdrCliError && ["workspace_not_found", "tab_not_found", "pane_not_found", "invalid_params", "invalid_request"].includes(error.code ?? "");
 }
 
 function errorPayload(text: string): Record<string, unknown> | undefined {

@@ -51,6 +51,17 @@ test("Herdr agent-file isolation and max_turns carry over", () => {
 	assert.equal(parse("max_turns: 4\n").maxTurns, 4);
 });
 
+test("Herdr keep defaults accept only booleans and preserve explicit false", () => {
+	assert.equal(parse().keep, undefined);
+	assert.equal(parse("keep: true\n").keep, true);
+	assert.equal(parse("keep: false\n").keep, false);
+	for (const value of ["'true'", "yes", "1", "null", "[]"]) {
+		const definition = parse(`keep: ${value}\n`);
+		assert.equal(definition.keep, undefined);
+		assert.deepEqual(definition.diagnostics, ["keep must be a boolean"]);
+	}
+});
+
 test("BOM, CRLF, trimmed body and quoted scalars", () => {
 	const result = parseDefinitionFile("\uFEFF" + markdown("'my agent'", '"A: description"', "", "\uFEFF  body  \n\n").replaceAll("\n", "\r\n"), { source: "project", path: "/agent.md" });
 	assert.equal(result.definition?.agentType, "my agent");

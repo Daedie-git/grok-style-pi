@@ -69,9 +69,13 @@ A sidecar that cannot continue without a decision submits its report with `needs
 
 Run it in the background like a request. Exit 0 confirms the fresh runtime; exit 1 means it was refused or not confirmed. `SIDECAR_RELOAD_TIMEOUT_S` (default 30) bounds confirmation **after** the request has finished, not the active task. On timeout, inspect the pane before retrying; reload might have started. A foreign or blocked session is not reloaded. This loads Pi's reloadable resources, not a new Pi executable or changed startup flags. The command never interrupts work to make a hung request finish.
 
-## Stopping a sidecar
+## Pane lifecycle
 
-`sidecar [--slot N] stop` closes the slot's pane after checking that it runs the sidecar's own session; a pane another agent took over is left running. The session, role, agent and machine binding are kept, so the next request resumes the conversation in a new pane, and `status` shows `stopped` meanwhile. It refuses with exit 7 while a request holds the slot; `--force` stops anyway, ending that request without a report. `--fresh` also drops the saved pi, Claude or Codex session, so the next start begins a new one. `--all` stops every slot of the calling Claude pane. A slot on a machine is stopped there.
+Local panes close after 15 idle minutes or when their owning Claude pane disappears. Cleanup preserves the session, so the next request resumes the conversation. Active requests, agents without confirmed idle status, unanswered questions and focused panes stay open. `ask --keep TEXT` or `sidecar [--slot N] keep` pins a pane against idle cleanup; use this only while the user watches it. `unkeep` removes the pin; a missing owner still allows cleanup.
+
+`sidecar sweep` checks every owner's local slots using one pane list and non-blocking locks. Launcher commands and the Bash hook schedule it in the background at most once per minute, logging to `~/.cache/claude-sidecar/sweep.log`. `SIDECAR_IDLE_CLOSE_S` changes the idle limit in seconds; `0` disables idle cleanup. Slots without a request use their agent record's modification time. Remote slots are skipped. Each completed local request also schedules a deferred cleanup, so idle closure needs no further tool calls; later requests replace the deadline. SessionEnd marks the registered owning Claude session ended and sweeps its local slots unless the reason is `clear`. Automatic cleanup keeps the same protections at session end; later sweeps reclaim protected slots once they become idle. Remote slots still need explicit `stop`. Nested, headless or unidentified Claude sessions leave the owner's slots alone.
+
+`sidecar [--slot N] stop` closes the slot's pane after checking that it runs the sidecar's own session; a pane another agent took over is left running. The session, role, agent and machine binding are kept, so the next request resumes the conversation in a new pane, and `status` shows `stopped` meanwhile. It refuses with exit 7 while a request holds the slot; `--force` stops anyway, ending that request without a report. `--fresh` also removes the pin and saved pi, Claude or Codex session, so the next start begins a new one. `--all` stops every slot of the calling Claude pane. A slot on a machine is stopped there.
 
 ## Steering a sidecar
 
@@ -138,7 +142,7 @@ Implementer asks append a completion contract: a `Status: done|partial|blocked` 
 
 ### Push gate
 
-The plugin's PreToolUse hook runs `scripts/push-gate` for every Bash call (about 1 ms). It starts `sidecar push-gate` only for commands that could publish. Inside Herdr, it denies `git push`, `gh pr create` and `glab mr create` when the repository has a recorded diff review from any slot of this Claude pane and `unreviewed` against the newest record finds changed files. Repositories without a record pass. A command containing `SIDECAR_REVIEW_SKIP=<why>` passes.
+The plugin's PreToolUse hook runs `scripts/push-gate` for every Bash call. A recent cleanup timestamp takes a builtin-only fast path. It starts `sidecar push-gate` only for commands that could publish. Inside Herdr, it denies `git push`, `gh pr create` and `glab mr create` when the repository has a recorded diff review from any slot of this Claude pane and `unreviewed` against the newest record finds changed files. Repositories without a record pass. A command containing `SIDECAR_REVIEW_SKIP=<why>` passes.
 
 ### Completion and report recovery
 

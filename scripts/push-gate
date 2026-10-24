@@ -2,6 +2,9 @@
 # PreToolUse hook entry. It runs before every Bash call, so it stays tiny: only commands that may publish start the
 # launcher. It guards against accidental pushes; quotes inside a command name (gi""t push) are not followed.
 [[ ${HERDR_ENV:-} == 1 ]] || exit 0
+# shellcheck source=scripts/sweep-trigger disable=SC1091
+source "${BASH_SOURCE[0]%/*}/sweep-trigger"
+schedule_sweep "${BASH_SOURCE[0]%/*}/sidecar"
 IFS= read -r -d '' input || true
 # Raw hook JSON: forward anything with a \u escape, which could spell the command differently.
 [[ $input =~ git.*push|gh.*pr.*create|glab.*mr.*create|\\u ]] || exit 0

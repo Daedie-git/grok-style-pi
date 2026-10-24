@@ -7,6 +7,9 @@
 #                                machine (herdr 0.9.1+); a slot stays on the machine it started on
 #                                native claude/codex agents support reports and answers; reload and busy steer require pi
 #   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
+#   sidecar session-end          SessionEnd hook entry; stop this owner's panes unless clearing
+#   sidecar sweep                close idle local panes and panes whose owner is gone
+#   sidecar keep|unkeep          pin or unpin this slot's pane against idle cleanup
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when its name belongs to another session
 #   sidecar reload               wait between requests, then reload pi resources without losing its report channel
@@ -25,7 +28,7 @@
 #                                cooperative diff review by a pi and a Claude Code reviewer (default dedicated slots 98 and 99): both
 #                                review in parallel, check each other's findings, and one combined report is printed
 #   sidecar unreviewed           list files changed since the last diff review (exit 1 when there are any)
-#   sidecar ask [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-
+#   sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-
 #                                follow-up request (- reads TEXT from stdin); prints the report. --accept runs CMD here
 #                                after the report and --scope flags changed files outside GLOB; both persist on the slot
 #   sidecar reject TEXT          tell the reviewer a finding is rejected and why; it withdraws with evidence or stands
@@ -609,6 +612,8 @@ ${REMOTE_CWD}"
   marker=$(mktemp "$file.XXXXXX")
   printf '%s\n' "${want%$'\n'}" >"$marker"
   mv -f -- "$marker" "$file"
+  owner_name >"$STATE_DIR/$(agent_name).owner"
+  printf '%s\n' "$HERDR_PANE_ID" >"$STATE_DIR/$(agent_name).owner-pane"
 }
 
 cmd_start() {
@@ -678,10 +683,18 @@ stop_unlocked() {
     fi
     echo "sidecar: stopping $hname during a request (--force); that request will end without a report" >&2
   fi
+  if [[ ${3:-} == sweep ]]; then
+    sweep_eligible "$name" "$hname" || return 0
+  fi
   if [[ $(agent_status "$hname") == missing ]]; then
     echo "$hname is not running"
   elif agent_runs_sidecar_session "$hname" && owns_pane_process "$hname"; then
     pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || die "cannot find the pane of $hname"
+    if [[ ${3:-} == sweep ]]; then
+      # Refresh live state after the session checks, which can take time.
+      [[ $(agent_status "$hname") == @(idle|done) ]] || return 0
+      hd pane get "$pane" | jq -e '.result.pane.focused == false' >/dev/null || return 0
+    fi
     hd pane close "$pane" >/dev/null || die "could not close pane $pane of $hname"
     echo "$hname stopped (closed $pane)"
   else
@@ -692,7 +705,7 @@ stop_unlocked() {
   if [[ -n $fresh ]]; then
     {
       flock 7
-      rm -f -- "$STATE_DIR/$name.codex-session" "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session"
+      rm -f -- "$STATE_DIR/$name.codex-session" "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session" "$STATE_DIR/$name.keep"
       printf 'f%s\n' "$(date +%s%N)" >"$STATE_DIR/$name.fresh"
     } 7>"$STATE_DIR/$name.identity.lock"
     echo "$hname: the next start begins a new $BACKEND session"
@@ -927,7 +940,7 @@ restart_unlocked() {
 # SessionStart hook: publish the sidecar identity to this Claude session's
 # Bash environment. Panes and agents are created only by the first request.
 cmd_session_start() {
-  local input sid pid argv i
+  local input sid ancestry=0
   input=$(cat)
   [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || exit 0
   local dependency
@@ -941,25 +954,8 @@ cmd_session_start() {
     echo "sidecar: missing agent CLI (pi, claude or codex); skipping startup" >&2
     exit 0
   fi
-  # Headless `claude -p` runs get no sidecar.
-  pid=$PPID
-  while (( pid > 1 )); do
-    mapfile -d '' argv <"/proc/$pid/cmdline" 2>/dev/null || argv=()
-    # Native Claude, or the npm CLI launched through a Node interpreter.
-    if [[ ${#argv[@]} -gt 0 ]] && {
-      [[ ${argv[0]##*/} == claude ]] ||
-      [[ ${argv[0]##*/} == node && ${#argv[@]} -gt 1 &&
-         ( ${argv[1]##*/} == claude || ${argv[1]} == */claude-code/cli.js ) ]];
-    }; then
-      for ((i = 1; i < ${#argv[@]}; i++)); do
-        [[ ${argv[i]} == -p || ${argv[i]} == --print ]] && exit 0
-        # A Claude sidecar (see start_claude) must not start sidecars of its own.
-        [[ ${argv[i]} == -n && ${argv[i + 1]:-} == claude-sidecar ]] && exit 0
-      done
-      break
-    fi
-    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
-  done
+  interactive_claude_owner || ancestry=$?
+  (( ancestry != 1 )) || return 0
   sid=$(jq -r '.session_id // empty' <<<"$input")
   [[ -n "$sid" ]] || exit 0
   export SIDECAR_AGENT SIDECAR_PI_SESSION
@@ -968,6 +964,12 @@ cmd_session_start() {
   # A separate short-lived lock keeps /clear from waiting for pane startup.
   {
     flock 7
+    rm -f -- "$STATE_DIR/$SIDECAR_AGENT.ended"
+    if (( ancestry == 0 )); then
+      printf '%s\n' "$sid" >"$STATE_DIR/$SIDECAR_AGENT.claude-owner-session"
+    else
+      rm -f -- "$STATE_DIR/$SIDECAR_AGENT.claude-owner-session"
+    fi
     if [[ -s "$STATE_DIR/$SIDECAR_AGENT.session" ]]; then
       SIDECAR_PI_SESSION=$(<"$STATE_DIR/$SIDECAR_AGENT.session")
     else
@@ -978,8 +980,41 @@ cmd_session_start() {
       printf 'export SIDECAR_AGENT=%q SIDECAR_PI_SESSION=%q\n' "$SIDECAR_AGENT" "$SIDECAR_PI_SESSION" >>"$CLAUDE_ENV_FILE"
     fi
   } 7>"$STATE_DIR/$SIDECAR_AGENT.identity.lock"
+  schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
   jq -n --arg machines "$(machine_guidance)" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext:
     ("Persistent pi, Claude Code and Codex sidecars are available on demand in Herdr; none is started at startup. Follow the claude-sidecar:sidecar-review skill. Requests start their sidecar automatically. Use --agent codex on a fresh slot for Codex CLI with ultra reasoning. Use --slot N before a command for independent parallel sidecars; reuse that slot for follow-ups and answers." + $machines)}}'
+}
+
+# 0: identified interactive owner; 1: excluded Claude; 2: ancestry unavailable or unidentified.
+interactive_claude_owner() {
+  local pid argv i executable script
+  # Tests can bound the walk without depending on the invoking agent's ancestors.
+  pid=${SIDECAR_TEST_ANCESTRY_PID:-$PPID}
+  [[ $pid =~ ^[0-9]+$ ]] || return 2
+  while (( pid > 1 )); do
+    mapfile -d '' argv <"/proc/$pid/cmdline" 2>/dev/null || argv=()
+    executable=${argv[0]:-}
+    executable=${executable//\\//}
+    executable=${executable,,}
+    executable=${executable##*/}
+    script=${argv[1]:-}
+    script=${script//\\//}
+    script=${script,,}
+    # Normalize native Windows names and npm CLI paths before classifying the nearest Claude.
+    if [[ $executable == claude || $executable == claude.exe ||
+          ( ( $executable == node || $executable == node.exe ) &&
+            ( ${script##*/} == claude || ${script##*/} == claude.exe || $script == */claude-code/cli.js ) ) ]]; then
+      for ((i = 1; i < ${#argv[@]}; i++)); do
+        [[ ${argv[i]} == -p || ${argv[i]} == --print || ${argv[i]} == --print=* ]] && return 1
+        # A Claude sidecar (see start_claude) must not start sidecars of its own.
+        [[ ( ${argv[i]} == -n || ${argv[i]} == --name ) && ${argv[i + 1]:-} == claude-sidecar ||
+           ${argv[i]} == --name=claude-sidecar ]] && return 1
+      done
+      return 0
+    fi
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+  done
+  return 2
 }
 
 # Names the enabled saved machines so "run it on the laptop" maps to a label. Empty when herdr cannot list them (older
@@ -1174,6 +1209,7 @@ finish_request() {
     '. + {finished: $finished, exit_code: $code}' "$ACTIVE_REQUEST" >"$tmp"
   mv -f -- "$tmp" "$ACTIVE_REQUEST"
   ACTIVE_REQUEST=
+  schedule_idle_close
 }
 
 # Sends a request and prints the submitted report. Exit codes: 0 report delivered, 2 no report,
@@ -1559,16 +1595,19 @@ ${2:-(none)}"
 }
 
 cmd_ask() {
-  local accept=() scope=() clear='' text
-  while [[ ${1:-} == --accept || ${1:-} == --scope || ${1:-} == --no-checks ]]; do
+  local accept=() scope=() clear='' text keep=''
+  while [[ ${1:-} == --accept || ${1:-} == --scope || ${1:-} == --no-checks || ${1:-} == --keep ]]; do
     case $1 in
       --accept) [[ -n ${2:-} ]] || die "--accept requires a command"; accept+=("$2"); shift 2 ;;
       --scope) [[ -n ${2:-} ]] || die "--scope requires a path glob"; scope+=("$2"); shift 2 ;;
       --no-checks) clear=1; shift ;;
+      --keep) keep=1; shift ;;
     esac
   done
   require_herdr
-  [[ $# -ge 1 ]] || die "usage: sidecar ask [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-"
+  [[ $# -ge 1 ]] || die "usage: sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-"
+  [[ -z $keep ]] || set_keep keep
+  schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
   text="$*"
   if [[ $# == 1 && $1 == - ]]; then text=$(cat); fi
   local lock_mode=acquire
@@ -2383,6 +2422,177 @@ cmd_status() {
   fi
 }
 
+# shellcheck source=scripts/sweep-trigger disable=SC1091
+source "$PLUGIN_ROOT/scripts/sweep-trigger"
+
+owner_ended() {
+  [[ -s $STATE_DIR/$1.ended && -s $STATE_DIR/$1.claude-owner-session &&
+     $(<"$STATE_DIR/$1.ended") == "$(<"$STATE_DIR/$1.claude-owner-session")" ]]
+}
+
+# Only a structured pane_not_found error proves absence; transport failures are unknown.
+owner_presence() {
+  local response code=0
+  response=$(timeout 10 herdr pane get "$1" 2>&1) || code=$?
+  if (( code == 0 )) && jq -se 'length == 1 and (.[0].result.pane.pane_id | type == "string" and length > 0)' <<<"$response" >/dev/null 2>&1; then
+    echo alive
+  elif (( code == 1 )) && jq -se 'length == 1 and .[0].error.code == "pane_not_found"' <<<"$response" >/dev/null 2>&1; then
+    echo gone
+  else
+    echo unknown
+  fi
+}
+
+# Runs under the slot's startup and request locks, immediately before stop's ownership checks.
+sweep_eligible() {
+  local name=$1 hname=$2 pane status owner candidate finished now age_file owner_pane presence other
+  if [[ -n ${SWEEP_REQUEST:-} ]]; then
+    [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 1
+  fi
+  status=$(agent_status "$hname")
+  [[ $status == idle || $status == 'done' ]] || return 1
+  [[ ! -s $STATE_DIR/$name.pending ]] || return 1
+  pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || return 1
+  jq -e --arg pane "$pane" 'any(.result.panes[]; .pane_id == $pane and .focused == true)' <<<"$SWEEP_PANES" >/dev/null && return 1
+  owner=$name
+  if [[ -s $STATE_DIR/$name.owner ]]; then
+    owner=$(<"$STATE_DIR/$name.owner")
+    candidate=$owner
+  else
+    # Legacy slots have no owner record; either spelling may be an owner with a numeric pane ID.
+    candidate=${name%-*}
+  fi
+  if owner_ended "$owner"; then return 0; fi
+  if [[ ! -s $STATE_DIR/$name.owner ]] && owner_ended "$candidate"; then return 0; fi
+  if ! jq -e --arg owner "$owner" --arg candidate "$candidate" '
+    any(.result.panes[]; ("sc-" + (.pane_id | ascii_downcase | gsub(":"; "-"))) as $n |
+      $n == $owner or $n == $candidate)' <<<"$SWEEP_PANES" >/dev/null; then
+    if [[ -s $STATE_DIR/$name.owner-pane ]]; then
+      owner_pane=$(<"$STATE_DIR/$name.owner-pane")
+      presence=$(owner_presence "$owner_pane")
+    else
+      # Old Herdr public IDs use wN:pN; preserve aliases for legacy slot records too.
+      owner_pane=${owner#sc-}
+      presence=$(owner_presence "${owner_pane/-p/:p}")
+      owner_pane=${candidate#sc-}
+      other=$(owner_presence "${owner_pane/-p/:p}")
+      if [[ $presence == alive || $other == alive ]]; then presence=alive
+      elif [[ $presence != gone || $other != gone ]]; then presence=unknown; fi
+    fi
+    [[ $presence != gone ]] || return 0
+  fi
+  [[ ! -e $STATE_DIR/$name.keep ]] || return 1
+  (( SWEEP_IDLE > 0 )) || return 1
+  age_file="$STATE_DIR/$name.request.json"
+  if [[ -s $age_file ]]; then
+    finished=$(jq -r '.finished // empty' "$age_file") || return 1
+    [[ $finished =~ ^[0-9]+$ ]] || return 1
+  else
+    finished=$(stat -c %Y "$STATE_DIR/$name.agent") || return 1
+  fi
+  printf -v now '%(%s)T' -1
+  (( now - finished > SWEEP_IDLE ))
+}
+
+cmd_sweep() {
+  local file name binding slot owner candidate MACHINE=''
+  SWEEP_IDLE=${SIDECAR_IDLE_CLOSE_S:-900}
+  [[ $SWEEP_IDLE =~ ^[0-9]+$ ]] || die "SIDECAR_IDLE_CLOSE_S must be a non-negative integer"
+  SWEEP_IDLE=$((10#$SWEEP_IDLE))
+  SWEEP_PANES=$(herdr pane list) || die "cannot list herdr panes"
+  jq -e '.result.panes | type == "array"' <<<"$SWEEP_PANES" >/dev/null || die "invalid herdr pane list"
+  shopt -s nullglob
+  for file in "$STATE_DIR"/sc-*.agent; do
+    name=${file##*/}; name=${name%.agent}
+    [[ $# == 0 || $name == "$1" ]] || continue
+    if [[ -n ${SWEEP_OWNER:-} ]]; then
+      slot=${name#"$SWEEP_OWNER"-}
+      [[ $name == "$SWEEP_OWNER" || ( $name == "$SWEEP_OWNER"-* && $slot =~ ^[1-9][0-9]*$ ) ]] || continue
+      [[ ! -s $STATE_DIR/$name.owner || $(<"$STATE_DIR/$name.owner") == "$SWEEP_OWNER" ]] || continue
+    fi
+    binding=local
+    if [[ -s $STATE_DIR/$name.machine ]]; then read -r binding <"$STATE_DIR/$name.machine"; fi
+    [[ $binding == local ]] || continue
+    (
+      export SIDECAR_AGENT=$name
+      unset SIDECAR_PI_SESSION SIDECAR_MACHINE
+      SLOT=1 ROLE_ARG='' AGENT_ARG='' MACHINE_ARG='' REMOTE_CWD='' RESOLVED=1
+      flock -n 8 || exit 0
+      owner=$name
+      if [[ -s $STATE_DIR/$name.owner ]]; then
+        owner=$(<"$STATE_DIR/$name.owner")
+      else
+        # Legacy eligibility accepts either owner spelling; serialize both against SessionStart.
+        candidate=${name%-*}
+        exec 5>"$STATE_DIR/$candidate.identity.lock"
+        flock -n 5 || exit 0
+      fi
+      exec 7>"$STATE_DIR/$owner.identity.lock"
+      flock -n 7 || exit 0
+      stop_unlocked '' '' sweep
+    ) 8>"$STATE_DIR/$name.startup.lock" || true
+  done
+}
+
+# Each completion schedules one check. Its request ID makes older deadlines harmless.
+schedule_idle_close() {
+  local idle=${SIDECAR_IDLE_CLOSE_S:-900} name id finished
+  [[ -z $MACHINE && $idle =~ ^[0-9]+$ ]] || return 0
+  (( 10#$idle > 0 )) || return 0
+  name=$(agent_name)
+  id=$(jq -r '.id' "$STATE_DIR/$name.request.json")
+  finished=$(jq -r '.finished' "$STATE_DIR/$name.request.json")
+  (
+    exec_detached "$PLUGIN_ROOT/scripts/sidecar" idle-close "$name" "$id" "$finished"
+  ) </dev/null >>"$STATE_DIR/sweep.log" 2>&1 6>&- 7>&- 8>&- 9>&- &
+}
+
+cmd_idle_close() {
+  local name=$1 SWEEP_REQUEST=$2 finished=$3 now delay idle=${SIDECAR_IDLE_CLOSE_S:-900}
+  [[ $finished =~ ^[0-9]+$ && $idle =~ ^[0-9]+$ ]] || return 0
+  idle=$((10#$idle))
+  (( idle > 0 )) || return 0
+  printf -v now '%(%s)T' -1
+  delay=$((finished + idle + 1 - now))
+  if (( delay > 0 )); then sleep "$delay"; fi
+  [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 0
+  # Recheck under the request lock too: a new request can arrive after this fast rejection.
+  cmd_sweep "$name"
+}
+
+cmd_keep() {
+  require_identity
+  [[ $# == 1 ]] || die "usage: sidecar [--slot N] keep|unkeep"
+  set_keep "$1"
+  schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
+}
+
+set_keep() {
+  (
+    flock 8
+    if [[ $1 == keep ]]; then : >"$STATE_DIR/$(agent_name).keep"; else rm -f -- "$STATE_DIR/$(agent_name).keep"; fi
+  ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+cmd_session_end() {
+  local input reason sid owner
+  input=$(cat)
+  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || return 0
+  reason=$(jq -r '.reason // empty' <<<"$input")
+  [[ $reason != clear ]] || return 0
+  interactive_claude_owner || return 0
+  sid=$(jq -r '.session_id // empty' <<<"$input")
+  owner=$(owner_name)
+  [[ -n $sid ]] || return 0
+  {
+    flock 7
+    [[ -s $STATE_DIR/$owner.claude-owner-session && $(<"$STATE_DIR/$owner.claude-owner-session") == "$sid" ]] || return 0
+    printf '%s\n' "$sid" >"$STATE_DIR/$owner.ended"
+  } 7>"$STATE_DIR/$owner.identity.lock"
+  local SWEEP_OWNER=$owner
+  cmd_sweep
+}
+
 SLOT=1
 SLOT_ARG=
 ROLE_ARG=
@@ -2415,7 +2625,15 @@ mkdir -p "$REQUEST_DIR" "$REPORT_DIR"
 # Parse dispatch and exit together before starting long-running work. Otherwise Bash reads past this command
 # after it returns; an in-place plugin update can move that offset into unrelated text in the new file.
 {
+case ${1:-} in
+  sweep|idle-close|push-gate|session-start|session-end|ask|keep|unkeep) ;;
+  *) schedule_sweep "$PLUGIN_ROOT/scripts/sidecar" ;;
+esac
 case "${1:-}" in
+  sweep) shift; cmd_sweep "$@" ;;
+  idle-close) shift; cmd_idle_close "$@" ;;
+  keep|unkeep) cmd_keep "$@" ;;
+  session-end) shift; cmd_session_end "$@" ;;
   session-start) shift; cmd_session_start "$@" ;;
   start) shift; cmd_start "$@" ;;
   restart) shift; cmd_restart "$@" ;;

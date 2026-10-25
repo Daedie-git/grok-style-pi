@@ -1161,6 +1161,89 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('left it running', result.stderr)
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
 
+    def test_unprofiled_fresh_reset_preserves_legacy_remote_and_request_bindings(self):
+        self.add_machines()
+        self.remote_run('--slot', '2', '--machine', 'laptop', 'start')
+        state = self.home / '.cache/claude-sidecar'
+        preserved = {state / 'sc-pane-1-2.machine': (state / 'sc-pane-1-2.machine').read_bytes(),
+                     state / 'sc-pane-1-2.checks.json': b'{"accept":["echo existing-check"]}\n',
+                     state / 'sc-pane-1-2.pending': b'existing-request\n'}
+        for path, content in preserved.items():
+            path.write_bytes(content)
+        session = (state / 'sc-pane-1-2.session').read_bytes()
+        # Generic fresh also writes .profile-fresh; it must never imply an active profile.
+        for _ in range(2):
+            self.remote_run('--slot', '2', 'stop', '--fresh')
+            for path, content in preserved.items():
+                self.assertTrue(path.exists(), str(path))
+                self.assertEqual(path.read_bytes(), content)
+            self.remote_run('--slot', '2', 'start')
+            self.assertEqual(self.all_starts()[-1][:2], ['--machine', 'm1'])
+            updated = (state / 'sc-pane-1-2.session').read_bytes()
+            self.assertNotEqual(updated, session)
+            session = updated
+
+    def test_explicit_profile_fresh_rebind_clears_legacy_remote_and_request_bindings(self):
+        self.add_machines()
+        self.remote_run('--slot', '2', '--machine', 'laptop', 'start')
+        state = self.home / '.cache/claude-sidecar'
+        checks, pending = state / 'sc-pane-1-2.checks.json', state / 'sc-pane-1-2.pending'
+        checks.write_text('{"accept":["echo old-check"]}\n')
+        pending.write_text('old-request\n')
+        profile, _ = self.write_profile()
+        self.remote_run('--slot', '2', '--profile-file', str(profile), 'stop', '--fresh')
+        for path in (state / 'sc-pane-1-2.machine', checks, pending):
+            self.assertFalse(path.exists(), str(path))
+        self.run_cli('--slot', '2', '--profile-file', str(profile), 'start')
+        self.assertEqual(self.all_starts()[-1][:2], ['agent', 'start'])
+        self.assertTrue(self.profile_snapshot('sc-pane-1-2').exists())
+
+    def test_queued_assignments_cannot_cross_fresh_generation_but_allow_normal_recreation(self):
+        import fcntl
+        import selectors
+        profile, _ = self.write_profile(role='implementer', allow=None)
+        for number, mode in enumerate(('profiled', 'unprofiled', 'adopting-profile', 'normal-recreation'), 30):
+            with self.subTest(mode=mode):
+                first, second = self.home / ('checkout-a-' + mode), self.home / ('checkout-b-' + mode)
+                first.mkdir()
+                second.mkdir()
+                initial = ['--profile-file', str(profile)] if mode in ('profiled', 'normal-recreation') else []
+                replacement = [] if mode == 'unprofiled' else ['--profile-file', str(profile)]
+                flags = ['--slot', str(number)]
+                self.run_cli(*flags, *initial, 'start', cwd=first)
+                process = None
+                try:
+                    lock_file = self.home / '.cache/claude-sidecar' / ('sc-pane-1-' + str(number) + '.lock')
+                    with lock_file.open('w') as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        process = subprocess.Popen([str(self.launcher), *flags, 'ask', 'Modify relative file src/main.cpp'],
+                                                   cwd=first, env=self.env, stdout=subprocess.PIPE,
+                                                   stderr=subprocess.PIPE, text=True)
+                        with selectors.DefaultSelector() as watcher:
+                            watcher.register(process.stderr, selectors.EVENT_READ)
+                            self.assertTrue(watcher.select(10), 'queued command did not reach the request lock')
+                            self.assertIn('waiting for it', process.stderr.readline())
+                        fresh = [] if mode == 'normal-recreation' else ['--fresh']
+                        self.run_cli(*flags, 'stop', '--force', *fresh, cwd=first)
+                        self.run_cli(*flags, *replacement, 'start', cwd=second)
+                        prompts = len([c for c in self.calls() if c[:2] == ['agent', 'prompt']])
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    stdout, stderr = process.communicate(timeout=15)
+                    after = len([c for c in self.calls() if c[:2] == ['agent', 'prompt']])
+                    if mode == 'normal-recreation':
+                        self.assertEqual(process.returncode, 0, stderr)
+                        self.assertIn('ship', stdout)
+                        self.assertEqual(after, prompts + 1)
+                    else:
+                        self.assertNotEqual(process.returncode, 0, stdout)
+                        self.assertIn('generation changed', stderr)
+                        self.assertNotIn('# Sidecar report', stdout)
+                        self.assertEqual(after, prompts, 'stale assignment reached the replacement worker')
+                finally:
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=10)
+
     def test_stop_fresh_starts_a_new_pi_session(self):
         self.run_cli('start')
         self.run_cli('stop', '--fresh')

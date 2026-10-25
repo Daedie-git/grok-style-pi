@@ -1,5 +1,6 @@
 """Launcher integration tests with isolated HOME and a fake Herdr executable."""
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 import re
@@ -2357,6 +2358,328 @@ class LauncherTests(unittest.TestCase):
         self.assertRegex(result.stderr, r'still working \(0m[12]s\); last output: reading src/foo.ts')
         quiet = self.run_cli('ask', 'Task two', env=dict(env, SIDECAR_PROGRESS_S='0'))
         self.assertNotIn('still working', quiet.stderr)
+
+    # --- Fleet role profiles (real launcher, isolated fake Herdr) ---
+
+    def write_profile(self, filename='fleet profile.json', **overrides):
+        profile = dict(version=1, role='reviewer', prompt='Fleet policy: review without editing.',
+                       allow=[], deny=[], skills=[], mcp=False)
+        profile.update(overrides)
+        path = self.home / filename
+        path.write_text(json.dumps(profile))
+        return path, profile
+
+    def profile_start(self, *args, **kwargs):
+        self.run_cli(*args, 'start', **kwargs)
+        return [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
+
+    def profile_snapshot(self, name='sc-pane-1'):
+        return self.home / '.cache/claude-sidecar' / (name + '.profile.json')
+
+    def assert_profile_rejected(self, path, *args, cwd=None, env=None):
+        before = len(self.all_starts())
+        result = self.run_cli(*args, '--profile-file', str(path), 'start',
+                              cwd=cwd, env=env, check=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.all_starts()), before, result.stderr)
+        return result
+
+    def test_profile_launch_uses_only_explicit_extensions_and_fleet_prompt_last(self):
+        path, profile = self.write_profile(prompt='Fleet policy: preserve café and "quoted" text.\nNo edits.')
+        start = self.profile_start('--profile-file', str(path))
+        self.assertIn('--no-extensions', start)
+        extensions = [start[i + 1] for i, flag in enumerate(start) if flag == '-e']
+        self.assertEqual(extensions, [str(self.plugin / 'sidecar/sidecar.ts')])
+        self.assertIn('--no-mcp', start)
+        prompts = [Path(start[i + 1]) for i, flag in enumerate(start)
+                   if flag == '--append-system-prompt']
+        self.assertGreaterEqual(len(prompts), 2)
+        self.assertEqual(prompts[-1].read_text(), profile['prompt'])
+        self.assertEqual(prompts[0].name, 'profile.md')
+        self.assertTrue(prompts[0].read_text().strip())
+        self.assertFalse(any(p.name == 'reviewer.md' for p in prompts),
+                         'legacy reviewer prompt grants permissions the fleet profile may prohibit')
+        tools = start[start.index('--tools') + 1].split(',')
+        self.assertCountEqual(tools, ['read', 'submit_review'])
+
+    def test_profile_mcp_true_explicitly_loads_only_builtin_mcp_and_sidecar(self):
+        path, _ = self.write_profile(mcp=True)
+        start = self.profile_start('--profile-file', str(path))
+        self.assertIn('--no-extensions', start)
+        self.assertNotIn('--no-mcp', start)
+        extensions = [start[i + 1] for i, flag in enumerate(start) if flag == '-e']
+        self.assertCountEqual(extensions, [str(self.plugin / 'sidecar/sidecar.ts'), 'builtin:mcp',
+                                           'builtin:codemode', 'builtin:tool-search'])
+
+    def test_profile_null_allow_preserves_ambient_tools_and_adds_mandatory_tools(self):
+        path, _ = self.write_profile(role='implementer', allow=None)
+        start = self.profile_start('--profile-file', str(path))
+        if '--tools' in start:
+            self.assertCountEqual(start[start.index('--tools') + 1].split(','),
+                                  ['+read', '+submit_review'])
+        self.assertNotIn('--no-tools', start)
+
+    def test_profile_explicit_allow_keeps_requested_tools_and_mandatory_tools(self):
+        path, _ = self.write_profile(role='implementer', allow=['write', 'bash'])
+        start = self.profile_start('--profile-file', str(path))
+        self.assertCountEqual(start[start.index('--tools') + 1].split(','),
+                              ['write', 'bash', 'read', 'submit_review'])
+
+    def test_unprofiled_launch_keeps_ambient_extensions_mcp_skills_and_tools(self):
+        start = self.profile_start()
+        for flag in ('--no-extensions', '--no-mcp', '--no-skills', '--tools', '--exclude-tools'):
+            self.assertNotIn(flag, start)
+
+    def test_profile_empty_allow_assignment_is_published_and_report_returned(self):
+        path, _ = self.write_profile(allow=[])
+        assignment = 'Review the published assignment: café, "quotes", and shell $variables.\nSecond line.'
+        result = self.run_cli('--profile-file', str(path), 'ask', assignment)
+        self.assertIn('ship', result.stdout)
+        self.assertIn(assignment, self.request_text('ask'))
+        start = self.all_starts()[0]
+        self.assertCountEqual(start[start.index('--tools') + 1].split(','), ['read', 'submit_review'])
+        prompt = next(c[3] for c in self.calls() if c[:2] == ['agent', 'prompt'])
+        request = next((self.home / '.cache/claude-sidecar/requests').glob('*.md'))
+        self.assertIn(str(request), prompt)
+
+    def test_profile_cannot_attach_to_legacy_session_marker_without_fresh(self):
+        state = self.home / '.cache/claude-sidecar'
+        (state / 'sc-pane-1.session').write_text('legacy-session-id\n')
+        path, _ = self.write_profile()
+        self.assert_profile_rejected(path)
+        self.run_cli('stop', '--fresh')
+        self.profile_start('--profile-file', str(path))
+
+    def test_profile_remote_recreation_preserves_cwd_and_fresh_permits_rebinding(self):
+        self.add_machines()
+        second_caller = self.home / 'another local checkout'
+        second_caller.mkdir()
+        for slot, transport in (('2', 'sh'), ('3', 'node')):
+            with self.subTest(transport=transport):
+                first = self.remote_home() / ('first checkout ' + transport)
+                second = self.remote_home() / ('second checkout ' + transport)
+                first.mkdir()
+                second.mkdir()
+                config = self.home / 'sidecar-machines.json'
+                config.write_text(json.dumps({'laptop': {'transport': transport}}))
+                env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+                path, _ = self.write_profile(filename='remote rebind ' + transport + '.json')
+                self.remote_run('--slot', slot, '--machine', 'laptop', '--remote-cwd', str(first),
+                                '--profile-file', str(path), 'start', env=env)
+                self.remote_run('--slot', slot, 'stop', env=env)
+                self.run_cli('--slot', slot, 'start', cwd=second_caller, env=env)
+                creation = [c for c in self.remote_calls()
+                            if c[:2] in (['pane', 'split'], ['tab', 'create'])][-1]
+                self.assertEqual(creation[creation.index('--cwd') + 1], str(first))
+                self.remote_run('--slot', slot, 'stop', '--fresh', env=env)
+                path, _ = self.write_profile(filename='remote rebind ' + transport + '.json',
+                                              prompt='Rebound remote profile.')
+                self.remote_run('--slot', slot, '--machine', 'laptop', '--remote-cwd', str(second),
+                                '--profile-file', str(path), 'start', env=env)
+                creation = [c for c in self.remote_calls()
+                            if c[:2] in (['pane', 'split'], ['tab', 'create'])][-1]
+                self.assertEqual(creation[creation.index('--cwd') + 1], str(second))
+
+    def test_profile_idle_steer_reports_and_busy_steer_fails_without_sending(self):
+        path, _ = self.write_profile()
+        self.profile_start('--profile-file', str(path))
+        idle = self.run_cli('steer', 'Review the bound checkout')
+        self.assertIn('ship', idle.stdout)
+        prompts = [c for c in self.calls() if c[:2] == ['agent', 'prompt']]
+        busy = self.run_cli('steer', 'Do not send this message',
+                            env=dict(self.env, FAKE_AGENT_WORKING='1'), check=False)
+        self.assertNotEqual(busy.returncode, 0)
+        self.assertIn('busy steering is unavailable', busy.stderr)
+        self.assertIn('nothing was sent', busy.stderr)
+        self.assertEqual([c for c in self.calls() if c[:2] == ['agent', 'prompt']], prompts)
+        self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
+
+    def test_profile_canonical_snapshot_digest_and_cwd_are_persisted(self):
+        path, profile = self.write_profile()
+        work = self.home / 'profile checkout'
+        work.mkdir()
+        self.profile_start('--profile-file', str(path), cwd=work)
+        snapshot = self.profile_snapshot()
+        self.assertEqual(json.loads(snapshot.read_text()), profile)
+        self.assertEqual(snapshot.with_suffix('.sha256').read_text().strip(),
+                         hashlib.sha256(snapshot.read_bytes()).hexdigest())
+        self.assertEqual((snapshot.parent / 'sc-pane-1.cwd').read_text().strip(), str(work.resolve()))
+        # Formatting and object key order are not identity changes.
+        path.write_text(json.dumps(dict(reversed(list(profile.items()))), indent=4))
+        self.run_cli('--profile-file', str(path), 'start', cwd=work)
+        self.assertEqual(len(self.all_starts()), 1)
+
+    def test_profile_schema_is_strict_before_any_launch(self):
+        _, valid = self.write_profile()
+        invalid = [
+            ('unknown key', dict(valid, extension=True)),
+            ('version zero', dict(valid, version=0)),
+            ('version bool', dict(valid, version=True)),
+            ('version string', dict(valid, version='1')),
+            ('role', dict(valid, role='admin')),
+            ('prompt null', dict(valid, prompt=None)),
+            ('allow scalar', dict(valid, allow='read')),
+            ('allow item', dict(valid, allow=[1])),
+            ('allow empty item', dict(valid, allow=[''])),
+            ('allow additive prefix', dict(valid, allow=['+bash'])),
+            ('allow subtractive prefix', dict(valid, allow=['-read'])),
+            ('allow comma', dict(valid, allow=['bash,read'])),
+            ('allow whitespace', dict(valid, allow=['bash read'])),
+            ('deny null', dict(valid, deny=None)),
+            ('deny scalar', dict(valid, deny='bash')),
+            ('deny item', dict(valid, deny=[False])),
+            ('deny comma injection', dict(valid, deny=['bash,read'])),
+            ('skills null', dict(valid, skills=None)),
+            ('skills scalar', dict(valid, skills='skill.md')),
+            ('skills item', dict(valid, skills=[{}])),
+            ('skills relative', dict(valid, skills=['relative/skill.md'])),
+            ('skills newline', dict(valid, skills=[str(self.home / 'skill\\n.md')])),
+            ('mcp number', dict(valid, mcp=1)),
+            ('mcp string', dict(valid, mcp='false')),
+            ('top level list', []),
+        ]
+        invalid += [('missing ' + key, {k: v for k, v in valid.items() if k != key}) for key in valid]
+        for description, value in invalid:
+            with self.subTest(description=description):
+                path = self.home / 'invalid-profile.json'
+                path.write_text(json.dumps(value))
+                self.assert_profile_rejected(path)
+        path.write_text('{not json')
+        self.assert_profile_rejected(path)
+        self.assert_profile_rejected(self.home / 'missing-profile.json')
+
+    def test_profile_cannot_deny_mandatory_tools_exactly_or_with_wildcards(self):
+        for pattern in ('read', 'submit_review', '*', 'r*', 'submit_*', '*review'):
+            with self.subTest(pattern=pattern):
+                path, _ = self.write_profile(deny=[pattern])
+                self.assert_profile_rejected(path)
+
+    def test_profile_role_and_backend_mismatches_are_rejected(self):
+        path, _ = self.write_profile()
+        self.assert_profile_rejected(path, '--role', 'implementer')
+        for backend in ('claude', 'codex'):
+            with self.subTest(backend=backend):
+                self.assert_profile_rejected(path, '--agent', backend)
+
+    def test_profile_rebinding_requires_fresh_and_omission_retains_snapshot(self):
+        path, profile = self.write_profile()
+        self.profile_start('--profile-file', str(path))
+        self.run_cli('start')
+        self.assertEqual(len(self.all_starts()), 1)
+        path.write_text(json.dumps(dict(profile, prompt='A different fleet policy.')))
+        self.assert_profile_rejected(path)
+        self.run_cli('stop')
+        self.assert_profile_rejected(path)
+        self.run_cli('stop', '--fresh')
+        self.assertFalse(self.profile_snapshot().exists())
+        self.assertFalse(self.profile_snapshot().with_suffix('.sha256').exists())
+        self.profile_start('--profile-file', str(path))
+        self.assertEqual(json.loads(self.profile_snapshot().read_text())['prompt'], 'A different fleet policy.')
+
+    def test_profile_first_attachment_to_unprofiled_conversation_requires_fresh(self):
+        path, _ = self.write_profile()
+        self.run_cli('start')
+        self.assert_profile_rejected(path)
+        self.assertFalse(self.profile_snapshot().exists())
+        self.run_cli('stop')
+        self.assert_profile_rejected(path)
+        self.assertFalse(self.profile_snapshot().exists())
+        self.run_cli('stop', '--fresh')
+        self.profile_start('--profile-file', str(path))
+        self.assertTrue(self.profile_snapshot().exists())
+
+    def test_profile_fresh_reset_permits_cwd_and_profile_rebind(self):
+        path, _ = self.write_profile()
+        first, second = self.home / 'first checkout', self.home / 'second checkout'
+        first.mkdir()
+        second.mkdir()
+        self.profile_start('--profile-file', str(path), cwd=first)
+        self.run_cli('--profile-file', str(path), 'start', cwd=second)
+        self.assertEqual(len(self.all_starts()), 1)
+        self.assertEqual((self.profile_snapshot().parent / 'sc-pane-1.cwd').read_text().strip(), str(first))
+        state = self.profile_snapshot().parent
+        checks, pending = state / 'sc-pane-1.checks.json', state / 'sc-pane-1.pending'
+        checks.write_text(json.dumps({'accept': ['echo stale-check']}))
+        pending.write_text('stale-request-id\n')
+        self.run_cli('stop', '--fresh', cwd=first)
+        self.assertFalse((state / 'sc-pane-1.cwd').exists())
+        self.assertFalse(checks.exists())
+        self.assertFalse(pending.exists())
+        path, _ = self.write_profile(role='implementer', allow=None, prompt='Implement in the new checkout.')
+        start = self.profile_start('--profile-file', str(path), cwd=second)
+        self.assertEqual((self.profile_snapshot().parent / 'sc-pane-1.cwd').read_text().strip(), str(second))
+        self.assertEqual(json.loads(self.profile_snapshot().read_text())['role'], 'implementer')
+
+    def test_profile_completion_auto_close_recreates_in_bound_cwd_from_another_cwd(self):
+        self.lifecycle_state()
+        path, _ = self.write_profile()
+        first, second = self.home / 'first checkout', self.home / 'second checkout'
+        first.mkdir()
+        second.mkdir()
+        env = dict(self.env, SIDECAR_CLOSE_WHEN_DONE='1')
+        self.run_cli('--profile-file', str(path), 'ask', 'Review first checkout', cwd=first, env=env)
+        self.wait_for_close(self.start_pane())
+        self.wait_lifecycle_workers()
+        before = len(self.all_starts())
+        self.run_cli('ask', 'Continue reviewing the bound checkout', cwd=second)
+        self.assertEqual(len(self.all_starts()), before + 1)
+        self.assertEqual((self.profile_snapshot().parent / 'sc-pane-1.cwd').read_text().strip(), str(first))
+        creations = [c for c in self.calls() if c[:2] in (['pane', 'split'], ['tab', 'create'])]
+        self.assertEqual(creations[-1][creations[-1].index('--cwd') + 1], str(first))
+
+    def test_profile_nonmandatory_denies_are_forwarded_and_question_mark_is_literal(self):
+        path, _ = self.write_profile(allow=None, deny=['bash', 'edit*', 'rea?'])
+        start = self.profile_start('--profile-file', str(path))
+        self.assertCountEqual(start[start.index('--exclude-tools') + 1].split(','),
+                              ['bash', 'edit*', 'rea?'])
+
+    def test_profile_missing_local_skill_is_rejected_before_launch(self):
+        path, _ = self.write_profile(skills=[str(self.home / 'missing skill.md')])
+        self.assert_profile_rejected(path)
+
+    def test_profile_existing_local_skill_is_explicitly_loaded(self):
+        skill = self.home / 'fleet skill.md'
+        skill.write_text('---\nname: fleet-skill\ndescription: Test skill\n---\nFleet skill body.\n')
+        path, _ = self.write_profile(skills=[str(skill)])
+        start = self.profile_start('--profile-file', str(path))
+        self.assertIn('--skill', start)
+        self.assertEqual(start[start.index('--skill') + 1], str(skill))
+
+    def test_profile_transfer_and_target_skill_validation_for_posix_and_node(self):
+        self.add_machines()
+        for slot, transport in (('2', 'sh'), ('3', 'node')):
+            with self.subTest(transport=transport):
+                config = self.home / 'sidecar-machines.json'
+                config.write_text(json.dumps({'laptop': {'transport': transport}}))
+                env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+                # Require the skill on the selected target, not just a valid profile file.
+                skill = self.remote_home() / ('remote fleet skill ' + transport + '.md')
+                path, profile = self.write_profile(filename='profile ' + transport + '.json',
+                                                  prompt='Remote fleet policy: "quoted" café.\nLast prompt.',
+                                                  skills=[str(skill)])
+                self.assert_profile_rejected(path, '--slot', slot, '--machine', 'laptop',
+                                             cwd=self.work, env=env)
+                skill.write_text('---\nname: remote-fleet\ndescription: Test skill\n---\nTarget skill.\n')
+                self.remote_run('--slot', slot, '--machine', 'laptop', '--profile-file', str(path),
+                                'start', env=env)
+                start = [c for c in self.remote_calls() if c[:2] == ['agent', 'start']][-1]
+                self.assertIn('--no-extensions', start)
+                self.assertIn('--no-mcp', start)
+                self.assertEqual(start[start.index('--skill') + 1], str(skill))
+                prompts = [Path(start[i + 1]) for i, flag in enumerate(start)
+                           if flag == '--append-system-prompt']
+                self.assertTrue(prompts[-1].is_relative_to(self.remote_home()))
+                self.assertEqual(prompts[-1].read_text(), profile['prompt'])
+                # Source profile removal must not break restart from the canonical snapshot.
+                path.unlink()
+                self.remote_run('--slot', slot, 'stop', env=env)
+                self.remote_run('--slot', slot, 'start', env=env)
+                self.remote_run('--slot', slot, 'stop', env=env)
+                skill.unlink()
+                before = len(self.all_starts())
+                result = self.remote_run('--slot', slot, 'start', env=env, check=False)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(len(self.all_starts()), before)
 
     # --- Saved herdr machines (herdr 0.9.1+) ---
 

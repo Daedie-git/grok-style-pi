@@ -2,7 +2,8 @@
 # shellcheck disable=SC2016  # remote scripts are single-quoted on purpose: the machine expands them
 # Persistent review sidecars, hosted in Herdr panes beside Claude.
 #
-#   sidecar [--slot N] [--role reviewer|implementer] [--agent pi|claude|codex] [--machine NAME [--remote-cwd DIR]] COMMAND
+#   sidecar [--slot N] [--role reviewer|implementer] [--agent pi|claude|codex] [--profile-file FILE] [--machine NAME [--remote-cwd DIR]] COMMAND
+#                                --profile-file binds a resolved version 1 Fleet role profile to a fresh pi conversation
 #                                select an independent persistent sidecar (default 1), optionally on a saved herdr
 #                                machine (herdr 0.9.1+); a slot stays on the machine it started on
 #                                native claude/codex agents support reports and answers; reload and busy steer require pi
@@ -88,9 +89,137 @@ require_herdr() {
   for dependency in herdr jq flock; do
     type -P "$dependency" >/dev/null || die "missing dependency $dependency; install it on PATH before using sidecar"
   done
+  if [[ -z ${PROFILE_RESET:-} ]]; then
+    { flock 7; profile_input_unlocked; } 7>"$STATE_DIR/$(agent_name).identity.lock"
+  fi
   [[ -n $RESOLVED ]] || resolve_machine
   resolve_role
   resolve_backend
+  if [[ -z ${PROFILE_RESET:-} ]]; then
+    { flock 7; profile_check_unlocked; } 7>"$STATE_DIR/$(agent_name).identity.lock"
+  fi
+  if [[ -n $PROFILE_JSON && -f "$STATE_DIR/$(agent_name).cwd" ]]; then
+    WORK_DIR=$(<"$STATE_DIR/$(agent_name).cwd")
+  fi
+  # Unlike legacy remote slots, profiled sessions always bind their execution directory.
+  if [[ -n $PROFILE_JSON && -n $MACHINE ]]; then REMOTE_CWD=$WORK_DIR; fi
+}
+
+# Fleet owns profile policy. The launcher accepts only this resolved, versioned Pi contract.
+# All snapshot reads, validation, hashing and publication happen under the slot identity lock.
+profile_input_unlocked() {
+  local file source=${PROFILE_ARG:-} saved='' role expected=${PROFILE_HASH:-}
+  file="$STATE_DIR/$(agent_name).profile.json"
+  [[ ! -f $file ]] || saved=$(<"$file")
+  if [[ -z $source && -n $saved ]]; then source=$file; fi
+  PROFILE_JSON=
+  PROFILE_HASH=
+  if [[ -z $source ]]; then
+    [[ -z $expected ]] || die "slot profile was reset while waiting; retry the command"
+    return 0
+  fi
+  [[ -f $source ]] || die "profile file does not exist: $source"
+  PROFILE_JSON=$(jq -sceS '
+    def strings: type == "array" and all(.[]; type == "string" and (contains("\u0000") | not));
+    def tools: strings and all(.[]; length > 0 and (test("[,\\s]|^[+-]") | not));
+    if length == 1 then .[0] else error("expected one profile") end
+    | select(type == "object" and keys == ["allow","deny","mcp","prompt","role","skills","version"])
+    | select(.version == 1 and (.role == "reviewer" or .role == "implementer")
+      and (.prompt | type == "string" and (contains("\u0000") | not))
+      and (.allow == null or (.allow | tools)) and (.deny | tools)
+      and (.skills | strings and all(.[]; length > 0 and (test("[\\r\\n]") | not)
+        and (startswith("/") or test("^[A-Za-z]:[/\\\\]")))) and (.mcp | type == "boolean"))' "$source") || die "invalid version 1 role profile: $source"
+  [[ -z $saved || $saved == "$PROFILE_JSON" ]] || die "slot profile differs; use stop --fresh before attaching a different profile"
+  PROFILE_HASH=$(printf '%s\n' "$PROFILE_JSON" | sha256sum | cut -d' ' -f1)
+  [[ -z $expected || $expected == "$PROFILE_HASH" ]] || die "slot profile changed while waiting; retry the command"
+  role=$(jq -r .role <<<"$PROFILE_JSON")
+  [[ -z $ROLE_ARG || $ROLE_ARG == "$role" ]] || die "--role conflicts with profile role $role"
+  ROLE_ARG=$role
+  local pattern mandatory
+  while IFS= read -r pattern; do
+    # Pi patterns support only '*'; quote Bash's other glob metacharacters.
+    pattern=${pattern//\\/\\\\}; pattern=${pattern//\?/\\?}; pattern=${pattern//\[/\\[}
+    for mandatory in read submit_review; do
+      # shellcheck disable=SC2053 # Deliberately match Pi's '*' denial patterns.
+      [[ $mandatory != $pattern ]] || die "profile cannot deny mandatory tool $mandatory"
+    done
+  done < <(jq -r '.deny[]' <<<"$PROFILE_JSON")
+}
+
+profile_check_unlocked() {
+  [[ -n $PROFILE_JSON ]] || return 0
+  [[ $BACKEND == pi ]] || die "role profiles support --agent pi only"
+  local name hname
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  if [[ ! -f "$STATE_DIR/$name.profile.json" && ! -f "$STATE_DIR/$name.profile-fresh" ]]; then
+    if [[ -f "$STATE_DIR/$name.session" || -f "$STATE_DIR/$name.agent" || -f "$STATE_DIR/$name.role" || -f "$STATE_DIR/$name.claude-started" ||
+          -f "$STATE_DIR/$name.codex-session" ]] || [[ $(agent_status "$hname") != missing ]]; then
+      die "cannot attach a profile to an unprofiled conversation; use stop --fresh first"
+    fi
+  fi
+  if [[ -f "$STATE_DIR/$name.profile.json" ]]; then
+    [[ $(<"$STATE_DIR/$name.profile.json") == "$PROFILE_JSON" ]] || die "slot profile differs; use stop --fresh first"
+    [[ -s "$STATE_DIR/$name.cwd" ]] || die "profile cwd binding is missing; use stop --fresh first"
+  fi
+}
+
+profile_bind_unlocked() {
+  [[ -n $PROFILE_JSON ]] || return 0
+  profile_check_unlocked
+  local base tmp
+  base="$STATE_DIR/$(agent_name)"
+  if [[ ! -f $base.profile.json ]]; then
+    tmp=$(mktemp "$base.profile.json.XXXXXX")
+    printf '%s\n' "$PROFILE_JSON" >"$tmp"; mv -f -- "$tmp" "$base.profile.json"
+    tmp=$(mktemp "$base.profile.sha256.XXXXXX")
+    printf '%s\n' "$PROFILE_HASH" >"$tmp"; mv -f -- "$tmp" "$base.profile.sha256"
+    tmp=$(mktemp "$base.cwd.XXXXXX")
+    printf '%s\n' "$WORK_DIR" >"$tmp"; mv -f -- "$tmp" "$base.cwd"
+  fi
+}
+
+# Materialize text locally and transfer it, never interpolate profile content into shell argv.
+# Skills are execution-machine paths, not local resources implicitly copied to another host.
+profile_launch_args() {
+  local base prompt delivery skill tools
+  base="$STATE_DIR/$(agent_name)"
+  prompt="$base.profile-prompt.md"
+  delivery="$SIDECAR_HOME/profile.md"
+  jq -j .prompt <<<"$PROFILE_JSON" >"$prompt"
+  if [[ -n $MACHINE ]]; then
+    publish_file "$base.profile.json" >/dev/null || return 1
+    prompt=$(publish_file "$prompt") || return 1
+    delivery=$(publish_file "$delivery" "$(agent_name).profile-delivery.md") || return 1
+  fi
+  PROFILE_LAUNCH_ARGS=(--no-extensions --no-skills --no-prompt-templates -e "$AGENT_HOME/sidecar.ts")
+  if [[ $(jq -r .mcp <<<"$PROFILE_JSON") == true ]]; then
+    # MCP's default codemode/deferred exposure needs these built-ins too; ambient adapters stay excluded.
+    PROFILE_LAUNCH_ARGS+=(-e builtin:mcp -e builtin:codemode -e builtin:tool-search)
+  else
+    PROFILE_LAUNCH_ARGS+=(--no-mcp)
+  fi
+  if [[ $(jq -r '.allow == null' <<<"$PROFILE_JSON") == true ]]; then
+    tools=+read,+submit_review
+  else
+    tools=$(jq -r '(.allow + ["read","submit_review"] | unique) | join(",")' <<<"$PROFILE_JSON")
+  fi
+  PROFILE_LAUNCH_ARGS+=(--tools "$tools")
+  tools=$(jq -r '.deny | join(",")' <<<"$PROFILE_JSON")
+  [[ -z $tools ]] || PROFILE_LAUNCH_ARGS+=(--exclude-tools "$tools")
+  while IFS= read -r skill; do
+    [[ -n $skill && $skill != *$'\n'* && $skill != *$'\r'* ]] || die "profile skill paths must be nonempty single-line paths"
+    if [[ -n $MACHINE && $REMOTE_TRANSPORT == node ]]; then
+      remote_node 'if(!fs.existsSync(args[0]))process.exit(1);const s=fs.statSync(args[0]);if(!s.isFile()&&!s.isDirectory())process.exit(1);' "$skill" </dev/null || die "profile skill does not exist on $MACHINE_LABEL: $skill"
+    elif [[ -n $MACHINE ]]; then
+      remote 'test -f "$1" || test -d "$1"' "$skill" </dev/null || die "profile skill does not exist on $MACHINE_LABEL: $skill"
+    else
+      [[ -f $skill || -d $skill ]] || die "profile skill does not exist: $skill"
+    fi
+    PROFILE_LAUNCH_ARGS+=(--skill "$skill")
+  done < <(jq -r '.skills[]' <<<"$PROFILE_JSON")
+  # The delivery protocol grants no permissions; Fleet's literal role guidance is always last.
+  PROFILE_LAUNCH_ARGS+=(--append-system-prompt "$delivery" --append-system-prompt "$prompt")
 }
 
 # Slots retain their role; do not silently reuse an implementer's context as a reviewer (or vice versa).
@@ -98,6 +227,8 @@ resolve_role() {
   local file saved=
   file="$STATE_DIR/$(agent_name).role"
   if [[ -f $file ]]; then saved=$(<"$file"); fi
+  # A fresh conversation may bind a new Fleet role without adopting old role context.
+  if [[ -n $PROFILE_JSON && -f "$STATE_DIR/$(agent_name).profile-fresh" ]]; then saved=; fi
   [[ -z $saved || $saved == reviewer || $saved == implementer ]] || die "invalid slot role in $file"
   if [[ -n $saved && -n $ROLE_ARG && $saved != "$ROLE_ARG" ]]; then
     die "slot is already a $saved; use a new slot for $ROLE_ARG"
@@ -666,6 +797,7 @@ cmd_stop() {
     done
     return "$code"
   fi
+  local PROFILE_RESET=$fresh
   require_herdr
   ( flock 8; stop_unlocked "$force" "$fresh"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
 }
@@ -705,8 +837,11 @@ stop_unlocked() {
   if [[ -n $fresh ]]; then
     {
       flock 7
-      rm -f -- "$STATE_DIR/$name.codex-session" "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session" "$STATE_DIR/$name.keep"
+      rm -f -- "$STATE_DIR/$name.codex-session" "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session" "$STATE_DIR/$name.keep" \
+        "$STATE_DIR/$name.profile.json" "$STATE_DIR/$name.profile.sha256" "$STATE_DIR/$name.profile-prompt.md" \
+        "$STATE_DIR/$name.cwd" "$STATE_DIR/$name.machine" "$STATE_DIR/$name.checks.json" "$STATE_DIR/$name.pending"
       printf 'f%s\n' "$(date +%s%N)" >"$STATE_DIR/$name.fresh"
+      : >"$STATE_DIR/$name.profile-fresh"
     } 7>"$STATE_DIR/$name.identity.lock"
     echo "$hname: the next start begins a new $BACKEND session"
   fi
@@ -787,12 +922,15 @@ start_unlocked() {
   hname=$(herdr_agent)
   {
     flock 7
+    profile_input_unlocked
+    profile_check_unlocked
+    profile_bind_unlocked
     session=$(pi_session_id)
     publish_session "$name" "$session"
     bind_machine
     resolve_role
     resolve_backend
-    if [[ ! -f "$STATE_DIR/$name.role" ]]; then
+    if [[ ! -f "$STATE_DIR/$name.role" || ( -n $PROFILE_JSON && -f "$STATE_DIR/$name.profile-fresh" ) ]]; then
       printf '%s\n' "$ROLE" >"$STATE_DIR/$name.role"
     fi
     if [[ ! -f "$STATE_DIR/$name.agent" ]]; then
@@ -810,6 +948,10 @@ start_unlocked() {
     return
   fi
   local attempt err allocation origin=given
+  local PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/reviewer.md")
+  if [[ -n $PROFILE_JSON ]]; then profile_launch_args || die "could not prepare role profile launch"; fi
+  # A subsequent generic start is a real unprofiled conversation, not permission to adopt it later.
+  rm -f -- "$STATE_DIR/$name.profile-fresh"
   pane=${1:-}
   if [[ -z $pane ]]; then
     allocation=$(allocate_pane)
@@ -826,8 +968,7 @@ start_unlocked() {
     elif err=$(hd agent start "$hname" --kind pi --pane "$pane" --timeout 60000 -- \
       --session-id "$session" -n claude-sidecar \
       --model "$MODEL" --thinking "$THINKING" \
-      -e "$AGENT_HOME/sidecar.ts" \
-      --append-system-prompt "$AGENT_HOME/reviewer.md" 2>&1 >/dev/null); then
+      "${PROFILE_LAUNCH_ARGS[@]}" 2>&1 >/dev/null); then
       # Herdr can detect Pi before asynchronous session_start handlers publish the receiver.
       if [[ -n $TARGET_WINDOWS ]]; then windows_control ready >/dev/null || return $?; fi
       echo "$hname started in $pane (pi session $session)"
@@ -1223,7 +1364,8 @@ request() {
   hash=${REQUEST_KEY:-$(sha256sum <<<"$body" | cut -d' ' -f1)}
   # The idle-steer caller already holds descriptor 9 so its idle decision and request are serialized together.
   [[ $lock_mode != acquire ]] || lock_slot "$hash"
-  # A slot may have been bound to another agent while this request waited for the lock.
+  # A slot may have been rebound while this request waited for the lock.
+  { flock 7; profile_input_unlocked; profile_check_unlocked; } 7>"$STATE_DIR/$name.identity.lock"
   resolve_backend
   INFLIGHT="$STATE_DIR/$name.inflight"
   printf '%s\n' "$hash" >"$INFLIGHT"
@@ -2242,6 +2384,7 @@ $*" held
     windows_control steer "[steer from Claude] $*"
     return
   fi
+  [[ -z $PROFILE_JSON ]] || die "busy steering is unavailable for profiled Linux pi workers (ambient steering extensions are disabled); nothing was sent. Wait for the report, then ask"
   session=$(pi_session_id)
   # Herdr can publish a new pi's session file late (notably on Windows); the owner check needs it.
   for ((attempt = 0; attempt < 10; attempt++)); do
@@ -2591,6 +2734,9 @@ SLOT=1
 SLOT_ARG=
 ROLE_ARG=
 AGENT_ARG=
+PROFILE_ARG=
+PROFILE_JSON=
+PROFILE_HASH=
 MACHINE_ARG=
 REMOTE_CWD=
 while [[ ${1:-} == --* ]]; do
@@ -2605,6 +2751,9 @@ while [[ ${1:-} == --* ]]; do
     --agent)
       [[ ${2:-} == pi || ${2:-} == claude || ${2:-} == codex ]] || die "--agent requires pi, claude or codex"
       AGENT_ARG=$2 ;;
+    --profile-file)
+      [[ -n ${2:-} ]] || die "--profile-file requires a JSON file"
+      if [[ $2 == /* || $2 =~ ^[A-Za-z]:[/\\] ]]; then PROFILE_ARG=$2; else PROFILE_ARG="$PWD/$2"; fi ;;
     --machine)
       [[ -n ${2:-} ]] || die "--machine requires a saved herdr machine label or ID"
       MACHINE_ARG=$2 ;;

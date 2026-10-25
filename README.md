@@ -30,7 +30,7 @@ claude plugin validate .claude-plugin/plugin.json
 claude plugin validate .claude-plugin/marketplace.json
 ```
 
-Tests use a fake Herdr and isolated home directories; they never start a real model session.
+Tests use a fake Herdr and isolated home directories; they never start a real model session. Optional runtime checks use `SIDECAR_TEST_PI=/absolute/path/to/pi PYTHONPATH=tests python3 -m unittest test_profile_runtime` (point at the actual executable, not a personal wrapper). They inspect active tools, selected skills, reload commands, and a fixture MCP server through isolated RPC extension commands without making model calls; the ordinary harness skips these checks.
 
 ## Windows hosts
 
@@ -168,6 +168,22 @@ Override pi's model and either role's reasoning level in the environment before 
 export SIDECAR_MODEL=openai-codex/gpt-6.1-sol
 export SIDECAR_THINKING=high
 ```
+
+## Fleet role profiles
+
+`sidecar --slot N --agent pi --profile-file FILE ask TEXT` accepts a fully resolved Fleet profile. Fleet retains configuration authority; sidecar does not look up role names or expand policy. The JSON has exactly these fields:
+
+```json
+{"version":1,"role":"implementer","prompt":"Implement only the assigned change.","allow":null,"deny":[],"skills":[],"mcp":false}
+```
+
+`prompt` is literal text, not a filename. The launcher materializes it and appends it last, after a permission-neutral request/report protocol, instead of the generic reviewer prompt. `allow: null` preserves Pi's default tools (including editing); an array selects tools explicitly. `read` and `submit_review` are always added, even for `allow: []`. `deny` uses Pi's `*` patterns and cannot match either mandatory tool. Tool entries cannot contain commas, whitespace, or additive/subtractive prefixes. Unprofiled slots retain their existing behavior.
+
+Profiled workers disable ambient extensions, skills, and prompt templates; only the sidecar extension and explicit resources load. `skills` contains absolute paths to existing skill files or directories **on the execution machine**; missing resources refuse launch. Remote profiles and prompt files transfer over either transport, but skills and their assets are not copied. The profile supports Pi workers only; the calling planner/orchestrator may use Pi or Claude.
+
+MCP is all-or-nothing in version 1: `mcp: false` passes `--no-mcp`; `true` explicitly loads Pi's built-in MCP, codemode, and tool-search extensions, enabling that machine's normal trusted user/project MCP configuration. It does not select named servers. Tool lists retain Pi's MCP selection/exposure semantics; hiding tools does not prevent server connections. These controls are not an operating-system sandbox. Linux busy steering requires the normally ambient steering extension and therefore is unavailable in a profiled worker; idle steering, requests, answers, and reload retain the sidecar protocol.
+
+The slot persists canonical JSON, its SHA-256 hash, and its working directory under `~/.cache/claude-sidecar/<agent>.profile.json`, `.profile.sha256`, and `.cwd`, protected by its identity lock. Follow-ups may omit `--profile-file`; recreation resumes in the bound directory even when the caller changes directories. Changed profile content, and first attachment to any existing unprofiled conversation (running or stopped), require `sidecar --slot N stop --fresh` first. Fresh reset clears the profile and cwd/machine binding with the session generation, permitting a new profile, role, and directory. It also clears pending questions and launcher checks so a rebound worker cannot run the previous checkout's acceptance commands. A matching live session is reused; `restart` and `reload` do not apply changed startup flags. Profile snapshots contain the literal prompt, so do not put credentials in them.
 
 ## Sidecars on another machine
 

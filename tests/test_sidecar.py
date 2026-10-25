@@ -2696,6 +2696,38 @@ class LauncherTests(unittest.TestCase):
         self.profile_start('--profile-file', str(path))
         self.assertTrue(self.profile_snapshot().exists())
 
+    def test_profile_adoption_after_legacy_fresh_drops_old_checks_and_question(self):
+        first, _ = self.repo_with_change()
+        for direct_ask in (False, True):
+            with self.subTest(direct_ask=direct_ask):
+                slot = '2' if direct_ask else '1'
+                flags = ['--slot', slot]
+                second = self.home / ('checkout-b-' + slot)
+                second.mkdir()
+                self.run_cli(*flags, 'ask', '--accept', 'printf stale > stale-check-ran',
+                             'Legacy task', cwd=first)
+                marker = first / 'stale-check-ran'
+                marker.unlink()
+                state = self.home / '.cache/claude-sidecar'
+                name = 'sc-pane-1' + ('-2' if direct_ask else '')
+                checks, pending = state / (name + '.checks.json'), state / (name + '.pending')
+                pending.write_text('old-request\n')
+                self.run_cli(*flags, 'stop', '--fresh', cwd=first)
+                self.assertTrue(checks.exists())
+                self.assertTrue(pending.exists())
+                profile, _ = self.write_profile()
+                if direct_ask:
+                    self.run_cli(*flags, '--profile-file', str(profile), 'ask', '--accept',
+                                 'printf current > current-check-ran', 'Review checkout B', cwd=second)
+                    self.assertTrue((second / 'current-check-ran').exists())
+                    self.assertTrue(checks.exists())
+                else:
+                    self.run_cli(*flags, '--profile-file', str(profile), 'start', cwd=second)
+                    self.assertFalse(checks.exists())
+                    self.run_cli(*flags, 'ask', 'Review checkout B', cwd=second)
+                self.assertFalse(pending.exists())
+                self.assertFalse(marker.exists())
+
     def test_profile_fresh_reset_permits_cwd_and_profile_rebind(self):
         path, _ = self.write_profile()
         first, second = self.home / 'first checkout', self.home / 'second checkout'

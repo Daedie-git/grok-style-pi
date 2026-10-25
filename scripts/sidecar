@@ -218,6 +218,11 @@ profile_bind_unlocked() {
     if [[ -z $MACHINE ]]; then
       WORK_DIR=$(cd -- "$WORK_DIR" && pwd -P) || die "cannot resolve profile working directory"
     fi
+    # Ordinary unprofiled --fresh preserves legacy request state. First profile
+    # adoption must not carry it into the newly bound checkout/conversation.
+    # An adopting ask may already have installed its own replacement checks.
+    if [[ -z ${CHECKS_REPLACED:-} ]]; then rm -f -- "$base.checks.json"; fi
+    rm -f -- "$base.pending"
     tmp=$(mktemp "$base.startup.json.XXXXXX")
     jq -cn --arg model "$MODEL" --arg thinking "$THINKING" '{model:$model,thinking:$thinking}' >"$tmp"
     mv -f -- "$tmp" "$base.startup.json"
@@ -1819,7 +1824,7 @@ ${2:-(none)}"
 }
 
 cmd_ask() {
-  local accept=() scope=() clear='' text keep=''
+  local accept=() scope=() clear='' text keep='' CHECKS_REPLACED=''
   while [[ ${1:-} == --accept || ${1:-} == --scope || ${1:-} == --no-checks || ${1:-} == --keep ]]; do
     case $1 in
       --accept) [[ -n ${2:-} ]] || die "--accept requires a command"; accept+=("$2"); shift 2 ;;
@@ -1842,6 +1847,7 @@ cmd_ask() {
     lock_slot "$REQUEST_KEY"
     lock_mode=held
     if [[ -n $clear ]]; then rm -f -- "$(checks_file)"; else save_checks accept scope; fi
+    CHECKS_REPLACED=1
   fi
   if [[ $ROLE == implementer ]]; then
     text+="

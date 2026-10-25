@@ -220,8 +220,11 @@ profile_bind_unlocked() {
     fi
     # Ordinary unprofiled --fresh preserves legacy request state. First profile
     # adoption must not carry it into the newly bound checkout/conversation.
-    # An adopting ask may already have installed its own replacement checks.
-    if [[ -z ${CHECKS_REPLACED:-} ]]; then rm -f -- "$base.checks.json"; fi
+    # Never wait for a request while holding startup/identity locks: that request
+    # may itself be waiting for startup. Its admission also performs this cleanup.
+    ( exec 9>"$base.lock"
+      if flock -n 9; then profile_clear_legacy_checks_unlocked; fi
+    )
     rm -f -- "$base.pending"
     tmp=$(mktemp "$base.startup.json.XXXXXX")
     jq -cn --arg model "$MODEL" --arg thinking "$THINKING" '{model:$model,thinking:$thinking}' >"$tmp"
@@ -1426,7 +1429,11 @@ lock_slot() {
     flock 9
   fi
   # Also protect callers that update acceptance checks before entering request().
-  { flock 7; validate_generation_unlocked; } 7>"$STATE_DIR/$name.identity.lock"
+  {
+    flock 7
+    validate_generation_unlocked
+    if [[ ! -f "$STATE_DIR/$name.profile.json" ]]; then profile_clear_legacy_checks_unlocked; fi
+  } 7>"$STATE_DIR/$name.identity.lock"
 }
 
 finish_request() {
@@ -1824,7 +1831,7 @@ ${2:-(none)}"
 }
 
 cmd_ask() {
-  local accept=() scope=() clear='' text keep='' CHECKS_REPLACED=''
+  local accept=() scope=() clear='' text keep=''
   while [[ ${1:-} == --accept || ${1:-} == --scope || ${1:-} == --no-checks || ${1:-} == --keep ]]; do
     case $1 in
       --accept) [[ -n ${2:-} ]] || die "--accept requires a command"; accept+=("$2"); shift 2 ;;
@@ -1847,7 +1854,6 @@ cmd_ask() {
     lock_slot "$REQUEST_KEY"
     lock_mode=held
     if [[ -n $clear ]]; then rm -f -- "$(checks_file)"; else save_checks accept scope; fi
-    CHECKS_REPLACED=1
   fi
   if [[ $ROLE == implementer ]]; then
     text+="
@@ -1863,6 +1869,19 @@ $text" "$lock_mode"
 # replaced by another ask with --accept/--scope, or cleared with --no-checks.
 checks_file() { echo "$STATE_DIR/$(agent_name).checks.json"; }
 
+# Caller holds both the request and identity locks. Legacy files have no generation;
+# current checks survive first profile binding even when another launcher binds it.
+profile_clear_legacy_checks_unlocked() {
+  [[ -n $PROFILE_JSON ]] || return 0
+  local file
+  file=$(checks_file)
+  [[ -f $file ]] || return 0
+  if ! jq -e --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+    '.generation == {session:$session,fresh:$fresh}' "$file" >/dev/null; then
+    rm -f -- "$file"
+  fi
+}
+
 save_checks() {
   local -n accept_ref=$1 scope_ref=$2
   local root start before file tmp
@@ -1874,7 +1893,8 @@ save_checks() {
   change_manifest "$start" "$before.names" >"$before" || die "could not fingerprint the working tree"
   tmp=$(mktemp "$file.XXXXXX")
   jq -n --arg cwd "$PWD" --arg root "$root" --arg start "$start" --arg before "$before" \
-    '{cwd: $cwd, root: $root, start: $start, before: $before, accept: $ARGS.positional[0:($n|tonumber)], scope: $ARGS.positional[($n|tonumber):]}' \
+    --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+    '{generation: {session:$session,fresh:$fresh}, cwd: $cwd, root: $root, start: $start, before: $before, accept: $ARGS.positional[0:($n|tonumber)], scope: $ARGS.positional[($n|tonumber):]}' \
     --arg n "${#accept_ref[@]}" --args "${accept_ref[@]}" "${scope_ref[@]}" >"$tmp"
   mv -f -- "$tmp" "$file"
 }

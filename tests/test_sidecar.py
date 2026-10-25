@@ -2696,6 +2696,45 @@ class LauncherTests(unittest.TestCase):
         self.profile_start('--profile-file', str(path))
         self.assertTrue(self.profile_snapshot().exists())
 
+    def test_concurrent_profile_start_preserves_current_assignments_checks(self):
+        import fcntl
+        repo, _ = self.repo_with_change()
+        profile, _ = self.write_profile()
+        processes = []
+        state = self.home / '.cache/claude-sidecar'
+        checks = state / 'sc-pane-1.checks.json'
+        try:
+            with (state / 'sc-pane-1.startup.lock').open('w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                start = subprocess.Popen([str(self.launcher), '--profile-file', str(profile), 'start'],
+                                         cwd=repo, env=self.env, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True)
+                processes.append(start)
+                # Queue start ahead of the assignment's own startup attempt.
+                time.sleep(0.5)
+                self.assertIsNone(start.poll())
+                ask = subprocess.Popen([str(self.launcher), '--profile-file', str(profile), 'ask',
+                                       '--accept', 'printf current > current-check-ran', 'Current task'],
+                                      cwd=repo, env=self.env, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True)
+                processes.append(ask)
+                deadline = time.monotonic() + 10
+                while not checks.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(checks.exists(), 'assignment did not install checks before startup')
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertTrue((repo / 'current-check-ran').exists())
+            self.assertTrue(checks.exists())
+            self.assertIn('generation', json.loads(checks.read_text()))
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=10)
+
     def test_profile_adoption_after_legacy_fresh_drops_old_checks_and_question(self):
         first, _ = self.repo_with_change()
         for direct_ask in (False, True):

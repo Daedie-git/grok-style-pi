@@ -2494,6 +2494,31 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual([c for c in self.calls() if c[:2] == ['agent', 'prompt']], prompts)
         self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
 
+    def test_profile_startup_pair_is_bound_across_live_reuse_and_stopped_recreation(self):
+        path, _ = self.write_profile()
+        initial = dict(self.env, SIDECAR_MODEL='fixture/model-a', SIDECAR_THINKING='low')
+        self.profile_start('--profile-file', str(path), env=initial)
+        startup = self.profile_snapshot().parent / 'sc-pane-1.startup.json'
+        self.assertEqual(json.loads(startup.read_text()), {'model': 'fixture/model-a', 'thinking': 'low'})
+        for stopped in (False, True):
+            if stopped:
+                self.run_cli('stop')
+            for variable, value in (('SIDECAR_MODEL', 'fixture/model-b'), ('SIDECAR_THINKING', 'high')):
+                with self.subTest(stopped=stopped, variable=variable):
+                    result = self.assert_profile_rejected(path, env=dict(self.env, **{variable: value}))
+                    self.assertIn('stop --fresh', result.stderr)
+            # Omitted overrides retain the original effective startup pair, not role defaults.
+            start = self.profile_start('--profile-file', str(path))
+            self.assertEqual(start[start.index('--model') + 1], 'fixture/model-a')
+            self.assertEqual(start[start.index('--thinking') + 1], 'low')
+        self.run_cli('stop', '--fresh')
+        self.assertFalse(startup.exists())
+        updated = dict(self.env, SIDECAR_MODEL='fixture/model-b', SIDECAR_THINKING='high')
+        start = self.profile_start('--profile-file', str(path), env=updated)
+        self.assertEqual(start[start.index('--model') + 1], 'fixture/model-b')
+        self.assertEqual(start[start.index('--thinking') + 1], 'high')
+        self.assertEqual(json.loads(startup.read_text()), {'model': 'fixture/model-b', 'thinking': 'high'})
+
     def test_profile_canonical_snapshot_digest_and_cwd_are_persisted(self):
         path, profile = self.write_profile()
         work = self.home / 'profile checkout'
@@ -2610,6 +2635,21 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual((self.profile_snapshot().parent / 'sc-pane-1.cwd').read_text().strip(), str(second))
         self.assertEqual(json.loads(self.profile_snapshot().read_text())['role'], 'implementer')
 
+    def test_profile_local_cwd_binding_survives_alias_retargeting(self):
+        path, _ = self.write_profile()
+        first, second, alias = self.home / 'first physical checkout', self.home / 'second physical checkout', self.home / 'checkout alias'
+        first.mkdir()
+        second.mkdir()
+        alias.symlink_to(first, target_is_directory=True)
+        self.profile_start('--profile-file', str(path), cwd=alias, env=dict(self.env, PWD=str(alias)))
+        self.assertEqual((self.profile_snapshot().parent / 'sc-pane-1.cwd').read_text().strip(), str(first))
+        self.run_cli('stop')
+        alias.unlink()
+        alias.symlink_to(second, target_is_directory=True)
+        self.run_cli('start', cwd=alias, env=dict(self.env, PWD=str(alias)))
+        creations = [c for c in self.calls() if c[:2] in (['pane', 'split'], ['tab', 'create'])]
+        self.assertEqual(creations[-1][creations[-1].index('--cwd') + 1], str(first))
+
     def test_profile_completion_auto_close_recreates_in_bound_cwd_from_another_cwd(self):
         self.lifecycle_state()
         path, _ = self.write_profile()
@@ -2636,6 +2676,67 @@ class LauncherTests(unittest.TestCase):
     def test_profile_missing_local_skill_is_rejected_before_launch(self):
         path, _ = self.write_profile(skills=[str(self.home / 'missing skill.md')])
         self.assert_profile_rejected(path)
+
+    def test_profile_local_home_skills_expand_and_preserve_manifest(self):
+        directory = self.home / 'skills/home skill'
+        directory.mkdir(parents=True)
+        (directory / 'SKILL.md').write_text('Selected directory skill.\n')
+        markdown = self.home / 'skills/standalone.MD'
+        markdown.write_text('Selected Markdown skill.\n')
+        paths = ['~/skills/home skill', '~/skills/standalone.MD']
+        profile, _ = self.write_profile(skills=paths)
+        start = self.profile_start('--profile-file', str(profile))
+        self.assertEqual([start[i + 1] for i, arg in enumerate(start) if arg == '--skill'],
+                         [str(directory), str(markdown)])
+        self.assertEqual(json.loads(self.profile_snapshot().read_text())['skills'], paths)
+
+    def test_profile_remote_home_skills_resolve_on_target_not_local_home(self):
+        self.add_machines()
+        for slot, transport in (('2', 'sh'), ('3', 'node')):
+            with self.subTest(transport=transport):
+                config = self.home / 'sidecar-machines.json'
+                config.write_text(json.dumps({'laptop': {'transport': transport}}))
+                env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+                relative = 'skills/target home skill ' + transport
+                local = self.home / relative
+                local.mkdir(parents=True)
+                (local / 'SKILL.md').write_text('Local decoy.\n')
+                profile, _ = self.write_profile(skills=['~/' + relative])
+                result = self.assert_profile_rejected(profile, '--slot', slot, '--machine', 'laptop',
+                                                       cwd=self.work, env=env)
+                self.assertIn('skill', result.stderr)
+                target = self.remote_home() / relative
+                target.mkdir(parents=True)
+                (target / 'SKILL.md').write_text('Target skill.\n')
+                self.remote_run('--slot', slot, '--machine', 'laptop', '--profile-file', str(profile),
+                                'start', env=env)
+                start = [c for c in self.remote_calls() if c[:2] == ['agent', 'start']][-1]
+                self.assertEqual(start[start.index('--skill') + 1], str(target))
+                self.assertNotEqual(start[start.index('--skill') + 1], str(local))
+
+    def test_profile_invalid_skill_layouts_refuse_before_local_or_remote_launch(self):
+        self.add_machines()
+        slot = 10
+        for transport in ('local', 'sh', 'node'):
+            config = self.home / 'sidecar-machines.json'
+            config.write_text(json.dumps({'laptop': {'transport': transport if transport != 'local' else 'sh'}}))
+            env = self.env if transport == 'local' else dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
+            root = self.home if transport == 'local' else self.remote_home()
+            empty = root / ('empty skill ' + transport)
+            empty.mkdir()
+            wrong_kind = root / ('wrong skill ' + transport)
+            (wrong_kind / 'SKILL.md').mkdir(parents=True)
+            text = root / ('not Markdown ' + transport + '.txt')
+            text.write_text('Not a Markdown file.\n')
+            for invalid in (empty, wrong_kind, text):
+                with self.subTest(transport=transport, path=invalid.name):
+                    profile, _ = self.write_profile(skills=[str(invalid)])
+                    args = ['--slot', str(slot)]
+                    if transport != 'local':
+                        args += ['--machine', 'laptop']
+                    result = self.assert_profile_rejected(profile, *args, cwd=self.work, env=env)
+                    self.assertIn('skill', result.stderr)
+                    slot += 1
 
     def test_profile_existing_local_skill_is_explicitly_loaded(self):
         skill = self.home / 'fleet skill.md'

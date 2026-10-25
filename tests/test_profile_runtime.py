@@ -50,7 +50,7 @@ for line in sys.stdin:
         ambient = agent / 'extensions/ambient.mjs'
         ambient.parent.mkdir()
         ambient.write_text("export default pi => { throw new Error('ambient extension must not load'); };\n")
-        profile, _ = fixture.write_profile(mcp=mcp, allow=allow, skills=[str(skill)])
+        profile, _ = fixture.write_profile(mcp=mcp, allow=allow, skills=['~/selected skill'])
         fixture.run_cli('--profile-file', str(profile), 'start', cwd=work)
         start = [c for c in fixture.calls() if c[:2] == ['agent', 'start']][-1]
         flags = start[start.index('--') + 1:]

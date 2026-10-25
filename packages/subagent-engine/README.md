@@ -16,7 +16,7 @@ Grok users get the engine through `integrations/subagents.ts` instead. Load exac
 
 | Tool | Purpose |
 |---|---|
-| `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model`, `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` pins pane agents against idle cleanup; it does not select the pane backend or affect in-process agents. |
+| `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model`, `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` keeps a pane agent's pane open after it finishes; it does not select the pane backend or affect in-process agents. |
 | `SendMessage` | `{to, message, summary?}`. A running agent gets the message after its current tool round. A finished agent resumes the same conversation in a new run. `to: "main"` reaches the root conversation. |
 | `TaskStop` | Stop an agent. The main conversation can stop any agent; an agent can stop only itself. A stop by the user (Grok activity panel) also stops the agent's descendants, and none of them resume automatically. |
 | `TaskCreate` / `TaskGet` / `TaskList` / `TaskUpdate` | A shared task list. Every agent of the root session sees the same list. `owner` is a plain assignment; completed blockers are hidden in `TaskList`. |
@@ -43,7 +43,7 @@ To add your own, write markdown files with frontmatter: `name`, `description`, `
 5. Command line: `PI_AGENTS_JSON`
 6. Managed policy: `PI_AGENTS_POLICY_DIR`
 
-For Herdr panes, agent-file `keep: true` defaults to pinning the pane against idle cleanup. An explicit `Agent.keep` overrides this default, including `false`; pinning persists across resumes. Owner-gone cleanup still applies. In-process agents ignore `keep`.
+For Herdr panes, agent-file `keep: true` defaults to keeping the pane open after the agent finishes. An explicit `Agent.keep` overrides this default, including `false`; pinning persists across resumes. Owner-gone cleanup still applies. In-process agents ignore `keep`.
 
 The tool language matches Claude's. `Read`, `Bash`, `Glob` and similar names map to Pi's tools. `Agent(Explore, Plan)` limits which types an agent may launch, and `mcp__server` names a whole MCP server. A deny always wins over an allow.
 

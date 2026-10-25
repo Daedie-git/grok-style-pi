@@ -22,9 +22,8 @@ test("parking preserves the completed run and acknowledgement and fences the old
 	await store.claimNextCommand(task.id, binding.token, false);
 	await store.recordExecutionEvent(ref, binding.token, { type: "live" }, 3);
 	await store.recordExecutionEvent(ref, binding.token, { type: "completed", result: "remember me" }, 3);
-	assert.equal((await store.lifecycleCandidates())[0].acknowledged, false);
 	await store.acknowledgeNotice(ref.runId);
-	assert.equal((await store.lifecycleCandidates())[0].acknowledged, true);
+	assert.equal((await store.lifecycleCandidates())[0].run.phase, "completed");
 	assert.equal(await store.parkAgent(ref, task.paneId, 4), true);
 	assert.equal((await store.findAgent(task.id))?.paneState, "parked");
 	assert.equal(await store.attach(task.paneId, binding.agent.sessionFile, "conversation"), undefined);

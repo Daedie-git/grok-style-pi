@@ -33,7 +33,9 @@ export interface HerdrTask {
 	parentWorkspaceId?: string;
 	/** Set when the owning parent lives on another machine, regardless of which runner observes this record. */
 	parentMachine?: string;
-	/** The owner's idle policy, retained across target-host maintenance and cold resumes. */
+	/** The owner's close policy, retained across target-host maintenance and cold resumes. */
+	closeWhenDone?: boolean;
+	/** Legacy idle policy; zero still disables closing. */
 	idleCloseSeconds?: number;
 	cwd?: string;
 	keep?: boolean;

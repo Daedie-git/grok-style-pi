@@ -33,22 +33,20 @@ test("machine defaults accept Windows paths and resolve both labels and IDs", (t
 	}
 });
 
-test("idle pane cleanup settings default to 900 seconds and accept zero without machines", (t) => {
+test("closeWhenDone defaults to true and accepts only booleans", (t) => {
 	const dir = mkdtempSync(join(tmpdir(), "herdr-config-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
-	assert.deepEqual(readHerdrSettings(dir), { machines: {}, idleCloseSeconds: 900 });
+	assert.deepEqual(readHerdrSettings(dir), { machines: {}, closeWhenDone: true });
 	const path = join(dir, "herdr-subagents.json");
-	for (const value of [{}, { machines: {} }, { idleCloseSeconds: 0 }, { idleCloseSeconds: 30.5 }, { idleCloseSeconds: 900, machines: { lappy: { cwd: "C:/git" } } }]) {
+	for (const value of [{}, { machines: {} }, { closeWhenDone: false }, { closeWhenDone: true, machines: { lappy: { cwd: "C:/git" } } }]) {
 		writeFileSync(path, JSON.stringify(value));
-		assert.equal(readHerdrSettings(dir).idleCloseSeconds, "idleCloseSeconds" in value ? value.idleCloseSeconds : 900);
+		assert.equal(readHerdrSettings(dir).closeWhenDone, "closeWhenDone" in value ? value.closeWhenDone : true);
 		assert.deepEqual(readMachineSettings(dir), readHerdrSettings(dir).machines);
 	}
-	for (const value of [-1, "900", null, false, {}, []]) {
-		writeFileSync(path, JSON.stringify({ idleCloseSeconds: value }));
-		assert.throws(() => readHerdrSettings(dir), /idleCloseSeconds must be a nonnegative finite number/);
+	for (const value of [0, "true", null, {}, []]) {
+		writeFileSync(path, JSON.stringify({ closeWhenDone: value }));
+		assert.throws(() => readHerdrSettings(dir), /closeWhenDone must be true or false/);
 	}
-	writeFileSync(path, '{"idleCloseSeconds":1e400}');
-	assert.throws(() => readHerdrSettings(dir), /idleCloseSeconds must be a nonnegative finite number/);
 });
 
 test("agent-file keep distinguishes pinned, explicitly unpinned and absent defaults", () => {

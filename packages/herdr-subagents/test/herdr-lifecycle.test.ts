@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,7 +8,7 @@ import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } fr
 import { HerdrRunner, spawnHerdrAgent } from "../src/herdr/runner.ts";
 import type { ChildBinding } from "../src/herdr/store.ts";
 
-async function fixture(t: test.TestContext, options: { keep?: boolean; idleCloseSeconds?: number; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string } = {}) {
+async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-lifecycle-"));
 	let now = 1_000_000;
 	let sequence = 1;
@@ -55,7 +56,7 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; idleClose
 		async listAgents() { return structuredClone([...named.values()]); },
 		async listPanes() { return structuredClone([...panes.values()]); },
 	};
-	runner = new HerdrRunner({ root, client, now: () => now, idleCloseSeconds: options.idleCloseSeconds, machine: options.machine });
+	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const ref = await runner.spawn({
 		prompt: "remember this", description: "test", subagentType: "test", runtime: options.runtime,
@@ -86,7 +87,7 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; idleClose
 	return { runner, client, ref, panes, named, starts, closed, complete, advance: (ms = 901_000) => { now += ms; } };
 }
 
-test("idle finished panes park and resume on the same session with original settings", async (t) => {
+test("completed panes park and resume on the same session with original settings", async (t) => {
 	const f = await fixture(t);
 	await f.complete();
 	const before = await f.runner.resolve(f.ref.agentId);
@@ -107,10 +108,10 @@ test("idle finished panes park and resume on the same session with original sett
 	assert.equal(reopened.owner, f.runner.owner);
 });
 
-for (const reason of ["running", "unacknowledged", "pinned", "focused", "unknown-focus", "disabled", "missing-session", "mismatched-session", "working", "unknown-status"] as const) {
-	test(`idle reaper preserves ${reason} panes`, async (t) => {
-		const f = await fixture(t, { keep: reason === "pinned", idleCloseSeconds: reason === "disabled" ? 0 : undefined });
-		if (reason !== "running") await f.complete(reason !== "unacknowledged");
+for (const reason of ["running", "pinned", "focused", "unknown-focus", "disabled", "missing-session", "mismatched-session", "working", "unknown-status"] as const) {
+	test(`completion reaper preserves ${reason} panes`, async (t) => {
+		const f = await fixture(t, { keep: reason === "pinned", closeWhenDone: reason === "disabled" ? false : undefined });
+		if (reason !== "running") await f.complete();
 		const record = await f.runner.resolve(f.ref.agentId);
 		const pane = f.panes.get(record.paneId)!;
 		if (reason === "focused") pane.focused = true;
@@ -125,8 +126,8 @@ for (const reason of ["running", "unacknowledged", "pinned", "focused", "unknown
 	});
 }
 
-test("owner disappearance stops an active pinned child independently of idle closure", async (t) => {
-	const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+test("owner disappearance stops an active pinned child independently of completion closure", async (t) => {
+	const f = await fixture(t, { keep: true, closeWhenDone: false });
 	f.panes.delete("w1:p1");
 	await f.runner.maintain();
 	assert.equal(f.closed.length, 1);
@@ -137,7 +138,7 @@ test("owner disappearance stops an active pinned child independently of idle clo
 for (const stage of ["initial", "final"] as const) {
 	for (const occupant of ["shell", "agent", "malformed", "missing"] as const) {
 		test(`${stage} native ${occupant} metadata ${occupant === "shell" ? "permits" : "preserves uncertainty during"} owner-gone cleanup`, async (t) => {
-			const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+			const f = await fixture(t, { keep: true, closeWhenDone: false });
 			const record = await f.runner.resolve(f.ref.agentId);
 			const binding = (await f.runner.store.attach(record.paneId, record.sessionFile, record.sessionId!))!;
 			await f.runner.store.claimNextCommand(record.id, binding.token, false);
@@ -166,7 +167,7 @@ for (const stage of ["initial", "final"] as const) {
 for (const surface of ["resume", "maintenance"] as const) {
 	for (const identity of ["matching", "unknown"] as const) {
 		test(`${surface} close recovery preserves ${identity} moved-session execution and binding`, async (t) => {
-			const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+			const f = await fixture(t, { keep: true, closeWhenDone: false });
 			const record = await f.runner.resolve(f.ref.agentId);
 			const binding = (await f.runner.store.attach(record.paneId, record.sessionFile, record.sessionId!))!;
 			await f.runner.store.claimNextCommand(record.id, binding.token, false);
@@ -196,21 +197,21 @@ for (const surface of ["resume", "maintenance"] as const) {
 	}
 }
 
-for (const cleanup of ["idle", "owner-gone"] as const) {
+for (const cleanup of ["done", "owner-gone"] as const) {
 	test(`a quarantined database does not prepare ${cleanup} cleanup`, async (t) => {
 		const f = await fixture(t);
-		if (cleanup === "idle") { await f.complete(); f.advance(); }
+		if (cleanup === "done") await f.complete();
 		else f.panes.delete("w1:p1");
 		f.runner.store.lifecycleAllowed = async () => false;
 		await f.runner.maintain();
 		assert.deepEqual(f.closed, []);
 		assert.equal((await f.runner.resolve(f.ref.agentId)).paneClose, undefined);
-		assert.equal((await f.runner.read(f.ref)).phase, cleanup === "idle" ? "completed" : "queued");
+		assert.equal((await f.runner.read(f.ref)).phase, cleanup === "done" ? "completed" : "queued");
 	});
 
 	test(`quarantine enabled at the final ${cleanup} close boundary retains intent`, async (t) => {
 		const f = await fixture(t);
-		if (cleanup === "idle") { await f.complete(); f.advance(); }
+		if (cleanup === "done") await f.complete();
 		else f.panes.delete("w1:p1");
 		const record = await f.runner.resolve(f.ref.agentId);
 		let allowed = true;
@@ -224,7 +225,7 @@ for (const cleanup of ["idle", "owner-gone"] as const) {
 		await f.runner.maintain();
 		assert.deepEqual(f.closed, []);
 		assert.ok((await f.runner.resolve(record.id)).paneClose);
-		assert.equal((await f.runner.read(f.ref)).phase, cleanup === "idle" ? "completed" : "queued");
+		assert.equal((await f.runner.read(f.ref)).phase, cleanup === "done" ? "completed" : "queued");
 	});
 }
 
@@ -445,7 +446,7 @@ test("a moved root parent is resolved through its old pane alias", async (t) => 
 
 for (const oldPane of ["absent", "replaced"] as const) {
 	test(`an unmanaged owner session moved to another pane survives an ${oldPane} old alias`, async (t) => {
-		const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+		const f = await fixture(t, { keep: true, closeWhenDone: false });
 		f.panes.delete("w1:p1");
 		if (oldPane === "replaced") f.panes.set("w1:p1", { paneId: "w1:p1", session: "/replacement.jsonl", focused: false });
 		f.panes.set("w2:p10", { paneId: "w2:p10", session: "/owner.jsonl", focused: false });
@@ -457,7 +458,7 @@ for (const oldPane of ["absent", "replaced"] as const) {
 
 for (const uncertainty of ["pane-id", "pane-session", "agent-session"] as const) {
 	test(`owner-gone cleanup preserves incomplete ${uncertainty} evidence`, async (t) => {
-		const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+		const f = await fixture(t, { keep: true, closeWhenDone: false });
 		f.panes.delete("w1:p1");
 		if (uncertainty === "pane-id") f.panes.set("unknown", { session: "/unrelated.jsonl" });
 		else if (uncertainty === "pane-session") f.panes.set("w2:p10", { paneId: "w2:p10", status: "working" });
@@ -470,7 +471,7 @@ for (const uncertainty of ["pane-id", "pane-session", "agent-session"] as const)
 }
 
 test("an owner returning during readiness prevents an owner-gone close", async (t) => {
-	const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+	const f = await fixture(t, { keep: true, closeWhenDone: false });
 	f.panes.delete("w1:p1");
 	const prepare = f.runner.store.preparePaneClose.bind(f.runner.store);
 	f.runner.store.preparePaneClose = async (...args) => {
@@ -486,7 +487,7 @@ test("an owner returning during readiness prevents an owner-gone close", async (
 
 for (const returned of ["session", "unknown-old-pane", "unknown-agent"] as const) {
 	test(`the final pre-close snapshot preserves a returned owner with ${returned} evidence`, async (t) => {
-		const f = await fixture(t, { keep: true, idleCloseSeconds: 0 });
+		const f = await fixture(t, { keep: true, closeWhenDone: false });
 		f.panes.delete("w1:p1");
 		const record = await f.runner.resolve(f.ref.agentId);
 		const get = f.client.getAgent;
@@ -602,9 +603,9 @@ test("ambiguous cold pane creation is retained and never blindly retried", async
 });
 
 for (const ownerGone of [false, true]) {
-	test(`a runner killed by its own ${ownerGone ? "owner-gone" : "idle"} close leaves recoverable durable intent`, async (t) => {
+	test(`a runner killed by its own ${ownerGone ? "owner-gone" : "completion"} close leaves recoverable durable intent`, async (t) => {
 		const f = await fixture(t, { keep: ownerGone });
-		if (!ownerGone) { await f.complete(); f.advance(); }
+		if (!ownerGone) await f.complete();
 		else f.panes.delete("w1:p1");
 		const record = await f.runner.resolve(f.ref.agentId);
 		const close = f.client.closePane;
@@ -640,25 +641,24 @@ test("a confirmed live pane after close failure rolls back intent without parkin
 });
 
 for (const activity of ["working", "blocked", "focused"] as const) {
-	test(`observed ${activity} activity restarts the idle interval before the original deadline`, async (t) => {
-		const f = await fixture(t);
-		await f.complete();
-		const record = await f.runner.resolve(f.ref.agentId);
-		const pane = f.panes.get(record.paneId)!;
-		if (activity === "focused") pane.focused = true;
-		else pane.status = activity;
-		f.advance(800_000);
-		await f.runner.maintain();
-		assert.equal((await f.runner.resolve(record.id)).lastActivityAt, 1_800_000);
-		pane.focused = false;
-		pane.status = "idle";
-		f.advance(200_000);
-		await f.runner.maintain();
-		assert.deepEqual(f.closed, []);
-		f.advance(701_000);
-		await f.runner.maintain();
-		assert.equal(f.closed.length, 1);
-	});
+	for (const late of [false, true]) {
+		test(`${activity} activity ${late ? "after" : "while"} a completed pane settles ${late ? "keeps it open" : "delays its close"}`, async (t) => {
+			const f = await fixture(t);
+			await f.complete();
+			const record = await f.runner.resolve(f.ref.agentId);
+			const pane = f.panes.get(record.paneId)!;
+			if (activity === "focused") pane.focused = true;
+			else pane.status = activity;
+			f.advance(late ? 121_000 : 60_000);
+			await f.runner.maintain();
+			assert.deepEqual(f.closed, []);
+			pane.focused = false;
+			pane.status = "idle";
+			f.advance(901_000);
+			await f.runner.maintain();
+			assert.equal(f.closed.length, late ? 0 : 1);
+		});
+	}
 }
 
 test("close intent preserves an active binding and fences liveness failure until settlement", async (t) => {
@@ -744,21 +744,35 @@ test("target-host maintenance preserves remotely owned pinned running children",
 	}
 });
 
-for (const policy of [0, 1800]) {
-	test(`target-host maintenance retains the owner's ${policy}-second idle policy`, async (t) => {
-		const f = await fixture(t, { idleCloseSeconds: policy });
-		await f.complete();
+for (const policy of [false, true]) {
+	test(`target-host maintenance retains the owner's closeWhenDone ${policy} policy`, async (t) => {
+		const f = await fixture(t, { closeWhenDone: policy });
 		const record = await f.runner.resolve(f.ref.agentId);
-		assert.equal(record.idleCloseSeconds, policy);
-		let now = 2_000_000;
-		const local = new HerdrRunner({ root: record.cwd!, client: f.client, now: () => now, idleCloseSeconds: 1 });
+		assert.equal(record.closeWhenDone, policy);
+		f.runner.maintain = async () => {};
+		await f.complete();
+		const local = new HerdrRunner({ root: record.cwd!, client: f.client, now: () => 1_000_000, closeWhenDone: !policy });
 		try {
 			await local.maintain();
-			assert.deepEqual(f.closed, []);
-			now = 3_000_000;
-			await local.maintain();
-			assert.equal(f.closed.length, policy === 0 ? 0 : 1);
+			assert.equal(f.closed.length, policy ? 1 : 0);
 		} finally { await local.close(); }
+	});
+}
+
+for (const legacy of [0, 900]) {
+	test(`a legacy ${legacy}-second idle policy ${legacy ? "closes" : "keeps"} completed panes`, async (t) => {
+		const f = await fixture(t);
+		const record = await f.runner.resolve(f.ref.agentId);
+		const file = readdirSync(record.cwd!, { recursive: true }).map(String).find((name) => name.endsWith("control.sqlite"))!;
+		const db = new DatabaseSync(join(record.cwd!, file));
+		try {
+			db.prepare("UPDATE agents SET data=json_set(json_remove(data,'$.closeWhenDone'),'$.idleCloseSeconds',?) WHERE id=?").run(legacy, record.id);
+		} finally { db.close(); }
+		// The foreign write quarantines lifecycle like an old worker's would.
+		await f.runner.store.confirmLifecycleUpgrade("all-old-workers-stopped");
+		await f.complete();
+		await f.runner.maintain();
+		assert.equal(f.closed.length, legacy ? 1 : 0);
 	});
 }
 
@@ -794,23 +808,13 @@ test("explicit resume refuses an unprovable interrupted close without opening an
 	assert.equal(f.starts.length, 1);
 });
 
-test("manual work while unacknowledged restarts the idle clock before a late acknowledgement", async (t) => {
+test("a completed pane closes before its notice is acknowledged and keeps the result and notice", async (t) => {
 	const f = await fixture(t);
 	await f.complete(false);
-	const record = await f.runner.resolve(f.ref.agentId);
-	const pane = f.panes.get(record.paneId)!;
-	pane.status = "working";
-	f.advance(1_000_000);
-	await f.runner.maintain();
-	assert.equal((await f.runner.resolve(record.id)).lastActivityAt, 2_000_000);
-	pane.status = "idle";
-	await f.runner.store.acknowledgeNotice(f.ref.runId);
-	f.advance(2000);
-	await f.runner.maintain();
-	assert.deepEqual(f.closed, []);
-	f.advance(899_000);
 	await f.runner.maintain();
 	assert.equal(f.closed.length, 1);
+	assert.equal((await f.runner.read(f.ref)).result, "remembered");
+	await f.runner.store.acknowledgeNotice(f.ref.runId);
 });
 
 test("cold resume allocates a fresh Herdr name if another session took the old name", async (t) => {
@@ -1041,23 +1045,9 @@ test("definite cold pane creation rejection releases its reservation for retry",
 	assert.equal((await f.runner.read(next)).phase, "queued");
 });
 
-for (const acknowledged of [false, true]) {
-	test(`${acknowledged ? "acknowledged" : "unacknowledged"} finished panes expire at ${acknowledged ? "1x" : "4x"} their persisted timeout`, async (t) => {
-		const f = await fixture(t, { idleCloseSeconds: 10 });
-		await f.complete(acknowledged);
-		f.advance(acknowledged ? 9999 : 39999);
-		await f.runner.maintain();
-		assert.deepEqual(f.closed, []);
-		f.advance(2000);
-		await f.runner.maintain();
-		assert.equal(f.closed.length, 1);
-		assert.equal((await f.runner.read(f.ref)).phase, "completed");
-	});
-}
-
 for (const guard of ["disabled", "pinned", "focused", "working", "blocked", "unknown-focus", "unknown-status", "unknown-session"] as const) {
-	test(`unacknowledged expiry preserves the ${guard} idle guard beyond 4x`, async (t) => {
-		const f = await fixture(t, { idleCloseSeconds: guard === "disabled" ? 0 : 10, keep: guard === "pinned" });
+	test(`unacknowledged completion preserves the ${guard} guard`, async (t) => {
+		const f = await fixture(t, { closeWhenDone: guard === "disabled" ? false : undefined, keep: guard === "pinned" });
 		await f.complete(false);
 		const record = await f.runner.resolve(f.ref.agentId);
 		const pane = f.panes.get(record.paneId)!;

@@ -94,7 +94,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const savedMachines = machineGuidance(profiles);
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
-		const getRunner = () => runner ??= new HerdrRunner({ ...deps, idleCloseSeconds: settings.idleCloseSeconds });
+		const getRunner = () => runner ??= new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone });
 		/** One runner, and one SSH store channel, per saved machine used by this session. */
 		const machines = new Map<string, Promise<HerdrRunner>>();
 		const machineRunners = new Map<string, HerdrRunner>();
@@ -110,7 +110,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine, idleCloseSeconds: settings.idleCloseSeconds }));
+				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine, closeWhenDone: settings.closeWhenDone }));
 				pending = connected.then(async (opened) => {
 					// Refuse a mismatched package before any launch or owner retirement runs on that store.
 					// An unverified store is closed without retiring anything: its operations are not established.
@@ -262,7 +262,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				run_in_background: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false to wait for the result, or for blocked." })),
 				resume: Type.Optional(Type.String({ description: "Agent ID to resume after its current run has finished." })),
 				isolated: Type.Optional(Type.Boolean({ description: "If true, the child may use only built-in tools." })),
-				keep: Type.Optional(Type.Boolean({ description: "Pin this agent's pane against idle cleanup. Overrides agent-file keep; preserved on resume. Owner disappearance still closes it." })),
+				keep: Type.Optional(Type.Boolean({ description: "Keep this agent's pane open after it finishes. Overrides agent-file keep; preserved on resume. Owner disappearance still closes it." })),
 				inherit_context: Type.Optional(Type.Boolean({ description: "Must remain false. The orchestrating agent provides all needed context in the prompt." })),
 				machine: Type.Optional(Type.String({ description: "Saved Herdr SSH machine (label or profile ID) to run on. Only when the user asks. Ignored with resume; the agent ID names its machine." })),
 				machine_cwd: Type.Optional(Type.String({ description: "Absolute working directory on that machine, such as C:/git/project on Windows. Overrides the per-machine cwd in the user agent directory's herdr-subagents.json; otherwise defaults to this session's directory." })),

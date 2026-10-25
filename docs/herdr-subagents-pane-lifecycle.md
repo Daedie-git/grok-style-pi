@@ -1,4 +1,4 @@
-# herdr-subagents: close idle panes, resume cold
+# herdr-subagents: close completed panes, resume cold
 
 Idle subagent panes accumulate because `Runner.resume` sends the prompt to the live pane (`locate`, `runner.ts`) and fails when it is gone, so closing a pane loses the agent. Make the pane disposable and the session file the conversation, then close panes on clear rules.
 
@@ -21,16 +21,17 @@ Closing the pane of a finished run on purpose records the agent as `parked`, not
 In the existing lease-based maintenance loop, close a child's pane when all hold:
 
 - its current run is terminal,
-- it has been idle at least `idleCloseSeconds` after acknowledgement, or **four times** that timeout if its completion notice remains unacknowledged (default 900/3600 seconds; `0` disables both). The timeout is recorded from the launching parent's configuration and retained across resumes so other runners cannot replace its policy. The result and pending notice remain durable after closing the pane,
+- its run `completed` (failed and stopped runs stay for inspection), and the launching parent's `closeWhenDone` (default true, recorded on the agent and retained across resumes; legacy `idleCloseSeconds: 0` records count as false) allows closing. Acknowledgement is not required: the result and pending notice remain durable after closing the pane,
+- no work or focus was observed more than two minutes after completion; later activity means someone uses the pane, so it stays,
 - it is not pinned,
 - the pane is positively reported unfocused (missing focus metadata refuses cleanup),
-- Herdr positively reports the live agent `idle` or `done`; a terminal managed run alone does not prove idleness, because a manual follow-up can still be running. Observed work or focus resets the idle clock,
+- Herdr positively reports the live agent `idle` or `done`; a terminal managed run alone does not prove idleness, because a manual follow-up can still be running,
 - its pane still runs the agent's own session,
 - its saved session and original directory are available for cold resume. Pi entries must form a valid tree with loadable message/context structure; reconstruct context with Pi's public session loader rather than accepting JSON syntax alone. Unverifiable or corrupt sessions refuse cleanup.
 
 Independently, when the owner's session ended, cancel its running children and close its children's panes, pinned or not, subject to cold-resume safety. Confirm a missing parent through Herdr's alias-resolving pane lookup: moving a parent changes its listed pane ID without ending its session. An intentionally parked parent conversation still owns its running children; parking is not session termination. Missing or failed identity observations do not prove owner death. A remote parent identity must not be compared against the child's remote pane list.
 
-Implementation limitations: remote owner-session termination has no verifiable cross-machine identity observation, so remote children receive idle cleanup only. Active Claude owner-gone cleanup is also excluded: cancellation would permanently disable resume, conflicting with the safety invariant. Cancelled Claude conversations always remain non-resumable. Older records missing their original directory or saved session evidence are preserved rather than guessed.
+Implementation limitations: remote owner-session termination has no verifiable cross-machine identity observation, so remote children receive completion cleanup only. Active Claude owner-gone cleanup is also excluded: cancellation would permanently disable resume, conflicting with the safety invariant. Cancelled Claude conversations always remain non-resumable. Older records missing their original directory or saved session evidence are preserved rather than guessed.
 
 Mixed-version databases remain quarantined until an operator explicitly confirms every old parent, child, remote stdio worker and other installation sharing the database has exited or reloaded. Old commands, execution events and results continue normally; no elapsed quiet interval or new-worker heartbeat automatically enables lifecycle. Fresh databases assume all-new workers. Unknown legacy SQL writes revoke activation; intentional-close recovery cannot be settled as an old maintainer's generic pane-death failure. The `lifecycle-upgrade.mjs` CLI provides read-only status and explicit post-drain activation; confirmation must not be used while an old worker remains, or followed by restarting an old installation.
 
@@ -38,8 +39,8 @@ All resume and close effects serialize through the placement lock and check the 
 
 ## 4. Pinning
 
-`Agent` takes `keep: true` (also an agent-file key) to exempt the agent from the idle rule, both standalone and through the combined subagent engine. Explicit `keep: false` overrides an agent-file pin. Pinning persists across resumes; it does not exempt an agent from confirmed owner-session termination.
+`Agent` takes `keep: true` (also an agent-file key) to exempt the agent from the completion rule, both standalone and through the combined subagent engine. Explicit `keep: false` overrides an agent-file pin. Pinning persists across resumes; it does not exempt an agent from confirmed owner-session termination.
 
 ## Tests
 
-Close an idle finished agent, then resume it cold and get a result from the same conversation; running, pinned and focused agents stay. Unacknowledged agents stay through the normal timeout, then close only after four times that timeout without losing their result or pending notice. A manual follow-up still working after focus leaves also stays. Owner-session termination closes and cancels safely; moved parents and parked parents with running children do not trigger orphan cleanup. A pane dying mid-run still fails the run. Test explicit and agent-file `keep` through the combined engine entry point, unknown observations, invalid cold sessions, concurrent resume/close, and cancelled Claude refusal. Cover resumed-parent child ownership and notice routing, explicit orphan adoption, ambiguous cold startup followed by a warm retry, renamed live agents, focus/status/session changes during readiness, deleted historical workspaces through the public wrapper, and parseable sessions rejected by the real Pi loader.
+Close a completed agent, then resume it cold and get a result from the same conversation; running, pinned and focused agents stay. Unacknowledged agents close without losing their result or pending notice. Activity within the settle window delays closing; later activity keeps the pane. Owner-session termination closes and cancels safely; moved parents and parked parents with running children do not trigger orphan cleanup. A pane dying mid-run still fails the run. Test explicit and agent-file `keep` through the combined engine entry point, unknown observations, invalid cold sessions, concurrent resume/close, and cancelled Claude refusal. Cover resumed-parent child ownership and notice routing, explicit orphan adoption, ambiguous cold startup followed by a warm retry, renamed live agents, focus/status/session changes during readiness, deleted historical workspaces through the public wrapper, and parseable sessions rejected by the real Pi loader.

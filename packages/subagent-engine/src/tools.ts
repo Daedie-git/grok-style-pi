@@ -31,7 +31,7 @@ export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => En
 			name: Type.Optional(Type.String({ description: "Optional name, so SendMessage can address this agent by name." })),
 			isolation: Type.Optional(Type.Literal("worktree", { description: "Run in an isolated git worktree." })),
 			...(options.panes ? {
-				keep: Type.Optional(Type.Boolean({ description: "Pin a Herdr pane against idle cleanup. Overrides agent-file keep and persists across resumes. Does not select the pane backend or prevent owner-gone cleanup." })),
+				keep: Type.Optional(Type.Boolean({ description: "Keep a Herdr pane open after the agent finishes. Overrides agent-file keep and persists across resumes. Does not select the pane backend or prevent owner-gone cleanup." })),
 				backend: Type.Optional(Type.Union([Type.Literal("in-process"), Type.Literal("pane")], { description: options.paneDefault
 					? "In a top-level Herdr session, agents default to a pane; forks, worktree, nested agents and definitions with skills, memory, hooks or MCP servers run in-process. Use in-process only when the user asks to keep the agent out of a pane."
 					: "Default in-process. Use pane only when the user asks for a visible Herdr pane." })),

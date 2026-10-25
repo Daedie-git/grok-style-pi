@@ -8,8 +8,8 @@ export interface MachineSettings {
 
 export interface HerdrSettings {
 	machines: Record<string, MachineSettings>;
-	/** Zero disables idle pane cleanup. */
-	idleCloseSeconds: number;
+	/** False keeps finished panes open. */
+	closeWhenDone: boolean;
 }
 
 /** User-level settings shared by local and saved-machine runners. */
@@ -18,17 +18,15 @@ export function readHerdrSettings(agentDir: string): HerdrSettings {
 	let text: string;
 	try { text = readFileSync(path, "utf8"); }
 	catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { machines: {}, idleCloseSeconds: 900 };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { machines: {}, closeWhenDone: true };
 		throw error;
 	}
 	try {
 		const config: unknown = JSON.parse(text);
 		if (!record(config)) throw new Error("expected a settings object");
 		if (config.machines !== undefined && !record(config.machines)) throw new Error("expected a machines object");
-		const idleCloseSeconds = config.idleCloseSeconds === undefined ? 900 : config.idleCloseSeconds;
-		if (typeof idleCloseSeconds !== "number" || !Number.isFinite(idleCloseSeconds) || idleCloseSeconds < 0) {
-			throw new Error("idleCloseSeconds must be a nonnegative finite number (0 disables idle cleanup)");
-		}
+		const closeWhenDone = config.closeWhenDone === undefined ? true : config.closeWhenDone;
+		if (typeof closeWhenDone !== "boolean") throw new Error("closeWhenDone must be true or false");
 		const machines: Record<string, MachineSettings> = Object.create(null);
 		for (const [selector, settings] of Object.entries(config.machines ?? {})) {
 			if (!record(settings) || typeof settings.cwd !== "string" || !settings.cwd.trim()) {
@@ -37,7 +35,7 @@ export function readHerdrSettings(agentDir: string): HerdrSettings {
 			// Absolute paths are checked on the target machine, not with the local OS's rules.
 			machines[selector] = { cwd: settings.cwd.trim() };
 		}
-		return { machines, idleCloseSeconds };
+		return { machines, closeWhenDone };
 	} catch (error) {
 		throw new Error(`Invalid ${path}: ${error instanceof Error ? error.message : String(error)}`);
 	}

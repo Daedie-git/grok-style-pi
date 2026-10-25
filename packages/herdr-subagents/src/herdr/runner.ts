@@ -14,6 +14,8 @@ export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "
 export const MAX_AGENTS_PER_TAB = 4;
 const POLL_MS = 200;
 const CLOSE_GRACE_MS = 2000;
+/** Status lag and a glance at a just-finished pane do not keep it open. */
+const DONE_SETTLE_MS = 120_000;
 
 export interface SpawnRequest {
 	runtime?: "pi" | "claude-code";
@@ -58,8 +60,8 @@ export interface RunnerDeps {
 	runner?: HerdrRunner;
 	/** Saved Herdr machine whose panes and store this runner uses. Omitted for the local server. */
 	machine?: string;
-	/** Finished unfocused panes expire at 1x after acknowledgement, otherwise 4x; zero disables both. */
-	idleCloseSeconds?: number;
+	/** False keeps completed panes open; default true. */
+	closeWhenDone?: boolean;
 }
 
 export interface ToolText {
@@ -431,7 +433,7 @@ export class HerdrRunner {
 				cwd: request.cwd, parentSessionFile: request.sessionFile,
 				parentTabId: request.tabId, parentWorkspaceId: request.workspaceId,
 				parentMachine: this.machine ? MACHINE : undefined,
-				idleCloseSeconds: this.deps.idleCloseSeconds ?? 900,
+				closeWhenDone: this.deps.closeWhenDone ?? true,
 				keep: request.keep ?? definition?.keep,
 				createdAt: new Date(this.now()).toISOString(),
 			};
@@ -601,10 +603,10 @@ export class HerdrRunner {
 			const panes = await this.deps.client.listPanes({ signal: this.stopping.signal });
 			if (panes.some((pane) => !pane.paneId)) throw new Error("Herdr returned an incomplete pane listing");
 			const records = await this.store.listAgents();
-			for (const { agent, run, acknowledged } of await this.store.lifecycleCandidates()) {
+			for (const { agent, run } of await this.store.lifecycleCandidates()) {
 				check(this.stopping.signal);
 				if (agent.paneClose && !(await this.recoverPaneClose(agent, token))) continue;
-				const idleSeconds = agent.idleCloseSeconds ?? this.deps.idleCloseSeconds ?? 900;
+				const closeWhenDone = agent.closeWhenDone ?? (agent.idleCloseSeconds !== 0 && (this.deps.closeWhenDone ?? true));
 				if (agent.paneState === "parked" || !agent.cwd) continue;
 				const ownerGone = await this.ownerDeparted(agent, records, this.stopping.signal);
 				// Closing active Claude is cancellation, which permanently destroys resumability. Preserve it.
@@ -619,9 +621,9 @@ export class HerdrRunner {
 					await this.store.notePaneActivity({ agentId: agent.id, runId: run.runId }, this.now());
 					if (!ownerGone) continue;
 				}
-				const idleMs = idleSeconds * 1000 * (acknowledged ? 1 : 4);
-				if (!ownerGone && (agent.keep || idleSeconds <= 0 || pane.focused !== false || !["idle", "done"].includes(named.status ?? "")
-					|| this.now() - Math.max(run.updatedAt, agent.lastActivityAt ?? 0) < idleMs)) continue;
+				// Like a finished subagent: close once the run completes. Activity seen after it settled means someone uses the pane.
+				if (!ownerGone && (agent.keep || !closeWhenDone || run.phase !== "completed" || pane.focused !== false
+					|| !["idle", "done"].includes(named.status ?? "") || (agent.lastActivityAt ?? 0) > run.updatedAt + DONE_SETTLE_MS)) continue;
 				const current = await this.resolve(agent.id);
 				if (current.currentRunId !== run.runId || current.paneState === "parked") continue;
 				const ref = { agentId: agent.id, runId: run.runId };

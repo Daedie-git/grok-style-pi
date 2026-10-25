@@ -302,13 +302,11 @@ const operations = {
 		const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
 		return lifecycleAllowed() && lease.token === token && Number(lease.expires) > now;
 	},
-	lifecycleCandidates(): Array<{ agent: AgentRecord; run: RunSnapshot; acknowledged: boolean }> {
-		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data,n.acknowledged FROM agents a
-			JOIN runs r ON r.id=json_extract(a.data,'$.currentRunId') LEFT JOIN notices n ON n.run=r.id
+	lifecycleCandidates(): Array<{ agent: AgentRecord; run: RunSnapshot }> {
+		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data FROM agents a
+			JOIN runs r ON r.id=json_extract(a.data,'$.currentRunId')
 			WHERE json_extract(r.data,'$.deadline')>0`).all().map((row) => ({
 			agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)),
-			// Foreground runs have no notice to deliver.
-			acknowledged: row.acknowledged == null || Number(row.acknowledged) === 1,
 		}));
 	},
 	coldResumeReady(agentId: string): boolean {

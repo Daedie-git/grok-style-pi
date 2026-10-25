@@ -26,12 +26,11 @@ if (process.argv.includes("--upgrade-db")) {
 }
 const extension = join(root, "extension.ts");
 const factory = new URL("../../src/herdr/extension.ts", import.meta.url).pathname;
-writeFileSync(join(root, "herdr-subagents.json"), JSON.stringify({ idleCloseSeconds: 1 }));
 writeFileSync(extension, `import { createHerdrSubagents } from ${JSON.stringify(factory)};\nexport default createHerdrSubagents({ root: ${JSON.stringify(root)}, agentDir: ${JSON.stringify(root)} });\n`);
 const native = createHerdrCli();
 const reporter = process.env.HERDR_PI_REPORTER || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "extensions", "herdr-agent-state.ts");
 const client = { ...native, startPi: (options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal) => native.startPi({ ...options, args: ["--no-extensions", "--no-mcp", "--no-skills", "--no-context-files", "-e", reporter, "-e", extension, ...options.args] }, signal) };
-const runner = new HerdrRunner({ root, client, idleCloseSeconds: 1 });
+const runner = new HerdrRunner({ root, client });
 const token = `remember-${Date.now()}`;
 const request: SpawnRequest = {
 	name: `lifecycle-${process.pid}`, subagentType: "test", description: "Lifecycle live smoke",

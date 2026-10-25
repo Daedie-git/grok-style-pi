@@ -2800,9 +2800,64 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
                     self.run_cli(*flags, '--profile-file', str(profile), 'start')
                 else:
                     self.run_cli(*flags, 'stop', '--fresh')
+                    profile, _ = self.write_profile()
+                    self.run_cli(*flags, '--profile-file', str(profile), 'start')
                 result = self.run_cli(*flags, 'answer', 'Target B', check=False)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('another session generation', result.stderr)
+
+    def test_unprofiled_fresh_reset_keeps_acceptance_checks_active(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('ask', '--accept', 'echo checked >> acceptance-runs', 'First task', cwd=repo)
+        self.run_cli('stop', '--fresh', cwd=repo)
+        self.run_cli('ask', 'Next task', cwd=repo)
+        self.assertEqual((repo / 'acceptance-runs').read_text().splitlines(), ['checked', 'checked'])
+
+    def test_unprofiled_main_flows_match_baseline_launcher(self):
+        baseline = subprocess.check_output(['git', 'show', '0a82737:scripts/sidecar'], cwd=ROOT)
+        outcomes = []
+        for revision in (baseline, self.launcher.read_bytes()):
+            case = LauncherTests()
+            case.setUp()
+            try:
+                case.launcher.write_bytes(revision)
+                repo, _ = case.repo_with_change()
+                observed = []
+
+                def record(result):
+                    observed.append((result.returncode, 'ship' in result.stdout,
+                                     'NEEDS_ANSWER:' in result.stdout,
+                                     '## Launcher checks' in result.stdout))
+
+                record(case.run_cli('ask', 'Initial task', cwd=repo))
+                record(case.run_cli('ask', '--accept', 'echo checked >> acceptance-runs',
+                                    'Checked task', cwd=repo))
+                record(case.run_cli('stop', '--fresh', cwd=repo))
+                record(case.run_cli('ask', 'Task after fresh reset', cwd=repo))
+                record(case.run_cli('ask', 'Question', cwd=repo,
+                                    env=dict(case.env, FAKE_QUESTION='Which target?'), check=False))
+                # Baseline keeps pending questions and checks across ordinary fresh resets.
+                record(case.run_cli('stop', '--fresh', cwd=repo))
+                record(case.run_cli('answer', 'Target B', cwd=repo))
+                state = case.home / '.cache/claude-sidecar'
+                observed.append(('acceptance-runs', (repo / 'acceptance-runs').read_text().splitlines()))
+                observed.append(('pending', (state / 'sc-pane-1.pending').exists()))
+                case.add_machines()
+                record(case.remote_run('--slot', '2', '--machine', 'laptop', 'start'))
+                record(case.remote_run('--slot', '2', 'ask', 'Remote task'))
+                binding = state / 'sc-pane-1-2.machine'
+                observed.append(('remote-binding', binding.read_text()))
+                record(case.remote_run('--slot', '2', 'stop', '--fresh'))
+                record(case.remote_run('--slot', '2', 'ask', 'Remote task after fresh reset'))
+                observed.append(('remote-binding-after-fresh', binding.read_text()))
+                observed.append(('remote-start-count', sum(c[:2] == ['agent', 'start']
+                                                          for c in case.remote_calls())))
+                outcomes.append(observed)
+            finally:
+                case.doCleanups()
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertIn(('acceptance-runs', ['checked', 'checked', 'checked']), outcomes[1])
+        self.assertIn(('remote-binding-after-fresh', 'm1\n'), outcomes[1])
 
     def test_legacy_unprofiled_pending_question_survives_launcher_upgrade(self):
         result = self.run_cli('ask', 'Question', env=dict(self.env, FAKE_QUESTION='Which target?'), check=False)

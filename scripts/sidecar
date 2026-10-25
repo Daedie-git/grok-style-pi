@@ -1861,8 +1861,8 @@ $text" "$lock_mode"
 checks_file() { echo "$STATE_DIR/$(agent_name).checks.json"; }
 
 # Validate ownership at use time, not during startup: another launcher may bind
-# the profile while this assignment installs checks. Only unprofiled slots may
-# use pre-generation legacy check files.
+# the profile while this assignment installs checks. Unprofiled slots retain
+# baseline persistence across resets, regardless of generation metadata.
 generation_matches_request() {
   jq -e --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
     '.generation == {session:$session,fresh:$fresh}' "$1" >/dev/null 2>&1
@@ -1872,11 +1872,8 @@ checks_match_request() {
   local file
   file=$(checks_file)
   [[ -s $file ]] || return 1
-  if jq -e 'type == "object" and has("generation")' "$file" >/dev/null 2>&1; then
-    generation_matches_request "$file"
-  else
-    [[ -z $PROFILE_JSON ]] && jq -e 'type == "object"' "$file" >/dev/null 2>&1
-  fi
+  [[ -n $PROFILE_JSON ]] || return 0
+  generation_matches_request "$file"
 }
 
 save_checks() {
@@ -2444,7 +2441,9 @@ cmd_answer() {
   lock_slot ''
   [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question in slot $SLOT; use: sidecar --slot $SLOT ask TEXT for a new request"
   if jq -e 'type == "object"' "$STATE_DIR/$name.pending" >/dev/null 2>&1; then
-    generation_matches_request "$STATE_DIR/$name.pending" || die "pending question belongs to another session generation; use ask for a new request"
+    if [[ -n $PROFILE_JSON ]]; then
+      generation_matches_request "$STATE_DIR/$name.pending" || die "pending question belongs to another session generation; use ask for a new request"
+    fi
     prev=$(jq -er '.id | select(type == "string" and length > 0)' "$STATE_DIR/$name.pending") || die "invalid pending question"
   else
     # Older launchers stored only the request ID. Preserve live unprofiled

@@ -335,7 +335,7 @@ class LauncherTests(unittest.TestCase):
         (bin_dir / 'ssh').chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:/usr/bin:/bin:{NODE_DIR}',
                         HERDR_ENV='1', HERDR_PANE_ID='PANE:1', HERDR_WORKSPACE_ID='workspace-1',
-                        SIDECAR_IDLE_CLOSE_S='0')
+                        SIDECAR_CLOSE_WHEN_DONE='0')
         for key in ('SIDECAR_AGENT', 'SIDECAR_PI_SESSION', 'SIDECAR_MODEL', 'SIDECAR_CODEX_MODEL',
                     'SIDECAR_THINKING', 'CLAUDE_ENV_FILE',
                     'SIDECAR_MACHINE', 'SIDECAR_REMOTE_HOME', 'GROK_STEER_DIR', 'XDG_STATE_HOME',
@@ -343,8 +343,6 @@ class LauncherTests(unittest.TestCase):
             self.env.pop(key, None)
 
     def run_cli(self, *args, input='', env=None, cwd=None, check=True):
-        if args == ('sweep',) and env is None:
-            env = dict(self.env, SIDECAR_IDLE_CLOSE_S='900')
         if args in (('session-start',), ('session-end',)):
             return self.run_hook(args[0], input=input, env=env, cwd=cwd, check=check)
         return subprocess.run([str(self.launcher), *args], input=input, text=True,
@@ -560,51 +558,63 @@ class LauncherTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, 'lifecycle worker did not finish before cleanup')
             time.sleep(0.05)
 
-    def age_lifecycle_slot(self, name='sc-pane-1', seconds=3600):
-        state = self.home / '.cache/claude-sidecar'
-        old = time.time() - seconds
-        request = state / (name + '.request.json')
-        if request.exists():
-            record = json.loads(request.read_text())
-            record['finished'] = int(old)
-            request.write_text(json.dumps(record))
-        os.utime(state / (name + '.agent'), (old, old))
+    def start_orphan(self, *args):
+        # Starts a slot for another Claude pane, then closes that pane.
+        panes_path = self.home / 'panes.json'
+        panes = json.loads(panes_path.read_text()) if panes_path.exists() else [
+            {'pane_id': 'PANE:1', 'tab_id': 't1', 'workspace_id': 'workspace-1', 'agent': 'claude',
+             'width': 324, 'height': 97}]
+        panes_path.write_text(json.dumps(panes + [dict(panes[0], pane_id='PANE:77', tab_id='t77')]))
+        self.run_cli(*args, 'start', env=dict(self.env, HERDR_PANE_ID='PANE:77'))
+        self.remove_owner('PANE:77')
+        return self.start_pane()
 
-    def test_sweep_idle_request_closes_pane_and_resumes_saved_session(self):
+    def remove_owner(self, owner='PANE:1'):
+        panes_path = self.home / 'panes.json'
+        panes = json.loads(panes_path.read_text())
+        panes_path.write_text(json.dumps([p for p in panes if p['pane_id'] != owner]))
+
+    def wait_for_close(self, pane, message='pane was not closed'):
+        deadline = time.monotonic() + 10
+        while ['pane', 'close', pane] not in self.calls():
+            self.assertLess(time.monotonic(), deadline, message)
+            time.sleep(0.05)
+
+    def test_delivered_report_closes_pane_and_next_request_resumes_session(self):
         state = self.lifecycle_state()
-        self.run_cli('ask', 'First request')
+        env = dict(self.env, SIDECAR_CLOSE_WHEN_DONE='1')
+        self.run_cli('ask', 'First request', env=env)
         pane = self.start_pane()
         session = (state / 'sc-pane-1.session').read_text()
-        self.age_lifecycle_slot()
-        before = len(self.calls())
-        result = self.run_cli('sweep')
-        self.assertIn('sc-pane-1', result.stdout)
-        self.assertIn(['pane', 'close', pane], self.calls()[before:])
-        self.assertEqual(sum(c[:2] == ['pane', 'list'] for c in self.calls()[before:]), 1)
+        self.wait_for_close(pane, 'delivered report did not close its pane')
+        self.wait_lifecycle_workers()
         self.assertEqual((state / 'sc-pane-1.session').read_text(), session)
-        self.run_cli('ask', 'Resume swept conversation')
+        self.run_cli('ask', 'Resume closed conversation')
         starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
         self.assertEqual(len(starts), 2)
         self.assertEqual(starts[0][starts[0].index('--session-id') + 1],
                          starts[1][starts[1].index('--session-id') + 1])
         self.assertNotEqual(self.start_pane(), pane)
 
-    def test_sweep_never_requested_slot_uses_agent_mtime(self):
+    def test_sweep_leaves_slots_of_a_live_owner_open(self):
         self.lifecycle_state()
         self.run_cli('start')
+        self.run_cli('--slot', '2', 'ask', 'Finished request')
+        old = time.time() - 86400
+        for path in (self.home / '.cache/claude-sidecar').glob('*.agent'):
+            os.utime(path, (old, old))
         self.run_cli('sweep')
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-        self.age_lifecycle_slot()
+        self.remove_owner()
         self.run_cli('sweep')
-        self.assertIn(['pane', 'close', self.start_pane()], self.calls())
+        self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 2)
 
     def test_sweep_rechecks_live_status_after_process_ownership_check(self):
         self.lifecycle_state()
         self.run_cli('--agent', 'claude', 'start')
-        self.age_lifecycle_slot()
+        self.remove_owner()
         before = len(self.calls())
-        self.run_cli('sweep', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='900',
-                                      FAKE_WORKING_ON_PROCESS_INFO='1'))
+        self.run_cli('sweep', env=dict(self.env, FAKE_WORKING_ON_PROCESS_INFO='1'))
         self.assertTrue(any(c[:2] == ['pane', 'process-info'] for c in self.calls()[before:]))
         self.assertEqual(json.loads((self.home / 'agent.json').read_text())['agent_status'], 'working')
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
@@ -612,29 +622,18 @@ class LauncherTests(unittest.TestCase):
     def test_sweep_rechecks_live_focus_after_process_ownership_check(self):
         self.lifecycle_state()
         self.run_cli('--agent', 'claude', 'start')
-        self.age_lifecycle_slot()
+        self.remove_owner()
         pane = self.start_pane()
-        self.run_cli('sweep', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='900',
-                                      FAKE_FOCUS_ON_PROCESS_INFO='1'))
+        self.run_cli('sweep', env=dict(self.env, FAKE_FOCUS_ON_PROCESS_INFO='1'))
         self.assertIn(['pane', 'get', pane], self.calls())
         panes = json.loads((self.home / 'panes.json').read_text())
         self.assertTrue(next(p for p in panes if p['pane_id'] == pane)['focused'])
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
 
-    def test_sweep_recent_finished_request_overrides_old_agent_mtime(self):
-        state = self.lifecycle_state()
-        self.run_cli('ask', 'Recent request')
-        old = time.time() - 3600
-        os.utime(state / 'sc-pane-1.agent', (old, old))
-        self.run_cli('sweep')
-        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-
-    def test_sweep_protects_busy_pending_pinned_and_focused_slots(self):
+    def test_done_close_protects_busy_pending_pinned_and_focused_slots(self):
         state = self.lifecycle_state()
         for slot in range(1, 8):
-            self.run_cli('--slot', str(slot), 'start')
-            name = 'sc-pane-1' + (f'-{slot}' if slot > 1 else '')
-            self.age_lifecycle_slot(name)
+            self.run_cli('--slot', str(slot), 'ask', 'Finished request')
         for filename, status in [('agent.json', 'working'), ('sc-pane-1-2.agent.json', 'blocked'),
                                  ('sc-pane-1-6.agent.json', 'unknown'), ('sc-pane-1-7.agent.json', '')]:
             path = self.home / filename
@@ -647,18 +646,22 @@ class LauncherTests(unittest.TestCase):
         focused = json.loads((self.home / 'sc-pane-1-5.agent.json').read_text())['pane_id']
         next(p for p in panes if p['pane_id'] == focused)['focused'] = True
         (self.home / 'panes.json').write_text(json.dumps(panes))
-        self.run_cli('sweep')
+        for slot in range(1, 8):
+            name = 'sc-pane-1' + (f'-{slot}' if slot > 1 else '')
+            request = json.loads((state / (name + '.request.json')).read_text())
+            subprocess.run([str(self.launcher), 'done-close', name, request['id']], text=True,
+                           capture_output=True, check=True, timeout=10,
+                           env=dict(self.env, DONE_CLOSE_WAIT_S='1'))
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
 
     def test_sweep_skips_a_held_request_lock_without_waiting(self):
         import fcntl
         state = self.lifecycle_state()
         self.run_cli('start')
-        self.age_lifecycle_slot()
+        self.remove_owner()
         with (state / 'sc-pane-1.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            result = subprocess.run([str(self.launcher), 'sweep'],
-                                    env=dict(self.env, SIDECAR_IDLE_CLOSE_S='900'),
+            result = subprocess.run([str(self.launcher), 'sweep'], env=self.env,
                                     text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
@@ -669,8 +672,7 @@ class LauncherTests(unittest.TestCase):
         state = self.lifecycle_state()
         self.run_cli('ask', '--keep', 'Watch this request')
         self.assertTrue((state / 'sc-pane-1.keep').exists())
-        panes = json.loads((self.home / 'panes.json').read_text())
-        (self.home / 'panes.json').write_text(json.dumps([p for p in panes if p['pane_id'] != 'PANE:1']))
+        self.remove_owner()
         self.run_cli('sweep')
         self.assertIn(['pane', 'close', self.start_pane()], self.calls())
 
@@ -689,28 +691,15 @@ class LauncherTests(unittest.TestCase):
         self.run_cli('--slot', '2', 'stop', '--fresh')
         self.assertFalse(pin.exists())
 
-    def test_sweep_idle_disabled_still_closes_ownerless_slots(self):
-        self.lifecycle_state()
-        self.run_cli('start')
-        self.age_lifecycle_slot()
-        env = dict(self.env, SIDECAR_IDLE_CLOSE_S='0')
-        self.run_cli('sweep', env=env)
-        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-        panes = json.loads((self.home / 'panes.json').read_text())
-        (self.home / 'panes.json').write_text(json.dumps([p for p in panes if p['pane_id'] != 'PANE:1']))
-        self.run_cli('sweep', env=env)
-        self.assertIn(['pane', 'close', self.start_pane()], self.calls())
-
     def test_sweep_refuses_stale_session_and_process_identities(self):
         self.lifecycle_state()
         self.run_cli('start')
-        self.age_lifecycle_slot()
         path = self.home / 'agent.json'
         original = json.loads(path.read_text())
         original['agent_session'] = {'value': '/tmp/time_foreign.jsonl'}
         path.write_text(json.dumps(original))
         self.run_cli('--slot', '2', '--agent', 'claude', 'start')
-        self.age_lifecycle_slot('sc-pane-1-2')
+        self.remove_owner()
         claude_path = self.home / 'sc-pane-1-2.agent.json'
         claude = json.loads(claude_path.read_text())
         claude['_argv'] = ['claude', '--resume', 'aaaaaaaa-bbbb-4ccc-addd-eeeeeeeeeeee']
@@ -720,14 +709,13 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(claude_path.exists())
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
 
-    def test_sweep_closes_idle_claude_and_codex_slots(self):
+    def test_sweep_closes_ownerless_claude_and_codex_slots(self):
         state = self.lifecycle_state()
         self.run_cli('--agent', 'claude', 'ask', 'Claude request')
         self.run_cli('--slot', '2', '--agent', 'codex', 'ask', 'Codex request')
         files = ['sc-pane-1.session', 'sc-pane-1.claude-started', 'sc-pane-1-2.codex-session']
         sessions = {name: (state / name).read_text() for name in files}
-        self.age_lifecycle_slot()
-        self.age_lifecycle_slot('sc-pane-1-2')
+        self.remove_owner()
         codex = self.home / 'sc-pane-1-2.agent.json'
         record = json.loads(codex.read_text())
         record['agent_status'] = 'done'
@@ -740,8 +728,9 @@ class LauncherTests(unittest.TestCase):
     def test_sweep_skips_remote_slots_but_stop_all_closes_them(self):
         self.lifecycle_state()
         self.add_machines()
-        self.remote_run('--machine', 'm1', 'ask', 'Remote request')
-        self.age_lifecycle_slot()
+        self.remote_run('--machine', 'm1', 'ask', 'Remote request',
+                        env=dict(self.remote_env, SIDECAR_CLOSE_WHEN_DONE='1'))
+        (self.home / '.cache/claude-sidecar/sc-pane-1.ended').write_text('gone\n')
         self.run_cli('sweep')
         self.assertFalse(any('close' in c for c in self.calls()))
         self.remote_run('stop', '--all')
@@ -750,20 +739,14 @@ class LauncherTests(unittest.TestCase):
     def test_sweep_visits_other_owners_and_slots(self):
         self.lifecycle_state()
         self.run_cli('start')
-        other = dict(self.env, HERDR_PANE_ID=self.start_pane())
-        self.run_cli('--slot', '2', 'start', env=other)
-        name = 'sc-' + other['HERDR_PANE_ID'].lower().replace(':', '-') + '-2'
-        self.age_lifecycle_slot(name)
-        pane = self.start_pane()
+        pane = self.start_orphan('--slot', '2')
         self.run_cli('sweep')
         self.assertIn(['pane', 'close', pane], self.calls())
         self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 1)
 
     def test_command_sweep_is_async_and_rate_limited(self):
         state = self.lifecycle_state()
-        self.run_cli('start')
-        pane = self.start_pane()
-        self.age_lifecycle_slot()
+        pane = self.start_orphan()
         timestamp = state / 'sweep.timestamp'
         now = int(time.time())
         timestamp.write_text(str(now))
@@ -772,11 +755,11 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
         timestamp.write_text(str(now - 120))
         started = time.monotonic()
-        self.run_cli('status', env=dict(self.env, HERDR_GET_DELAY='0.5', SIDECAR_IDLE_CLOSE_S='900'))
+        self.run_cli('status', env=dict(self.env, HERDR_GET_DELAY='0.5'))
         self.assertLess(time.monotonic() - started, 3, 'launcher waited for the entire sweep')
         deadline = time.monotonic() + 12
         while ['pane', 'close', pane] not in self.calls():
-            self.assertLess(time.monotonic(), deadline, 'detached sweep did not close the idle pane')
+            self.assertLess(time.monotonic(), deadline, 'detached sweep did not close the ownerless pane')
             time.sleep(0.05)
         self.assertGreater(int(timestamp.read_text().strip()), now - 120)
         self.assertTrue((state / 'sweep.log').exists())
@@ -787,12 +770,9 @@ class LauncherTests(unittest.TestCase):
 
     def test_session_start_triggers_detached_sweep(self):
         state = self.lifecycle_state()
-        self.run_cli('start')
-        pane = self.start_pane()
-        self.age_lifecycle_slot()
+        pane = self.start_orphan()
         (state / 'sweep.timestamp').write_text(str(int(time.time()) - 120))
-        result = self.run_cli('session-start', input=json.dumps({'session_id': 'owner-session'}),
-                              env=dict(self.env, SIDECAR_IDLE_CLOSE_S='900'))
+        result = self.run_cli('session-start', input=json.dumps({'session_id': 'owner-session'}))
         self.assertEqual(json.loads(result.stdout)['hookSpecificOutput']['hookEventName'], 'SessionStart')
         deadline = time.monotonic() + 10
         while ['pane', 'close', pane] not in self.calls():
@@ -802,14 +782,11 @@ class LauncherTests(unittest.TestCase):
     def test_push_gate_triggers_sweep_and_respects_rate_limit_lock(self):
         import fcntl
         state = self.lifecycle_state()
-        self.run_cli('start')
-        pane = self.start_pane()
-        self.age_lifecycle_slot()
+        pane = self.start_orphan()
         timestamp = state / 'sweep.timestamp'
         old = str(int(time.time()) - 120)
         timestamp.write_text(old)
         hook = self.plugin / 'scripts/push-gate'
-        self.env['SIDECAR_IDLE_CLOSE_S'] = '900'
         payload = json.dumps({'tool_input': {'command': 'echo harmless'}})
         with (state / 'sweep.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -840,23 +817,10 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
         self.assertIn(['pane', 'get', 'PANE:1'], self.calls())
 
-    def test_sweep_alias_owner_still_applies_idle_expiry(self):
-        self.lifecycle_state()
-        self.run_cli('start')
-        self.age_lifecycle_slot()
-        panes_path = self.home / 'panes.json'
-        panes = json.loads(panes_path.read_text())
-        owner = next(p for p in panes if p['pane_id'] == 'PANE:1')
-        owner.update(pane_id='PANE:99', aliases=['PANE:1'])
-        panes_path.write_text(json.dumps(panes))
-        self.run_cli('sweep')
-        self.assertIn(['pane', 'close', self.start_pane()], self.calls())
-
-    def test_sweep_unknown_owner_lookup_preserves_pin_and_recent_activity(self):
+    def test_sweep_unknown_owner_lookup_closes_nothing(self):
         self.lifecycle_state()
         self.run_cli('start')
         self.run_cli('keep')
-        self.age_lifecycle_slot()
         self.run_cli('--slot', '2', 'start')
         panes_path = self.home / 'panes.json'
         panes = json.loads(panes_path.read_text())
@@ -883,57 +847,6 @@ class LauncherTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 25, 'owner lookup must be bounded')
                 self.assertIn(['pane', 'get', 'PANE:1'], self.calls()[before:])
                 self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-
-    def test_sweep_unknown_owner_still_applies_idle_expiry(self):
-        self.lifecycle_state()
-        self.run_cli('start')
-        self.age_lifecycle_slot()
-        panes_path = self.home / 'panes.json'
-        panes = json.loads(panes_path.read_text())
-        next(p for p in panes if p['pane_id'] == 'PANE:1').update(
-            pane_id='PANE:99', aliases=['PANE:1'])
-        panes_path.write_text(json.dumps(panes))
-        (self.home / 'pane-errors.json').write_text(json.dumps({
-            'PANE:1': {'stderr': 'transport: timed out waiting for response'}}))
-        self.run_cli('sweep')
-        self.assertIn(['pane', 'close', self.start_pane()], self.calls())
-
-    def test_new_request_with_idle_disabled_cancels_previous_timer(self):
-        state = self.lifecycle_state()
-        self.run_cli('ask', 'Timed request', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='1'))
-        finished = json.loads((state / 'sc-pane-1.request.json').read_text())['finished']
-        self.run_cli('ask', 'Disable idle cleanup for this request')
-        while time.time() < finished + 3:
-            self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-            time.sleep(0.05)
-        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-
-    def test_new_request_with_longer_idle_timeout_replaces_previous_deadline(self):
-        state = self.lifecycle_state()
-        self.run_cli('ask', 'Short timeout', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='1'))
-        pane = self.start_pane()
-        old_finished = json.loads((state / 'sc-pane-1.request.json').read_text())['finished']
-        self.run_cli('ask', 'Longer timeout', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='3'))
-        while time.time() < old_finished + 2.2:
-            self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-            time.sleep(0.05)
-        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-        deadline = time.monotonic() + 8
-        while ['pane', 'close', pane] not in self.calls():
-            self.assertLess(time.monotonic(), deadline, 'longer timeout never closed its pane')
-            time.sleep(0.05)
-
-    def test_new_request_with_shorter_idle_timeout_uses_new_deadline(self):
-        state = self.lifecycle_state()
-        self.run_cli('ask', 'Long timeout', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='5'))
-        pane = self.start_pane()
-        old_finished = json.loads((state / 'sc-pane-1.request.json').read_text())['finished']
-        self.run_cli('ask', 'Shorter timeout', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='1'))
-        deadline = time.monotonic() + 5
-        while ['pane', 'close', pane] not in self.calls():
-            self.assertLess(time.monotonic(), deadline, 'shorter timeout never closed its pane')
-            time.sleep(0.05)
-        self.assertLess(time.time(), old_finished + 6, 'worker used the obsolete longer deadline')
 
     def test_session_end_rejects_unregistered_or_mismatched_session(self):
         self.lifecycle_state()
@@ -985,7 +898,7 @@ class LauncherTests(unittest.TestCase):
         panes = json.loads(panes_path.read_text())
         next(p for p in panes if p['pane_id'] == focused)['focused'] = False
         panes_path.write_text(json.dumps(panes))
-        self.run_cli('sweep', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='0'))
+        self.run_cli('sweep')
         self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 8)
 
     def test_sweep_legacy_numbered_slot_locks_parent_before_using_ended_marker(self):
@@ -994,13 +907,11 @@ class LauncherTests(unittest.TestCase):
         self.run_cli('session-start', input=json.dumps({'session_id': 'old-owner'}))
         self.run_cli('--slot', '2', 'start')
         self.run_cli('--slot', '2', 'keep')
-        self.age_lifecycle_slot('sc-pane-1-2')
         (state / 'sc-pane-1-2.owner').unlink()
         (state / 'sc-pane-1.ended').write_text('old-owner\n')
         with (state / 'sc-pane-1.identity.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            result = subprocess.run([str(self.launcher), 'sweep'],
-                                    env=dict(self.env, SIDECAR_IDLE_CLOSE_S='900'),
+            result = subprocess.run([str(self.launcher), 'sweep'], env=self.env,
                                     text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
@@ -1018,10 +929,7 @@ class LauncherTests(unittest.TestCase):
         owned = self.start_pane()
         other = dict(self.env, HERDR_PANE_ID=owned)
         self.run_cli('start', env=other)
-        other_name = 'sc-' + owned.lower().replace(':', '-')
-        self.age_lifecycle_slot(other_name)
-        self.run_cli('session-end', input=json.dumps({'session_id': 'owner-session', 'reason': 'logout'}),
-                     env=dict(self.env, SIDECAR_IDLE_CLOSE_S='900'))
+        self.run_cli('session-end', input=json.dumps({'session_id': 'owner-session', 'reason': 'logout'}))
         self.assertEqual([c for c in self.calls() if c[:2] == ['pane', 'close']],
                          [['pane', 'close', owned]])
 
@@ -1082,7 +990,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((state / 'sc-pane-1.claude-owner-session').exists())
         self.run_cli('ask', '--keep', 'Continue under the new session')
         self.run_cli('--slot', '2', 'ask', 'A fresh numbered slot')
-        self.run_cli('sweep', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='0'))
+        self.run_cli('sweep')
         # Neither an unidentified ending nor the old identified owner's ending may reclaim the slots.
         self.run_hook('session-end', env=env,
                       input=json.dumps({'session_id': 'new-live-owner', 'reason': 'logout'}))
@@ -1155,35 +1063,40 @@ class LauncherTests(unittest.TestCase):
                            capture_output=True, text=True, check=True)
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
 
-    def test_finished_request_closes_without_another_launcher_command(self):
-        self.lifecycle_state()
-        self.run_cli('ask', 'One final request', env=dict(self.env, SIDECAR_IDLE_CLOSE_S='1'))
-        pane = self.start_pane()
-        deadline = time.monotonic() + 10
-        while ['pane', 'close', pane] not in self.calls():
-            self.assertLess(time.monotonic(), deadline, 'finished request did not schedule idle cleanup')
-            time.sleep(0.05)
-
-    def test_superseded_idle_close_does_not_close_newer_request_or_other_slot(self):
+    def test_unfinished_requests_keep_their_panes(self):
         state = self.lifecycle_state()
-        env = dict(self.env, SIDECAR_IDLE_CLOSE_S='2')
-        self.run_cli('ask', 'First request', env=env)
-        pane = self.start_pane()
-        request = state / 'sc-pane-1.request.json'
-        old_finished = json.loads(request.read_text())['finished']
-        self.run_cli('--slot', '2', 'start')
-        self.age_lifecycle_slot('sc-pane-1-2')
-        self.run_cli('ask', 'Newer request', env=dict(env, HERDR_PROMPT_DELAY='1.5'))
-        self.assertGreater(json.loads(request.read_text())['finished'], old_finished)
-        # Cross the original deadline: its worker must follow the newer completion instead.
-        while time.time() < old_finished + 3.1:
-            self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-            time.sleep(0.05)
+        env = dict(self.env, SIDECAR_CLOSE_WHEN_DONE='1')
+        self.run_cli('ask', '--keep', 'Pinned request', env=env)
+        self.run_cli('--slot', '2', 'ask', 'Question', env=dict(env, FAKE_QUESTION='Which one?'), check=False)
+        self.run_cli('--slot', '3', 'ask', 'No report', env=dict(env, FAKE_NO_REPORT='1'), check=False)
+        self.assertEqual(json.loads((state / 'sc-pane-1-2.request.json').read_text())['exit_code'], 3)
+        self.assertEqual(json.loads((state / 'sc-pane-1-3.request.json').read_text())['exit_code'], 2)
+        time.sleep(3)
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
-        deadline = time.monotonic() + 8
-        while ['pane', 'close', pane] not in self.calls():
-            self.assertLess(time.monotonic(), deadline, 'newer completion lost its idle timer')
-            time.sleep(0.05)
+
+    def test_unkeep_after_a_delivered_report_closes_the_pane(self):
+        self.lifecycle_state()
+        env = dict(self.env, SIDECAR_CLOSE_WHEN_DONE='1')
+        self.run_cli('ask', '--keep', 'Watch this request', env=env)
+        pane = self.start_pane()
+        time.sleep(1)
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
+        self.run_cli('unkeep', env=env)
+        self.wait_for_close(pane, 'unkeep did not close the finished pane')
+
+    def test_done_close_skips_a_newer_request_and_other_slots(self):
+        state = self.lifecycle_state()
+        self.run_cli('--slot', '2', 'start')
+        self.run_cli('ask', 'First request')
+        pane = self.start_pane()
+        first = json.loads((state / 'sc-pane-1.request.json').read_text())['id']
+        self.run_cli('ask', 'Newer request')
+        subprocess.run([str(self.launcher), 'done-close', 'sc-pane-1', first], text=True,
+                       capture_output=True, check=True, timeout=10, env=self.env)
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
+        newer = json.loads((state / 'sc-pane-1.request.json').read_text())['id']
+        subprocess.run([str(self.launcher), 'done-close', 'sc-pane-1', newer], text=True,
+                       capture_output=True, check=True, timeout=10, env=self.env)
         self.assertEqual([c for c in self.calls() if c[:2] == ['pane', 'close']],
                          [['pane', 'close', pane]])
 

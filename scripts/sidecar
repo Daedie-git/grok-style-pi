@@ -8,8 +8,8 @@
 #                                native claude/codex agents support reports and answers; reload and busy steer require pi
 #   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
 #   sidecar session-end          SessionEnd hook entry; stop this owner's panes unless clearing
-#   sidecar sweep                close idle local panes and panes whose owner is gone
-#   sidecar keep|unkeep          pin or unpin this slot's pane against idle cleanup
+#   sidecar sweep                close local panes whose owner is gone
+#   sidecar keep|unkeep          pin or unpin this slot's pane against closing after its report
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when its name belongs to another session
 #   sidecar reload               wait between requests, then reload pi resources without losing its report channel
@@ -1209,7 +1209,7 @@ finish_request() {
     '. + {finished: $finished, exit_code: $code}' "$ACTIVE_REQUEST" >"$tmp"
   mv -f -- "$tmp" "$ACTIVE_REQUEST"
   ACTIVE_REQUEST=
-  schedule_idle_close
+  [[ $code != 0 ]] || schedule_done_close
 }
 
 # Sends a request and prints the submitted report. Exit codes: 0 report delivered, 2 no report,
@@ -2445,7 +2445,7 @@ owner_presence() {
 
 # Runs under the slot's startup and request locks, immediately before stop's ownership checks.
 sweep_eligible() {
-  local name=$1 hname=$2 pane status owner candidate finished now age_file owner_pane presence other
+  local name=$1 hname=$2 pane status owner candidate owner_pane presence other
   if [[ -n ${SWEEP_REQUEST:-} ]]; then
     [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 1
   fi
@@ -2481,24 +2481,13 @@ sweep_eligible() {
     fi
     [[ $presence != gone ]] || return 0
   fi
-  [[ ! -e $STATE_DIR/$name.keep ]] || return 1
-  (( SWEEP_IDLE > 0 )) || return 1
-  age_file="$STATE_DIR/$name.request.json"
-  if [[ -s $age_file ]]; then
-    finished=$(jq -r '.finished // empty' "$age_file") || return 1
-    [[ $finished =~ ^[0-9]+$ ]] || return 1
-  else
-    finished=$(stat -c %Y "$STATE_DIR/$name.agent") || return 1
-  fi
-  printf -v now '%(%s)T' -1
-  (( now - finished > SWEEP_IDLE ))
+  # Only the completed request's own close reaches here: a delivered report, and no pin.
+  [[ -n ${SWEEP_REQUEST:-} && ! -e $STATE_DIR/$name.keep ]] || return 1
+  [[ $(jq -r '.exit_code // empty' "$STATE_DIR/$name.request.json") == 0 ]]
 }
 
 cmd_sweep() {
   local file name binding slot owner candidate MACHINE=''
-  SWEEP_IDLE=${SIDECAR_IDLE_CLOSE_S:-900}
-  [[ $SWEEP_IDLE =~ ^[0-9]+$ ]] || die "SIDECAR_IDLE_CLOSE_S must be a non-negative integer"
-  SWEEP_IDLE=$((10#$SWEEP_IDLE))
   SWEEP_PANES=$(herdr pane list) || die "cannot list herdr panes"
   jq -e '.result.panes | type == "array"' <<<"$SWEEP_PANES" >/dev/null || die "invalid herdr pane list"
   shopt -s nullglob
@@ -2534,36 +2523,41 @@ cmd_sweep() {
   done
 }
 
-# Each completion schedules one check. Its request ID makes older deadlines harmless.
-schedule_idle_close() {
-  local idle=${SIDECAR_IDLE_CLOSE_S:-900} name id finished
-  [[ -z $MACHINE && $idle =~ ^[0-9]+$ ]] || return 0
-  (( 10#$idle > 0 )) || return 0
+# A delivered report ends the sidecar's task, so its pane closes like a finished subagent; the session stays for the next request.
+# Takes the request ID that permits closing; defaults to the current request.
+schedule_done_close() {
+  local name id=${1:-}
+  [[ -z $MACHINE && ${SIDECAR_CLOSE_WHEN_DONE:-1} != 0 ]] || return 0
   name=$(agent_name)
-  id=$(jq -r '.id' "$STATE_DIR/$name.request.json")
-  finished=$(jq -r '.finished' "$STATE_DIR/$name.request.json")
+  [[ -n $id ]] || id=$(jq -r '.id' "$STATE_DIR/$name.request.json")
   (
-    exec_detached "$PLUGIN_ROOT/scripts/sidecar" idle-close "$name" "$id" "$finished"
+    exec_detached "$PLUGIN_ROOT/scripts/sidecar" done-close "$name" "$id"
   ) </dev/null >>"$STATE_DIR/sweep.log" 2>&1 6>&- 7>&- 8>&- 9>&- &
 }
 
-cmd_idle_close() {
-  local name=$1 SWEEP_REQUEST=$2 finished=$3 now delay idle=${SIDECAR_IDLE_CLOSE_S:-900}
-  [[ $finished =~ ^[0-9]+$ && $idle =~ ^[0-9]+$ ]] || return 0
-  idle=$((10#$idle))
-  (( idle > 0 )) || return 0
-  printf -v now '%(%s)T' -1
-  delay=$((finished + idle + 1 - now))
-  if (( delay > 0 )); then sleep "$delay"; fi
-  [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 0
-  # Recheck under the request lock too: a new request can arrive after this fast rejection.
-  cmd_sweep "$name"
+# Waits for the launcher to release the slot, then up to DONE_CLOSE_WAIT_S for the agent to settle after its report.
+cmd_done_close() {
+  local name=$1 SWEEP_REQUEST=$2 deadline
+  flock "$STATE_DIR/$name.lock" true
+  deadline=$((SECONDS + ${DONE_CLOSE_WAIT_S:-120}))
+  while [[ ! -e $STATE_DIR/$name.keep && ! -e $STATE_DIR/$name.stopped ]] && (( SECONDS < deadline )); do
+    # A newer request owns the slot now; its own completion decides.
+    [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 0
+    cmd_sweep "$name"
+    [[ -e $STATE_DIR/$name.stopped ]] || sleep 2
+  done
 }
 
 cmd_keep() {
   require_identity
   [[ $# == 1 ]] || die "usage: sidecar [--slot N] keep|unkeep"
   set_keep "$1"
+  # Unpinning after a delivered report closes the pane as that completion would have; done-close skips remote slots.
+  local id
+  # One read: the ID must belong to the completion that permits closing, or done-close cannot detect a newer request.
+  if [[ $1 == unkeep ]] && id=$(jq -er 'select(.exit_code == 0) | .id' "$STATE_DIR/$(agent_name).request.json" 2>/dev/null); then
+    schedule_done_close "$id"
+  fi
   schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
 }
 
@@ -2626,12 +2620,12 @@ mkdir -p "$REQUEST_DIR" "$REPORT_DIR"
 # after it returns; an in-place plugin update can move that offset into unrelated text in the new file.
 {
 case ${1:-} in
-  sweep|idle-close|push-gate|session-start|session-end|ask|keep|unkeep) ;;
+  sweep|done-close|push-gate|session-start|session-end|ask|keep|unkeep) ;;
   *) schedule_sweep "$PLUGIN_ROOT/scripts/sidecar" ;;
 esac
 case "${1:-}" in
   sweep) shift; cmd_sweep "$@" ;;
-  idle-close) shift; cmd_idle_close "$@" ;;
+  done-close) shift; cmd_done_close "$@" ;;
   keep|unkeep) cmd_keep "$@" ;;
   session-end) shift; cmd_session_end "$@" ;;
   session-start) shift; cmd_session_start "$@" ;;

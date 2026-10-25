@@ -2795,11 +2795,30 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
                 self.assertTrue(pending.exists())
                 if legacy:
                     pending.write_text('legacy-request\n')
+                    self.run_cli(*flags, 'stop', '--fresh')
+                    profile, _ = self.write_profile()
+                    self.run_cli(*flags, '--profile-file', str(profile), 'start')
                 else:
                     self.run_cli(*flags, 'stop', '--fresh')
                 result = self.run_cli(*flags, 'answer', 'Target B', check=False)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('another session generation', result.stderr)
+
+    def test_legacy_unprofiled_pending_question_survives_launcher_upgrade(self):
+        result = self.run_cli('ask', 'Question', env=dict(self.env, FAKE_QUESTION='Which target?'), check=False)
+        self.assertEqual(result.returncode, 3)
+        state = self.home / '.cache/claude-sidecar'
+        pending = state / 'sc-pane-1.pending'
+        request_id = json.loads(pending.read_text())['id']
+        # 0a82737's pending format was a bare request ID followed by a newline.
+        pending.write_text(request_id + '\n')
+        session = (state / 'sc-pane-1.session').read_bytes()
+        result = self.run_cli('answer', 'Target B')
+        self.assertIn('ship', result.stdout)
+        self.assertEqual((state / 'sc-pane-1.session').read_bytes(), session)
+        answer = next((state / 'requests').glob('*-answer-*.md')).read_text()
+        self.assertIn('blocked on request `' + request_id + '`', answer)
+        self.assertFalse(pending.exists())
 
     def test_profile_adoption_cannot_answer_previous_generations_question(self):
         result = self.run_cli('ask', 'Question', env=dict(self.env, FAKE_QUESTION='Which target?'), check=False)

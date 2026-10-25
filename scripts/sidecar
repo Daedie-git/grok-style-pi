@@ -2443,8 +2443,16 @@ cmd_answer() {
   name=$(agent_name)
   lock_slot ''
   [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question in slot $SLOT; use: sidecar --slot $SLOT ask TEXT for a new request"
-  generation_matches_request "$STATE_DIR/$name.pending" || die "pending question belongs to another session generation; use ask for a new request"
-  prev=$(jq -er '.id | select(type == "string" and length > 0)' "$STATE_DIR/$name.pending") || die "invalid pending question"
+  if jq -e 'type == "object"' "$STATE_DIR/$name.pending" >/dev/null 2>&1; then
+    generation_matches_request "$STATE_DIR/$name.pending" || die "pending question belongs to another session generation; use ask for a new request"
+    prev=$(jq -er '.id | select(type == "string" and length > 0)' "$STATE_DIR/$name.pending") || die "invalid pending question"
+  else
+    # Older launchers stored only the request ID. Preserve live unprofiled
+    # conversations across upgrades, but never import those questions into a profile.
+    [[ -z $PROFILE_JSON ]] || die "pending question belongs to another session generation; use ask for a new request"
+    prev=$(<"$STATE_DIR/$name.pending")
+    [[ $prev =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid pending question"
+  fi
   request answer "# Answer from Claude
 
 You were blocked on request \`$prev\` and asked a question. Answer: $*

@@ -218,14 +218,6 @@ profile_bind_unlocked() {
     if [[ -z $MACHINE ]]; then
       WORK_DIR=$(cd -- "$WORK_DIR" && pwd -P) || die "cannot resolve profile working directory"
     fi
-    # Ordinary unprofiled --fresh preserves legacy request state. First profile
-    # adoption must not carry it into the newly bound checkout/conversation.
-    # Never wait for a request while holding startup/identity locks: that request
-    # may itself be waiting for startup. Its admission also performs this cleanup.
-    ( exec 9>"$base.lock"
-      if flock -n 9; then profile_clear_legacy_checks_unlocked; fi
-    )
-    rm -f -- "$base.pending"
     tmp=$(mktemp "$base.startup.json.XXXXXX")
     jq -cn --arg model "$MODEL" --arg thinking "$THINKING" '{model:$model,thinking:$thinking}' >"$tmp"
     mv -f -- "$tmp" "$base.startup.json"
@@ -1429,11 +1421,7 @@ lock_slot() {
     flock 9
   fi
   # Also protect callers that update acceptance checks before entering request().
-  {
-    flock 7
-    validate_generation_unlocked
-    if [[ ! -f "$STATE_DIR/$name.profile.json" ]]; then profile_clear_legacy_checks_unlocked; fi
-  } 7>"$STATE_DIR/$name.identity.lock"
+  { flock 7; validate_generation_unlocked; } 7>"$STATE_DIR/$name.identity.lock"
 }
 
 finish_request() {
@@ -1523,7 +1511,7 @@ $(remote_notice)"
       [[ -z $question ]] || printf '%s\n' "$question" >"${saved_report%.md}.needs-answer"
     fi
     rejections_parse "$saved_report"
-    if [[ -z $question && ( $kind == ask || $kind == answer ) && -s $(checks_file) ]]; then
+    if [[ -z $question && ( $kind == ask || $kind == answer ) ]] && checks_match_request; then
       echo "sidecar: running launcher checks" >&2
       run_checks "$saved_report"
     fi
@@ -1531,7 +1519,10 @@ $(remote_notice)"
     printf '%s\n' "$saved_report" >"$state_tmp"
     mv -f -- "$state_tmp" "$STATE_DIR/$name.report"
     if [[ -n $question ]]; then
-      echo "$id" >"$STATE_DIR/$name.pending"
+      state_tmp=$(mktemp "$STATE_DIR/$name.pending.XXXXXX")
+      jq -n --arg id "$id" --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+        '{id:$id,generation:{session:$session,fresh:$fresh}}' >"$state_tmp"
+      mv -f -- "$state_tmp" "$STATE_DIR/$name.pending"
     else
       rm -f -- "$STATE_DIR/$name.pending"
     fi
@@ -1869,16 +1860,22 @@ $text" "$lock_mode"
 # replaced by another ask with --accept/--scope, or cleared with --no-checks.
 checks_file() { echo "$STATE_DIR/$(agent_name).checks.json"; }
 
-# Caller holds both the request and identity locks. Legacy files have no generation;
-# current checks survive first profile binding even when another launcher binds it.
-profile_clear_legacy_checks_unlocked() {
-  [[ -n $PROFILE_JSON ]] || return 0
+# Validate ownership at use time, not during startup: another launcher may bind
+# the profile while this assignment installs checks. Only unprofiled slots may
+# use pre-generation legacy check files.
+generation_matches_request() {
+  jq -e --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+    '.generation == {session:$session,fresh:$fresh}' "$1" >/dev/null 2>&1
+}
+
+checks_match_request() {
   local file
   file=$(checks_file)
-  [[ -f $file ]] || return 0
-  if ! jq -e --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
-    '.generation == {session:$session,fresh:$fresh}' "$file" >/dev/null; then
-    rm -f -- "$file"
+  [[ -s $file ]] || return 1
+  if jq -e 'type == "object" and has("generation")' "$file" >/dev/null 2>&1; then
+    generation_matches_request "$file"
+  else
+    [[ -z $PROFILE_JSON ]] && jq -e 'type == "object"' "$file" >/dev/null 2>&1
   fi
 }
 
@@ -1908,7 +1905,7 @@ implementer_contract() {
   echo "- Exercise the change through the real entry point a user or caller uses (the CLI command, editor action, app or service run), not only tests that call internals directly. A section \`## Verified\` quotes each command you ran and its result."
   echo "- A section \`## Not verified\` lists what you did not run (GPU, other platforms, slow suites) and why."
   echo "- Change only what the task needs. List anything else you think should change under \`## Suggested follow-ups\` instead of doing it. A section \`## Files changed\` lists every file you touched."
-  [[ -s $file ]] || return 0
+  checks_match_request || return 0
   while IFS= read -r -d '' cmd; do
     echo "- After your report, the launcher runs \`$cmd\` itself in \`$(jq -r .cwd "$file")\` and shows its result to Claude. Run it first."
   done < <(jq -j '.accept[] | . + "\u0000"' "$file")
@@ -1922,6 +1919,7 @@ implementer_contract() {
 run_checks() {
   local report=$1 file cwd root start before out now changed outside=() path glob matched cmd n=0 code log key raw
   local -A names=()
+  checks_match_request || return 0
   file=$(checks_file)
   cwd=$(jq -r .cwd "$file")
   root=$(jq -r .root "$file")
@@ -2443,13 +2441,15 @@ cmd_answer() {
   [[ $# -ge 1 ]] || die "usage: sidecar answer TEXT"
   local name prev
   name=$(agent_name)
+  lock_slot ''
   [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question in slot $SLOT; use: sidecar --slot $SLOT ask TEXT for a new request"
-  prev=$(<"$STATE_DIR/$name.pending")
+  generation_matches_request "$STATE_DIR/$name.pending" || die "pending question belongs to another session generation; use ask for a new request"
+  prev=$(jq -er '.id | select(type == "string" and length > 0)' "$STATE_DIR/$name.pending") || die "invalid pending question"
   request answer "# Answer from Claude
 
 You were blocked on request \`$prev\` and asked a question. Answer: $*
 
-Continue that original task to completion with this answer; do not restart finished work. If a genuinely new blocker appears, submit it with needs_answer."
+Continue that original task to completion with this answer; do not restart finished work. If a genuinely new blocker appears, submit it with needs_answer." held
 }
 
 # Delivers TEXT through the session's steering inbox (grok-style-pi, src/steering/inbox.ts): a file the running pi

@@ -2696,6 +2696,124 @@ class LauncherTests(unittest.TestCase):
         self.profile_start('--profile-file', str(path))
         self.assertTrue(self.profile_snapshot().exists())
 
+    def test_profile_binding_and_admission_interleaving_cannot_run_old_checks(self):
+        import fcntl
+        first, _ = self.repo_with_change()
+        second = self.home / 'checkout-b'
+        second.mkdir()
+        self.run_cli('ask', '--accept', 'printf stale > stale-check-ran', 'Legacy task', cwd=first)
+        marker = first / 'stale-check-ran'
+        marker.unlink()
+        self.run_cli('stop', '--fresh', cwd=first)
+        profile, _ = self.write_profile()
+        barrier = self.home / 'binding-barrier'
+        real_flock = shutil.which('flock')
+        wrapper = self.home / 'bin/flock'
+        wrapper.write_text(f'''#!{sys.executable}
+import os,pathlib,subprocess,sys,time
+if os.environ.get('BIND_BARRIER') and sys.argv[1:] == ['7']:
+    root=pathlib.Path(os.environ['BIND_BARRIER'])
+    count=root.with_suffix('.count')
+    n=int(count.read_text())+1 if count.exists() else 1
+    count.write_text(str(n))
+    if n==5:
+        result=subprocess.run([{real_flock!r},'7'],close_fds=False)
+        if result.returncode: sys.exit(result.returncode)
+        root.with_suffix('.ready').touch()
+        while not root.with_suffix('.go').exists(): time.sleep(.01)
+        sys.exit(0)
+os.execv({real_flock!r},['flock',*sys.argv[1:]])
+''')
+        wrapper.chmod(0o755)
+        processes = []
+
+        def until(predicate, message):
+            deadline = time.monotonic() + 10
+            while not predicate():
+                self.assertLess(time.monotonic(), deadline, message)
+                time.sleep(0.01)
+
+        try:
+            ask = subprocess.Popen([str(self.launcher), '--profile-file', str(profile), 'ask', '-'],
+                                   cwd=second, env=self.env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes.append(ask)
+            until(lambda: 'cat' in subprocess.run(['ps', '--ppid', str(ask.pid), '-o', 'comm='],
+                                                  capture_output=True, text=True).stdout,
+                  'assignment did not reach stdin read after admission')
+            start = subprocess.Popen([str(self.launcher), '--profile-file', str(profile), 'start'],
+                                     cwd=second, env=dict(self.env, BIND_BARRIER=str(barrier)),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes.append(start)
+            until(lambda: barrier.with_suffix('.ready').exists(), 'startup did not reach binding lock')
+            ask.stdin.write('Review checkout B\n')
+            ask.stdin.close()
+            ask.stdin = None
+            with (self.home / '.cache/claude-sidecar/sc-pane-1.lock').open('w') as lock:
+                def request_is_locked():
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                        return False
+                    except BlockingIOError:
+                        return True
+                until(request_is_locked, 'assignment did not acquire request lock')
+            barrier.with_suffix('.go').touch()
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertFalse(marker.exists())
+        finally:
+            barrier.with_suffix('.go').touch()
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=10)
+
+    def test_profile_checks_without_generation_are_not_executed(self):
+        repo, _ = self.repo_with_change()
+        profile, _ = self.write_profile()
+        self.run_cli('--profile-file', str(profile), 'ask', '--accept',
+                     'printf current > current-check-ran', 'Current task', cwd=repo)
+        marker = repo / 'current-check-ran'
+        marker.unlink()
+        checks = self.home / '.cache/claude-sidecar/sc-pane-1.checks.json'
+        record = json.loads(checks.read_text())
+        del record['generation']
+        checks.write_text(json.dumps(record))
+        self.run_cli('ask', 'Next assignment', cwd=repo)
+        self.assertFalse(marker.exists())
+        self.assertTrue(checks.exists())
+
+    def test_pending_questions_are_answerable_only_in_their_generation(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                slot = '2' if legacy else '1'
+                flags = ['--slot', slot]
+                self.run_cli(*flags, 'ask', 'Question', env=dict(self.env, FAKE_QUESTION='Which target?'), check=False)
+                pending = self.home / '.cache/claude-sidecar' / ('sc-pane-1' + ('-2' if legacy else '') + '.pending')
+                self.assertTrue(pending.exists())
+                if legacy:
+                    pending.write_text('legacy-request\n')
+                else:
+                    self.run_cli(*flags, 'stop', '--fresh')
+                result = self.run_cli(*flags, 'answer', 'Target B', check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('another session generation', result.stderr)
+
+    def test_profile_adoption_cannot_answer_previous_generations_question(self):
+        result = self.run_cli('ask', 'Question', env=dict(self.env, FAKE_QUESTION='Which target?'), check=False)
+        self.assertEqual(result.returncode, 3)
+        self.run_cli('stop', '--fresh')
+        profile, _ = self.write_profile()
+        self.run_cli('--profile-file', str(profile), 'start')
+        result = self.run_cli('answer', 'Target B', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('another session generation', result.stderr)
+        result = self.run_cli('ask', 'Current question', env=dict(self.env, FAKE_QUESTION='Which option?'), check=False)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('ship', self.run_cli('answer', 'Option A').stdout)
+
     def test_concurrent_profile_start_preserves_current_assignments_checks(self):
         import fcntl
         repo, _ = self.repo_with_change()
@@ -2762,7 +2880,8 @@ class LauncherTests(unittest.TestCase):
                     self.assertTrue(checks.exists())
                 else:
                     self.run_cli(*flags, '--profile-file', str(profile), 'start', cwd=second)
-                    self.assertFalse(checks.exists())
+                    self.assertTrue(checks.exists(), 'startup must not mutate acceptance checks')
+                    self.assertTrue(pending.exists(), 'startup must not mutate pending questions')
                     self.run_cli(*flags, 'ask', 'Review checkout B', cwd=second)
                 self.assertFalse(pending.exists())
                 self.assertFalse(marker.exists())

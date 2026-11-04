@@ -16,6 +16,9 @@ const root = (workerData as { root?: string } | null)?.root ?? process.argv[2] ?
 mkdirSync(root, { recursive: true });
 const BUSY_MS = 5000;
 const MAINTENANCE_BUSY_MS = 250;
+const RESERVED = "reserved:";
+/** Comfortably longer than a poll interval, without stalling maintenance when the owner has gone. */
+const RESERVATION_MS = 2000;
 
 function database(name: string): DatabaseSync {
 	const db = new DatabaseSync(join(root, name));
@@ -274,13 +277,14 @@ const operations = {
 	agentForSession(paneId: string, sessionFile: string): AgentRecord | undefined {
 		return decode<AgentRecord>(db.prepare("SELECT data FROM agents WHERE pane=? AND session_file=?").get(paneId, resolve(sessionFile)));
 	},
-	claimMaintenance(token: string, now: number, leaseMs = 5000): boolean {
+	claimMaintenance(token: string, now: number, leaseMs = 5000, session?: string): boolean {
 		// An early read avoids taking the write lock on every 200 ms tick in every pane.
-		const lease = db.prepare("SELECT expires,next_at FROM maintenance WHERE id=1").get()!;
-		if (Number(lease.expires) > now || Number(lease.next_at) > now) return false;
+		const lease = db.prepare("SELECT token,expires,next_at FROM maintenance WHERE id=1").get()!;
+		const reservation = RESERVED + (session ?? "");
+		if (lease.token !== reservation && (Number(lease.expires) > now || Number(lease.next_at) > now)) return false;
 		// Maintenance is best-effort and retried every tick, so a busy database only means another pane is writing.
 		db.exec(`PRAGMA busy_timeout=${MAINTENANCE_BUSY_MS}`);
-		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + leaseMs, now, now).changes) === 1); }
+		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND ((expires<=? AND next_at<=?) OR token=?)").run(token, now + leaseMs, now, now, reservation).changes) === 1); }
 		catch (error) { if (isBusy(error)) return false; throw error; }
 		finally { db.exec(`PRAGMA busy_timeout=${BUSY_MS}`); }
 	},
@@ -290,7 +294,7 @@ const operations = {
 			AND json_extract(r.data,'$.deadline')>0 AND json_extract(a.data,'$.currentRunId')=r.id`).all()
 			.map((row) => ({ agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)) }));
 	},
-	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number): boolean {
+	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number, reserveFor?: string): boolean {
 		return transaction(() => {
 			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
 			if (lease.token !== token || Number(lease.expires) <= now) return false;
@@ -303,19 +307,22 @@ const operations = {
 				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: departureError(value, ref) }, now);
 				if (next !== value) saveRun(next);
 			}
-			db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
+			// Only the owning session can declare its agents dead, so it gets the next pass.
+			if (reserveFor) db.prepare("UPDATE maintenance SET token=?,expires=?,next_at=? WHERE id=1 AND token=?").run(RESERVED + reserveFor, now + RESERVATION_MS, now + 1000, token);
+			else db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
 			return true;
 		});
 	},
 	/** `extendMs` renews a valid lease, so a pass may outlast one lease while it keeps making progress. */
 	maintenanceValid(token: string, now: number, extendMs?: number): boolean {
-		const valid = () => {
+		const held = () => {
 			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
-			return lifecycleAllowed() && lease.token === token && Number(lease.expires) > now;
+			return lease.token === token && Number(lease.expires) > now;
 		};
-		if (!extendMs) return valid();
+		if (!extendMs) return lifecycleAllowed() && held();
+		// Renewal keeps liveness settling while lifecycle effects are quarantined; those check the guard themselves.
 		return transaction(() => {
-			if (!valid()) return false;
+			if (!held()) return false;
 			db.prepare("UPDATE maintenance SET expires=? WHERE id=1 AND token=?").run(now + extendMs, token);
 			return true;
 		});

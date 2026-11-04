@@ -94,7 +94,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const savedMachines = machineGuidance(profiles);
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
-		const getRunner = () => runner ??= new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone });
+		const getRunner = () => runner ??= new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone, herdrSession: deps.env.HERDR_SESSION });
 		/** One runner, and one SSH store channel, per saved machine used by this session. */
 		const machines = new Map<string, Promise<HerdrRunner>>();
 		const machineRunners = new Map<string, HerdrRunner>();

@@ -1403,6 +1403,7 @@ test("maintenance does not keep a run alive through a name reused in another pan
 		{ name: records[1].herdrName, paneId: "w1:p99", session: "/elsewhere/session.jsonl" },
 		{ name: records[2].herdrName, paneId: "w1:p98" },
 	];
+	f.client.getAgent = async (name) => (await f.client.listAgents()).find((agent) => agent.name === name);
 	await f.runner.maintain();
 	assert.equal((await f.runner.read(moved)).phase, "queued");
 	assert.match((await f.runner.read(reused)).error ?? "", /pane closed/);

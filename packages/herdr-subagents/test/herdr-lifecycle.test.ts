@@ -9,7 +9,7 @@ import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } fr
 import { HerdrRunner, spawnHerdrAgent } from "../src/herdr/runner.ts";
 import type { ChildBinding } from "../src/herdr/store.ts";
 
-async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string; sleep?: (ms: number) => Promise<void> } = {}) {
+async function fixture(t: test.TestContext, options: { herdrSession?: string; keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string; sleep?: (ms: number) => Promise<void> } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-lifecycle-"));
 	let now = 1_000_000;
 	let sequence = 1;
@@ -57,7 +57,7 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhen
 		async listAgents() { return structuredClone([...named.values()]); },
 		async listPanes() { return structuredClone([...panes.values()]); },
 	};
-	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine, sleep: options.sleep ?? (async (ms) => { now += ms; }) });
+	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine, herdrSession: options.herdrSession, sleep: options.sleep ?? (async (ms) => { now += ms; }) });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const ref = await runner.spawn({
 		prompt: "remember this", description: "test", subagentType: "test", runtime: options.runtime,
@@ -90,7 +90,15 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhen
 		await runner.store.claimNextCommand(current.id, binding!.token, false);
 		await runner.store.recordExecutionEvent(ref, binding!.token, { type: "live" }, now);
 	}
-	return { runner, client, ref, panes, named, starts, closed, complete, accept, root, advance: (ms = 901_000) => { now += ms; } };
+	/** Pi exits: its name goes and its pane drops to a shell. */
+	const kill = (...names: string[]) => {
+		for (const name of names.length ? names : [...named.keys()]) {
+			const pane = named.get(name);
+			named.delete(name);
+			if (pane?.paneId) panes.set(pane.paneId, { paneId: pane.paneId, focused: false, plainShell: true });
+		}
+	};
+	return { runner, client, ref, panes, named, starts, closed, complete, accept, root, kill, now: () => now, advance: (ms = 901_000) => { now += ms; } };
 }
 
 test("completed panes park and resume on the same session with original settings", async (t) => {
@@ -670,8 +678,7 @@ for (const activity of ["working", "blocked", "focused"] as const) {
 test("a pi that exits during startup fails its run and names the pane it left", async (t) => {
 	const f = await fixture(t);
 	const record = await f.runner.resolve(f.ref.agentId);
-	f.named.clear();
-	f.panes.set(record.paneId, { paneId: record.paneId, focused: false, plainShell: true });
+	f.kill();
 	f.advance(1000);
 	await f.runner.maintain();
 	const run = await f.runner.read(f.ref);
@@ -681,7 +688,7 @@ test("a pi that exits during startup fails its run and names the pane it left", 
 
 test("a failed reap still settles the liveness it observed", async (t) => {
 	const f = await fixture(t);
-	f.named.clear();
+	f.kill();
 	f.advance(1000);
 	f.client.listPanes = async () => { throw new Error("listing failed"); };
 	await assert.rejects(f.runner.maintain(), /listing failed/);
@@ -693,7 +700,7 @@ test("a machine's maintenance pass survives calls that outlast the local lease",
 	await f.complete();
 	const finished = await f.runner.resolve(f.ref.agentId);
 	const dead = await f.runner.spawn({ prompt: "second", description: "second", subagentType: "test", name: "second", cwd: finished.cwd!, paneId: "w1:p1", runInBackground: true });
-	f.named.delete((await f.runner.resolve(dead.agentId)).herdrName);
+	f.kill((await f.runner.resolve(dead.agentId)).herdrName);
 	const getAgent = f.client.getAgent;
 	f.client.getAgent = async (...args) => { f.advance(6000); return getAgent(...args); };
 	f.advance(1000);
@@ -706,7 +713,7 @@ test("a machine's maintenance pass survives calls that outlast the local lease",
 for (const [name, listing] of [["completes", false], ["fails", true]] as const) {
 	test(`a stale dead observation cannot fail a child that advanced while the reap ${name}`, async (t) => {
 		const f = await fixture(t);
-		f.named.clear();
+		f.kill();
 		f.advance(1000);
 		const list = f.client.listPanes;
 		f.client.listPanes = async (...args) => {
@@ -761,6 +768,205 @@ test("a local pi keeps the short start window", async (t) => {
 	assert.equal((await f.runner.read(f.ref)).phase, "failed");
 });
 
+test("maintenance in another Herdr session leaves a run it cannot see alone", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
+	const other = new HerdrRunner({ root: f.root, client: empty, now: f.now, herdrSession: "hermes-jobs" });
+	t.after(() => other.close());
+	f.advance(1000);
+	await other.maintain();
+	await other.reconcile(f.ref);
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+});
+
+test("only a run's own session can declare it dead", async (t) => {
+	const f = await fixture(t, { herdrSession: "hermes-jobs" });
+	const record = await f.runner.resolve(f.ref.agentId);
+	assert.equal(record.herdrSession, "hermes-jobs");
+	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
+	const standard = new HerdrRunner({ root: f.root, client: empty, now: f.now, herdrSession: "default" });
+	t.after(() => standard.close());
+	f.advance(1000);
+	await standard.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "queued");
+	f.kill();
+	f.advance(2000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("a pass reserves the next lease for the session that owns a dead agent", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	f.kill();
+	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
+	const foreign = [0, 1].map(() => new HerdrRunner({ root: f.root, client: empty, now: f.now, herdrSession: "hermes-jobs" }));
+	t.after(() => Promise.all(foreign.map((runner) => runner.close())));
+	f.advance(1000);
+	await foreign[0].maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+	assert.equal(await foreign[1].store.claimMaintenance("peer", f.now(), 5000, "hermes-jobs"), false, "every other runner honours it");
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("reservations rotate among every session with an unseen agent", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	const spawn = (runner: HerdrRunner, name: string) => runner.spawn({ prompt: name, description: name, subagentType: "test", name, cwd: f.root, paneId: "w1:p1", runInBackground: true });
+	const owners = ["gone", "jobs"].map((session) => new HerdrRunner({ root: f.root, client: f.client, now: f.now, herdrSession: session }));
+	t.after(() => Promise.all(owners.map((runner) => runner.close())));
+	await spawn(owners[0], "gone-agent");
+	await spawn(owners[1], "jobs-agent");
+	f.kill();
+	const reserved = new Set<string>();
+	const db = new DatabaseSync(join(f.root, "control.sqlite"), { readOnly: true });
+	t.after(() => db.close());
+	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
+	const third = new HerdrRunner({ root: f.root, client: empty, now: f.now, herdrSession: "third" });
+	t.after(() => third.close());
+	for (let pass = 0; pass < 6; pass++) {
+		f.advance(2100);
+		await third.maintain();
+		reserved.add(String((db.prepare("SELECT token FROM maintenance WHERE id=1").get() as { token: string }).token));
+	}
+	assert.ok(reserved.has("reserved:gone") && reserved.has("reserved:jobs"), [...reserved].join());
+});
+
+test("a quarantined machine still settles a dead run", async (t) => {
+	const f = await fixture(t, { machine: "lappy" });
+	await f.accept();
+	f.kill();
+	const db = new DatabaseSync(join(f.root, "control.sqlite"));
+	db.exec("BEGIN; INSERT OR IGNORE INTO lifecycle_writer(id) VALUES(1); UPDATE lifecycle_guard SET allowed=0 WHERE id=1; COMMIT");
+	db.close();
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal(await f.runner.store.lifecycleAllowed(), false);
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+	assert.deepEqual(f.closed, []);
+});
+
+test("a reservation lapses when its session is gone", async (t) => {
+	const f = await fixture(t);
+	assert.equal(await f.runner.store.claimMaintenance("a", 1000, 5000, "hermes-jobs"), true);
+	assert.equal(await f.runner.store.finishMaintenance("a", [], 1000, "gone"), true);
+	assert.equal(await f.runner.store.claimMaintenance("b", 2500, 5000, "hermes-jobs"), false);
+	assert.equal(await f.runner.store.claimMaintenance("c", 3001, 5000, "hermes-jobs"), true);
+	assert.equal(await f.runner.store.lifecycleAllowed(), true);
+});
+
+test("a record from before sessions were tracked keeps its old behaviour", async (t) => {
+	const f = await fixture(t);
+	await f.complete();
+	const old = new DatabaseSync(join(f.root, "control.sqlite"));
+	const { data } = old.prepare("SELECT data FROM agents WHERE id=?").get(f.ref.agentId) as { data: string };
+	const record = JSON.parse(data);
+	delete record.herdrSession;
+	const tag = old.prepare("UPDATE agents SET data=? WHERE id=?");
+	old.exec("BEGIN; INSERT OR IGNORE INTO lifecycle_writer(id) VALUES(1)");
+	tag.run(JSON.stringify(record), f.ref.agentId);
+	old.exec("COMMIT");
+	old.close();
+	f.advance();
+	await f.runner.maintain();
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked");
+	const other = new HerdrRunner({ root: f.root, client: f.client, now: f.now, herdrSession: "hermes-jobs" });
+	t.after(() => other.close());
+	await other.resume(f.ref.agentId, "again");
+	assert.equal(f.starts.length, 2);
+});
+
+test("a machine renews its lease before a slow confirmation", async (t) => {
+	const f = await fixture(t, { machine: "lappy" });
+	await f.accept();
+	f.kill();
+	const getAgent = f.client.getAgent;
+	const list = f.client.listAgents;
+	f.client.listAgents = async (...args) => { f.advance(9000); return list(...args); };
+	f.client.getAgent = async (...args) => { f.advance(59_500); return getAgent(...args); };
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("cold resume is refused from another Herdr session", async (t) => {
+	const f = await fixture(t);
+	await f.complete();
+	f.advance();
+	await f.runner.maintain();
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked");
+	const other = new HerdrRunner({ root: f.root, client: f.client, now: f.now, herdrSession: "hermes-jobs" });
+	t.after(() => other.close());
+	await assert.rejects(other.resume(f.ref.agentId, "again"), /belongs to Herdr session default/);
+	assert.equal(f.starts.length, 1);
+});
+
+test("an agent confirmed alive still meets its start deadline", async (t) => {
+	const f = await fixture(t);
+	f.client.listAgents = async () => [];
+	f.advance(16_000);
+	await f.runner.maintain();
+	const run = await f.runner.read(f.ref);
+	assert.equal(run.phase, "failed");
+	assert.match(run.error!, /did not confirm task execution/);
+});
+
+test("a name reused in the same pane does not confirm a dead agent", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	const { paneId, herdrName } = await f.runner.resolve(f.ref.agentId);
+	f.client.listAgents = async () => [];
+	f.client.getAgent = async () => ({ name: herdrName, paneId });
+	f.client.getPane = async () => ({ paneId, session: "/elsewhere/other.jsonl" });
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("a failed confirmation leaves that run undecided and others still settle", async (t) => {
+	const f = await fixture(t);
+	const { cwd } = await f.runner.resolve(f.ref.agentId);
+	const dead = await f.runner.spawn({ prompt: "second", description: "second", subagentType: "test", name: "second", cwd: cwd!, paneId: "w1:p1", runInBackground: true });
+	const second = (await f.runner.resolve(dead.agentId)).herdrName;
+	const first = (await f.runner.resolve(f.ref.agentId)).herdrName;
+	f.kill();
+	const getAgent = f.client.getAgent;
+	f.client.getAgent = async (name, signal) => { if (name === first) throw new Error("lookup timeout"); return getAgent(name, signal); };
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "queued");
+	assert.equal((await f.runner.read(dead)).phase, "failed", second);
+});
+
+test("explicit reconciliation also confirms before failing a run", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	f.client.listAgents = async () => [];
+	f.client.getAgent = async () => undefined;
+	f.advance(1000);
+	await f.runner.reconcile(f.ref);
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+});
+
+test("one listing that omits a live agent cannot fail its run", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	const list = f.client.listAgents;
+	f.client.listAgents = async () => [];
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running", "the named agent still answers");
+	const getAgent = f.client.getAgent;
+	f.client.getAgent = async () => undefined;
+	f.advance(2000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running", "the pane still holds its session");
+	f.client.listAgents = list;
+	f.client.getAgent = getAgent;
+});
+
 test("a machine runner leaves a local definition's model to that machine's default", async (t) => {
 	const f = await fixture(t, { machine: "lappy" });
 	const agentDir = join(f.root, "agent");
@@ -779,7 +985,7 @@ test("a local pass over many records outlasts one lease and still saves its obse
 	const spawn = (name: string) => f.runner.spawn({ prompt: name, description: name, subagentType: "test", name, cwd: cwd!, paneId: "w1:p1", runInBackground: true, sessionFile: "/owner.jsonl" });
 	await spawn("second");
 	const dead = await spawn("third");
-	f.named.delete((await f.runner.resolve(dead.agentId)).herdrName);
+	f.kill((await f.runner.resolve(dead.agentId)).herdrName);
 	const getPane = f.client.getPane!;
 	f.client.getPane = async (...args) => { f.advance(3000); return getPane(...args); };
 	f.advance(1000);
@@ -788,14 +994,14 @@ test("a local pass over many records outlasts one lease and still saves its obse
 });
 
 test("a machine pass renews before each slow step, however its time is spent", async (t) => {
-	for (const [before, steps] of [[0, [29_000, 32_000]], [42_000, [19_000]], [0, [900, 59_500]]] as const) {
+	for (const [before, steps] of [[0, [29_000, 32_000]], [42_000, [19_000]], [0, [900, 59_500]], [0, [9000, 9000, 9000, 9000, 9000, 9000, 9000, 9000]]] as const) {
 		const f = await fixture(t, { machine: "lappy", keep: true });
 		await f.complete();
 		const { cwd } = await f.runner.resolve(f.ref.agentId);
 		const spawn = (name: string) => f.runner.spawn({ prompt: name, description: name, subagentType: "test", name, cwd: cwd!, paneId: "w1:p1", runInBackground: true });
 		await f.runner.store.recordPaneClosed(await spawn("finished"), 1_000_000);
 		const dead = await spawn("dead");
-		f.named.delete((await f.runner.resolve(dead.agentId)).herdrName);
+		f.kill((await f.runner.resolve(dead.agentId)).herdrName);
 		const listPanes = f.client.listPanes;
 		f.client.listPanes = async (...args) => { f.advance(before); f.client.listPanes = listPanes; return listPanes(...args); };
 		const getAgent = f.client.getAgent;

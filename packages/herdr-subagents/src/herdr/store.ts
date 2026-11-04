@@ -11,6 +11,8 @@ export type { RunRef, RunSnapshot, ExecutionEvent } from "./state.ts";
 export interface HerdrTask {
 	/** Missing on existing records means Pi. */
 	runtime?: "pi" | "claude-code";
+	/** The Herdr session that owns the pane. Missing on records from before sessions were tracked. */
+	herdrSession?: string;
 	id: string;
 	herdrName: string;
 	paneId: string;
@@ -241,7 +243,7 @@ export class HerdrStore {
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }
 	findAgent(id: string) { return this.call("findAgent", id); }
 	agentForSession(paneId: string, sessionFile: string) { return this.call("agentForSession", paneId, sessionFile); }
-	claimMaintenance(token: string, now: number, leaseMs?: number) { return this.call("claimMaintenance", token, now, leaseMs); }
+	claimMaintenance(token: string, now: number, leaseMs?: number, session?: string) { return this.call("claimMaintenance", token, now, leaseMs, session); }
 	activeRuns() { return this.call("activeRuns"); }
 	lifecycleAllowed() { return this.call("lifecycleAllowed"); }
 	lifecycleStatus() { return this.call("lifecycleStatus"); }
@@ -256,7 +258,7 @@ export class HerdrStore {
 	parkAgent(ref: RunRef, paneId: string, now: number) { return this.call("parkAgent", ref, paneId, now); }
 	closeOwnedAgent(ref: RunRef, paneId: string, now: number) { return this.call("closeOwnedAgent", ref, paneId, now); }
 	maintenanceValid(token: string, now: number, extendMs?: number) { return this.call("maintenanceValid", token, now, extendMs); }
-	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number) { return this.call("finishMaintenance", token, observations, now); }
+	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number, reserveFor?: string) { return this.call("finishMaintenance", token, observations, now, reserveFor); }
 	listAgents() { return this.call("listAgents"); }
 	read(ref: RunRef) { return this.call("read", ref); }
 	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership, startTimeoutMs?: number) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now, ownership, startTimeoutMs); }

@@ -67,6 +67,8 @@ export interface RunnerDeps {
 	signal?: AbortSignal;
 	/** The extension shares one runner across tools and session maintenance. */
 	runner?: HerdrRunner;
+	/** The named Herdr session this runner's panes belong to. Omitted for the default session. */
+	herdrSession?: string;
 	/** Saved Herdr machine whose panes and store this runner uses. Omitted for the local server. */
 	machine?: string;
 	/** False keeps completed panes open; default true. */
@@ -194,6 +196,7 @@ export class HerdrRunner {
 	private active = new Set<Promise<unknown>>();
 	private maintenance?: Promise<void>;
 	private closing?: Promise<void>;
+	private readonly herdrSession: string;
 	private now: () => number;
 	private sleep: (ms: number) => Promise<void>;
 
@@ -201,6 +204,8 @@ export class HerdrRunner {
 		this.deps = privateDeps;
 		this.store = new HerdrStore(privateDeps.channel ?? privateDeps.root);
 		this.machine = privateDeps.machine;
+		// Saved machines are reached through their default session.
+		this.herdrSession = privateDeps.machine ? "default" : (privateDeps.herdrSession ?? process.env.HERDR_SESSION)?.trim() || "default";
 		this.now = privateDeps.now ?? Date.now;
 		this.sleep = privateDeps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
 	}
@@ -303,8 +308,11 @@ export class HerdrRunner {
 		this.maintenance = this.track((async () => {
 			const token = randomUUID();
 			const claimedAt = this.now();
-			if (!(await this.store.claimMaintenance(token, claimedAt, this.maintenanceLeaseMs))) return;
+			if (!(await this.store.claimMaintenance(token, claimedAt, this.maintenanceLeaseMs, this.herdrSession))) return;
 			let observations: MaintenanceObservation[] = [];
+			const skipped = new Set<string>();
+			// Rotating by time keeps several sessions, or one that has gone, from holding every reservation.
+			const reservation = () => [...skipped].sort()[Math.floor(this.now() / LEASE_RENEWAL_MS) % skipped.size];
 			try {
 				const runs = await this.store.activeRuns();
 				const candidates = await this.store.lifecycleCandidates();
@@ -313,18 +321,27 @@ export class HerdrRunner {
 				if (agents.some((agent) => !agent.paneId)) throw new Error("Herdr returned an incomplete agent listing");
 				const named = new Map(agents.flatMap((agent) => agent.name ? [[agent.name, agent] as const] : []));
 				const unnamedPanes = new Set(agents.filter((agent) => !agent.name).map((agent) => agent.paneId));
-				observations = runs.flatMap(({ agent, run }) => {
+				for (const { agent, run } of runs) {
 					// A durable close intent owns settlement, including when closePane killed its caller.
-					if (agent.paneClose) return [];
+					if (agent.paneClose) continue;
 					// A live conversation can move and be renamed without losing its run or binding.
 					const presence = agents.some((item) => item.session !== undefined && sameSession(item.session, agent))
 						? "alive" : agentPresence(agent, named.get(agent.herdrName));
 					// An older/incomplete listing at the right pane is unknown, not proof of death.
-					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) return [];
-					return [{ ref: { agentId: run.agentId, runId: run.runId }, alive: presence === "alive", seen: run }];
-				});
+					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) continue;
+					let alive = presence === "alive";
+					if (!alive) {
+						// Another session's agent is simply invisible here, so leave its owner room to win the lease.
+						if (!this.owns(agent)) { skipped.add(agent.herdrSession!); continue; }
+						if (this.machine && !(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) break;
+						try { alive = await this.stillPresent(agent); }
+						catch { continue; }
+						if (this.machine && !(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) break;
+					}
+					observations.push({ ref: { agentId: run.agentId, runId: run.runId }, alive, seen: run });
+				}
 				if (candidates.length) await this.reap(token, claimedAt);
-				await this.store.finishMaintenance(token, observations, this.now());
+				await this.store.finishMaintenance(token, observations, this.now(), reservation());
 				for (const { agent } of runs) if (agent.runtime === "claude-code") await this.serviceClaude(agent.id, this.stopping.signal);
 				if (await this.store.tryPlacementLock(token)) {
 					try { await this.recoverLaunches(); }
@@ -332,11 +349,26 @@ export class HerdrRunner {
 				}
 			} catch (error) {
 				// Liveness observed before a failed reap still settles, so one bad candidate cannot hold every run open.
-				await this.store.finishMaintenance(token, observations, this.now());
+				await this.store.finishMaintenance(token, observations, this.now(), reservation());
 				throw error;
 			}
 		})()).finally(() => { this.maintenance = undefined; });
 		return this.maintenance;
+	}
+
+	/** A store can be shared by Herdr servers that cannot see each other's panes. Untagged records predate this. */
+	private owns(agent: AgentRecord): boolean {
+		return agent.herdrSession === undefined || agent.herdrSession === this.herdrSession;
+	}
+
+	/** Failing a run is permanent, so one listing that omits an agent is not enough. */
+	private async stillPresent(agent: AgentRecord): Promise<boolean> {
+		const signal = this.stopping.signal;
+		// Only the agent's own session counts: a name can be reused by another pane.
+		const named = await this.deps.client.getAgent(agent.herdrName, signal);
+		if (named?.session !== undefined && sameSession(named.session, agent)) return true;
+		const pane = await this.deps.client.getPane?.(agent.paneId, signal);
+		return pane?.session !== undefined && sameSession(pane.session, agent);
 	}
 
 	private get startTimeoutMs(): number | undefined {
@@ -374,11 +406,11 @@ export class HerdrRunner {
 		const value = await this.read(ref);
 		if (isTerminal(value.phase) || !value.deadline) return;
 		const record = await this.resolve(ref.agentId);
-		if (record.paneClose) return;
+		if (record.paneClose || !this.owns(record)) return;
 		// Unknown liveness is not proof of pane death. The CLI adapter throws for transport errors.
 		const namedPresence = agentPresence(record, await this.deps.client.getAgent(record.herdrName));
 		const sessionAlive = namedPresence === "dead" && (await this.deps.client.listAgents()).some((item) => item.paneId && item.session !== undefined && sameSession(item.session, record));
-		if (namedPresence === "dead" && !sessionAlive) await this.store.recordPaneClosed(ref, this.now());
+		if (namedPresence === "dead" && !sessionAlive && !(await this.stillPresent(record))) await this.store.recordPaneClosed(ref, this.now());
 		else await this.store.expireUnacceptedRun(ref, this.now());
 	}
 
@@ -455,6 +487,7 @@ export class HerdrRunner {
 				parentTabId: request.tabId, parentWorkspaceId: request.workspaceId,
 				parentMachine: this.machine ? MACHINE : undefined,
 				closeWhenDone: this.deps.closeWhenDone ?? true,
+				herdrSession: this.herdrSession,
 				keep: request.keep ?? definition?.keep,
 				createdAt: new Date(this.now()).toISOString(),
 			};
@@ -519,6 +552,7 @@ export class HerdrRunner {
 
 	/** Placement lock covers the terminal-run CAS, pane effects, and publication of the follow-up run. */
 	private async coldResume(record: AgentRecord, signal: AbortSignal, caller?: ResumeCaller): Promise<void> {
+		if (!this.owns(record)) throw new Error(`Agent ${record.id} belongs to Herdr session ${record.herdrSession ?? "default"}. Resume it from there.`);
 		await this.assertColdResumeAllowed(record.id);
 		if (!(await this.store.coldResumeReady(record.id))) throw new Error(`Agent ${record.id} is no longer running and cannot resume cold: its saved session or working directory is unavailable, or this conversation was stopped.`);
 		if (record.runtime === "claude-code" && !this.deps.client.startClaude) throw new Error("The Herdr client does not support Claude Code launches.");

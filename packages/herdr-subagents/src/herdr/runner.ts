@@ -16,6 +16,8 @@ const POLL_MS = 200;
 const CLOSE_GRACE_MS = 2000;
 /** Status lag and a glance at a just-finished pane do not keep it open. */
 const DONE_SETTLE_MS = 120_000;
+/** A starting pane publishes its session within seconds; longer uncertainty refuses the reopen. */
+const DEPARTURE_SETTLE_MS = 10_000;
 
 export interface SpawnRequest {
 	runtime?: "pi" | "claude-code";
@@ -707,7 +709,13 @@ export class HerdrRunner {
 	/** A lost/reused name alone never authorizes a second process on the saved conversation. */
 	private async assertDeparted(record: AgentRecord, signal: AbortSignal): Promise<void> {
 		if (!this.deps.client.getPane) throw new Error(`Agent ${record.id} is no longer running under its saved Herdr name; cannot reopen because Herdr cannot verify the original pane's departure.`);
-		if (await this.sessionPresence(record, signal) !== "dead") {
+		let presence = await this.sessionPresence(record, signal);
+		for (let waited = 0; presence === "unknown" && waited < DEPARTURE_SETTLE_MS; waited += POLL_MS) {
+			await this.sleep(POLL_MS);
+			check(signal);
+			presence = await this.sessionPresence(record, signal);
+		}
+		if (presence !== "dead") {
 			throw new Error(`Cannot reopen ${record.id}: the original session may still be live; Herdr's session inventory does not prove departure.`);
 		}
 	}

@@ -8,7 +8,7 @@ import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } fr
 import { HerdrRunner, spawnHerdrAgent } from "../src/herdr/runner.ts";
 import type { ChildBinding } from "../src/herdr/store.ts";
 
-async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string } = {}) {
+async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string; sleep?: (ms: number) => Promise<void> } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-lifecycle-"));
 	let now = 1_000_000;
 	let sequence = 1;
@@ -56,7 +56,7 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhen
 		async listAgents() { return structuredClone([...named.values()]); },
 		async listPanes() { return structuredClone([...panes.values()]); },
 	};
-	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine });
+	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine, sleep: options.sleep });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const ref = await runner.spawn({
 		prompt: "remember this", description: "test", subagentType: "test", runtime: options.runtime,
@@ -1061,3 +1061,27 @@ for (const guard of ["disabled", "pinned", "focused", "working", "blocked", "unk
 		assert.deepEqual(f.closed, []);
 	});
 }
+
+test("cold resume waits out a pane that has not published its session yet", async (t) => {
+	const f = await fixture(t, { sleep: async () => {} });
+	await f.complete();
+	f.advance();
+	await f.runner.maintain();
+	const list = f.client.listPanes;
+	let observations = 0;
+	f.client.listPanes = async (...args) => [...await list(...args), ...(++observations < 3 ? [{ paneId: "w2:p10", name: "starting" }] : [])];
+	await f.runner.resume(f.ref.agentId, "follow up");
+	assert.equal(observations >= 3, true);
+	assert.equal(f.starts.length, 2);
+});
+
+test("cold resume still refuses a session uncertainty that never clears", async (t) => {
+	const f = await fixture(t, { sleep: async () => {} });
+	await f.complete();
+	f.advance();
+	await f.runner.maintain();
+	const list = f.client.listPanes;
+	f.client.listPanes = async (...args) => [...await list(...args), { paneId: "w2:p10", name: "agent without a session" }];
+	await assert.rejects(f.runner.resume(f.ref.agentId, "follow up"), /original session may still be live/);
+	assert.equal(f.starts.length, 1);
+});

@@ -57,7 +57,7 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhen
 		async listAgents() { return structuredClone([...named.values()]); },
 		async listPanes() { return structuredClone([...panes.values()]); },
 	};
-	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine, sleep: options.sleep });
+	runner = new HerdrRunner({ root, client, now: () => now, closeWhenDone: options.closeWhenDone, machine: options.machine, sleep: options.sleep ?? (async (ms) => { now += ms; }) });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const ref = await runner.spawn({
 		prompt: "remember this", description: "test", subagentType: "test", runtime: options.runtime,
@@ -1220,7 +1220,7 @@ for (const guard of ["disabled", "pinned", "focused", "working", "blocked", "unk
 }
 
 test("cold resume waits out a pane that has not published its session yet", async (t) => {
-	const f = await fixture(t, { sleep: async () => {} });
+	const f = await fixture(t);
 	await f.complete();
 	f.advance();
 	await f.runner.maintain();
@@ -1233,12 +1233,19 @@ test("cold resume waits out a pane that has not published its session yet", asyn
 });
 
 test("cold resume still refuses a session uncertainty that never clears", async (t) => {
-	const f = await fixture(t, { sleep: async () => {} });
+	const f = await fixture(t);
 	await f.complete();
 	f.advance();
 	await f.runner.maintain();
 	const list = f.client.listPanes;
-	f.client.listPanes = async (...args) => [...await list(...args), { paneId: "w2:p10", name: "agent without a session" }];
+	let observations = 0;
+	f.client.listPanes = async (...args) => {
+		// The settle window counts time spent observing, not only the sleeps between observations.
+		observations++;
+		f.advance(800);
+		return [...await list(...args), { paneId: "w2:p10", name: "agent without a session" }];
+	};
 	await assert.rejects(f.runner.resume(f.ref.agentId, "follow up"), /original session may still be live/);
 	assert.equal(f.starts.length, 1);
+	assert.ok(observations > 1 && observations < 15, `observed ${observations} times`);
 });

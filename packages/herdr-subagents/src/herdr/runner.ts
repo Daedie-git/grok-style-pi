@@ -736,8 +736,9 @@ export class HerdrRunner {
 	/** A lost/reused name alone never authorizes a second process on the saved conversation. */
 	private async assertDeparted(record: AgentRecord, signal: AbortSignal): Promise<void> {
 		if (!this.deps.client.getPane) throw new Error(`Agent ${record.id} is no longer running under its saved Herdr name; cannot reopen because Herdr cannot verify the original pane's departure.`);
+		const deadline = this.now() + DEPARTURE_SETTLE_MS;
 		let presence = await this.sessionPresence(record, signal);
-		for (let waited = 0; presence === "unknown" && waited < DEPARTURE_SETTLE_MS; waited += POLL_MS) {
+		while (presence === "unknown" && this.now() < deadline) {
 			await this.sleep(POLL_MS);
 			check(signal);
 			presence = await this.sessionPresence(record, signal);

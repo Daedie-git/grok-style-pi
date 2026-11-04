@@ -2302,6 +2302,15 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.run_cli('unreviewed', cwd=repo).returncode, 0)
         return repo, git
 
+    def test_unreviewed_uses_the_latest_review_from_any_slot(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('--slot', '2', 'diff', cwd=repo)
+        result = self.run_cli('unreviewed', cwd=repo)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('nothing changed', result.stdout)
+        (repo / 'late.txt').write_text('unreviewed\n')
+        self.assert_unreviewed(repo, 'late.txt')
+
     def assert_unreviewed(self, repo, name):
         result = self.run_cli('unreviewed', cwd=repo, check=False)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

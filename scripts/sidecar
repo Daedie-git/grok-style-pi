@@ -28,7 +28,7 @@
 #   sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]
 #                                cooperative diff review by a pi and a Claude Code reviewer (default dedicated slots 98 and 99): both
 #                                review in parallel, check each other's findings, and one combined report is printed
-#   sidecar unreviewed           list files changed since the last diff review (exit 1 when there are any)
+#   sidecar unreviewed           list files changed since the last diff review from any slot (exit 1 when there are any)
 #   sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-
 #                                follow-up request (- reads TEXT from stdin); prints the report. --accept runs CMD here
 #                                after the report and --scope flags changed files outside GLOB; both persist on the slot
@@ -1609,7 +1609,16 @@ reviewed_file() {
 }
 
 cmd_unreviewed() {
-  unreviewed_since "$(reviewed_file)"
+  unreviewed_since "$(latest_reviewed_file "$(git rev-parse --show-toplevel)")"
+}
+
+# The newest diff review of a repository from any slot of this Claude.
+latest_reviewed_file() {
+  local file latest=
+  for file in "$STATE_DIR/$(owner_name)"{,-*}".reviewed.$(sha256sum <<<"$1" | cut -c1-12)"; do
+    if [[ -s $file && ( -z $latest || $file -nt $latest ) ]]; then latest=$file; fi
+  done
+  echo "$latest"
 }
 
 unreviewed_since() {
@@ -1636,7 +1645,7 @@ unreviewed_since() {
 # repository the command publishes from (any slot). Repositories with no recorded review pass, as do commands run with
 # SIDECAR_REVIEW_SKIP=<why> in their environment assignments.
 cmd_push_gate() {
-  local input command cwd dir repo file latest reason reasons=()
+  local input command cwd dir repo latest reason reasons=()
   [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || return 0
   input=$(cat)
   command=$(jq -r '.tool_input.command // empty' <<<"$input")
@@ -1648,10 +1657,7 @@ cmd_push_gate() {
   while IFS= read -r -d '' dir; do
     [[ -d $dir ]] || continue
     repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
-    latest=
-    for file in "$STATE_DIR/$(owner_name)"{,-*}".reviewed.$(sha256sum <<<"$repo" | cut -c1-12)"; do
-      if [[ -s $file && ( -z $latest || $file -nt $latest ) ]]; then latest=$file; fi
-    done
+    latest=$(latest_reviewed_file "$repo")
     [[ -n $latest ]] || continue
     if ! reason=$(cd -- "$repo" && unreviewed_since "$latest" 2>&1); then reasons+=("$repo: $reason"); fi
   done < <(node -e "$PUBLISH_DIRS_JS" "$command" "${cwd:-$PWD}" "$HOME")

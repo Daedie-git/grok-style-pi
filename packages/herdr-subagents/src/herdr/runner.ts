@@ -16,6 +16,8 @@ const POLL_MS = 200;
 /** A local pass takes milliseconds. A machine's pass makes many SSH calls of several seconds each. */
 const MAINTENANCE_LEASE_MS = 5000;
 const MACHINE_MAINTENANCE_LEASE_MS = 60_000;
+/** Pi on a loaded laptop took 20s to pick up its task. A pi that exits is caught sooner, by its missing name. */
+const MACHINE_START_TIMEOUT_MS = 120_000;
 const CLOSE_GRACE_MS = 2000;
 /** Status lag and a glance at a just-finished pane do not keep it open. */
 const DONE_SETTLE_MS = 120_000;
@@ -248,7 +250,7 @@ export class HerdrRunner {
 					parentTabId: caller.tabId, parentWorkspaceId: caller.workspaceId, parentMachine: this.machine ? MACHINE : undefined,
 				} : undefined;
 				// Adoption and the previous-run CAS must commit together, including against legacy callers.
-				return this.store.beginRun(record.id, previous, prompt, notify, this.now(), ownership);
+				return this.store.beginRun(record.id, previous, prompt, notify, this.now(), ownership, this.startTimeoutMs);
 			}, combined);
 			const record = await this.resolve(ref.agentId);
 			try {
@@ -332,6 +334,10 @@ export class HerdrRunner {
 			}
 		})()).finally(() => { this.maintenance = undefined; });
 		return this.maintenance;
+	}
+
+	private get startTimeoutMs(): number | undefined {
+		return this.machine ? MACHINE_START_TIMEOUT_MS : undefined;
 	}
 
 	private get maintenanceLeaseMs(): number {
@@ -490,7 +496,7 @@ export class HerdrRunner {
 				await this.deps.client.startClaude!({ name: task.id, paneId: paneId!, args: claudeArgs(task, sessionId, this.deps.root) }, signal);
 			} else await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile!) }, signal);
 			check(signal);
-			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now());
+			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now(), this.startTimeoutMs);
 			published = true;
 			if (claude && !signal.aborted) await this.serviceClaude(task.id, signal);
 			if (signal.aborted) { await this.cancel(ref); return ref; }

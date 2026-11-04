@@ -259,8 +259,8 @@ export class HerdrStore {
 	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number) { return this.call("finishMaintenance", token, observations, now); }
 	listAgents() { return this.call("listAgents"); }
 	read(ref: RunRef) { return this.call("read", ref); }
-	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now, ownership); }
-	publish(ref: RunRef, prompt: string, notify: boolean, now: number) { return this.call("publish", ref, prompt, notify, now); }
+	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership, startTimeoutMs?: number) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now, ownership, startTimeoutMs); }
+	publish(ref: RunRef, prompt: string, notify: boolean, now: number, startTimeoutMs?: number) { return this.call("publish", ref, prompt, notify, now, startTimeoutMs); }
 	steer(ref: RunRef, text: string) { return this.call("steer", ref, text); }
 	requestCancellation(ref: RunRef, now: number) { return this.call("requestCancellation", ref, now); }
 	expireUnacceptedRun(ref: RunRef, now: number) { return this.call("expireUnacceptedRun", ref, now); }

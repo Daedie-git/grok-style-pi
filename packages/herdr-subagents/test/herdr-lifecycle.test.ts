@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { transition } from "../src/herdr/state.ts";
 import test from "node:test";
 import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } from "../src/herdr/client.ts";
 import { HerdrRunner, spawnHerdrAgent } from "../src/herdr/runner.ts";
@@ -727,6 +728,37 @@ test("a dead observation yields to any run change, even within one millisecond",
 	assert.notEqual(accepted.accepted, seen.accepted);
 	await f.runner.store.finishMaintenance("same-ms", [{ ref: f.ref, alive: false, seen: { ...seen, updatedAt: accepted.updatedAt, phase: accepted.phase } }], seen.updatedAt + 1000);
 	assert.equal((await f.runner.read(f.ref)).phase, "running");
+});
+
+test("a machine's slow pi keeps its start window on launch and on resume", async (t) => {
+	const f = await fixture(t, { machine: "lappy" });
+	const assertStartWindow = async (ref: typeof f.ref) => {
+		f.advance(30_000);
+		await f.runner.maintain();
+		assert.equal((await f.runner.read(ref)).phase, "queued", "20s of startup is normal on a loaded laptop");
+		f.advance(91_000);
+		await f.runner.maintain();
+		const run = await f.runner.read(ref);
+		assert.equal(run.phase, "failed");
+		assert.match(run.error!, /did not confirm task execution/);
+	};
+	await assertStartWindow(f.ref);
+	const next = await f.runner.resume(f.ref.agentId, "again");
+	await assertStartWindow(next);
+});
+
+test("dismissing a startup prompt restores a machine's start window", () => {
+	const run = { agentId: "a", runId: "r", phase: "blocked", accepted: false, cancelRequested: false, deadline: 1, startTimeoutMs: 120_000, turns: 0, updatedAt: 0 } as const;
+	assert.equal(transition(run, { type: "unblocked" }, 1000).deadline, 121_000);
+	const { startTimeoutMs: _, ...local } = run;
+	assert.equal(transition(local, { type: "unblocked" }, 1000).deadline, 16_000);
+});
+
+test("a local pi keeps the short start window", async (t) => {
+	const f = await fixture(t);
+	f.advance(16_000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
 });
 
 test("a machine runner leaves a local definition's model to that machine's default", async (t) => {

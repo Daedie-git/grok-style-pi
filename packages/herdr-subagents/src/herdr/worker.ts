@@ -176,13 +176,13 @@ function launch(ref: RunRef): LaunchRecord {
 function saveLaunch(value: LaunchRecord) {
 	db.prepare("UPDATE launches SET data=? WHERE run=?").run(JSON.stringify(value), value.runId);
 }
-function publish(ref: RunRef, prompt: string, notify: boolean, now: number): RunSnapshot {
+function publish(ref: RunRef, prompt: string, notify: boolean, now: number, startTimeoutMs?: number): RunSnapshot {
 	const value = run(ref);
 	if (!current(ref) || value.phase !== "queued" || value.cancelRequested) throw new Error("Run cannot be published");
 	if (commands(ref).some((command) => command.type === "prompt")) throw new Error("Run already published");
 	addCommand(ref, "prompt", prompt);
 	if (notify) db.prepare("INSERT INTO notices(run) VALUES(?)").run(ref.runId);
-	return saveRun({ ...value, deadline: now + START_TIMEOUT_MS, updatedAt: now });
+	return saveRun({ ...value, deadline: now + (startTimeoutMs ?? START_TIMEOUT_MS), ...(startTimeoutMs ? { startTimeoutMs } : {}), updatedAt: now });
 }
 
 /** A process that exits during startup usually leaves its error in the pane. */
@@ -422,7 +422,7 @@ const operations = {
 		return db.prepare("SELECT data FROM agents").all().map((row) => decode<AgentRecord>(row)!);
 	},
 	read: run,
-	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership): RunRef {
+	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership, startTimeoutMs?: number): RunRef {
 		return transaction(() => {
 			const record = agent(agentId);
 			if (!record || record.paneClose || record.currentRunId !== previousRunId || !isTerminal(run({ agentId, runId: previousRunId }).phase)) {
@@ -432,13 +432,13 @@ const operations = {
 			insertRun(next);
 			// Ownership and publication share the run CAS: a losing caller cannot retarget another run's notice.
 			saveAgent({ ...(ownership ? withOwnership(record, ownership) : record), currentRunId: next.runId, paneState: undefined });
-			publish(next, prompt, notify, now);
+			publish(next, prompt, notify, now, startTimeoutMs);
 			return { agentId, runId: next.runId };
 		});
 	},
-	publish(ref: RunRef, prompt: string, notify: boolean, now: number): RunSnapshot {
+	publish(ref: RunRef, prompt: string, notify: boolean, now: number, startTimeoutMs?: number): RunSnapshot {
 		return transaction(() => {
-			const value = publish(ref, prompt, notify, now);
+			const value = publish(ref, prompt, notify, now, startTimeoutMs);
 			const pending = launch(ref);
 			saveLaunch({ ...pending, stage: "published", updatedAt: now });
 			return value;

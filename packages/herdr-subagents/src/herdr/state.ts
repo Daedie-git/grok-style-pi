@@ -16,6 +16,8 @@ export interface RunSnapshot extends RunRef {
 	inputReceived?: boolean;
 	cancelRequested: boolean;
 	deadline: number;
+	/** Set when this run's start window differs from START_TIMEOUT_MS. */
+	startTimeoutMs?: number;
 	turns: number;
 	updatedAt: number;
 }
@@ -54,7 +56,7 @@ export function transition(run: RunSnapshot, event: ExecutionEvent, now: number)
 		case "unblocked":
 			if (!run.accepted && run.phase !== "starting" && run.phase !== "blocked") return run;
 			next.phase = event.type === "blocked" ? "blocked" : run.accepted ? "running" : "starting";
-			if (event.type === "unblocked" && !run.accepted) next.deadline = now + START_TIMEOUT_MS;
+			if (event.type === "unblocked" && !run.accepted) next.deadline = now + (run.startTimeoutMs ?? START_TIMEOUT_MS);
 			break;
 		case "turn":
 			if (!run.accepted) return run;

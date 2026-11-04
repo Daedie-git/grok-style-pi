@@ -4,7 +4,7 @@ import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { paneCreationRejected, type HerdrClient, type HerdrAgentRef, type HerdrPaneLayout } from "./client.ts";
 import { defaultThinking, parseAgentFile } from "./agent-file.ts";
-import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask } from "./store.ts";
+import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask, type MaintenanceObservation } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
 import { claudeArgs, claudeEnforceable, claudePrompt, claudeTools } from "./claude.ts";
@@ -13,6 +13,9 @@ export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 export const MAX_AGENTS_PER_TAB = 4;
 const POLL_MS = 200;
+/** A local pass takes milliseconds. A machine's pass makes many SSH calls of several seconds each. */
+const MAINTENANCE_LEASE_MS = 5000;
+const MACHINE_MAINTENANCE_LEASE_MS = 60_000;
 const CLOSE_GRACE_MS = 2000;
 /** Status lag and a glance at a just-finished pane do not keep it open. */
 const DONE_SETTLE_MS = 120_000;
@@ -295,7 +298,8 @@ export class HerdrRunner {
 		if (this.maintenance) return this.maintenance;
 		this.maintenance = this.track((async () => {
 			const token = randomUUID();
-			if (!(await this.store.claimMaintenance(token, this.now()))) return;
+			if (!(await this.store.claimMaintenance(token, this.now(), this.maintenanceLeaseMs))) return;
+			let observations: MaintenanceObservation[] = [];
 			try {
 				const runs = await this.store.activeRuns();
 				const candidates = await this.store.lifecycleCandidates();
@@ -304,7 +308,7 @@ export class HerdrRunner {
 				if (agents.some((agent) => !agent.paneId)) throw new Error("Herdr returned an incomplete agent listing");
 				const named = new Map(agents.flatMap((agent) => agent.name ? [[agent.name, agent] as const] : []));
 				const unnamedPanes = new Set(agents.filter((agent) => !agent.name).map((agent) => agent.paneId));
-				const observations = runs.flatMap(({ agent, run }) => {
+				observations = runs.flatMap(({ agent, run }) => {
 					// A durable close intent owns settlement, including when closePane killed its caller.
 					if (agent.paneClose) return [];
 					// A live conversation can move and be renamed without losing its run or binding.
@@ -312,7 +316,7 @@ export class HerdrRunner {
 						? "alive" : agentPresence(agent, named.get(agent.herdrName));
 					// An older/incomplete listing at the right pane is unknown, not proof of death.
 					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) return [];
-					return [{ ref: { agentId: run.agentId, runId: run.runId }, alive: presence === "alive" }];
+					return [{ ref: { agentId: run.agentId, runId: run.runId }, alive: presence === "alive", seen: run }];
 				});
 				if (candidates.length) await this.reap(token);
 				await this.store.finishMaintenance(token, observations, this.now());
@@ -322,11 +326,16 @@ export class HerdrRunner {
 					finally { await this.store.releasePlacementLock(token); }
 				}
 			} catch (error) {
-				await this.store.finishMaintenance(token, [], this.now());
+				// Liveness observed before a failed reap still settles, so one bad candidate cannot hold every run open.
+				await this.store.finishMaintenance(token, observations, this.now());
 				throw error;
 			}
 		})()).finally(() => { this.maintenance = undefined; });
 		return this.maintenance;
+	}
+
+	private get maintenanceLeaseMs(): number {
+		return this.machine ? MACHINE_MAINTENANCE_LEASE_MS : MAINTENANCE_LEASE_MS;
 	}
 
 	/** Explicit lifecycle maintenance; never performed by read() or wait(). */
@@ -430,7 +439,8 @@ export class HerdrRunner {
 				description: request.description, prompt: request.prompt, instructions: (request.resolved ? request.resolved.instructions : definition?.body) || undefined,
 				allowedTools: tools,
 				projectTrusted: request.projectTrusted === false ? false : this.machine ? undefined : request.projectTrusted,
-				maxTurns, model: request.model ?? definition?.model,
+				// A machine's providers are unknown here, so its Pi uses its own default unless the caller names a model.
+				maxTurns, model: request.model ?? (this.machine && !claude ? undefined : definition?.model),
 				thinking, parentPaneId: request.paneId, parentAgentId: parent?.id,
 				cwd: request.cwd, parentSessionFile: request.sessionFile,
 				parentTabId: request.tabId, parentWorkspaceId: request.workspaceId,
@@ -610,6 +620,7 @@ export class HerdrRunner {
 				if (agent.paneClose && !(await this.recoverPaneClose(agent, token))) continue;
 				const closeWhenDone = agent.closeWhenDone ?? (agent.idleCloseSeconds !== 0 && (this.deps.closeWhenDone ?? true));
 				if (agent.paneState === "parked" || !agent.cwd) continue;
+				if (this.machine && !(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) return;
 				const ownerGone = await this.ownerDeparted(agent, records, this.stopping.signal);
 				// Closing active Claude is cancellation, which permanently destroys resumability. Preserve it.
 				if (ownerGone && agent.runtime === "claude-code" && !isTerminal(run.phase)) continue;

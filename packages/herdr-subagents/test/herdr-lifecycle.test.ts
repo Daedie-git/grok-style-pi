@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,7 +84,12 @@ async function fixture(t: test.TestContext, options: { keep?: boolean; closeWhen
 		}
 		if (acknowledge) await runner.store.acknowledgeNotice(ref.runId);
 	}
-	return { runner, client, ref, panes, named, starts, closed, complete, advance: (ms = 901_000) => { now += ms; } };
+	async function accept() {
+		const current = await runner.resolve(ref.agentId);
+		await runner.store.claimNextCommand(current.id, binding!.token, false);
+		await runner.store.recordExecutionEvent(ref, binding!.token, { type: "live" }, now);
+	}
+	return { runner, client, ref, panes, named, starts, closed, complete, accept, root, advance: (ms = 901_000) => { now += ms; } };
 }
 
 test("completed panes park and resume on the same session with original settings", async (t) => {
@@ -660,6 +665,92 @@ for (const activity of ["working", "blocked", "focused"] as const) {
 		});
 	}
 }
+
+test("a pi that exits during startup fails its run and names the pane it left", async (t) => {
+	const f = await fixture(t);
+	const record = await f.runner.resolve(f.ref.agentId);
+	f.named.clear();
+	f.panes.set(record.paneId, { paneId: record.paneId, focused: false, plainShell: true });
+	f.advance(1000);
+	await f.runner.maintain();
+	const run = await f.runner.read(f.ref);
+	assert.equal(run.phase, "failed");
+	assert.match(run.error!, new RegExp(`before accepting the task \\(Herdr pane ${record.paneId}\\)`));
+});
+
+test("a failed reap still settles the liveness it observed", async (t) => {
+	const f = await fixture(t);
+	f.named.clear();
+	f.advance(1000);
+	f.client.listPanes = async () => { throw new Error("listing failed"); };
+	await assert.rejects(f.runner.maintain(), /listing failed/);
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("a machine's maintenance pass survives calls that outlast the local lease", async (t) => {
+	const f = await fixture(t, { machine: "lappy" });
+	await f.complete();
+	const finished = await f.runner.resolve(f.ref.agentId);
+	const dead = await f.runner.spawn({ prompt: "second", description: "second", subagentType: "test", name: "second", cwd: finished.cwd!, paneId: "w1:p1", runInBackground: true });
+	f.named.delete((await f.runner.resolve(dead.agentId)).herdrName);
+	const getAgent = f.client.getAgent;
+	f.client.getAgent = async (...args) => { f.advance(6000); return getAgent(...args); };
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.deepEqual(f.closed, [finished.paneId], "the reap finished inside its lease");
+	assert.equal((await f.runner.read(dead)).phase, "failed", "and its observations were saved");
+	assert.equal(await f.runner.store.lifecycleAllowed(), true);
+});
+
+for (const [name, listing] of [["completes", false], ["fails", true]] as const) {
+	test(`a stale dead observation cannot fail a child that advanced while the reap ${name}`, async (t) => {
+		const f = await fixture(t);
+		f.named.clear();
+		f.advance(1000);
+		const list = f.client.listPanes;
+		f.client.listPanes = async (...args) => {
+			await f.accept();
+			if (listing) throw new Error("listing failed");
+			return list(...args);
+		};
+		await f.runner.maintain().catch(() => undefined);
+		assert.equal((await f.runner.read(f.ref)).phase, "running");
+	});
+}
+
+test("a dead observation yields to any run change, even within one millisecond", async (t) => {
+	const f = await fixture(t);
+	const seen = await f.runner.read(f.ref);
+	assert.equal(await f.runner.store.claimMaintenance("same-ms", seen.updatedAt + 1000), true);
+	await f.accept();
+	const accepted = await f.runner.read(f.ref);
+	assert.notEqual(accepted.accepted, seen.accepted);
+	await f.runner.store.finishMaintenance("same-ms", [{ ref: f.ref, alive: false, seen: { ...seen, updatedAt: accepted.updatedAt, phase: accepted.phase } }], seen.updatedAt + 1000);
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+});
+
+test("a machine runner leaves a local definition's model to that machine's default", async (t) => {
+	const f = await fixture(t, { machine: "lappy" });
+	const agentDir = join(f.root, "agent");
+	mkdirSync(join(agentDir, "agents"), { recursive: true });
+	writeFileSync(join(agentDir, "agents", "local-model.md"), "---\nname: local-model\ndescription: local\nmodel: claude-sonnet-5-5\n---\nWork.");
+	const spawn = { prompt: "work", description: "work", subagentType: "local-model", cwd: f.root, paneId: "w1:p1", runInBackground: true, agentDir };
+	await f.runner.spawn({ ...spawn, name: "default" });
+	await f.runner.spawn({ ...spawn, name: "named", model: "openai-codex/gpt-6.1-sol" });
+	assert.equal(f.starts[1].args.includes("--model"), false);
+	assert.equal(f.starts[2].args[f.starts[2].args.indexOf("--model") + 1], "openai-codex/gpt-6.1-sol");
+});
+
+test("renewing a maintenance lease keeps peers out and the pass valid", async (t) => {
+	const f = await fixture(t);
+	const now = Date.now();
+	assert.equal(await f.runner.store.claimMaintenance("holder", now, 60_000), true);
+	assert.equal(await f.runner.store.maintenanceValid("holder", now + 50_000, 60_000), true);
+	assert.equal(await f.runner.store.claimMaintenance("peer", now + 70_000), false);
+	assert.equal(await f.runner.store.finishMaintenance("holder", [], now + 100_000), true);
+	assert.equal(await f.runner.store.maintenanceValid("holder", now + 100_001, 60_000), false, "a finished lease cannot be renewed");
+	assert.equal(await f.runner.store.lifecycleAllowed(), true, "renewal is a recognized writer, so it cannot trip the legacy guard");
+});
 
 test("close intent preserves an active binding and fences liveness failure until settlement", async (t) => {
 	const f = await fixture(t);

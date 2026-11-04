@@ -427,6 +427,11 @@ export class Engine {
 		if (invocation.internal?.workflow) meta.workflow = invocation.internal.workflow;
 		if (skill) meta.skill = { name: skill.skill.name, path: skill.skill.path, scope: skill.skill.allowedTools ?? [] };
 		if (pane) meta.backend = "herdr";
+		// The local resolution says nothing about a machine's Pi, which runs the named model or its own default.
+		if (pane && params.machine?.trim() && params.runtime !== "claude-code") {
+			if (params.model) meta.model = { requested: params.model, effective: params.model };
+			else delete meta.model;
+		}
 		const reserved = this.control.reserveSpawn({ meta, background, uncapped: Boolean(invocation.internal) });
 		if ("error" in reserved) return error(reserved.error);
 		if (pane) return this.spawnHerdr(meta, reserved.runId, params, definition, background, invocation);
@@ -842,9 +847,12 @@ export class Engine {
 			runtime: params.runtime, name: meta.name, projectTrusted: this.projectTrusted, resolved: this.paneDefinition(definition, meta),
 			maxTurns: definition.maxTurns, keep: params.keep ?? definition.keep,
 			// A local Pi pane runs the engine's resolved model and effort, as an in-process child would.
-			...(params.runtime === "claude-code" || params.machine?.trim()
+			// A machine's providers are unknown here, so its Pi uses its own default unless the caller names a model.
+			...(params.runtime === "claude-code"
 				? { model: params.model ?? (definition.model === "inherit" ? undefined : definition.model), thinking: params.effort ?? definition.effort }
-				: { model: meta.model?.effective, thinking: meta.effort?.effective }),
+				: params.machine?.trim()
+					? { model: params.model, thinking: params.effort ?? definition.effort }
+					: { model: meta.model?.effective, thinking: meta.effort?.effective }),
 			definitionsCwd: invocation.ctx.cwd, machine: params.machine?.trim() || undefined, machineCwd: params.machine_cwd,
 		}, invocation.ctx, { background, signal: invocation.signal });
 		return { text: result.text, isError: result.isError, details: result.details };

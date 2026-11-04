@@ -178,7 +178,7 @@ test("a remote package with another protocol is refused before any launch, with 
 	const ctx = { cwd: PROJECT, sessionManager: { getSessionFile: () => undefined } };
 	const launch = (machine: string) => tools[0].execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine, machine_cwd: PROJECT }, undefined, undefined, ctx);
 	await assert.rejects(launch("old"), /old runs an older Herdr subagent runner\. Update herdr-subagents .* on old/);
-	await assert.rejects(launch("behind"), /behind speaks remote protocol 1; this machine speaks 2\. Update herdr-subagents .* on behind/);
+	await assert.rejects(launch("behind"), /behind speaks remote protocol 1; this machine speaks 3\. Update herdr-subagents .* on behind/);
 	await assert.rejects(launch("ahead"), /Update herdr-subagents .* on this machine/);
 	assert.deepEqual(operations, ["remoteProtocol", "remoteProtocol", "remoteProtocol"]);
 });

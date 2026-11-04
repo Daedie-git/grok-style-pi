@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, threadId, workerData } from "node:worker_threads";
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -5,7 +6,7 @@ import { createInterface } from "node:readline";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
-import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot } from "./store.ts";
+import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, type MaintenanceObservation } from "./store.ts";
 import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, AgentOwnership, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 import { piSessionReady } from "./session-ready.ts";
@@ -184,6 +185,12 @@ function publish(ref: RunRef, prompt: string, notify: boolean, now: number): Run
 	return saveRun({ ...value, deadline: now + START_TIMEOUT_MS, updatedAt: now });
 }
 
+/** A process that exits during startup usually leaves its error in the pane. */
+function departureError(value: RunSnapshot, ref: RunRef): string {
+	if (value.accepted) return "The Herdr pane closed before the agent finished.";
+	return `The agent exited or its pane closed before accepting the task (Herdr pane ${agent(ref.agentId)?.paneId ?? "unknown"}).`;
+}
+
 function nextCommand(agentId: string, token: string, streaming: boolean): { value: RunSnapshot; command: Command } | undefined {
 	if (!owns(agentId, token)) return undefined;
 	const record = agent(agentId)!;
@@ -267,13 +274,13 @@ const operations = {
 	agentForSession(paneId: string, sessionFile: string): AgentRecord | undefined {
 		return decode<AgentRecord>(db.prepare("SELECT data FROM agents WHERE pane=? AND session_file=?").get(paneId, resolve(sessionFile)));
 	},
-	claimMaintenance(token: string, now: number): boolean {
+	claimMaintenance(token: string, now: number, leaseMs = 5000): boolean {
 		// An early read avoids taking the write lock on every 200 ms tick in every pane.
 		const lease = db.prepare("SELECT expires,next_at FROM maintenance WHERE id=1").get()!;
 		if (Number(lease.expires) > now || Number(lease.next_at) > now) return false;
 		// Maintenance is best-effort and retried every tick, so a busy database only means another pane is writing.
 		db.exec(`PRAGMA busy_timeout=${MAINTENANCE_BUSY_MS}`);
-		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + 5000, now, now).changes) === 1); }
+		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + leaseMs, now, now).changes) === 1); }
 		catch (error) { if (isBusy(error)) return false; throw error; }
 		finally { db.exec(`PRAGMA busy_timeout=${BUSY_MS}`); }
 	},
@@ -283,24 +290,35 @@ const operations = {
 			AND json_extract(r.data,'$.deadline')>0 AND json_extract(a.data,'$.currentRunId')=r.id`).all()
 			.map((row) => ({ agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)) }));
 	},
-	finishMaintenance(token: string, observations: Array<{ ref: RunRef; alive: boolean }>, now: number): boolean {
+	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number): boolean {
 		return transaction(() => {
 			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
 			if (lease.token !== token || Number(lease.expires) <= now) return false;
-			for (const { ref, alive } of observations) {
+			for (const { ref, alive, seen } of observations) {
 				if (!current(ref) || agent(ref.agentId)?.paneClose) continue;
 				const value = run(ref);
 				if (isTerminal(value.phase)) continue;
-				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: "The Herdr pane closed before the agent finished." }, now);
+				// A pass can span many slow calls. A run that advanced since its listing proves the child is alive.
+				if (!alive && seen && !isDeepStrictEqual(seen, value)) continue;
+				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: departureError(value, ref) }, now);
 				if (next !== value) saveRun(next);
 			}
 			db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
 			return true;
 		});
 	},
-	maintenanceValid(token: string, now: number): boolean {
-		const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
-		return lifecycleAllowed() && lease.token === token && Number(lease.expires) > now;
+	/** `extendMs` renews a valid lease, so a pass may outlast one lease while it keeps making progress. */
+	maintenanceValid(token: string, now: number, extendMs?: number): boolean {
+		const valid = () => {
+			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
+			return lifecycleAllowed() && lease.token === token && Number(lease.expires) > now;
+		};
+		if (!extendMs) return valid();
+		return transaction(() => {
+			if (!valid()) return false;
+			db.prepare("UPDATE maintenance SET expires=? WHERE id=1 AND token=?").run(now + extendMs, token);
+			return true;
+		});
 	},
 	lifecycleCandidates(): Array<{ agent: AgentRecord; run: RunSnapshot }> {
 		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data FROM agents a
@@ -448,7 +466,7 @@ const operations = {
 		return transaction(() => agent(ref.agentId)?.paneClose ? run(ref) : saveRun(expireUnaccepted(run(ref), now)));
 	},
 	recordPaneClosed(ref: RunRef, now: number): RunSnapshot {
-		return transaction(() => agent(ref.agentId)?.paneClose ? run(ref) : saveRun(transition(run(ref), { type: "failed", error: "The Herdr pane closed before the agent finished." }, now)));
+		return transaction(() => agent(ref.agentId)?.paneClose ? run(ref) : saveRun(transition(run(ref), { type: "failed", error: departureError(run(ref), ref) }, now)));
 	},
 	attach(paneId: string, sessionFile: string, sessionId: string): ChildBinding | undefined {
 		return transaction(() => {

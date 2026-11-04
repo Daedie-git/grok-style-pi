@@ -95,7 +95,14 @@ export interface CompletionNotice extends RunRef {
 }
 
 /** Raised whenever the parent and a remote worker would disagree on store operations; both ends must match. */
-export const HERDR_REMOTE_PROTOCOL = 2;
+export const HERDR_REMOTE_PROTOCOL = 3;
+
+/** One run's liveness, with the run state it was listed against. */
+export interface MaintenanceObservation {
+	ref: RunRef;
+	alive: boolean;
+	seen?: RunSnapshot;
+}
 
 export function herdrSubagentRoot(env: NodeJS.ProcessEnv = process.env): string {
 	return join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "grok-style-pi", "herdr-subagents");
@@ -234,7 +241,7 @@ export class HerdrStore {
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }
 	findAgent(id: string) { return this.call("findAgent", id); }
 	agentForSession(paneId: string, sessionFile: string) { return this.call("agentForSession", paneId, sessionFile); }
-	claimMaintenance(token: string, now: number) { return this.call("claimMaintenance", token, now); }
+	claimMaintenance(token: string, now: number, leaseMs?: number) { return this.call("claimMaintenance", token, now, leaseMs); }
 	activeRuns() { return this.call("activeRuns"); }
 	lifecycleAllowed() { return this.call("lifecycleAllowed"); }
 	lifecycleStatus() { return this.call("lifecycleStatus"); }
@@ -248,8 +255,8 @@ export class HerdrStore {
 	notePaneActivity(ref: RunRef, now: number) { return this.call("notePaneActivity", ref, now); }
 	parkAgent(ref: RunRef, paneId: string, now: number) { return this.call("parkAgent", ref, paneId, now); }
 	closeOwnedAgent(ref: RunRef, paneId: string, now: number) { return this.call("closeOwnedAgent", ref, paneId, now); }
-	maintenanceValid(token: string, now: number) { return this.call("maintenanceValid", token, now); }
-	finishMaintenance(token: string, observations: Array<{ ref: RunRef; alive: boolean }>, now: number) { return this.call("finishMaintenance", token, observations, now); }
+	maintenanceValid(token: string, now: number, extendMs?: number) { return this.call("maintenanceValid", token, now, extendMs); }
+	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number) { return this.call("finishMaintenance", token, observations, now); }
 	listAgents() { return this.call("listAgents"); }
 	read(ref: RunRef) { return this.call("read", ref); }
 	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now, ownership); }

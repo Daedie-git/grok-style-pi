@@ -330,6 +330,22 @@ test("a Claude Code pane falls back to the definition's native model and effort"
 	assert.equal(fake.spawns[0].thinking, "high");
 });
 
+test("a machine pane uses that machine's default model unless the caller names one", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [
+			{ name: "Agent", args: { ...assignment, name: "default", machine: "laptop", subagent_type: "local-model" } },
+			{ name: "Agent", args: { ...assignment, name: "named", machine: "laptop", subagent_type: "local-model", model: "openai-codex/gpt-6.1-sol" } },
+		] } : { text: "Parent useful work" },
+	{ agentFiles: { "local-model.md": "---\nname: local-model\ndescription: local\nmodel: claude-sonnet-5-5\neffort: high\n---\nWork." } });
+	await harness.parent.prompt("Machine panes", { source: "extension" });
+	assert.equal(fake.spawns.length, 2);
+	assert.equal(fake.spawns[0].model, undefined);
+	assert.equal(fake.spawns[0].thinking, "high");
+	assert.equal(fake.spawns[1].model, "openai-codex/gpt-6.1-sol");
+	const shown = [...harness.engine.control.conversations.values()].map((proxy) => proxy.meta.model?.effective);
+	assert.deepEqual(shown, [undefined, "openai-codex/gpt-6.1-sol"], "the panel shows only what the machine was told to run");
+});
+
 test("a definition's turn limit reaches a Claude Code pane request, for the runner to refuse", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => index === 0
 		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", subagent_type: "bounded" } }] } : { text: "Parent useful work" },

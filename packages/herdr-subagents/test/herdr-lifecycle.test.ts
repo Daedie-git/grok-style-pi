@@ -773,6 +773,40 @@ test("a machine runner leaves a local definition's model to that machine's defau
 	assert.equal(f.starts[2].args[f.starts[2].args.indexOf("--model") + 1], "openai-codex/gpt-6.1-sol");
 });
 
+test("a local pass over many records outlasts one lease and still saves its observations", async (t) => {
+	const f = await fixture(t);
+	const { cwd } = await f.runner.resolve(f.ref.agentId);
+	const spawn = (name: string) => f.runner.spawn({ prompt: name, description: name, subagentType: "test", name, cwd: cwd!, paneId: "w1:p1", runInBackground: true, sessionFile: "/owner.jsonl" });
+	await spawn("second");
+	const dead = await spawn("third");
+	f.named.delete((await f.runner.resolve(dead.agentId)).herdrName);
+	const getPane = f.client.getPane!;
+	f.client.getPane = async (...args) => { f.advance(3000); return getPane(...args); };
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(dead)).phase, "failed");
+});
+
+test("a machine pass renews before each slow step, however its time is spent", async (t) => {
+	for (const [before, steps] of [[0, [29_000, 32_000]], [42_000, [19_000]], [0, [900, 59_500]]] as const) {
+		const f = await fixture(t, { machine: "lappy", keep: true });
+		await f.complete();
+		const { cwd } = await f.runner.resolve(f.ref.agentId);
+		const spawn = (name: string) => f.runner.spawn({ prompt: name, description: name, subagentType: "test", name, cwd: cwd!, paneId: "w1:p1", runInBackground: true });
+		await f.runner.store.recordPaneClosed(await spawn("finished"), 1_000_000);
+		const dead = await spawn("dead");
+		f.named.delete((await f.runner.resolve(dead.agentId)).herdrName);
+		const listPanes = f.client.listPanes;
+		f.client.listPanes = async (...args) => { f.advance(before); f.client.listPanes = listPanes; return listPanes(...args); };
+		const getAgent = f.client.getAgent;
+		const remaining: number[] = [...steps];
+		f.client.getAgent = async (...args) => { f.advance(remaining.shift() ?? 0); return getAgent(...args); };
+		f.advance(1000);
+		await f.runner.maintain();
+		assert.equal((await f.runner.read(dead)).phase, "failed", `setup ${before}ms, steps ${steps}`);
+	}
+});
+
 test("renewing a maintenance lease keeps peers out and the pass valid", async (t) => {
 	const f = await fixture(t);
 	const now = Date.now();

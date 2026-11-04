@@ -13,9 +13,11 @@ export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 export const MAX_AGENTS_PER_TAB = 4;
 const POLL_MS = 200;
-/** A local pass takes milliseconds. A machine's pass makes many SSH calls of several seconds each. */
+/** A machine's pass makes many SSH calls of several seconds each. */
 const MAINTENANCE_LEASE_MS = 5000;
 const MACHINE_MAINTENANCE_LEASE_MS = 60_000;
+/** A local pass renews at most this often, leaving nearly a whole lease at one write a second. */
+const LEASE_RENEWAL_MS = 1000;
 /** Pi on a loaded laptop took 20s to pick up its task. A pi that exits is caught sooner, by its missing name. */
 const MACHINE_START_TIMEOUT_MS = 120_000;
 const CLOSE_GRACE_MS = 2000;
@@ -300,7 +302,8 @@ export class HerdrRunner {
 		if (this.maintenance) return this.maintenance;
 		this.maintenance = this.track((async () => {
 			const token = randomUUID();
-			if (!(await this.store.claimMaintenance(token, this.now(), this.maintenanceLeaseMs))) return;
+			const claimedAt = this.now();
+			if (!(await this.store.claimMaintenance(token, claimedAt, this.maintenanceLeaseMs))) return;
 			let observations: MaintenanceObservation[] = [];
 			try {
 				const runs = await this.store.activeRuns();
@@ -320,7 +323,7 @@ export class HerdrRunner {
 					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) return [];
 					return [{ ref: { agentId: run.agentId, runId: run.runId }, alive: presence === "alive", seen: run }];
 				});
-				if (candidates.length) await this.reap(token);
+				if (candidates.length) await this.reap(token, claimedAt);
 				await this.store.finishMaintenance(token, observations, this.now());
 				for (const { agent } of runs) if (agent.runtime === "claude-code") await this.serviceClaude(agent.id, this.stopping.signal);
 				if (await this.store.tryPlacementLock(token)) {
@@ -614,19 +617,26 @@ export class HerdrRunner {
 	}
 
 	/** External closes stay inside both the placement lock and the maintenance lease. */
-	private async reap(token: string): Promise<void> {
+	private async reap(token: string, claimedAt: number): Promise<void> {
 		await this.withPlacement(async () => {
 			if (!(await this.store.lifecycleAllowed())) return;
 			if (!(await this.store.maintenanceValid(token, this.now()))) return;
 			const panes = await this.deps.client.listPanes({ signal: this.stopping.signal });
 			if (panes.some((pane) => !pane.paneId)) throw new Error("Herdr returned an incomplete pane listing");
 			const records = await this.store.listAgents();
+			// Finished records stay candidates, so a pass grows with history until it outlasts one lease.
+			let renewedAt = claimedAt;
 			for (const { agent, run } of await this.store.lifecycleCandidates()) {
 				check(this.stopping.signal);
+				if (!agent.paneClose && (agent.paneState === "parked" || !agent.cwd)) continue;
+				// Local Herdr calls normally take milliseconds. A machine's next call may take nearly a whole lease.
+				if (this.machine || this.now() - renewedAt >= LEASE_RENEWAL_MS) {
+					if (!(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) return;
+					renewedAt = this.now();
+				}
 				if (agent.paneClose && !(await this.recoverPaneClose(agent, token))) continue;
 				const closeWhenDone = agent.closeWhenDone ?? (agent.idleCloseSeconds !== 0 && (this.deps.closeWhenDone ?? true));
 				if (agent.paneState === "parked" || !agent.cwd) continue;
-				if (this.machine && !(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) return;
 				const ownerGone = await this.ownerDeparted(agent, records, this.stopping.signal);
 				// Closing active Claude is cancellation, which permanently destroys resumability. Preserve it.
 				if (ownerGone && agent.runtime === "claude-code" && !isTerminal(run.phase)) continue;

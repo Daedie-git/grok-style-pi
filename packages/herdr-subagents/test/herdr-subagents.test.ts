@@ -1152,8 +1152,8 @@ console.log(JSON.stringify({ result: {} }));
 		await cli(2).startPi(options);
 		assert.equal(calls(), 3);
 		assert.equal(waits, 2);
-		await assert.rejects(cli(100).startPi(options), /60 seconds waiting for shell readiness in w1:p2/);
-		assert.equal(calls(), 3);
+		await assert.rejects(cli(100).startPi(options), /120 seconds waiting for shell readiness in w1:p2/);
+		assert.equal(calls(), 5);
 		for (const failure of ["connection lost", "agent readiness timed out", "agent target pane w1:p3 is not an available shell"]) {
 			await assert.rejects(cli(100, failure).startPi(options), { message: failure });
 			assert.equal(calls(), 1);

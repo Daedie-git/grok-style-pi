@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, threadId, workerData } from "node:worker_threads";
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -712,11 +713,35 @@ function serve(request: { id: number; operation: keyof StoreOperations; args: un
 	}
 }
 
+/** Runs alongside store calls, because a slow Herdr command must not hold their serial queue. */
+function runHerdr(request: { id: number; args: unknown[] }, children: Set<ChildProcess>, reply: (value: object) => void) {
+	const [args, timeout] = request.args;
+	if (!Array.isArray(args) || !args.every((item) => typeof item === "string") || typeof timeout !== "number") {
+		reply({ id: request.id, error: "Malformed Herdr control request" });
+		return;
+	}
+	const child = spawn(process.env.HERDR_BIN_PATH || "herdr", args, { timeout, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	children.add(child);
+	let stdout = "";
+	let stderr = "";
+	child.stdout!.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+	child.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+	child.on("error", (error: NodeJS.ErrnoException) => {
+		children.delete(child);
+		// No value tells the parent this machine's PATH lacks Herdr, so its own route must do.
+		reply(error.code === "ENOENT" ? { id: request.id } : { id: request.id, error: error.message });
+	});
+	child.on("close", (code) => {
+		if (children.delete(child)) reply({ id: request.id, value: { code, stdout, stderr } });
+	});
+}
+
 if (parentPort) parentPort.on("message", (request) => parentPort!.postMessage(serve(request)));
 else {
 	// A remote parent's PID cannot be probed here, so this channel's lifetime stands in for the parent's.
 	// Ending the channel, including by a parent crash, retires every launch owner seen on it.
 	const owners = new Set<string>();
+	const children = new Set<ChildProcess>();
 	const ownerArgument: Partial<Record<keyof StoreOperations, number>> = { reserveAgent: 2, recordLaunch: 1, claimLaunchRecovery: 2 };
 	let finished = false;
 	const finish = () => {
@@ -725,6 +750,7 @@ else {
 		for (const owner of owners) {
 			try { operations.retireOwner(owner); } catch {}
 		}
+		for (const child of children) child.kill("SIGKILL");
 		process.exit(0);
 	};
 	// Requests are serial, matching the worker's single message queue.
@@ -733,6 +759,10 @@ else {
 		try { request = JSON.parse(line); }
 		catch { return; } // A stray line must not end the process and drop the placement lock it holds.
 		if (typeof request?.id !== "number") return;
+		if ((request.operation as string) === "herdr" && Array.isArray(request.args)) {
+			runHerdr(request, children, (reply) => process.stdout.write(JSON.stringify(reply) + "\n"));
+			return;
+		}
 		const index = ownerArgument[request.operation];
 		const owner = index === undefined || !Array.isArray(request.args) ? undefined : request.args[index];
 		if (typeof owner === "string") owners.add(owner);

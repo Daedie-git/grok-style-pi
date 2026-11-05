@@ -561,3 +561,125 @@ test("another session's commands name it", async (t) => {
 	await createHerdrCli({ ...process.env, HERDR_BIN_PATH: bin }).forSession!("jobs").listAgents();
 	assert.equal(readFileSync(trace, "utf8").trim(), "--session jobs agent list");
 });
+
+test("machine Herdr calls run in the store's worker, beside its store calls", async (t) => {
+	fakeSsh(t);
+	const root = mkdtempSync(join(tmpdir(), "herdr-exec-"));
+	const bin = join(root, "herdr");
+	writeFileSync(bin, `#!/bin/sh
+if [ "$1" = slow ]; then sleep 1; fi
+if [ "$1" = missing ]; then echo '{"error":{"code":"agent_not_found","message":"no agent"}}' >&2; exit 1; fi
+echo '{"result":{"args":"'"$*"'"}}'
+`, { mode: 0o755 });
+	const previous = process.env.HERDR_BIN_PATH;
+	process.env.HERDR_BIN_PATH = bin;
+	const store = new HerdrStore(sshChannel({ target: "laptop", entry: ENTRY, root }));
+	t.after(async () => {
+		process.env.HERDR_BIN_PATH = previous;
+		if (previous === undefined) delete process.env.HERDR_BIN_PATH;
+		await store.close();
+		rmSync(root, { recursive: true, force: true });
+	});
+	const order: string[] = [];
+	const slow = store.herdr(["slow"], 5000).then((result) => { order.push("herdr"); return result; });
+	await store.listAgents().then(() => order.push("store"));
+	assert.equal((await slow)?.code, 0);
+	assert.deepEqual(order, ["store", "herdr"], "a slow command must not hold the serial store queue");
+
+	const cli = createHerdrCli({ ...process.env, HERDR_BIN_PATH: "/nonexistent/herdr" }, undefined, "laptop", undefined, (args, timeout, signal) => store.herdr(args, timeout, signal));
+	assert.equal(await cli.isAlive("x"), true);
+	await assert.rejects(store.herdr(["slow"], 5000, AbortSignal.abort()), /aborted/);
+	const missing = await store.herdr(["missing"], 5000);
+	assert.equal(missing?.code, 1);
+	assert.match(missing?.stderr ?? "", /agent_not_found/);
+});
+
+test("a machine that cannot run Herdr in its worker keeps using herdr --machine", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-fallback-"));
+	const trace = join(dir, "calls");
+	const bin = join(dir, "herdr");
+	writeFileSync(bin, `#!/bin/sh\necho "$*" >> "${trace}"\necho '{"result":{"agents":[]}}'\n`, { mode: 0o755 });
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	// An old worker answers an unknown operation; a worker without Herdr on its PATH sends no value.
+	for (const reply of [{ error: "Unknown Herdr control operation" }, {}]) {
+		let asked = 0;
+		const store = new HerdrStore((events) => ({
+			post: (request) => { asked++; queueMicrotask(() => events.reply({ id: request.id, ...reply })); },
+			hold: () => undefined,
+			close: async () => undefined,
+		}));
+		const cli = createHerdrCli({ ...process.env, HERDR_BIN_PATH: bin }, undefined, "laptop", undefined, (args, timeout, signal) => store.herdr(args, timeout, signal));
+		await cli.listAgents();
+		await cli.listAgents();
+		assert.equal(asked, 1, "the worker is not asked again");
+		await store.close();
+	}
+	assert.equal(readFileSync(trace, "utf8").trim().split("\n").filter((line) => line === "--machine laptop agent list").length, 4);
+});
+
+test("the worker's missing Herdr reaches the parent as an unavailable route", async (t) => {
+	fakeSsh(t);
+	const root = mkdtempSync(join(tmpdir(), "herdr-nobin-"));
+	const previous = process.env.HERDR_BIN_PATH;
+	process.env.HERDR_BIN_PATH = join(root, "absent");
+	const store = new HerdrStore(sshChannel({ target: "laptop", entry: ENTRY, root }));
+	t.after(async () => {
+		process.env.HERDR_BIN_PATH = previous;
+		if (previous === undefined) delete process.env.HERDR_BIN_PATH;
+		await store.close();
+		rmSync(root, { recursive: true, force: true });
+	});
+	assert.equal(await store.herdr(["agent", "list"], 5000), undefined);
+});
+
+test("an unknown profile session keeps herdr --machine instead of the worker's inherited session", async (t) => {
+	fakeSsh(t);
+	const root = mkdtempSync(join(tmpdir(), "herdr-transport-route-"));
+	const remoteRoot = join(root, "remote");
+	const trace = join(root, "trace.jsonl");
+	const bin = join(root, "herdr");
+	writeFileSync(bin, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+let args = process.argv.slice(2);
+let session = process.env.HERDR_SESSION || 'default';
+if (args[0] === '--machine') { session = 'default'; args = args.slice(2); }
+else if (args[0] === '--session') { session = args[1]; args = args.slice(2); }
+appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ session, args }) + '\\n');
+if (args[0] === 'agent' && args[1] === 'get') { console.error(JSON.stringify({ error: { code: 'agent_not_found', message: 'missing' } })); process.exit(1); }
+if (args[0] === 'pane' && args[1] === 'list') console.log(JSON.stringify({ result: { panes: [] } }));
+else if (args[0] === 'agent' && args[1] === 'list') console.log(JSON.stringify({ result: { agents: [] } }));
+else if (args[0] === 'tab' && args[1] === 'create') console.log(JSON.stringify({ result: { tab: { tab_id: 'w1:t2', workspace_id: 'w1' }, root_pane: { pane_id: 'w1:p2' } } }));
+else console.log(JSON.stringify({ result: {} }));
+`, { mode: 0o755 });
+	const previous = { bin: process.env.HERDR_BIN_PATH, session: process.env.HERDR_SESSION };
+	process.env.HERDR_BIN_PATH = bin;
+	process.env.HERDR_SESSION = "jobs";
+	t.after(() => {
+		if (previous.bin === undefined) delete process.env.HERDR_BIN_PATH; else process.env.HERDR_BIN_PATH = previous.bin;
+		if (previous.session === undefined) delete process.env.HERDR_SESSION; else process.env.HERDR_SESSION = previous.session;
+		rmSync(root, { recursive: true, force: true });
+	});
+	// An abandoned default-session launch can share its pane ID with unrelated jobs-session work.
+	const seed = new HerdrStore(remoteRoot);
+	const sessionFile = await seed.createSession({ type: "session", version: 3, id: "old", cwd: PROJECT });
+	const abandoned = (await seed.reserveAgent({ id: "old", herdrName: "old", herdrSession: "default", paneId: "", type: "test", description: "old", prompt: "old", depth: 1, cwd: PROJECT, createdAt: new Date().toISOString() }, sessionFile, "2147483646:dead", Date.now()))!;
+	await seed.recordLaunch(abandoned, "2147483646:dead", "pane-created", { paneId: "w1:p9" }, Date.now());
+	await seed.close();
+	const tools: any[] = [];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = { registerTool: (tool: any) => tools.push(tool), on: (event: string, handler: any) => handlers.set(event, handler), appendEntry() {} } as unknown as ExtensionAPI;
+	await createHerdrSubagents({
+		root, agentDir: root,
+		env: { ...process.env, HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+		// The extension explicitly tolerates a transiently unavailable startup listing.
+		listMachines: async () => [],
+		// The saved laptop profile is valid and reaches its default session when later resolved.
+		machineChannel: async () => sshChannel({ target: "laptop", entry: ENTRY, root: remoteRoot }),
+	})(pi);
+	t.after(async () => { await handlers.get("session_shutdown")!({ reason: "quit" }); });
+	const ctx = { cwd: PROJECT, isProjectTrusted: () => true, sessionManager: { getSessionFile: () => undefined } };
+	await tools[0].execute("call", { prompt: "test", description: "test", subagent_type: "test", machine: "laptop" }, undefined, undefined, ctx);
+	const calls = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	assert.ok(calls.length > 0);
+	assert.ok(calls.every((call) => call.session === "default"));
+});

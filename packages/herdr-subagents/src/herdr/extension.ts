@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHerdrCli, findHerdrMachine, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrMachine } from "./client.ts";
+import { createHerdrCli, findHerdrMachine, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrExec, type HerdrMachine } from "./client.ts";
 import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
 import { createBackendController, type HerdrBackendHandle } from "./backend.ts";
 export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "./backend.ts";
@@ -31,7 +31,7 @@ export interface HerdrSubagentDeps {
 	sleep: (ms: number) => Promise<void>;
 	now: () => number;
 	/** Herdr CLI routed to a saved SSH machine. */
-	machineClient: (machine: string) => HerdrClient;
+	machineClient: (machine: string, exec?: HerdrExec) => HerdrClient;
 	/** Opens the coordination store that lives on a saved SSH machine. */
 	machineChannel: (machine: string) => Promise<StoreChannelFactory>;
 	/** Distinguishes this machine's panes in a remote store, where pane IDs belong to another server. */
@@ -75,7 +75,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		agentDir: overrides.agentDir ?? getAgentDir(),
 		sleep: overrides.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
 		now: overrides.now ?? Date.now,
-		machineClient: overrides.machineClient ?? ((machine) => createHerdrCli(env, undefined, machine)),
+		machineClient: overrides.machineClient ?? ((machine, exec) => createHerdrCli(env, undefined, machine, undefined, exec)),
 		machineChannel: overrides.machineChannel ?? (async (machine) => sshChannel({
 			target: (await findHerdrMachine(machine, env)).target,
 			node: env.HERDR_SUBAGENTS_REMOTE_NODE || env.GROK_HERDR_REMOTE_NODE,
@@ -110,7 +110,14 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine, herdrSession: pickHerdrMachine(profiles, machine)?.session, closeWhenDone: settings.closeWhenDone }));
+				const session = pickHerdrMachine(profiles, machine)?.session;
+				const connected = deps.machineChannel(machine).then((channel) => {
+					// Herdr calls share the store's channel: `--machine` runs SSH twice per call, and PowerShell too on Windows.
+					// Only a known session may: a bare command would reach whichever session the worker inherited, where pane IDs repeat.
+					const exec: HerdrExec | undefined = session ? (args, timeout, signal) => runner.store.herdr(["--session", session, ...args], timeout, signal) : undefined;
+					const runner: HerdrRunner = new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine, exec), channel, machine, herdrSession: session, closeWhenDone: settings.closeWhenDone });
+					return runner;
+				});
 				pending = connected.then(async (opened) => {
 					// Refuse a mismatched package before any launch or owner retirement runs on that store.
 					// An unverified store is closed without retiring anything: its operations are not established.
@@ -167,7 +174,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		};
 		const remoteWorkspace = async (machine: string, source: HerdrRunner, cwd: string) => {
 			let panes: HerdrAgentRef[] = [];
-			try { panes = await deps.machineClient(machine).listPanes(); }
+			try { panes = await source.client.listPanes(); }
 			catch {}
 			// Pi stops at a startup prompt when its session directory is missing, so check on the machine itself.
 			const status = await source.store.directoryStatus(cwd);

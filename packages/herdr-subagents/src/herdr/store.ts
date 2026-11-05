@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { RunRef, RunSnapshot, ExecutionEvent } from "./state.ts";
+import type { HerdrExecResult } from "./client.ts";
 import type { StoreOperations } from "./worker.ts";
 
 export type { RunRef, RunSnapshot, ExecutionEvent } from "./state.ts";
@@ -234,6 +235,35 @@ export class HerdrStore {
 			this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
 			this.channel.hold(true);
 			this.channel.post({ id, operation, args });
+		});
+	}
+
+	/** Runs Herdr beside this store. Resolves undefined when that worker cannot: too old, or Herdr is not on its PATH. */
+	herdr(args: string[], timeout: number, signal?: AbortSignal): Promise<HerdrExecResult | undefined> {
+		if (this.closed || this.failure) return Promise.reject(this.failure ?? new Error("Herdr store closed"));
+		return new Promise((resolve, reject) => {
+			const id = ++this.sequence;
+			const settle = () => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", aborted);
+				this.pending.delete(id);
+				if (this.pending.size === 0) this.channel.hold(false);
+			};
+			const aborted = () => { settle(); reject(signal!.reason); };
+			// The worker kills the command at its timeout. This covers a worker that stopped answering.
+			const timer = setTimeout(() => { settle(); reject(new Error(`herdr ${args.join(" ")} got no reply from its machine`)); }, timeout + 5000);
+			this.pending.set(id, {
+				resolve: (value) => { settle(); resolve(value as HerdrExecResult | undefined); },
+				reject: (error) => {
+					settle();
+					if (error.message === "Unknown Herdr control operation") resolve(undefined);
+					else reject(error);
+				},
+			});
+			signal?.addEventListener("abort", aborted, { once: true });
+			if (signal?.aborted) { aborted(); return; }
+			this.channel.hold(true);
+			this.channel.post({ id, operation: "herdr", args: [args, timeout] });
 		});
 	}
 

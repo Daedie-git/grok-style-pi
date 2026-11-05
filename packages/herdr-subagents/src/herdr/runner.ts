@@ -207,6 +207,7 @@ export function herdrAgentName(preferred: string | undefined, fallback: string):
 /** Owns launch effects and recovery. Waiters only observe immutable run identities. */
 export class HerdrRunner {
 	readonly store: HerdrStore;
+	get client(): HerdrClient { return this.deps.client; }
 	readonly machine?: string;
 	/** Stable local identity used by remote stores to scope caller-session notice routes. */
 	readonly machineId = MACHINE;

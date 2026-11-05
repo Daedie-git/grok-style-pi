@@ -183,26 +183,42 @@ export function herdrSessionName(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /** With `machine`, every command is routed to that saved SSH machine's Herdr server. Pane IDs are then remote. */
+const CALL_TIMEOUT_MS = 70_000;
+/** A pane's shell and Pi can take over a minute to appear while a build holds every core. */
+const START_TIMEOUT_MS = 120_000;
+
+/** One Herdr command's raw outcome. */
+export interface HerdrExecResult { code: number | null; stdout: string; stderr: string }
+/** Runs Herdr on the client's machine without the CLI's own route. Undefined means that route is unavailable. */
+export type HerdrExec = (args: string[], timeout: number, signal?: AbortSignal) => Promise<HerdrExecResult | undefined>;
+
 export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 	now: () => Date.now(),
 	sleep: (ms: number, signal?: AbortSignal): Promise<void> => delay(ms, undefined, { signal }),
-}, machine?: string, session?: string): HerdrClient {
+}, machine?: string, session?: string, exec?: HerdrExec): HerdrClient {
 	const bin = env.HERDR_BIN_PATH || "herdr";
 	const prefix = machine ? ["--machine", machine] : session ? ["--session", session] : [];
 	// Listings cross SSH when routed to a machine.
 	const listTimeout = machine ? 10_000 : 2500;
-	const routed = (binary: string, args: string[], ...rest: CallOptions) => call(binary, [...prefix, ...args], ...rest);
+	const routed = async (binary: string, args: string[], ...rest: CallOptions) => {
+		const [, timeout = CALL_TIMEOUT_MS, signal] = rest;
+		const result = await exec?.(args, timeout, signal);
+		if (result) return herdrPayload(result, args);
+		// That machine's worker cannot run Herdr, so this client stops asking.
+		exec = undefined;
+		return call(binary, [...prefix, ...args], ...rest);
+	};
 	const start = async (kind: "pi" | "claude", options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal) => {
-		const deadline = timing.now() + 60_000;
+		const deadline = timing.now() + START_TIMEOUT_MS;
 		for (;;) {
 			signal?.throwIfAborted();
 			try {
-				await routed(bin, ["agent", "start", options.name, "--kind", kind, "--pane", options.paneId, "--timeout", "60000", "--", ...options.args], env, 70_000, signal);
+				await routed(bin, ["agent", "start", options.name, "--kind", kind, "--pane", options.paneId, "--timeout", String(START_TIMEOUT_MS), "--", ...options.args], env, START_TIMEOUT_MS + 10_000, signal);
 				return;
 			} catch (error) {
 				if (!(error instanceof HerdrCliError) || error.message !== `agent target pane ${options.paneId} is not an available shell`) throw error;
 				const remaining = deadline - timing.now();
-				if (remaining <= 0) throw new Error(`Timed out after 60 seconds waiting for shell readiness in ${options.paneId}: ${error.message}`);
+				if (remaining <= 0) throw new Error(`Timed out after ${START_TIMEOUT_MS / 1000} seconds waiting for shell readiness in ${options.paneId}: ${error.message}`);
 				await timing.sleep(Math.min(250, remaining), signal);
 			}
 		}
@@ -328,7 +344,18 @@ function errorPayload(text: string): Record<string, unknown> | undefined {
 
 type CallOptions = [env: NodeJS.ProcessEnv, timeout?: number, signal?: AbortSignal];
 
-function call(bin: string, args: string[], env: NodeJS.ProcessEnv, timeout = 70_000, signal?: AbortSignal): Promise<unknown> {
+function herdrPayload({ code, stdout, stderr }: HerdrExecResult, args: string[]): unknown {
+	const payload = code === 0 ? parsePayload(stdout) : undefined;
+	// Herdr sends structured failures to stderr. Older versions may use stdout.
+	const error = code === 0 ? object(object(payload)?.error) : errorPayload(stderr) ?? errorPayload(stdout);
+	if (code !== 0 || error) throw new HerdrCliError(
+		typeof error?.message === "string" ? error.message : stderr.trim() || stdout.trim() || `herdr ${args.join(" ")} exited ${code}`,
+		typeof error?.code === "string" ? error.code : undefined,
+	);
+	return payload;
+}
+
+function call(bin: string, args: string[], env: NodeJS.ProcessEnv, timeout = CALL_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(bin, args, { env, timeout, signal, killSignal: "SIGKILL" });
 		let stdout = "";
@@ -337,21 +364,8 @@ function call(bin: string, args: string[], env: NodeJS.ProcessEnv, timeout = 70_
 		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 		child.on("error", reject);
 		child.on("close", (code) => {
-			try {
-				const payload = code === 0 ? parsePayload(stdout) : undefined;
-				// Herdr sends structured failures to stderr. Older versions may use stdout.
-				const error = code === 0 ? object(object(payload)?.error) : errorPayload(stderr) ?? errorPayload(stdout);
-				if (code !== 0 || error) {
-					reject(new HerdrCliError(
-						typeof error?.message === "string" ? error.message : stderr.trim() || stdout.trim() || `herdr ${args.join(" ")} exited ${code}`,
-						typeof error?.code === "string" ? error.code : undefined,
-					));
-					return;
-				}
-				resolve(payload);
-			} catch (error) {
-				reject(error);
-			}
+			try { resolve(herdrPayload({ code, stdout, stderr }, args)); }
+			catch (error) { reject(error); }
 		});
 	});
 }

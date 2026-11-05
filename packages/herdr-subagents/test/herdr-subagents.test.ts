@@ -1371,12 +1371,13 @@ test("background maintenance batches the fleet and shares its interval across ru
 	f.client.isAlive = async () => { assert.fail("maintenance must batch liveness"); };
 	await Promise.all([f.runner.maintain(), peer.maintain()]);
 	await Promise.all([f.runner.maintain(), peer.maintain()]);
-	assert.equal(lists, 1);
+	// One for liveness, and one inside the placement lock, where nothing can reopen an agent underneath it.
+	assert.equal(lists, 2);
 	assert.ok((await Promise.all(refs.map((ref) => f.runner.read(ref)))).every((run) => run.phase === "queued"));
 	f.live.delete(refs[0].agentId);
 	f.advance(1100);
 	await f.runner.maintain();
-	assert.equal(lists, 2);
+	assert.equal(lists, 4);
 	assert.equal((await f.runner.read(refs[0])).phase, "failed");
 	assert.equal((await f.runner.read(refs[1])).phase, "queued");
 });
@@ -1434,7 +1435,7 @@ test("failed and incomplete fleet snapshots preserve unknown liveness", async (t
 	assert.equal((await f.runner.read(ref)).phase, "queued");
 	f.advance(1100);
 	f.client.listAgents = async () => [{}];
-	await assert.rejects(f.runner.maintain(), /incomplete agent listing/);
+	await assert.rejects(f.runner.maintain(), /incomplete listing/);
 	assert.equal((await f.runner.read(ref)).phase, "queued");
 	f.advance(1100);
 	const record = await f.runner.resolve(ref.agentId);

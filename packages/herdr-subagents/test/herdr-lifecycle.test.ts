@@ -9,6 +9,18 @@ import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } fr
 import { HerdrRunner, spawnHerdrAgent } from "../src/herdr/runner.ts";
 import type { ChildBinding } from "../src/herdr/store.ts";
 
+const emptyClient = () => ({ listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined }) as unknown as HerdrClient;
+/** A server's client that reaches `sessions` by name, like `herdr --session`. */
+const withSessions = (client: HerdrClient, sessions: Record<string, HerdrClient>): HerdrClient => ({ ...client, forSession: (name) => sessions[name] });
+/** A session's client while `up()` is false reports a stopped server. */
+const stoppable = (client: HerdrClient, up: () => boolean): HerdrClient => {
+	const guard = <T extends unknown[], R>(call: (...args: T) => Promise<R>) => async (...args: T) => {
+		if (!up()) throw new HerdrCliError("no herdr server is running", "server_not_running");
+		return call(...args);
+	};
+	return { ...client, listAgents: guard(client.listAgents), listPanes: guard(client.listPanes), getAgent: guard(client.getAgent), getPane: guard(client.getPane!) };
+};
+
 async function fixture(t: test.TestContext, options: { herdrSession?: string; keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string; sleep?: (ms: number) => Promise<void> } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-lifecycle-"));
 	let now = 1_000_000;
@@ -98,7 +110,8 @@ async function fixture(t: test.TestContext, options: { herdrSession?: string; ke
 			if (pane?.paneId) panes.set(pane.paneId, { paneId: pane.paneId, focused: false, plainShell: true });
 		}
 	};
-	return { runner, client, ref, panes, named, starts, closed, complete, accept, root, kill, now: () => now, advance: (ms = 901_000) => { now += ms; } };
+	const claim = async () => runner.store.claimNextCommand(ref.agentId, binding!.token, false);
+	return { runner, client, ref, panes, named, starts, closed, complete, accept, claim, root, kill, now: () => now, advance: (ms = 901_000) => { now += ms; } };
 }
 
 test("completed panes park and resume on the same session with original settings", async (t) => {
@@ -477,7 +490,7 @@ for (const uncertainty of ["pane-id", "pane-session", "agent-session"] as const)
 		if (uncertainty === "pane-id") f.panes.set("unknown", { session: "/unrelated.jsonl" });
 		else if (uncertainty === "pane-session") f.panes.set("w2:p10", { paneId: "w2:p10", status: "working" });
 		else f.named.set("unknown", { paneId: "w2:p10", name: "unknown" });
-		if (uncertainty === "pane-id") await assert.rejects(f.runner.maintain(), /incomplete pane listing/);
+		if (uncertainty === "pane-id") await assert.rejects(f.runner.maintain(), /incomplete listing/);
 		else await f.runner.maintain();
 		assert.deepEqual(f.closed, []);
 		assert.equal((await f.runner.read(f.ref)).phase, "queued");
@@ -768,7 +781,7 @@ test("a local pi keeps the short start window", async (t) => {
 	assert.equal((await f.runner.read(f.ref)).phase, "failed");
 });
 
-test("maintenance in another Herdr session leaves a run it cannot see alone", async (t) => {
+test("a session this runner cannot reach keeps its runs", async (t) => {
 	const f = await fixture(t);
 	await f.accept();
 	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
@@ -780,7 +793,7 @@ test("maintenance in another Herdr session leaves a run it cannot see alone", as
 	assert.equal((await f.runner.read(f.ref)).phase, "running");
 });
 
-test("only a run's own session can declare it dead", async (t) => {
+test("a run's own session can declare it dead", async (t) => {
 	const f = await fixture(t, { herdrSession: "hermes-jobs" });
 	const record = await f.runner.resolve(f.ref.agentId);
 	assert.equal(record.herdrSession, "hermes-jobs");
@@ -794,44 +807,6 @@ test("only a run's own session can declare it dead", async (t) => {
 	f.advance(2000);
 	await f.runner.maintain();
 	assert.equal((await f.runner.read(f.ref)).phase, "failed");
-});
-
-test("a pass reserves the next lease for the session that owns a dead agent", async (t) => {
-	const f = await fixture(t);
-	await f.accept();
-	f.kill();
-	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
-	const foreign = [0, 1].map(() => new HerdrRunner({ root: f.root, client: empty, now: f.now, herdrSession: "hermes-jobs" }));
-	t.after(() => Promise.all(foreign.map((runner) => runner.close())));
-	f.advance(1000);
-	await foreign[0].maintain();
-	assert.equal((await f.runner.read(f.ref)).phase, "running");
-	assert.equal(await foreign[1].store.claimMaintenance("peer", f.now(), 5000, "hermes-jobs"), false, "every other runner honours it");
-	await f.runner.maintain();
-	assert.equal((await f.runner.read(f.ref)).phase, "failed");
-});
-
-test("reservations rotate among every session with an unseen agent", async (t) => {
-	const f = await fixture(t);
-	await f.accept();
-	const spawn = (runner: HerdrRunner, name: string) => runner.spawn({ prompt: name, description: name, subagentType: "test", name, cwd: f.root, paneId: "w1:p1", runInBackground: true });
-	const owners = ["gone", "jobs"].map((session) => new HerdrRunner({ root: f.root, client: f.client, now: f.now, herdrSession: session }));
-	t.after(() => Promise.all(owners.map((runner) => runner.close())));
-	await spawn(owners[0], "gone-agent");
-	await spawn(owners[1], "jobs-agent");
-	f.kill();
-	const reserved = new Set<string>();
-	const db = new DatabaseSync(join(f.root, "control.sqlite"), { readOnly: true });
-	t.after(() => db.close());
-	const empty = { listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined } as unknown as HerdrClient;
-	const third = new HerdrRunner({ root: f.root, client: empty, now: f.now, herdrSession: "third" });
-	t.after(() => third.close());
-	for (let pass = 0; pass < 6; pass++) {
-		f.advance(2100);
-		await third.maintain();
-		reserved.add(String((db.prepare("SELECT token FROM maintenance WHERE id=1").get() as { token: string }).token));
-	}
-	assert.ok(reserved.has("reserved:gone") && reserved.has("reserved:jobs"), [...reserved].join());
 });
 
 test("a quarantined machine still settles a dead run", async (t) => {
@@ -848,16 +823,7 @@ test("a quarantined machine still settles a dead run", async (t) => {
 	assert.deepEqual(f.closed, []);
 });
 
-test("a reservation lapses when its session is gone", async (t) => {
-	const f = await fixture(t);
-	assert.equal(await f.runner.store.claimMaintenance("a", 1000, 5000, "hermes-jobs"), true);
-	assert.equal(await f.runner.store.finishMaintenance("a", [], 1000, "gone"), true);
-	assert.equal(await f.runner.store.claimMaintenance("b", 2500, 5000, "hermes-jobs"), false);
-	assert.equal(await f.runner.store.claimMaintenance("c", 3001, 5000, "hermes-jobs"), true);
-	assert.equal(await f.runner.store.lifecycleAllowed(), true);
-});
-
-test("a record from before sessions were tracked keeps its old behaviour", async (t) => {
+test("a record from before sessions were tracked belongs to the default session", async (t) => {
 	const f = await fixture(t);
 	await f.complete();
 	const old = new DatabaseSync(join(f.root, "control.sqlite"));
@@ -872,9 +838,10 @@ test("a record from before sessions were tracked keeps its old behaviour", async
 	f.advance();
 	await f.runner.maintain();
 	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked");
-	const other = new HerdrRunner({ root: f.root, client: f.client, now: f.now, herdrSession: "hermes-jobs" });
+	const other = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { default: f.client }), now: f.now, herdrSession: "hermes-jobs" });
 	t.after(() => other.close());
-	await other.resume(f.ref.agentId, "again");
+	await assert.rejects(other.resume(f.ref.agentId, "again"), /belongs to Herdr session default/);
+	await f.runner.resume(f.ref.agentId, "again");
 	assert.equal(f.starts.length, 2);
 });
 
@@ -901,6 +868,326 @@ test("cold resume is refused from another Herdr session", async (t) => {
 	t.after(() => other.close());
 	await assert.rejects(other.resume(f.ref.agentId, "again"), /belongs to Herdr session default/);
 	assert.equal(f.starts.length, 1);
+});
+
+test("any session can judge a run through the run's own session", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	const other = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { default: f.client }), now: f.now, herdrSession: "hermes-jobs" });
+	t.after(() => other.close());
+	f.advance(1000);
+	await other.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+	f.kill();
+	f.advance(2000);
+	await other.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("a stopped session's runs fail only once it stays down", async (t) => {
+	const f = await fixture(t, { herdrSession: "gone" });
+	await f.accept();
+	let up = false;
+	const survivor = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { gone: stoppable(f.client, () => up) }), now: f.now, herdrSession: "default" });
+	t.after(() => survivor.close());
+	const pass = async (ms: number) => { f.advance(ms); await survivor.maintain(); return (await f.runner.read(f.ref)).phase; };
+	assert.equal(await pass(1000), "running");
+	assert.equal(await pass(20_000), "running");
+	// A handoff restarts the server in place, so it answers again and the clock restarts.
+	up = true;
+	assert.equal(await pass(5000), "running");
+	up = false;
+	assert.equal(await pass(1000), "running");
+	assert.equal(await pass(29_000), "running");
+	assert.equal(await pass(2000), "failed");
+});
+
+test("several slow sessions cannot expire a local pass", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	f.kill();
+	const slow = { ...emptyClient(), listAgents: async () => { f.advance(1800); return []; } } as unknown as HerdrClient;
+	for (const name of ["a", "b", "c"]) {
+		const session = new HerdrRunner({ root: f.root, client: { ...f.client, isAlive: async () => false, createTab: async () => ({ paneId: `w7:p${name}`, tabId: "w7:t1" }), startPi: async () => {}, showLabel: async () => {} }, now: f.now, herdrSession: name });
+		t.after(() => session.close());
+		await session.spawn({ prompt: "p", description: "d", subagentType: "test", name, cwd: f.root, paneId: "w1:p1", runInBackground: true, resolved: {} });
+	}
+	const local = new HerdrRunner({ root: f.root, client: { ...f.client, forSession: () => slow }, now: f.now, herdrSession: "default" });
+	t.after(() => local.close());
+	f.advance(1000);
+	await local.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("any answer from a session ends its outage", async (t) => {
+	const f = await fixture(t, { herdrSession: "gone", keep: true });
+	await f.complete();
+	let agentsUp = false;
+	const down = () => new HerdrCliError("no herdr server is running", "server_not_running");
+	const flaky = { ...f.client,
+		listAgents: async () => { if (!agentsUp) throw down(); return f.client.listAgents(); },
+		listPanes: async () => { throw down(); },
+	};
+	const survivor = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { gone: flaky }), now: f.now, herdrSession: "default" });
+	t.after(() => survivor.close());
+	f.advance(1000);
+	await survivor.maintain();
+	agentsUp = true;
+	f.advance(31_000);
+	await survivor.maintain();
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, undefined, "the agent listing answered, so the clock restarted");
+});
+
+test("a record marked missing still takes back a child that survived", async (t) => {
+	const f = await fixture(t, { keep: true });
+	await f.complete();
+	const record = await f.runner.resolve(f.ref.agentId);
+	const pane = f.panes.get(record.paneId)!;
+	const name = f.named.get(record.herdrName)!;
+	f.kill();
+	f.advance(121_000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.resolve(record.id)).paneState, "missing");
+	f.panes.set(record.paneId, pane);
+	f.named.set(record.herdrName, name);
+	const ref = await f.runner.resume(record.id, "again");
+	assert.equal(f.starts.length, 1, "the surviving child is reused");
+	assert.equal((await f.client.isAlive(record.herdrName)), true);
+	assert.ok(await f.claim(), "it can take the follow-up");
+	assert.equal((await f.runner.read(ref)).phase, "starting");
+});
+
+test("a reloaded child reattaches to a record marked missing", async (t) => {
+	const f = await fixture(t, { keep: true });
+	await f.complete();
+	const record = await f.runner.resolve(f.ref.agentId);
+	f.kill();
+	f.advance(121_000);
+	await f.runner.maintain();
+	assert.deepEqual(await f.runner.store.lifecycleCandidates(), []);
+	assert.ok(await f.runner.store.attach(record.paneId, record.sessionFile, record.sessionId!));
+	assert.equal((await f.runner.resolve(record.id)).paneState, undefined);
+	assert.equal((await f.runner.store.lifecycleCandidates()).length, 1, "a live child's pane is reaped again");
+});
+
+test("a closed pane stays fenced: only a missing one can reattach", async (t) => {
+	const f = await fixture(t);
+	await f.complete();
+	const record = await f.runner.resolve(f.ref.agentId);
+	f.advance();
+	await f.runner.maintain();
+	assert.equal((await f.runner.resolve(record.id)).paneState, "parked");
+	assert.equal(await f.runner.store.attach(record.paneId, record.sessionFile, record.sessionId!), undefined);
+});
+
+test("slow confirmations in another session cannot expire a local pass", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	f.kill();
+	const spawnIn = async (session: string) => {
+		const owner = new HerdrRunner({ root: f.root, client: { ...f.client, isAlive: async () => false, createTab: async () => ({ paneId: "w7:p1", tabId: "w7:t1" }), startPi: async () => {}, showLabel: async () => {} }, now: f.now, herdrSession: session });
+		t.after(() => owner.close());
+		await owner.spawn({ prompt: "p", description: "d", subagentType: "test", name: session, cwd: f.root, paneId: "w1:p1", runInBackground: true, resolved: {} });
+	};
+	await spawnIn("a");
+	await spawnIn("b");
+	const step = (ms: number, value: unknown) => async () => { f.advance(ms); return value; };
+	const slow = { listAgents: step(500, []), listPanes: step(500, []), getAgent: step(2400, undefined), getPane: step(2400, undefined) } as unknown as HerdrClient;
+	const local = new HerdrRunner({ root: f.root, client: { ...f.client, forSession: () => slow }, now: f.now, herdrSession: "default" });
+	t.after(() => local.close());
+	f.advance(1000);
+	await local.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "failed");
+});
+
+test("another session's finished panes cost one listing and are left to it", async (t) => {
+	const f = await fixture(t, { herdrSession: "jobs" });
+	await f.complete();
+	const calls: string[] = [];
+	const counted = { ...emptyClient(), ...Object.fromEntries((["listAgents", "listPanes", "getAgent", "getPane", "closePane"] as const).map((name) => [name, async () => { calls.push(name); return []; }])) } as unknown as HerdrClient;
+	const local = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { jobs: counted }), now: f.now, herdrSession: "default" });
+	t.after(() => local.close());
+	f.advance();
+	await local.maintain();
+	assert.deepEqual(calls, ["listAgents"]);
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, undefined);
+	f.advance(1100);
+	await f.runner.maintain();
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked", "its own session closes it");
+});
+
+test("a stopped session's pending close is finished from another session", async (t) => {
+	const f = await fixture(t, { herdrSession: "gone", keep: true, closeWhenDone: false });
+	await f.accept();
+	const record = await f.runner.resolve(f.ref.agentId);
+	assert.equal(await f.runner.store.preparePaneClose(f.ref, record.paneId, true, f.now()), true);
+	const survivor = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { gone: stoppable(f.client, () => false) }), now: f.now, herdrSession: "default" });
+	t.after(() => survivor.close());
+	f.advance(1000);
+	await survivor.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+	f.advance(31_000);
+	await survivor.maintain();
+	const settled = await f.runner.resolve(record.id);
+	assert.equal(settled.paneClose, undefined);
+	assert.equal(settled.paneState, "parked");
+	assert.equal((await f.runner.read(f.ref)).phase, "stopped");
+});
+
+test("a liveness confirmation asks for a bounded lookup, and its timeout proves nothing", async (t) => {
+	const f = await fixture(t);
+	await f.accept();
+	let bounded: boolean | undefined;
+	const { getAgent } = f.client;
+	f.client.getAgent = async (name, signal, limit) => { bounded = limit; throw new Error("timed out"); };
+	f.kill();
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal(bounded, true);
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+	f.client.getAgent = getAgent;
+});
+
+test("a timeout after a brief stop proves nothing about a session", async (t) => {
+	const f = await fixture(t, { herdrSession: "gone" });
+	await f.accept();
+	let failure: Error = new HerdrCliError("no herdr server is running", "server_not_running");
+	const fail = async () => { throw failure; };
+	const flaky = { ...emptyClient(), listAgents: fail, listPanes: fail, getAgent: fail, getPane: fail } as unknown as HerdrClient;
+	const survivor = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { gone: flaky }), now: f.now, herdrSession: "default" });
+	t.after(() => survivor.close());
+	f.advance(1000);
+	await survivor.maintain();
+	failure = new Error("timed out");
+	f.advance(31_000);
+	await survivor.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+	failure = new HerdrCliError("no herdr server is running", "server_not_running");
+	f.advance(2000);
+	await survivor.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running", "the 30 seconds start again");
+});
+
+test("a live agent cannot be adopted from another session", async (t) => {
+	const f = await fixture(t);
+	await f.complete();
+	const other = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { default: f.client }), now: f.now, herdrSession: "jobs" });
+	t.after(() => other.close());
+	await assert.rejects(other.resume(f.ref.agentId, "again", undefined, true, { paneId: "w1:p7", sessionFile: "/foreign.jsonl" }), /belongs to Herdr session default/);
+	assert.equal((await f.runner.resolve(f.ref.agentId)).parentSessionFile, "/owner.jsonl");
+});
+
+test("a finished record leaves maintenance once its session has stopped", async (t) => {
+	const f = await fixture(t, { herdrSession: "gone", keep: true });
+	await f.complete();
+	const survivor = new HerdrRunner({ root: f.root, client: withSessions(emptyClient(), { gone: stoppable(f.client, () => false) }), now: f.now, herdrSession: "default" });
+	t.after(() => survivor.close());
+	f.advance(1000);
+	await survivor.maintain();
+	assert.equal((await f.runner.store.lifecycleCandidates()).length, 1);
+	f.advance(31_000);
+	await survivor.maintain();
+	assert.deepEqual(await f.runner.store.lifecycleCandidates(), []);
+	assert.deepEqual(f.closed, []);
+});
+
+test("a finished record whose agent left stops costing Herdr calls", async (t) => {
+	const f = await fixture(t, { keep: true });
+	await f.complete();
+	f.kill();
+	let calls = 0;
+	const { getAgent, getPane } = f.client;
+	f.client.getAgent = async (...args) => { calls++; return getAgent(...args); };
+	f.client.getPane = async (...args) => { calls++; return getPane!(...args); };
+	f.advance(1000);
+	await f.runner.maintain();
+	assert.equal(calls, 0);
+	assert.equal((await f.runner.store.lifecycleCandidates()).length, 1, "a just-finished agent may still reappear");
+	f.advance(121_000);
+	await f.runner.maintain();
+	assert.equal(calls, 0);
+	assert.deepEqual(await f.runner.store.lifecycleCandidates(), []);
+	assert.deepEqual((await f.runner.store.launches()).map((launch) => launch.stage), ["closed"]);
+	await f.runner.resume(f.ref.agentId, "again");
+	assert.equal(f.starts.length, 2, "it still reopens");
+});
+
+for (const occupant of ["pane", "name"]) {
+	test(`a record stays while its ${occupant} has an unproven occupant`, async (t) => {
+		const f = await fixture(t, { keep: true });
+		await f.complete();
+		const { paneId, herdrName } = await f.runner.resolve(f.ref.agentId);
+		f.kill();
+		if (occupant === "pane") f.panes.set(paneId, { paneId, status: "working" });
+		else f.named.set(herdrName, { paneId: "w9:p9", name: herdrName });
+		f.advance(121_000);
+		await f.runner.maintain();
+		assert.equal((await f.runner.store.lifecycleCandidates()).length, 1);
+		assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, undefined);
+	});
+}
+
+test("placement ignores another session's launches, whose IDs mean nothing here", async (t) => {
+	const f = await fixture(t, { herdrSession: "jobs", workspaceId: "w1" });
+	const [theirs] = await f.runner.store.launches();
+	assert.equal(theirs.herdrSession, "jobs");
+	const here = new HerdrRunner({ root: f.root, now: f.now, herdrSession: "default", client: {
+		...f.client, listPanes: async () => [], isAlive: async () => false, startPi: async () => {}, showLabel: async () => {},
+		createTab: async () => ({ paneId: "w1:p2", tabId: "w1:t2", workspaceId: "w1" }),
+	} });
+	t.after(() => here.close());
+	await here.spawn({ prompt: "p", description: "d", subagentType: "test", name: "local", cwd: f.root, paneId: "w1:p1", workspaceId: "w1", runInBackground: true, resolved: {} });
+	const launches = await f.runner.store.launches();
+	assert.equal(launches.find((launch) => launch.agentId === theirs.agentId)?.stage, "published", "its slot is not released");
+	assert.equal(launches.find((launch) => launch.agentId === "local")?.herdrSession, "default");
+});
+
+async function interrupted(f: Awaited<ReturnType<typeof fixture>>, herdrSession: string | undefined, id: string) {
+	const owner = "2147483646:dead";
+	const task = { ...(await f.runner.resolve(f.ref.agentId)), id, herdrName: id, paneId: "", herdrSession };
+	const ref = (await f.runner.store.reserveAgent(task, join(f.root, `${id}.jsonl`), owner, f.now()))!;
+	await f.runner.store.recordLaunch(ref, owner, "pane-created", { paneId: "w1:p9" }, f.now());
+	return ref;
+}
+
+test("launch recovery closes a dead launch's pane in that launch's session", async (t) => {
+	const f = await fixture(t);
+	// The launch rows carry no session at all, as an older worker writes them.
+	await interrupted(f, "jobs", "tagged");
+	await interrupted(f, undefined, "untagged");
+	const closed: Record<string, string[]> = { here: [], jobs: [], default: [] };
+	const closes = (name: string) => ({ ...emptyClient(), closePane: async (pane: string) => { closed[name].push(pane); } });
+	const here = new HerdrRunner({ root: f.root, now: f.now, herdrSession: "here", client: { ...closes("here"), forSession: (name: string) => closes(name) } as unknown as HerdrClient });
+	t.after(() => here.close());
+	await here.reconcile();
+	assert.deepEqual(closed, { here: [], jobs: ["w1:p9"], default: ["w1:p9"] });
+});
+
+test("a machine runner leaves a launch and a run in another session alone", async (t) => {
+	const f = await fixture(t, { machine: "lappy", herdrSession: "jobs" });
+	assert.equal((await f.runner.resolve(f.ref.agentId)).herdrSession, "jobs");
+	await f.accept();
+	const ref = await interrupted(f, "other", "stranded");
+	f.kill();
+	let closes = 0;
+	const client = { ...emptyClient(), closePane: async () => { closes++; } } as unknown as HerdrClient;
+	const remote = new HerdrRunner({ root: f.root, now: f.now, machine: "lappy", client });
+	t.after(() => remote.close());
+	f.advance(120_000);
+	await remote.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "running");
+	assert.equal(closes, 0);
+	assert.equal((await f.runner.store.launches()).find((launch) => launch.runId === ref.runId)?.stage, "pane-created");
+});
+
+test("cancelling Claude Code closes its pane through its own session", async (t) => {
+	const f = await fixture(t, { runtime: "claude-code", herdrSession: "jobs" });
+	const pane = (await f.runner.resolve(f.ref.agentId)).paneId;
+	const own = { ...emptyClient(), closePane: async () => assert.fail("wrong session") } as unknown as HerdrClient;
+	const other = new HerdrRunner({ root: f.root, client: withSessions(own, { jobs: f.client }), now: f.now, herdrSession: "default" });
+	t.after(() => other.close());
+	await other.cancel(f.ref);
+	assert.deepEqual(f.closed, [pane]);
 });
 
 test("an agent confirmed alive still meets its start deadline", async (t) => {

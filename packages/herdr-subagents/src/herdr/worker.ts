@@ -16,9 +16,6 @@ const root = (workerData as { root?: string } | null)?.root ?? process.argv[2] ?
 mkdirSync(root, { recursive: true });
 const BUSY_MS = 5000;
 const MAINTENANCE_BUSY_MS = 250;
-const RESERVED = "reserved:";
-/** Comfortably longer than a poll interval, without stalling maintenance when the owner has gone. */
-const RESERVATION_MS = 2000;
 
 function database(name: string): DatabaseSync {
 	const db = new DatabaseSync(join(root, name));
@@ -176,8 +173,20 @@ function launch(ref: RunRef): LaunchRecord {
 	if (!value || value.agentId !== ref.agentId) throw new Error("Launch not found");
 	return value;
 }
+/** The agent record carries the session, including for launches written by older workers. */
+function launchesWhere(condition = "1"): LaunchRecord[] {
+	return db.prepare(`SELECT l.data,json_extract(a.data,'$.herdrSession') AS session FROM launches l
+		LEFT JOIN agents a ON a.id=json_extract(l.data,'$.agentId') WHERE ${condition}`).all().map((row) => ({
+		...decode<LaunchRecord>(row)!, ...(typeof row.session === "string" ? { herdrSession: row.session } : {}),
+	}));
+}
 function saveLaunch(value: LaunchRecord) {
 	db.prepare("UPDATE launches SET data=? WHERE run=?").run(JSON.stringify(value), value.runId);
+}
+function closeLaunches(agentId: string, paneId: string, now: number) {
+	for (const row of db.prepare("SELECT data FROM launches WHERE json_extract(data,'$.agentId')=? AND json_extract(data,'$.paneId')=?").all(agentId, paneId)) {
+		saveLaunch({ ...decode<LaunchRecord>(row)!, stage: "closed", updatedAt: now });
+	}
 }
 function publish(ref: RunRef, prompt: string, notify: boolean, now: number, startTimeoutMs?: number): RunSnapshot {
 	const value = run(ref);
@@ -277,14 +286,13 @@ const operations = {
 	agentForSession(paneId: string, sessionFile: string): AgentRecord | undefined {
 		return decode<AgentRecord>(db.prepare("SELECT data FROM agents WHERE pane=? AND session_file=?").get(paneId, resolve(sessionFile)));
 	},
-	claimMaintenance(token: string, now: number, leaseMs = 5000, session?: string): boolean {
+	claimMaintenance(token: string, now: number, leaseMs = 5000): boolean {
 		// An early read avoids taking the write lock on every 200 ms tick in every pane.
-		const lease = db.prepare("SELECT token,expires,next_at FROM maintenance WHERE id=1").get()!;
-		const reservation = RESERVED + (session ?? "");
-		if (lease.token !== reservation && (Number(lease.expires) > now || Number(lease.next_at) > now)) return false;
+		const lease = db.prepare("SELECT expires,next_at FROM maintenance WHERE id=1").get()!;
+		if (Number(lease.expires) > now || Number(lease.next_at) > now) return false;
 		// Maintenance is best-effort and retried every tick, so a busy database only means another pane is writing.
 		db.exec(`PRAGMA busy_timeout=${MAINTENANCE_BUSY_MS}`);
-		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND ((expires<=? AND next_at<=?) OR token=?)").run(token, now + leaseMs, now, now, reservation).changes) === 1); }
+		try { return transaction(() => Number(db.prepare("UPDATE maintenance SET token=?,expires=? WHERE id=1 AND expires<=? AND next_at<=?").run(token, now + leaseMs, now, now).changes) === 1); }
 		catch (error) { if (isBusy(error)) return false; throw error; }
 		finally { db.exec(`PRAGMA busy_timeout=${BUSY_MS}`); }
 	},
@@ -294,7 +302,7 @@ const operations = {
 			AND json_extract(r.data,'$.deadline')>0 AND json_extract(a.data,'$.currentRunId')=r.id`).all()
 			.map((row) => ({ agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)) }));
 	},
-	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number, reserveFor?: string): boolean {
+	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number): boolean {
 		return transaction(() => {
 			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
 			if (lease.token !== token || Number(lease.expires) <= now) return false;
@@ -307,9 +315,7 @@ const operations = {
 				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: departureError(value, ref) }, now);
 				if (next !== value) saveRun(next);
 			}
-			// Only the owning session can declare its agents dead, so it gets the next pass.
-			if (reserveFor) db.prepare("UPDATE maintenance SET token=?,expires=?,next_at=? WHERE id=1 AND token=?").run(RESERVED + reserveFor, now + RESERVATION_MS, now + 1000, token);
-			else db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
+			db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
 			return true;
 		});
 	},
@@ -330,7 +336,8 @@ const operations = {
 	lifecycleCandidates(): Array<{ agent: AgentRecord; run: RunSnapshot }> {
 		return db.prepare(`SELECT a.data AS agent_data,r.data AS run_data FROM agents a
 			JOIN runs r ON r.id=json_extract(a.data,'$.currentRunId')
-			WHERE json_extract(r.data,'$.deadline')>0`).all().map((row) => ({
+			WHERE json_extract(r.data,'$.deadline')>0 AND (json_extract(a.data,'$.paneClose') IS NOT NULL
+				OR (json_extract(a.data,'$.paneState') IS NULL AND json_extract(a.data,'$.cwd') IS NOT NULL))`).all().map((row) => ({
 			agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)),
 		}));
 	},
@@ -409,8 +416,17 @@ const operations = {
 				|| (record.paneClose && !lifecycleAllowed())) return false;
 			saveAgent({ ...record, paneState: "parked", paneClose: undefined });
 			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(ref.agentId);
-			for (const item of operations.launches()) if (item.agentId === ref.agentId && item.paneId === paneId) saveLaunch({ ...item, stage: "closed", updatedAt: now });
+			closeLaunches(ref.agentId, paneId, now);
 			return true;
+		});
+	},
+	/** Evidence of absence, unlike parking: the binding stays and the child may attach again. */
+	markPaneMissing(ref: RunRef, paneId: string, now: number): void {
+		transaction(() => {
+			const record = agent(ref.agentId);
+			if (!record || !current(ref) || record.paneId !== paneId || record.paneState || record.paneClose || !isTerminal(run(ref).phase)) return;
+			saveAgent({ ...record, paneState: "missing" });
+			closeLaunches(ref.agentId, paneId, now);
 		});
 	},
 	closeOwnedAgent(ref: RunRef, paneId: string, now: number): void {
@@ -422,7 +438,7 @@ const operations = {
 			if (!isTerminal(value.phase)) saveRun({ ...value, phase: "stopped", cancelRequested: true, error: "Owner session ended", updatedAt: now });
 			saveAgent({ ...record, paneState: "parked", paneClose: undefined, nonResumable: record.nonResumable || (record.runtime === "claude-code" && !isTerminal(value.phase)) });
 			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(ref.agentId);
-			for (const item of operations.launches()) if (item.agentId === ref.agentId && item.paneId === paneId) saveLaunch({ ...item, stage: "closed", updatedAt: now });
+			closeLaunches(ref.agentId, paneId, now);
 		});
 	},
 	listAgents(): AgentRecord[] {
@@ -480,7 +496,7 @@ const operations = {
 			const record = operations.agentForSession(paneId, sessionFile);
 			if (!record || record.paneState === "parked" || (record.sessionId && record.sessionId !== sessionId)) return undefined;
 			const token = randomUUID();
-			saveAgent({ ...record, sessionId });
+			saveAgent({ ...record, sessionId, paneState: undefined });
 			db.prepare("UPDATE agents SET binding=? WHERE id=?").run(token, record.id);
 			const value = run({ agentId: record.id, runId: record.currentRunId });
 			const ambiguous = commands(value).some((command) => command.state === "dispatching");
@@ -599,11 +615,9 @@ const operations = {
 		});
 	},
 	recoverableLaunches(): LaunchRecord[] {
-		return db.prepare("SELECT data FROM launches WHERE json_extract(data,'$.stage') NOT IN ('published','closed','ambiguous')").all().map((row) => decode<LaunchRecord>(row)!);
+		return launchesWhere("json_extract(l.data,'$.stage') NOT IN ('published','closed','ambiguous')");
 	},
-	launches(): LaunchRecord[] {
-		return db.prepare("SELECT data FROM launches").all().map((row) => decode<LaunchRecord>(row)!);
-	},
+	launches(): LaunchRecord[] { return launchesWhere(); },
 	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: LaunchFacts, now: number): void {
 		transaction(() => {
 			const value = launch(ref);

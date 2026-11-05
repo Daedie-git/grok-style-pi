@@ -22,6 +22,8 @@ export interface HerdrMachine {
 	label: string;
 	target: string;
 	enabled: boolean;
+	/** The remote Herdr session this profile connects to. */
+	session?: string;
 }
 
 export interface HerdrPaneLayout {
@@ -30,6 +32,8 @@ export interface HerdrPaneLayout {
 }
 
 export interface HerdrClient {
+	/** The same commands against another session of this server's machine. */
+	forSession?(session: string): HerdrClient;
 	split(options: { paneId: string; direction: "right" | "down"; cwd: string }): Promise<{ paneId: string }>;
 	startPi(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
 	startClaude?(options: { name: string; paneId: string; args: string[] }, signal?: AbortSignal): Promise<void>;
@@ -38,7 +42,8 @@ export interface HerdrClient {
 	closePane(paneId: string): Promise<void>;
 	isAlive(name: string): Promise<boolean>;
 	/** The live agent holding this name, or undefined when none does. */
-	getAgent(name: string, signal?: AbortSignal): Promise<HerdrAgentRef | undefined>;
+	/** `bounded` limits it like a listing, for a caller holding a lease; a timeout then rejects, leaving liveness unknown. */
+	getAgent(name: string, signal?: AbortSignal, bounded?: boolean): Promise<HerdrAgentRef | undefined>;
 	/** Resolves inherited pane aliases after a workspace move. */
 	getPane?(paneId: string, signal?: AbortSignal): Promise<HerdrAgentRef | undefined>;
 	showLabel(paneId: string, label: string): Promise<void>;
@@ -137,7 +142,7 @@ export function machinesFromList(payload: unknown): HerdrMachine[] {
 	return payload.flatMap((item) => {
 		const record = object(item);
 		if (typeof record?.id !== "string" || typeof record.label !== "string" || typeof record.target !== "string") return [];
-		return [{ id: record.id, label: record.label, target: record.target, enabled: record.enabled !== false }];
+		return [{ id: record.id, label: record.label, target: record.target, enabled: record.enabled !== false, ...(typeof record.session === "string" ? { session: record.session } : {}) }];
 	});
 }
 
@@ -152,25 +157,38 @@ export async function listHerdrMachines(env: NodeJS.ProcessEnv = process.env, ti
 	}
 }
 
-/** Resolves a saved machine the way `herdr --machine` does: profile ID first, then a unique label. */
+/** Selects a saved machine the way `herdr --machine` does: profile ID first, then a unique label. */
+export function pickHerdrMachine(machines: HerdrMachine[], selector: string): HerdrMachine | undefined {
+	const byLabel = machines.filter((machine) => machine.label === selector);
+	return machines.find((machine) => machine.id === selector) ?? (byLabel.length === 1 ? byLabel[0] : undefined);
+}
+
 export async function findHerdrMachine(selector: string, env: NodeJS.ProcessEnv = process.env): Promise<HerdrMachine> {
 	const machines = await listHerdrMachines(env);
-	const byId = machines.find((machine) => machine.id === selector);
-	const byLabel = machines.filter((machine) => machine.label === selector);
-	if (!byId && byLabel.length > 1) throw new Error(`Herdr machine label '${selector}' is ambiguous; use its profile ID.`);
-	const machine = byId ?? byLabel[0];
+	const machine = pickHerdrMachine(machines, selector);
+	if (!machine && machines.some((item) => item.label === selector)) throw new Error(`Herdr machine label '${selector}' is ambiguous; use its profile ID.`);
 	if (!machine) throw new Error(`Unknown Herdr machine '${selector}'. Add it with herdr machine add, then check herdr machine list.`);
 	if (!machine.enabled) throw new Error(`Herdr machine '${selector}' is disabled.`);
 	return machine;
+}
+
+/**
+ * The session this process's Herdr commands reach. Panes receive the socket path, which also wins over an inherited
+ * `HERDR_SESSION` in Herdr, and a named session keeps its socket in `sessions/<name>/`.
+ */
+export function herdrSessionName(env: NodeJS.ProcessEnv = process.env): string {
+	const fromSocket = /[\\/]sessions[\\/]([^\\/]+)[\\/]herdr\.sock$/.exec(env.HERDR_SOCKET_PATH ?? "")?.[1];
+	if (fromSocket) return fromSocket;
+	return env.HERDR_SOCKET_PATH ? "default" : env.HERDR_SESSION?.trim() || "default";
 }
 
 /** With `machine`, every command is routed to that saved SSH machine's Herdr server. Pane IDs are then remote. */
 export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 	now: () => Date.now(),
 	sleep: (ms: number, signal?: AbortSignal): Promise<void> => delay(ms, undefined, { signal }),
-}, machine?: string): HerdrClient {
+}, machine?: string, session?: string): HerdrClient {
 	const bin = env.HERDR_BIN_PATH || "herdr";
-	const prefix = machine ? ["--machine", machine] : [];
+	const prefix = machine ? ["--machine", machine] : session ? ["--session", session] : [];
 	// Listings cross SSH when routed to a machine.
 	const listTimeout = machine ? 10_000 : 2500;
 	const routed = (binary: string, args: string[], ...rest: CallOptions) => call(binary, [...prefix, ...args], ...rest);
@@ -190,6 +208,8 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 		}
 	};
 	return {
+		// Herdr rejects `--session` with `--machine`: a machine exposes only its saved profile's session.
+		...(machine ? {} : { forSession: (name: string) => createHerdrCli(env, timing, undefined, name) }),
 		async split(options) {
 			const payload = await routed(bin, [
 				"pane", "split", "--pane", options.paneId, "--direction", options.direction,
@@ -215,9 +235,9 @@ export function createHerdrCli(env: NodeJS.ProcessEnv = process.env, timing = {
 				throw error;
 			}
 		},
-		async getAgent(name, signal) {
+		async getAgent(name, signal, bounded) {
 			try {
-				const payload = await routed(bin, ["agent", "get", name], env, undefined, signal);
+				const payload = await routed(bin, ["agent", "get", name], env, bounded ? listTimeout : undefined, signal);
 				const result = object(object(payload)?.result) ?? object(payload);
 				return agentRef(result?.agent);
 			} catch (error) {
@@ -289,6 +309,11 @@ export class HerdrCliError extends Error {
 		super(message);
 		this.code = code;
 	}
+}
+
+/** The session's server is not running. A handoff shows this briefly too, so it is not proof on its own. */
+export function herdrServerDown(error: unknown): boolean {
+	return error instanceof HerdrCliError && error.code === "server_not_running";
 }
 
 /** Only explicit pre-effect validation failures prove that no pane was created. */

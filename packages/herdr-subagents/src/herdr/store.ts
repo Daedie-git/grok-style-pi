@@ -52,7 +52,8 @@ export interface AgentRecord extends HerdrTask {
 	sessionFile: string;
 	sessionId?: string;
 	claudeTranscript?: string;
-	paneState?: "parked";
+	/** `parked`: the pane was closed on purpose. `missing`: it vanished, so nothing fences a child that survives. */
+	paneState?: "parked" | "missing";
 	/** Durable intent survives a runner closing its own pane before it can settle the run. */
 	paneClose?: { runId: string; paneId: string; ownerGone: boolean };
 	lastActivityAt?: number;
@@ -64,6 +65,8 @@ export type LaunchStage = "reserved" | "creating" | "pane-created" | "starting-p
 export interface LaunchRecord extends RunRef {
 	stage: LaunchStage;
 	owner: string;
+	/** Read from the launch's agent, because pane and tab IDs repeat across sessions. */
+	herdrSession?: string;
 	tabId?: string;
 	paneId?: string;
 	direction?: "right" | "down";
@@ -97,7 +100,7 @@ export interface CompletionNotice extends RunRef {
 }
 
 /** Raised whenever the parent and a remote worker would disagree on store operations; both ends must match. */
-export const HERDR_REMOTE_PROTOCOL = 3;
+export const HERDR_REMOTE_PROTOCOL = 4;
 
 /** One run's liveness, with the run state it was listed against. */
 export interface MaintenanceObservation {
@@ -243,7 +246,7 @@ export class HerdrStore {
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }
 	findAgent(id: string) { return this.call("findAgent", id); }
 	agentForSession(paneId: string, sessionFile: string) { return this.call("agentForSession", paneId, sessionFile); }
-	claimMaintenance(token: string, now: number, leaseMs?: number, session?: string) { return this.call("claimMaintenance", token, now, leaseMs, session); }
+	claimMaintenance(token: string, now: number, leaseMs?: number) { return this.call("claimMaintenance", token, now, leaseMs); }
 	activeRuns() { return this.call("activeRuns"); }
 	lifecycleAllowed() { return this.call("lifecycleAllowed"); }
 	lifecycleStatus() { return this.call("lifecycleStatus"); }
@@ -256,9 +259,10 @@ export class HerdrStore {
 	abortPaneClose(ref: RunRef, paneId: string) { return this.call("abortPaneClose", ref, paneId); }
 	notePaneActivity(ref: RunRef, now: number) { return this.call("notePaneActivity", ref, now); }
 	parkAgent(ref: RunRef, paneId: string, now: number) { return this.call("parkAgent", ref, paneId, now); }
+	markPaneMissing(ref: RunRef, paneId: string, now: number) { return this.call("markPaneMissing", ref, paneId, now); }
 	closeOwnedAgent(ref: RunRef, paneId: string, now: number) { return this.call("closeOwnedAgent", ref, paneId, now); }
 	maintenanceValid(token: string, now: number, extendMs?: number) { return this.call("maintenanceValid", token, now, extendMs); }
-	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number, reserveFor?: string) { return this.call("finishMaintenance", token, observations, now, reserveFor); }
+	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number) { return this.call("finishMaintenance", token, observations, now); }
 	listAgents() { return this.call("listAgents"); }
 	read(ref: RunRef) { return this.call("read", ref); }
 	beginRun(agentId: string, previousRunId: string, prompt: string, notify: boolean, now: number, ownership?: AgentOwnership, startTimeoutMs?: number) { return this.call("beginRun", agentId, previousRunId, prompt, notify, now, ownership, startTimeoutMs); }

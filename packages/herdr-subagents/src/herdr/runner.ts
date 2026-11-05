@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
-import { paneCreationRejected, type HerdrClient, type HerdrAgentRef, type HerdrPaneLayout } from "./client.ts";
+import { herdrServerDown, herdrSessionName, paneCreationRejected, type HerdrClient, type HerdrAgentRef, type HerdrPaneLayout } from "./client.ts";
 import { defaultThinking, parseAgentFile } from "./agent-file.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask, type MaintenanceObservation } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
@@ -25,6 +25,8 @@ const CLOSE_GRACE_MS = 2000;
 const DONE_SETTLE_MS = 120_000;
 /** A starting pane publishes its session within seconds; longer uncertainty refuses the reopen. */
 const DEPARTURE_SETTLE_MS = 10_000;
+/** A handoff restarts a server in place, so only a session that stays down has lost its panes. */
+const SESSION_GONE_MS = 30_000;
 
 export interface SpawnRequest {
 	runtime?: "pi" | "claude-code";
@@ -67,7 +69,7 @@ export interface RunnerDeps {
 	signal?: AbortSignal;
 	/** The extension shares one runner across tools and session maintenance. */
 	runner?: HerdrRunner;
-	/** The named Herdr session this runner's panes belong to. Omitted for the default session. */
+	/** The Herdr session this runner's client reaches. Defaults to this process's session, or a machine's default. */
 	herdrSession?: string;
 	/** Saved Herdr machine whose panes and store this runner uses. Omitted for the local server. */
 	machine?: string;
@@ -152,6 +154,24 @@ function sameSession(reported: string, record: Pick<AgentRecord, "sessionFile" |
 	return file(reported) === file(record.sessionFile) || (!!record.sessionId && reported.includes(record.sessionId));
 }
 
+/** Tags arrived with session tracking. Older records came from a default session, the only kind most machines run. */
+function sessionOf(item: { herdrSession?: string }): string {
+	return item.herdrSession ?? "default";
+}
+
+interface SessionInventory { items: HerdrAgentRef[]; panes: HerdrAgentRef[] }
+
+function complete(items: HerdrAgentRef[]): HerdrAgentRef[] {
+	if (items.some((item) => !item.paneId)) throw new Error("Herdr returned an incomplete listing");
+	return items;
+}
+
+/** Herdr can leave the name or pane without proving its occupant, so either keeps the record until it does. */
+function departed(agent: AgentRecord, { items, panes }: SessionInventory): boolean {
+	const pane = panes.find((item) => item.paneId === agent.paneId);
+	return !(pane && uncertainSession(pane)) && !items.some((item) => item.name === agent.herdrName && item.session === undefined);
+}
+
 /** Native shells have no agent session; missing or malformed occupant evidence is not a proven shell. */
 function uncertainSession(pane: HerdrAgentRef): boolean {
 	return !pane.paneId || ((!pane.session || !pane.session.trim()) && pane.plainShell !== true);
@@ -197,6 +217,9 @@ export class HerdrRunner {
 	private maintenance?: Promise<void>;
 	private closing?: Promise<void>;
 	private readonly herdrSession: string;
+	private readonly sessionClients = new Map<string, HerdrClient>();
+	/** When each other session was first seen down, until it answers again. */
+	private readonly sessionsDown = new Map<string, number>();
 	private now: () => number;
 	private sleep: (ms: number) => Promise<void>;
 
@@ -204,8 +227,7 @@ export class HerdrRunner {
 		this.deps = privateDeps;
 		this.store = new HerdrStore(privateDeps.channel ?? privateDeps.root);
 		this.machine = privateDeps.machine;
-		// Saved machines are reached through their default session.
-		this.herdrSession = privateDeps.machine ? "default" : (privateDeps.herdrSession ?? process.env.HERDR_SESSION)?.trim() || "default";
+		this.herdrSession = privateDeps.herdrSession?.trim() || (privateDeps.machine ? "default" : herdrSessionName(process.env));
 		this.now = privateDeps.now ?? Date.now;
 		this.sleep = privateDeps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
 	}
@@ -224,6 +246,8 @@ export class HerdrRunner {
 			const ref = await this.withPlacement(async () => {
 				let record = await this.resolve(agentId);
 				check(combined);
+				// Resuming adopts the caller as owner, and an owner in another session could not be checked from the child's.
+				if (sessionOf(record) !== this.herdrSession) throw new Error(`Agent ${record.id} belongs to Herdr session ${sessionOf(record)}. Resume it from there.`);
 				if (record.paneClose) {
 					await this.recoverPaneClose(record, undefined, combined);
 					record = await this.resolve(agentId);
@@ -308,22 +332,33 @@ export class HerdrRunner {
 		this.maintenance = this.track((async () => {
 			const token = randomUUID();
 			const claimedAt = this.now();
-			if (!(await this.store.claimMaintenance(token, claimedAt, this.maintenanceLeaseMs, this.herdrSession))) return;
+			if (!(await this.store.claimMaintenance(token, claimedAt, this.maintenanceLeaseMs))) return;
 			let observations: MaintenanceObservation[] = [];
-			const skipped = new Set<string>();
-			// Rotating by time keeps several sessions, or one that has gone, from holding every reservation.
-			const reservation = () => [...skipped].sort()[Math.floor(this.now() / LEASE_RENEWAL_MS) % skipped.size];
+			let renewedAt = claimedAt;
+			// A pass spans several calls of seconds each, so renewing after the next one could already be too late.
+			const renew = async (always = false) => {
+				if (!always && this.now() - renewedAt < LEASE_RENEWAL_MS) return true;
+				renewedAt = this.now();
+				return this.store.maintenanceValid(token, renewedAt, this.maintenanceLeaseMs);
+			};
 			try {
 				const runs = await this.store.activeRuns();
 				const candidates = await this.store.lifecycleCandidates();
-				const agents = runs.length || candidates.length ? await this.deps.client.listAgents(this.stopping.signal) : [];
-				check(this.stopping.signal);
-				if (agents.some((agent) => !agent.paneId)) throw new Error("Herdr returned an incomplete agent listing");
-				const named = new Map(agents.flatMap((agent) => agent.name ? [[agent.name, agent] as const] : []));
-				const unnamedPanes = new Set(agents.filter((agent) => !agent.name).map((agent) => agent.paneId));
+				const listings = new Map<string, Promise<HerdrAgentRef[] | undefined>>();
 				for (const { agent, run } of runs) {
 					// A durable close intent owns settlement, including when closePane killed its caller.
 					if (agent.paneClose) continue;
+					const client = this.clientOf(agent);
+					if (!client) continue;
+					if (!(await renew())) break;
+					const agents = await this.listing(listings, agent, async () => complete(await client.listAgents(this.stopping.signal)));
+					check(this.stopping.signal);
+					if (!agents) {
+						if (this.sessionGone(agent)) observations.push({ ref: { agentId: run.agentId, runId: run.runId }, alive: false, seen: run });
+						continue;
+					}
+					const named = new Map(agents.flatMap((item) => item.name ? [[item.name, item] as const] : []));
+					const unnamedPanes = new Set(agents.filter((item) => !item.name).map((item) => item.paneId));
 					// A live conversation can move and be renamed without losing its run or binding.
 					const presence = agents.some((item) => item.session !== undefined && sameSession(item.session, agent))
 						? "alive" : agentPresence(agent, named.get(agent.herdrName));
@@ -331,43 +366,87 @@ export class HerdrRunner {
 					if (presence === "unknown" || (presence === "dead" && unnamedPanes.has(agent.paneId))) continue;
 					let alive = presence === "alive";
 					if (!alive) {
-						// Another session's agent is simply invisible here, so leave its owner room to win the lease.
-						if (!this.owns(agent)) { skipped.add(agent.herdrSession!); continue; }
-						if (this.machine && !(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) break;
-						try { alive = await this.stillPresent(agent); }
+						// Its two calls together can take nearly a whole lease.
+						if (!(await renew(true))) break;
+						try { alive = await this.stillPresent(agent, client); }
 						catch { continue; }
-						if (this.machine && !(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) break;
+						if (!(await renew())) break;
 					}
 					observations.push({ ref: { agentId: run.agentId, runId: run.runId }, alive, seen: run });
 				}
-				if (candidates.length) await this.reap(token, claimedAt);
-				await this.store.finishMaintenance(token, observations, this.now(), reservation());
-				for (const { agent } of runs) if (agent.runtime === "claude-code") await this.serviceClaude(agent.id, this.stopping.signal);
+				if (candidates.length) await this.reap(token, renew, listings);
+				await this.store.finishMaintenance(token, observations, this.now());
+				for (const { agent } of runs) if (agent.runtime === "claude-code" && !this.sessionsDown.has(sessionOf(agent))) await this.serviceClaude(agent.id, this.stopping.signal);
 				if (await this.store.tryPlacementLock(token)) {
 					try { await this.recoverLaunches(); }
 					finally { await this.store.releasePlacementLock(token); }
 				}
 			} catch (error) {
 				// Liveness observed before a failed reap still settles, so one bad candidate cannot hold every run open.
-				await this.store.finishMaintenance(token, observations, this.now(), reservation());
+				await this.store.finishMaintenance(token, observations, this.now());
 				throw error;
 			}
 		})()).finally(() => { this.maintenance = undefined; });
 		return this.maintenance;
 	}
 
-	/** A store can be shared by Herdr servers that cannot see each other's panes. Untagged records predate this. */
-	private owns(agent: AgentRecord): boolean {
-		return agent.herdrSession === undefined || agent.herdrSession === this.herdrSession;
+	/**
+	 * Sessions on a machine share one store but not panes, and their pane IDs and names repeat. Every action on a
+	 * record therefore goes to its own session. A saved machine exposes one session; that machine's runners settle the rest.
+	 */
+	private clientOf(item: { herdrSession?: string }): HerdrClient | undefined {
+		const session = sessionOf(item);
+		if (session === this.herdrSession) return this.deps.client;
+		if (this.machine || !this.deps.client.forSession) return undefined;
+		let client = this.sessionClients.get(session);
+		if (!client) this.sessionClients.set(session, client = this.deps.client.forSession(session));
+		return client;
+	}
+
+	private hostOf(record: AgentRecord): HerdrClient {
+		const client = this.clientOf(record);
+		if (!client) throw new Error(`Agent ${record.id} belongs to Herdr session ${sessionOf(record)}, which this runner cannot reach. Use it from there.`);
+		return client;
+	}
+
+	/**
+	 * One listing per session per pass. Another session's failure leaves its agents unknown instead of stopping
+	 * the pass; this session's failure still stops it, because this process's own server must answer.
+	 */
+	private listing<T>(cache: Map<string, Promise<T | undefined>>, item: { herdrSession?: string }, read: () => Promise<T>): Promise<T | undefined> {
+		const session = sessionOf(item);
+		let listed = cache.get(session);
+		if (listed) return listed;
+		listed = (async () => {
+			try {
+				const value = await read();
+				this.sessionsDown.delete(session);
+				return value;
+			} catch (error) {
+				if (session === this.herdrSession) throw error;
+				// Only an unbroken run of this answer proves anything: any other failure leaves the session unknown.
+				if (!herdrServerDown(error)) this.sessionsDown.delete(session);
+				else if (!this.sessionsDown.has(session)) this.sessionsDown.set(session, this.now());
+				return undefined;
+			}
+		})();
+		cache.set(session, listed);
+		return listed;
+	}
+
+	/** A session that stayed down has lost its panes. */
+	private sessionGone(item: { herdrSession?: string }): boolean {
+		const since = this.sessionsDown.get(sessionOf(item));
+		return since !== undefined && this.now() - since >= SESSION_GONE_MS;
 	}
 
 	/** Failing a run is permanent, so one listing that omits an agent is not enough. */
-	private async stillPresent(agent: AgentRecord): Promise<boolean> {
+	private async stillPresent(agent: AgentRecord, client = this.hostOf(agent)): Promise<boolean> {
 		const signal = this.stopping.signal;
 		// Only the agent's own session counts: a name can be reused by another pane.
-		const named = await this.deps.client.getAgent(agent.herdrName, signal);
+		const named = await client.getAgent(agent.herdrName, signal, true);
 		if (named?.session !== undefined && sameSession(named.session, agent)) return true;
-		const pane = await this.deps.client.getPane?.(agent.paneId, signal);
+		const pane = await client.getPane?.(agent.paneId, signal);
 		return pane?.session !== undefined && sameSession(pane.session, agent);
 	}
 
@@ -406,12 +485,18 @@ export class HerdrRunner {
 		const value = await this.read(ref);
 		if (isTerminal(value.phase) || !value.deadline) return;
 		const record = await this.resolve(ref.agentId);
-		if (record.paneClose || !this.owns(record)) return;
-		// Unknown liveness is not proof of pane death. The CLI adapter throws for transport errors.
-		const namedPresence = agentPresence(record, await this.deps.client.getAgent(record.herdrName));
-		const sessionAlive = namedPresence === "dead" && (await this.deps.client.listAgents()).some((item) => item.paneId && item.session !== undefined && sameSession(item.session, record));
-		if (namedPresence === "dead" && !sessionAlive && !(await this.stillPresent(record))) await this.store.recordPaneClosed(ref, this.now());
-		else await this.store.expireUnacceptedRun(ref, this.now());
+		const client = this.clientOf(record);
+		if (record.paneClose || !client) return;
+		// Maintenance decides for a stopped session once it has stayed down.
+		try {
+			// Unknown liveness is not proof of pane death. The CLI adapter throws for transport errors.
+			const namedPresence = agentPresence(record, await client.getAgent(record.herdrName));
+			const sessionAlive = namedPresence === "dead" && (await client.listAgents()).some((item) => item.paneId && item.session !== undefined && sameSession(item.session, record));
+			if (namedPresence === "dead" && !sessionAlive && !(await this.stillPresent(record, client))) await this.store.recordPaneClosed(ref, this.now());
+			else await this.store.expireUnacceptedRun(ref, this.now());
+		} catch (error) {
+			if (sessionOf(record) === this.herdrSession || !herdrServerDown(error)) throw error;
+		}
 	}
 
 	close(): Promise<void> {
@@ -552,7 +637,6 @@ export class HerdrRunner {
 
 	/** Placement lock covers the terminal-run CAS, pane effects, and publication of the follow-up run. */
 	private async coldResume(record: AgentRecord, signal: AbortSignal, caller?: ResumeCaller): Promise<void> {
-		if (!this.owns(record)) throw new Error(`Agent ${record.id} belongs to Herdr session ${record.herdrSession ?? "default"}. Resume it from there.`);
 		await this.assertColdResumeAllowed(record.id);
 		if (!(await this.store.coldResumeReady(record.id))) throw new Error(`Agent ${record.id} is no longer running and cannot resume cold: its saved session or working directory is unavailable, or this conversation was stopped.`);
 		if (record.runtime === "claude-code" && !this.deps.client.startClaude) throw new Error("The Herdr client does not support Claude Code launches.");
@@ -651,26 +735,38 @@ export class HerdrRunner {
 	}
 
 	/** External closes stay inside both the placement lock and the maintenance lease. */
-	private async reap(token: string, claimedAt: number): Promise<void> {
+	private async reap(token: string, renew: (always?: boolean) => Promise<boolean>, listings: Map<string, Promise<HerdrAgentRef[] | undefined>>): Promise<void> {
 		await this.withPlacement(async () => {
 			if (!(await this.store.lifecycleAllowed())) return;
 			if (!(await this.store.maintenanceValid(token, this.now()))) return;
-			const panes = await this.deps.client.listPanes({ signal: this.stopping.signal });
-			if (panes.some((pane) => !pane.paneId)) throw new Error("Herdr returned an incomplete pane listing");
 			const records = await this.store.listAgents();
-			// Finished records stay candidates, so a pass grows with history until it outlasts one lease.
-			let renewedAt = claimedAt;
+			let inventory: SessionInventory | undefined;
 			for (const { agent, run } of await this.store.lifecycleCandidates()) {
 				check(this.stopping.signal);
-				if (!agent.paneClose && (agent.paneState === "parked" || !agent.cwd)) continue;
 				// Local Herdr calls normally take milliseconds. A machine's next call may take nearly a whole lease.
-				if (this.machine || this.now() - renewedAt >= LEASE_RENEWAL_MS) {
-					if (!(await this.store.maintenanceValid(token, this.now(), this.maintenanceLeaseMs))) return;
-					renewedAt = this.now();
+				if (!(await renew(!!this.machine))) return;
+				if (sessionOf(agent) !== this.herdrSession) {
+					// A session's own runners close its panes. From here, only a stopped session needs settling.
+					const client = this.clientOf(agent);
+					if (client && !(await this.listing(listings, agent, async () => complete(await client.listAgents(this.stopping.signal))))
+						&& this.sessionGone(agent) && (isTerminal(run.phase) || agent.paneClose)) await this.settleClosed(agent, run);
+					continue;
+				}
+				// Taken inside the placement lock, where nothing can reopen an agent underneath it.
+				if (!inventory) {
+					if (!(await renew(true))) return;
+					const agents = await this.deps.client.listAgents(this.stopping.signal);
+					const panes = await this.deps.client.listPanes({ signal: this.stopping.signal });
+					inventory = { items: complete([...agents, ...panes]), panes };
 				}
 				if (agent.paneClose && !(await this.recoverPaneClose(agent, token))) continue;
 				const closeWhenDone = agent.closeWhenDone ?? (agent.idleCloseSeconds !== 0 && (this.deps.closeWhenDone ?? true));
-				if (agent.paneState === "parked" || !agent.cwd) continue;
+				if (agent.paneState || !agent.cwd) continue;
+				// A pane is closed only on proof it hosts this session, so a record absent from the inventory costs no calls.
+				if (!inventory.items.some((item) => item.session !== undefined && sameSession(item.session, agent))) {
+					if (isTerminal(run.phase) && this.now() - run.updatedAt >= DONE_SETTLE_MS && departed(agent, inventory)) await this.settleClosed(agent, run);
+					continue;
+				}
 				const ownerGone = await this.ownerDeparted(agent, records, this.stopping.signal);
 				// Closing active Claude is cancellation, which permanently destroys resumability. Preserve it.
 				if (ownerGone && agent.runtime === "claude-code" && !isTerminal(run.phase)) continue;
@@ -678,7 +774,7 @@ export class HerdrRunner {
 				const named = await this.deps.client.getAgent(agent.herdrName, this.stopping.signal);
 				// An explicit matching session is required for destructive effects; same-pane inference is insufficient.
 				if (!named?.paneId || named.session === undefined || agentPresence(agent, named) !== "alive") continue;
-				const pane = panes.find((item) => item.paneId === named.paneId);
+				const pane = inventory.panes.find((item) => item.paneId === named.paneId);
 				if (!pane) continue;
 				if (pane.focused === true || ["working", "blocked"].includes(named.status ?? "")) {
 					await this.store.notePaneActivity({ agentId: agent.id, runId: run.runId }, this.now());
@@ -734,6 +830,14 @@ export class HerdrRunner {
 				}
 			}
 		}, this.stopping.signal);
+	}
+
+	/** The pane is gone, so nothing remains to watch or close, and the record leaves later passes. */
+	private async settleClosed(agent: AgentRecord, run: RunSnapshot): Promise<void> {
+		const ref = { agentId: agent.id, runId: run.runId };
+		if (agent.paneClose?.ownerGone) await this.store.closeOwnedAgent(ref, agent.paneClose.paneId, this.now());
+		else if (agent.paneClose) await this.store.parkAgent(ref, agent.paneClose.paneId, this.now());
+		else await this.store.markPaneMissing(ref, agent.paneId, this.now());
 	}
 
 	private async managedCaller(caller: ResumeCaller): Promise<AgentRecord | undefined> {
@@ -821,15 +925,17 @@ export class HerdrRunner {
 	private async serviceClaude(agentId: string, signal?: AbortSignal): Promise<void> {
 		const binding = await this.store.claudeBinding(agentId);
 		if (!binding || isTerminal(binding.run.phase)) return;
+		const client = this.clientOf(binding.agent);
+		if (!client) return;
 		if (binding.run.cancelRequested) {
 			// Closing the owned pane is an explicit, confirmed stop; Esc alone is not execution evidence.
 			await this.withPlacement(async () => {
 				if (isTerminal((await this.read(binding.run)).phase)) return;
 				// Close the agent where it is now. An exited agent has nothing to stop, and its old pane may host another process.
-				const named = await this.deps.client.getAgent(binding.agent.herdrName, signal);
+				const named = await client.getAgent(binding.agent.herdrName, signal);
 				const presence = agentPresence(binding.agent, named);
 				if (presence === "unknown") throw new Error(`Cannot cancel ${agentId}: Herdr agent ${binding.agent.herdrName} is in pane ${named!.paneId}, not ${binding.agent.paneId}, and reports no session to confirm it.`);
-				if (presence === "alive") await this.deps.client.closePane(named!.paneId!);
+				if (presence === "alive") await client.closePane(named!.paneId!);
 				await this.store.recordPaneClosed(binding.run, this.now());
 			}, signal ?? this.stopping.signal);
 			return;
@@ -839,7 +945,7 @@ export class HerdrRunner {
 		try {
 			// Target the verified pane: the name alone could reach another process that took it.
 			const paneId = await this.locate(binding.agent, signal);
-			await this.deps.client.promptAgent!(paneId, claudePrompt(command), signal);
+			await client.promptAgent!(paneId, claudePrompt(command), signal);
 			await this.store.commandDelivered(command, binding.token);
 		} catch (error) {
 			// Cancellation wins even before execution confirmation: close the owned pane
@@ -861,7 +967,7 @@ export class HerdrRunner {
 
 	/** The pane currently hosting this agent. Throws unless Herdr proves it is the launched process. */
 	private async locate(record: AgentRecord, signal?: AbortSignal): Promise<string> {
-		const named = await this.deps.client.getAgent(record.herdrName, signal);
+		const named = await this.hostOf(record).getAgent(record.herdrName, signal);
 		const presence = agentPresence(record, named);
 		if (presence === "dead") throw new Error(`Agent ${record.id} is no longer running in Herdr pane ${record.paneId}.`);
 		if (presence === "unknown") throw new Error(`Herdr agent ${record.herdrName} is now in pane ${named!.paneId}, not ${record.paneId}, and Herdr reports no session to confirm it is the same agent.`);
@@ -900,7 +1006,8 @@ export class HerdrRunner {
 		try { panes = await this.deps.client.listPanes({ workspaceId: request.workspaceId, signal }); }
 		catch { check(signal); return fresh; }
 		check(signal);
-		const launches = await this.store.launches();
+		// Another session's tab and pane IDs mean nothing here, and its agents are invisible to this client.
+		const launches = (await this.store.launches()).filter((launch) => sessionOf(launch) === this.herdrSession);
 		check(signal);
 		// Fill the caller's tab first, counting all physical panes and unpublished reservations.
 		if (request.tabId && panes.some((pane) => pane.tabId === request.tabId && pane.paneId === request.paneId)) {
@@ -956,18 +1063,20 @@ export class HerdrRunner {
 		if (!(await this.store.lifecycleAllowed())) return;
 		for (const pending of await this.store.recoverableLaunches()) {
 			if (pending.owner === this.owner || pending.stage === "published" || pending.stage === "closed" || pending.stage === "ambiguous") continue;
+			const client = this.clientOf(pending);
+			if (!client) continue;
 			if (ownerAlive(pending.owner) && !(await this.store.ownerRetired(pending.owner))) continue;
 			if (!(await this.store.claimLaunchRecovery(pending, pending.owner, this.owner, this.now()))) continue;
 			if (!(await this.store.lifecycleAllowed())) return;
-			await this.cleanup(pending, pending.paneId, "Launch interrupted before task publication", false);
+			await this.cleanup(pending, pending.paneId, "Launch interrupted before task publication", false, undefined, client);
 		}
 	}
 
-	private async cleanup(ref: RunRef, paneId: string | undefined, error: string, stopped: boolean, creationIssued?: boolean): Promise<string> {
+	private async cleanup(ref: RunRef, paneId: string | undefined, error: string, stopped: boolean, creationIssued?: boolean, client = this.deps.client): Promise<string> {
 		const pending = (await this.store.launches()).find((item) => item.runId === ref.runId)!;
 		if (paneId) {
 			await this.store.recordLaunch(ref, this.owner, "cleanup", { paneId, error }, this.now());
-			try { await this.deps.client.closePane(paneId); }
+			try { await client.closePane(paneId); }
 			catch (closeError) {
 				const failure = `${error}. Cleanup failed for pane ${paneId}: ${message(closeError)}. The pane may still be live; the reservation is retained.`;
 				await this.store.recordLaunch(ref, this.owner, "cleanup", { error: failure }, this.now());

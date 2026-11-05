@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHerdrCli, findHerdrMachine, listHerdrMachines, type HerdrAgentRef, type HerdrClient, type HerdrMachine } from "./client.ts";
+import { createHerdrCli, findHerdrMachine, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrMachine } from "./client.ts";
 import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
 import { createBackendController, type HerdrBackendHandle } from "./backend.ts";
 export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "./backend.ts";
@@ -94,7 +94,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const savedMachines = machineGuidance(profiles);
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
-		const getRunner = () => runner ??= new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone, herdrSession: deps.env.HERDR_SESSION });
+		const getRunner = () => runner ??= new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone, herdrSession: herdrSessionName(deps.env) });
 		/** One runner, and one SSH store channel, per saved machine used by this session. */
 		const machines = new Map<string, Promise<HerdrRunner>>();
 		const machineRunners = new Map<string, HerdrRunner>();
@@ -110,7 +110,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine, closeWhenDone: settings.closeWhenDone }));
+				const connected = deps.machineChannel(machine).then((channel) => new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine), channel, machine, herdrSession: pickHerdrMachine(profiles, machine)?.session, closeWhenDone: settings.closeWhenDone }));
 				pending = connected.then(async (opened) => {
 					// Refuse a mismatched package before any launch or owner retirement runs on that store.
 					// An unverified store is closed without retiring anything: its operations are not established.

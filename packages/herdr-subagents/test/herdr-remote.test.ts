@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { findHerdrMachine, machinesFromList, tabFromCreate, panesFromList, type HerdrClient } from "../src/herdr/client.ts";
+import { createHerdrCli, findHerdrMachine, herdrServerDown, herdrSessionName, HerdrCliError, machinesFromList, pickHerdrMachine, tabFromCreate, panesFromList, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger } from "../src/herdr/child.ts";
 import { createHerdrSubagents, machineGuidance, remoteWorkerEntry, samePath } from "../src/herdr/extension.ts";
 import { HerdrRunner, qualifiedAgentId, splitAgentId } from "../src/herdr/runner.ts";
@@ -135,7 +135,7 @@ test("machine listings and remote placement facts are parsed", () => {
 	assert.deepEqual(machinesFromList([
 		{ id: "m1", label: "laptop", target: "ssh://aim@laptop:2222", session: "default", enabled: true, selected: false },
 		{ id: "broken" },
-	]), [{ id: "m1", label: "laptop", target: "ssh://aim@laptop:2222", enabled: true }]);
+	]), [{ id: "m1", label: "laptop", target: "ssh://aim@laptop:2222", enabled: true, session: "default" }]);
 	assert.throws(() => machinesFromList({}), /array/);
 	assert.deepEqual(tabFromCreate({ result: { tab: { tab_id: "w2:t3", workspace_id: "w2" }, root_pane: { pane_id: "w2:p4" } } }), { tabId: "w2:t3", paneId: "w2:p4", workspaceId: "w2" });
 	assert.deepEqual(panesFromList({ result: { panes: [{ pane_id: "w2:p4", tab_id: "w2:t3", workspace_id: "w2", cwd: "/x" }] } }), [{ paneId: "w2:p4", tabId: "w2:t3", workspaceId: "w2", cwd: "/x" }]);
@@ -178,7 +178,7 @@ test("a remote package with another protocol is refused before any launch, with 
 	const ctx = { cwd: PROJECT, sessionManager: { getSessionFile: () => undefined } };
 	const launch = (machine: string) => tools[0].execute("call", { prompt: "x", description: "x", subagent_type: "Explore", machine, machine_cwd: PROJECT }, undefined, undefined, ctx);
 	await assert.rejects(launch("old"), /old runs an older Herdr subagent runner\. Update herdr-subagents .* on old/);
-	await assert.rejects(launch("behind"), /behind speaks remote protocol 1; this machine speaks 3\. Update herdr-subagents .* on behind/);
+	await assert.rejects(launch("behind"), /behind speaks remote protocol 1; this machine speaks 4\. Update herdr-subagents .* on behind/);
 	await assert.rejects(launch("ahead"), /Update herdr-subagents .* on this machine/);
 	assert.deepEqual(operations, ["remoteProtocol", "remoteProtocol", "remoteProtocol"]);
 });
@@ -309,7 +309,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" },
 		machineClient: (machine) => { assert.equal(machine, "laptop"); return remote.client; },
 		listMachines: async () => [
-			{ id: "m1", label: "laptop", target: "aim@lappy.local", enabled: true },
+			{ id: "m1", label: "laptop", target: "aim@lappy.local", enabled: true, session: "jobs" },
 			{ id: "m2", label: "old", target: "old", enabled: false },
 		],
 		machineChannel: async () => {
@@ -342,6 +342,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		t.after(() => laptop.close());
 		const record = (await laptop.findAgent("explore"))!;
 		assert.equal(record.parentPaneId, "desk/w1:p1");
+		assert.equal(record.herdrSession, "jobs", "the saved profile names the session its panes open in");
 		assert.equal(record.instructions, "Only read the build log.");
 		assert.deepEqual(record.allowedTools, ["read"]);
 		assert.ok(record.sessionFile.startsWith(remoteRoot));
@@ -511,4 +512,52 @@ test("shutdown is not held by a reconnect whose owner retirement stalls", { time
 	const shutdown = handlers.get("session_shutdown")!({ reason: "quit" });
 	const outcome = await Promise.race([shutdown.then(() => "closed"), new Promise((resolve) => setTimeout(resolve, 8000, "hung"))]);
 	assert.equal(outcome, "closed");
+});
+
+test("a process finds its Herdr session from the socket it was given", () => {
+	assert.equal(herdrSessionName({}), "default");
+	assert.equal(herdrSessionName({ HERDR_SESSION: "work" }), "work");
+	assert.equal(herdrSessionName({ HERDR_SOCKET_PATH: "/home/me/.config/herdr/herdr.sock" }), "default");
+	assert.equal(herdrSessionName({ HERDR_SOCKET_PATH: "/home/me/.config/herdr/sessions/hermes-jobs/herdr.sock" }), "hermes-jobs");
+	assert.equal(herdrSessionName({ HERDR_SOCKET_PATH: "C:\\Users\\me\\herdr\\sessions\\hermes-jobs\\herdr.sock" }), "hermes-jobs");
+	assert.equal(herdrSessionName({ HERDR_SOCKET_PATH: "/custom.sock", HERDR_SESSION: "work" }), "default", "Herdr uses the socket over the inherited name");
+});
+
+test("a saved machine resolves by ID before label, like Herdr", () => {
+	const machines = [
+		{ id: "m1", label: "m2", target: "a", enabled: true, session: "alpha" },
+		{ id: "m2", label: "b", target: "b", enabled: true, session: "default" },
+		{ id: "m3", label: "twin", target: "c", enabled: true },
+		{ id: "m4", label: "twin", target: "d", enabled: true },
+	];
+	assert.equal(pickHerdrMachine(machines, "m2")?.session, "default");
+	assert.equal(pickHerdrMachine(machines, "b")?.id, "m2");
+	assert.equal(pickHerdrMachine(machines, "twin"), undefined);
+});
+
+test("another session is reached by name, and a saved machine offers only its own", () => {
+	assert.equal(createHerdrCli({}, undefined, "lappy").forSession, undefined);
+	assert.ok(createHerdrCli({}).forSession);
+	assert.equal(herdrServerDown(new HerdrCliError("stopped", "server_not_running")), true);
+	assert.equal(herdrServerDown(new HerdrCliError("gone", "agent_not_found")), false);
+});
+
+test("a bounded agent lookup gives up like a listing", { timeout: 20_000 }, async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-bounded-get-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const bin = join(dir, "herdr");
+	writeFileSync(bin, "#!/bin/sh\nexec sleep 6\n", { mode: 0o755 });
+	const started = Date.now();
+	await assert.rejects(createHerdrCli({ ...process.env, HERDR_BIN_PATH: bin }).getAgent("slow", undefined, true));
+	assert.ok(Date.now() - started < 4000, "a five-second lease survives it");
+});
+
+test("another session's commands name it", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-session-cli-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const bin = join(dir, "herdr");
+	const trace = join(dir, "trace");
+	writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${trace}"\necho '{"result":{"agents":[]}}'\n`, { mode: 0o755 });
+	await createHerdrCli({ ...process.env, HERDR_BIN_PATH: bin }).forSession!("jobs").listAgents();
+	assert.equal(readFileSync(trace, "utf8").trim(), "--session jobs agent list");
 });

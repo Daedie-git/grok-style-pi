@@ -27,7 +27,7 @@ export const register: Register = on => {
     const home = await $.env.get('HOME')
     const pane = await $.env.get('HERDR_PANE_ID')
     // The launcher's owner name: SIDECAR_AGENT, else sc-<pane id, lowercased, ':' as '-'>.
-    const owner = (await $.env.get('SIDECAR_AGENT')) ?? (pane ? `sc-${pane.toLowerCase().replace(/:/g, '-')}` : undefined)
+    const owner = (await $.env.get('SIDECAR_AGENT')) || (pane ? `sc-${pane.toLowerCase().replace(/:/g, '-')}` : undefined)
     if (!home || !owner) return result
     const dir = `${home}/.cache/claude-sidecar`
     const pattern = new RegExp(`^${owner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:-(\\d+))?\\.request\\.json$`)
@@ -56,7 +56,8 @@ export const register: Register = on => {
           slot,
           role: await text(`${name}.role`, 'reviewer'),
           agent: await text(`${name}.agent`, 'pi'),
-          machine: await text(`${name}.machine`, 'local'),
+          // The binding's first line is the machine; a second may hold the remote checkout.
+          machine: (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local',
           kind: request.id?.split('-')[2] ?? 'request',
           started: request.started ?? 0,
           waiting,

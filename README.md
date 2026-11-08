@@ -50,7 +50,7 @@ Add `--machine NAME` to launch on a saved Herdr machine. On Windows, the launche
 
 ## Band above the prompt
 
-A function-hooks module (`hooks/band.tsx`) draws a band above Claude Code's prompt with one row per slot of this pane, coloured by role (reviewers red, implementers blue, researchers green, explorers yellow), that is running a request or waiting on an answer: slot, role, backend, machine, request kind and elapsed time. It reads the launcher's state in `~/.cache/claude-sidecar` every 3 seconds and needs a Claude Code version with function hooks.
+A function-hooks module (`hooks/band.tsx`) draws a band above Claude Code's prompt with one row per slot of this pane, coloured by role (reviewers red, implementers blue, researchers green, explorers yellow), that is running a request or waiting on an answer: slot, role, backend, machine, request kind and elapsed time. It reads the launcher's state in `~/.cache/claude-sidecar` every 3 seconds and needs a Claude Code version with function hooks. `claude plugin test .` runs its tests in `tests/band/`.
 
 ## Blocked questions
 

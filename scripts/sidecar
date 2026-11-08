@@ -2,7 +2,7 @@
 # shellcheck disable=SC2016  # remote scripts are single-quoted on purpose: the machine expands them
 # Persistent review sidecars, hosted in Herdr panes beside Claude.
 #
-#   sidecar [--slot N] [--role reviewer|implementer|researcher] [--agent pi|claude] [--profile-file FILE] [--machine NAME [--remote-cwd DIR]] COMMAND
+#   sidecar [--slot N] [--role reviewer|implementer|researcher|explorer] [--agent pi|claude] [--profile-file FILE] [--machine NAME [--remote-cwd DIR]] COMMAND
 #                                --profile-file binds a resolved version 1 Fleet role profile to a fresh pi conversation
 #                                select an independent persistent sidecar (default 1), optionally on a saved herdr
 #                                machine (herdr 0.9.1+); a slot stays on the machine it started on
@@ -312,7 +312,7 @@ resolve_role() {
   if [[ -f $file ]]; then saved=$(<"$file"); fi
   # A fresh conversation may bind a new Fleet role without adopting old role context.
   if [[ -n $PROFILE_JSON && -f "$STATE_DIR/$(agent_name).profile-fresh" ]]; then saved=; fi
-  [[ -z $saved || $saved == reviewer || $saved == implementer || $saved == researcher ]] || die "invalid slot role in $file"
+  [[ -z $saved || $saved == @(reviewer|implementer|researcher|explorer) ]] || die "invalid slot role in $file"
   if [[ -n $saved && -n $ROLE_ARG && $saved != "$ROLE_ARG" ]]; then
     die "slot is already a $saved; use a new slot for $ROLE_ARG"
   fi
@@ -493,7 +493,7 @@ resolve_machine() {
     # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files: a Windows checkout
     # holds them with CRLF endings, and rewriting identical content dirties it and blocks sync-machine.
     local runtime_file
-    for runtime_file in sidecar.ts reviewer.md profile.md implementer.md researcher.md reload.mjs windows-runtime.mjs; do
+    for runtime_file in sidecar.ts reviewer.md profile.md implementer.md researcher.md explorer.md reload.mjs windows-runtime.mjs; do
       remote_node 'const dest=args[0],data=fs.readFileSync(0),lf=b=>b.toString("utf8").replace(/\r\n/g,"\n");fs.mkdirSync(path.dirname(dest),{recursive:true});
         if(!fs.existsSync(dest)||lf(fs.readFileSync(dest))!==lf(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
     done
@@ -503,7 +503,7 @@ resolve_machine() {
   local home info status=0
   info=$(remote 'agent_home=${1:-"$HOME/$3"}
     printf "%s\n%s\n" "$HOME" "$agent_home"
-    test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" && test -f "$agent_home/implementer.md" && test -f "$agent_home/researcher.md" || exit 11
+    test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" && test -f "$agent_home/implementer.md" && test -f "$agent_home/researcher.md" && test -f "$agent_home/explorer.md" || exit 11
     test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" "$runtime_relative" </dev/null) || status=$?
   home=${info%%$'\n'*}
   AGENT_HOME=${info#*$'\n'}
@@ -2800,7 +2800,7 @@ while [[ ${1:-} == --* ]]; do
       SLOT=$2
       SLOT_ARG=$2 ;;
     --role)
-      [[ ${2:-} == reviewer || ${2:-} == implementer || ${2:-} == researcher ]] || die "--role requires reviewer, implementer or researcher"
+      [[ ${2:-} == @(reviewer|implementer|researcher|explorer) ]] || die "--role requires reviewer, implementer, researcher or explorer"
       ROLE_ARG=$2 ;;
     --agent)
       [[ ${2:-} == pi || ${2:-} == claude ]] || die "--agent requires pi or claude"

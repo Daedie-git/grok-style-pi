@@ -1300,13 +1300,15 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("Claude's implementer sidecar", claude)
         self.assertNotIn('be adversarial', claude.lower())
 
-    def test_researcher_runs_sol_medium_with_its_own_prompt(self):
-        self.run_cli('--slot', '2', '--role', 'researcher', 'start')
-        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
-        self.assertEqual(start[start.index('--model') + 1], 'openai-codex/gpt-6.1-sol')
-        self.assertEqual(start[start.index('--thinking') + 1], 'medium')
-        prompts = [Path(start[i + 1]).name for i, flag in enumerate(start) if flag == '--append-system-prompt']
-        self.assertEqual(prompts, ['profile.md', 'researcher.md'])
+    def test_researcher_and_explorer_run_sol_medium_with_their_own_prompts(self):
+        for slot, role in (('2', 'researcher'), ('3', 'explorer')):
+            self.run_cli('--slot', slot, '--role', role, 'start')
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        for start, role in zip(starts, ('researcher', 'explorer')):
+            self.assertEqual(start[start.index('--model') + 1], 'openai-codex/gpt-6.1-sol')
+            self.assertEqual(start[start.index('--thinking') + 1], 'medium')
+            prompts = [Path(start[i + 1]).name for i, flag in enumerate(start) if flag == '--append-system-prompt']
+            self.assertEqual(prompts, ['profile.md', role + '.md'])
         self.run_cli('--slot', '2', 'ask', 'Where is X handled?')
         self.assertNotIn('Completion contract', self.request_text('ask'))
 
@@ -1388,7 +1390,7 @@ class LauncherTests(unittest.TestCase):
     def test_invalid_role_is_rejected(self):
         result = self.run_cli('--role', 'writer', 'start', check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn('--role requires reviewer, implementer or researcher', result.stderr)
+        self.assertIn('--role requires reviewer, implementer, researcher or explorer', result.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_legacy_live_reviewer_cannot_become_implementer(self):

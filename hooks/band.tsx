@@ -8,8 +8,9 @@ const now = atom({ plugin: 'claude-sidecar', key: 'now' } as const, 0)
 
 const POLL_MS = 3000
 
-// Claude Code's subagent red for reviewers, blue for implementers.
-const roleColor = (role: string) => (role === 'implementer' ? '#2563eb' : '#dc2626')
+// Claude Code's subagent red for reviewers, blue for implementers, green for researchers.
+const ROLE_COLORS: Record<string, string> = { implementer: '#2563eb', researcher: '#16a34a' }
+const roleColor = (role: string) => ROLE_COLORS[role] ?? '#dc2626'
 
 function elapsed(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds))

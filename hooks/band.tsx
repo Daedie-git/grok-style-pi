@@ -56,7 +56,7 @@ export const register: Register = on => {
         if (!match) continue
         const slot = match[1] ?? '1'
         const name = slot === '1' ? owner : `${owner}-${slot}`
-        let request: { id?: string; started?: number; finished?: number }
+        let request: { id?: string; started?: number; finished?: number; machine?: string }
         try {
           request = JSON.parse(await text(entry.name, '{}'))
         } catch {
@@ -69,8 +69,8 @@ export const register: Register = on => {
           slot,
           role: await text(`${name}.role`, 'reviewer'),
           agent: await text(`${name}.agent`, 'pi'),
-          // The binding's first line is the machine; a second may hold the remote checkout.
-          machine: (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local',
+          // The launcher records a remote machine's label; the binding's first line is its id (or 'local').
+          machine: request.machine || (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local',
           kind: request.id?.split('-')[2] ?? 'request',
           started: request.started ?? 0,
           waiting,

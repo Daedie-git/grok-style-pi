@@ -3098,6 +3098,14 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
         self.assertNotIn('off', text)
         self.assertEqual(self.calls(), [])
 
+    def test_remote_request_records_the_machine_label(self):
+        self.add_machines()
+        self.remote_run('--slot', '2', '--machine', 'laptop', 'ask', 'Task')
+        state = json.loads((self.home / '.cache/claude-sidecar/sc-pane-1-2.request.json').read_text())
+        self.assertEqual(state['machine'], 'laptop')
+        self.run_cli('ask', 'Local task')
+        self.assertNotIn('machine', json.loads((self.home / '.cache/claude-sidecar/sc-pane-1.request.json').read_text()))
+
     def test_remote_implementer_defaults_to_medium(self):
         self.add_machines()
         self.remote_run('--slot', '2', '--role', 'implementer', '--machine', 'laptop', 'start')

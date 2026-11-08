@@ -1413,8 +1413,9 @@ request() {
   echo "# Sidecar report ($saved_report)"
   ACTIVE_REQUEST="$STATE_DIR/$name.request.json"
   state_tmp=$(mktemp "$ACTIVE_REQUEST.XXXXXX")
-  jq -n --arg id "$id" --arg report "$saved_report" --argjson started "$(date +%s)" \
-    '{id: $id, report: $report, started: $started}' >"$state_tmp"
+  # The band shows the machine by its label.
+  jq -n --arg id "$id" --arg report "$saved_report" --argjson started "$(date +%s)" --arg machine "${MACHINE_LABEL:-}" \
+    '{id: $id, report: $report, started: $started} + (if $machine == "" then {} else {machine: $machine} end)' >"$state_tmp"
   mv -f -- "$state_tmp" "$ACTIVE_REQUEST"
   prompt_path=$req
   if [[ -n $MACHINE ]]; then

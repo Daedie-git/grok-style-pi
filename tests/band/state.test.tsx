@@ -34,3 +34,15 @@ test('an empty SIDECAR_AGENT must use the same pane fallback as the launcher', a
   try { expect((await ui.find({type:'Text',text:/sidecar 1/}))?.text).toMatch(/sidecar 1/) }
   finally { await ui.unmount() }
 })
+
+test('a remote request shows its machine label, not the binding id', async ($, on) => {
+  records['sc-pane-1.request.json'] = '{"id":"20261108-215750-ask-sc-pane-1.x","started":1,"machine":"lappy"}'
+  setup(on, undefined)
+  await $.session.start({cwd:'/',surface:'terminal',isInteractive:true})
+  const ui = await mount($)
+  try { expect((await ui.find({type:'Text',text:/ @ lappy/}))?.text).toMatch(/@ lappy/) }
+  finally {
+    await ui.unmount()
+    records['sc-pane-1.request.json'] = '{"id":"20261108-215750-ask-sc-pane-1.x","started":1}'
+  }
+})

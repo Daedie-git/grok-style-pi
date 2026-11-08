@@ -48,6 +48,10 @@ After updating, run `sidecar --slot N reload` as a harness background task for e
 
 Add `--machine NAME` to launch on a saved Herdr machine. On Windows, the launcher disables Git Bash path conversion only for remote Herdr invocations, so Linux paths reach the target unchanged; local Herdr path handling and Linux launchers are unchanged.
 
+## Band above the prompt
+
+A function-hooks module (`hooks/band.tsx`) draws a band above Claude Code's prompt with one row per slot of this pane that is running a request or waiting on an answer: slot, role, backend, machine, request kind and elapsed time. It reads the launcher's state in `~/.cache/claude-sidecar` every 3 seconds and needs a Claude Code version with function hooks.
+
 ## Blocked questions
 
 A sidecar that cannot continue without a decision submits its report with `needs_answer`. After the first-line report path, the launcher prints `NEEDS_ANSWER: <question>` and exits 3; `sidecar answer TEXT` resumes the same task. Identical requests sent while one is in flight exit 4 instead of queueing. Requests have no deadline; a turn that ends without a report exits 2, and a sidecar blocked in its pane exits 5. A running sidecar loads the extension at start, so restart it (new Herdr pane or `sidecar restart` after ending the old pi) to gain `needs_answer`.

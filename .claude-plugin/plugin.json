@@ -1,8 +1,16 @@
 {
   "name": "claude-sidecar",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "description": "Persistent pi and Claude Code sidecars in Herdr.",
-  "author": { "name": "Daedie-git" },
+  "author": {
+    "name": "Daedie-git"
+  },
   "repository": "https://github.com/Daedie-git/claude-sidecar",
-  "keywords": ["review", "sidecar", "pi", "herdr"]
+  "keywords": [
+    "review",
+    "sidecar",
+    "pi",
+    "herdr"
+  ],
+  "types": "./types/index.d.ts"
 }

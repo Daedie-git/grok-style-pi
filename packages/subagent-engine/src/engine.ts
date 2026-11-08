@@ -523,10 +523,10 @@ export class Engine {
 			outcome = await this.awaitConversationReport(agentId, outcome, (extra) => settledRuns.push(extra));
 			if (settledRuns.length > 1) outcome = { ...outcome, usage: { ...outcome.usage, billable: sumUsage(settledRuns.map((run) => run.usage.billable)) } };
 			const result = truncateResult(outcome.resultText);
-			const failed = outcome.status !== "completed" && !(outcome as { foregroundRecovered?: boolean }).foregroundRecovered;
+			const failed = outcome.status !== "completed" && outcome.status !== "needs-answer" && !(outcome as { foregroundRecovered?: boolean }).foregroundRecovered;
 			const body = [result.text || "(The agent returned no text.)", outcome.note ? `\n[${outcome.note}]` : ""].join("");
 			return {
-				text: `${body}\n\nagentId: ${agentId} (use SendMessage to continue this agent)`, isError: failed && outcome.status !== "killed" ? true : undefined,
+				text: `${body}\n\n${outcome.status === "needs-answer" ? "Agent needs answer. Reply with SendMessage to this agent to resume the same child with your answer.\n" : ""}agentId: ${agentId} (use SendMessage to continue this agent)`, isError: failed && outcome.status !== "killed" ? true : undefined,
 				details: { agentId, runId: reserved.runId, status: outcome.status, classification: outcome.classification, usage: outcome.usage, background: false, resultText: result.text, error: outcome.error },
 				usage: piUsage(outcome.usage.billable),
 			};
@@ -996,6 +996,13 @@ export class Engine {
 		}
 	}
 
+	/** A child hands a decision back without failing or completing its assignment. */
+	needsAnswer(agentId: AgentId, question: string): void {
+		if (!question.trim()) throw new Error("needs_answer requires one concrete question.");
+		if (this.control.get(agentId)?.meta.isFork) throw new Error("Forks cannot ask follow-up questions.");
+		this.requireBackend().needsAnswer(agentId, question.trim());
+	}
+
 	// ---- Internals: launching and settling ----
 
 	private sessionSpec(meta: AgentMeta, definition: AgentDefinition, model: Model<any>, thinking: ThinkingLevel, background: boolean, parent?: ParentContext, extraTools: string[] = []): SessionSpec {
@@ -1091,10 +1098,10 @@ export class Engine {
 	private async afterSettle(conversation: Conversation, runId: RunId, outcome: RunOutcome, result: { text: string; truncated: boolean },
 		finalized: NonNullable<ReturnType<Control["finalize"]>>, deliveredSynchronously: boolean, stopHookAttempted: boolean): Promise<void> {
 		const meta = conversation.meta;
-		if (!stopHookAttempted && outcome.status !== "completed") await runInterruptedStopHooks(this.hookEnvironment(), meta, result.text);
+		if (!stopHookAttempted && outcome.status !== "completed" && outcome.status !== "needs-answer") await runInterruptedStopHooks(this.hookEnvironment(), meta, result.text);
 		let worktree: NoticePayload["worktree"];
 		const final = finalized.disposition === "evictable" || finalized.disposition === "stopped";
-		if (meta.worktree && final && !meta.worktreeCleanlyRemoved) {
+		if (meta.worktree && final && outcome.status !== "needs-answer" && !meta.worktreeCleanlyRemoved) {
 			// Never while parked or continuing: the conversation may still need its checkout (plan §12).
 			const cleaned = await cleanupWorktree({ ...meta.worktree, repoRoot: meta.originCwd ?? meta.cwd }).catch((cleanupError) => ({ removed: false, kept: true, reason: String(cleanupError), commits: [] as string[] }));
 			if (cleaned.removed) meta.worktreeCleanlyRemoved = true;

@@ -6,7 +6,7 @@ import { createHarness, toolResultText, until, type Harness, type Script } from 
 import { ROOT_CALLER } from "../src/engine.ts";
 import { SubagentAdapter } from "../../../src/subagents/adapter.ts";
 
-type Status = "running" | "blocked" | "completed" | "failed" | "stopped";
+type Status = "running" | "blocked" | "completed" | "failed" | "stopped" | "needs-answer";
 interface PaneRun { agentId: string; runId: string; status: Status; text: string; runtime: "pi" | "claude-code" }
 interface Ack { noticeId: string; rootHasNotice: boolean }
 
@@ -69,11 +69,11 @@ class FakeHerdr implements HerdrBackendHandle {
 	onNotice(listener: (notice: HerdrBackendNotice) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
 	paneChild() { return this.child; }
 	async acknowledge(noticeId: string) { this.acknowledgements.push({ noticeId, rootHasNotice: this.rootHasNotice() }); }
-	notice(agentId: string, status: "completed" | "failed" | "stopped" = "completed", text = "Pane notice: found src/panes.ts") {
+	notice(agentId: string, status: "completed" | "failed" | "stopped" | "needs-answer" = "completed", text = "Pane notice: found src/panes.ts") {
 		const run = this.agents.get(agentId)!;
 		run.status = status;
 		run.text = text;
-		const notice = { noticeId: `notice-${run.runId}`, agentId, runId: run.runId, phase: status, content: `Background agent ${status}: pane assignment\n\n${text}` };
+		const notice = { noticeId: `notice-${run.runId}`, agentId, runId: run.runId, phase: status, content: status === "needs-answer" ? text : `Background agent ${status}: pane assignment\n\n${text}` };
 		for (const listener of this.listeners) listener(notice);
 		return notice;
 	}
@@ -109,6 +109,30 @@ async function setup(t: TestContext, parent: Script, options: { attach?: boolean
 }
 const assignment = { backend: "pane", description: "Inspect pane code", prompt: "Inspect pane routing", name: "worker" };
 const launchScript: Script = ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: assignment }] } : { text: "Parent useful work" };
+
+test("pane needs-answer notice shows the question and SendMessage resumes the same proxy", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, launchScript);
+	const activities: { status: string }[] = [];
+	const adapter = new SubagentAdapter(harness.engine, (entry) => activities.push({ status: entry.status }));
+	t.after(() => adapter.dispose());
+	await harness.parent.prompt("Launch", { source: "extension" });
+	const proxy = firstProxy(harness);
+	const question = "Inspection complete, no edits. Choose A or B?";
+	fake.notice("pane-1", "needs-answer", question);
+	await until(() => rootNotices(harness).length === 1 && !proxy.active);
+	assert.equal(proxy.meta.runs[0].status, "needs-answer");
+	const notice = rootNotices(harness)[0];
+	assert.ok(notice.type === "custom_message" && String(notice.content).startsWith(question));
+	assert.match(JSON.stringify(notice), /Reply with SendMessage/);
+	assert.ok(activities.some((entry) => entry.status === "needs answer"));
+	await harness.engine.sendMessage({ to: "worker", message: "Choose B" }, ROOT_CALLER, "answer");
+	await until(() => fake.resumes.length === 1);
+	assert.equal(fake.resumes[0].agentId, "pane-1");
+	assert.match(fake.resumes[0].prompt, /Choose B/);
+	fake.notice("pane-1", "completed", "Used B");
+	await until(() => !proxy.active);
+	assert.equal(proxy.meta.runs.length, 2);
+});
 
 test("background pane Agent settles from a Herdr notice, persists a root notice, then acknowledges Herdr", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, launchScript);

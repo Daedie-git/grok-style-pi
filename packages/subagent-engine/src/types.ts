@@ -84,9 +84,10 @@ export interface UsageAccounting {
 
 // ---- Runs and results (plan §3, §6) ----
 
-export type RunStatus = "running" | "completed" | "failed" | "killed";
+export type RunStatus = "running" | "completed" | "failed" | "killed" | "needs-answer";
 export type KilledBy = "user" | "parent" | "session-end" | "watchdog";
 export type RunClassification =
+	| "needs-answer"
 	| "completed"
 	| "partial-max-turns"
 	| "partial-api"

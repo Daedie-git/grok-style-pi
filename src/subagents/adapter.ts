@@ -88,7 +88,7 @@ export class SubagentAdapter {
 		if (event.type === "settled") {
 			if (event.outcome.resultText && !run.activity.output.includes(event.outcome.resultText)) this.append(run, `\n${event.outcome.resultText}`);
 			if (event.outcome.error && !run.activity.output.includes(event.outcome.error)) this.append(run, `\n${event.outcome.error}`);
-			run.activity.status = event.outcome.status === "killed" ? "stopped" : event.outcome.status;
+			run.activity.status = event.outcome.status === "killed" ? "stopped" : event.outcome.status === "needs-answer" ? "needs answer" : event.outcome.status;
 			run.activity.endedAt = Date.now();
 			run.activity.stop = undefined; run.activity.transcript = undefined; run.activity.detail = undefined;
 			run.tools.clear();

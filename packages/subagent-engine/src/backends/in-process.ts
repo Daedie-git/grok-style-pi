@@ -68,6 +68,7 @@ interface RunState {
 	maxTurns?: number;
 	maxTurnsReached: boolean;
 	killedBy?: KilledBy;
+	question?: string;
 	toolsInFlight: number;
 	lastProgress: number;
 	pendingEnvelopes: Map<string, "submitted" | "persisted">;
@@ -104,6 +105,16 @@ export class InProcessBackend {
 		const child = this.live.get(agentId);
 		const state = child?.current;
 		return state ? { turns: state.turns, maxTurns: state.maxTurns, ended: child!.spec.shouldEndTurn?.() ?? false } : undefined;
+	}
+
+	/** End this run without cancelling the conversation; SendMessage can resume it with an answer. */
+	needsAnswer(agentId: AgentId, question: string): void {
+		const child = this.live.get(agentId);
+		if (!child?.current || child.current.killedBy) throw new Error("This agent has no active run.");
+		child.current.question = question;
+		child.session.clearQueue();
+		// abort waits for execution to settle, so never await it from a child tool.
+		void child.session.abort();
 	}
 
 	/** Drop queued steering/follow-up input; callers reconcile their durable inbox by identity (plan §17.2a). */
@@ -169,6 +180,7 @@ export class InProcessBackend {
 				error: errorMessage && !state.killedBy ? { message: errorMessage, retryable: !thrown && retryableApiError(errorMessage) } : undefined,
 				durationMs: this.now() - startedAt, usage: state.tracker.snapshot(),
 			});
+			if (state.question && !state.killedBy) Object.assign(outcome, { status: "needs-answer", classification: "needs-answer", resultText: state.question, error: undefined, note: undefined });
 			if (state.killedBy === "watchdog") Object.assign(outcome, { classification: "stalled", status: "failed" });
 			if (state.killedBy) emit({ type: "cancel-acknowledged" });
 			emit({ type: "settled", outcome });

@@ -15,6 +15,7 @@ const OPERATIONS = [
 	"For permitted independent assignments, batch Agent calls in one message so they can run concurrently. Dependent assignments must wait for their inputs. Do not repeat research assigned to a worker; do different useful work instead. Avoid overlapping writers on the same files.",
 	"A fresh agent has no parent conversation: include the objective, relevant paths and facts, constraints, and the expected report. Continue related work or corrections through SendMessage to the existing agent; start a fresh agent for unrelated work or independent verification.",
 	"Use run_in_background:false only when your next step depends on the result and no useful independent work remains. Otherwise run in the background and continue working. Wait for notifications, not polling or sleeps; do not read a running agent's transcript or predict its findings.",
+	"A non-fork child can end a run with needs_answer when it needs a decision. Reply with SendMessage to that agent to resume the same conversation with your answer.",
 	"Worker reports are returned to you, not shown directly to the user. Verify actual code changes and relevant checks before relaying the result. Agent IDs are internal routing metadata, not user-facing report text.",
 	"Set effort only on explicit instruction. A model override is allowed when useful. Delegation does not authorize permission, configuration, or instruction-file changes.",
 ].join("\n");
@@ -72,7 +73,7 @@ export function launchResultText(input: { agentId: string; name?: string; descri
 	].join("\n\n");
 }
 
-export const SEND_MESSAGE_DESCRIPTION = "Send a literal work message to one agent by ID or name, or to main (the root conversation, not the immediate parent). Use it to steer active work or continue a finished, resumable agent with related work. Delivery acceptance means queued, not that the agent has read or acted on it. Messages do not grant user consent or authorize permission, configuration, or instruction-file changes. Do not broadcast or send lifecycle/protocol frames. A user-stopped agent requires explicit user authorization before continuation.";
+export const SEND_MESSAGE_DESCRIPTION = "Send a literal work message to one agent by ID or name, or to main (the root conversation, not the immediate parent). Use it to steer active work, answer a needs_answer question, or continue a finished, resumable agent with related work. Delivery acceptance means queued, not that the agent has read or acted on it. Messages do not grant user consent or authorize permission, configuration, or instruction-file changes. Do not broadcast or send lifecycle/protocol frames. A user-stopped agent requires explicit user authorization before continuation.";
 
 export const TASK_STOP_DESCRIPTION = "Request cancellation of a running agent by its ID. The root may stop any agent in the session; a subagent may stop only itself, not its children. A terminal run that is still exiting may be signaled again. Cancellation is a request, not proof that execution has settled. User stop propagates to descendants and prevents automatic continuation; an already idle or finished agent cannot be stopped as a new running task.";
 
@@ -94,11 +95,12 @@ function workflowNoticeText(payload: NoticePayload & { workflow: NonNullable<Not
 
 export function noticeText(payload: NoticePayload): string {
 	if (payload.workflow) return workflowNoticeText(payload as NoticePayload & { workflow: NonNullable<NoticePayload["workflow"]> });
-	const title = payload.interim ? "Agent waiting" : payload.status === "completed" ? "Agent completed" : payload.status === "killed" ? "Agent stopped" : payload.status === "failed" ? "Agent failed" : "Agent update";
+	const title = payload.status === "needs-answer" ? "Agent needs answer" : payload.interim ? "Agent waiting" : payload.status === "completed" ? "Agent completed" : payload.status === "killed" ? "Agent stopped" : payload.status === "failed" ? "Agent failed" : "Agent update";
 	const sections = [
 		`${title}: ${line(payload.description)}`,
 		`Internal agent ID: ${JSON.stringify(payload.agentId)}${payload.name ? `; name: ${JSON.stringify(payload.name)}` : ""}. Status: ${payload.status}; classification: ${payload.classification ?? "unspecified"}. Do not quote the ID to the user.`,
 	];
+	if (payload.status === "needs-answer") sections.unshift(`${payload.resultText.slice(0, NOTICE_RESULT_LIMIT)}\n\nReply with SendMessage to ${JSON.stringify(payload.agentId)} to resume the same child with your answer.`);
 	if (payload.classification === "partial-max-turns") sections.push("Partial result: the turn budget was exhausted; the assignment may be unfinished.");
 	if (payload.classification === "partial-api") sections.push("Partial result: an API failure interrupted the run; recovered text is not proof of completion.");
 	else if (payload.status === "failed" && payload.resultText) sections.push(`Partial report from a failed run (${payload.classification ?? "unspecified failure"}); this text does not establish completion.`);

@@ -239,6 +239,11 @@ export class Control {
 			return finish("stopped", "stopped");
 		}
 		const report = outcome.status === "killed" ? "stopped" : outcome.status === "failed" ? "terminal_failure" : "terminal_result";
+		if (outcome.status === "needs-answer") {
+			// Retain unread input, but do not automatically restart a run that just asked for a decision.
+			conversation.evictAt = this.now() + EVICTION_GRACE_MS;
+			return finish("evictable", report);
+		}
 		// A run that failed without delivering the messages it was started for must not relaunch for them at once (that would
 		// repeat a permanent failure forever); they stay pending until a new message or wake arrives. Newer arrivals still continue.
 		const undelivered = this.inboxOf(agentId).undelivered().filter((envelope) => outcome.status !== "failed" || !ownEnvelopes.has(envelope.id));

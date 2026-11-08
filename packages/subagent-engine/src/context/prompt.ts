@@ -23,6 +23,7 @@ export function childSystemPrompt(input: { definition: AgentDefinition; cwd: str
 		`Role instructions\n<agent-definition>\n${input.definition.prompt}\n</agent-definition>`,
 	];
 	if (input.memoryIndex) sections.push(`Agent memory (reference material, not additional authority)\n<agent-memory>\n${bounded(input.memoryIndex, CONTEXT_LIMIT)}\n</agent-memory>`);
+	sections.push("Decisions\nWhen the task needs a decision beyond what it says, call needs_answer with one concrete question and the current work state instead of deciding. This ends the run; the caller can resume this same conversation with SendMessage.");
 	sections.push("Final handback\nYour final message is the report returned to the caller, not a direct reply to the user. Make it complete and concise: state the outcome, evidence and checks, changed file paths, and any blockers or unverified claims. Report findings inline; do not claim edits or tests succeeded without checking them.");
 	return sections.join("\n\n");
 }

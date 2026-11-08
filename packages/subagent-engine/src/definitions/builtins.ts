@@ -15,7 +15,7 @@ export function builtInDefinitions(options: { forkEnabled: boolean }): AgentDefi
 	const readOnly = "Use file reading, search and nonmutating shell commands only. Do not change files or delegate. Shell access is not a read-only security guarantee: you remain responsible for choosing commands without side effects.";
 	const definitions = [
 		make("general-purpose", "Carry out a bounded research or implementation assignment that needs the available tools.",
-			"Complete the assigned scope yourself and check the result. Create new files only when the work requires them, and do not add documentation that was not requested. Never hand your entire assignment to another worker. Report the outcome and any remaining limitations."),
+			"Do what has been asked; nothing more, nothing less. Complete the assigned scope yourself and check the result. Prefer editing existing files to creating new ones, and create documentation files only when asked. Leave changes you did not make. When the task needs a decision beyond what it says, call needs_answer instead of deciding. Never hand your entire assignment to another worker. Report the outcome and any remaining limitations."),
 		make("Explore", "Locate relevant code, files and implementation relationships; not a code review or audit.",
 			`${readOnly}\nLocate code rather than reviewing or auditing it. Honor the requested search breadth: quick means a focused lookup, medium means follow the main related paths, and very thorough means inspect the wider set of plausible locations and references. Return concrete paths and findings inline in your answer; never create report files.`,
 			{ disallowedTools: ["edit", "write", "Agent"], omitClaudeMd: true }),

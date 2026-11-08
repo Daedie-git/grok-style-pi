@@ -17,6 +17,16 @@ export interface ToolOptions {
 /** `engine` is resolved per call: after a reload the root's tools route to the adopted engine (plan §17.11). */
 export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => Engine), caller: Caller, options: ToolOptions): void {
 	const current = typeof engine === "function" ? engine : () => engine;
+	if (caller.agentId && !caller.isFork) pi.registerTool(defineTool({
+		name: "needs_answer",
+		label: "Needs Answer",
+		description: "End this run when a decision beyond the assignment is needed. Ask one concrete question and include the current work state in its text. The parent replies with SendMessage, resuming this same conversation. Call needs_answer alone, not alongside other tools.",
+		parameters: Type.Object({ question: Type.String({ minLength: 1, description: "One concrete question, including the work state and blocker." }) }),
+		execute: async (_toolCallId, { question }) => {
+			current().needsAnswer(caller.agentId!, question);
+			return { content: [{ type: "text" as const, text: question.trim() }], details: { question: question.trim() }, terminate: true };
+		},
+	}));
 	pi.registerTool(defineTool({
 		name: "Agent",
 		label: "Agent",

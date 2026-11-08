@@ -2,6 +2,56 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHarness, toolResultText, until } from "./fixtures/harness.ts";
 
+for (const background of [false, true]) test(`needs_answer ends a ${background ? "background" : "foreground"} run and SendMessage resumes the same child`, { timeout: 20_000 }, async (t) => {
+	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
+	const question = "I inspected the files and changed nothing. Should I use option A or option B?";
+	let answered = false;
+	const seen: string[] = [];
+	const harness = await createHarness({
+		parent: ({ index, messages }) => {
+			if (index === 0) return { tools: [{ name: "Agent", args: { description: "Choose an option", prompt: "Inspect and ask", name: "worker", run_in_background: background, subagent_type: "restricted" } }] };
+			if (!answered && JSON.stringify(messages).includes(question)) {
+				answered = true;
+				return { tools: [{ name: "SendMessage", args: { to: "worker", message: "Use option B." } }] };
+			}
+			return { text: "Parent waiting" };
+		},
+		child: () => ({ index, messages }) => {
+			seen.push(JSON.stringify(messages));
+			return index === 0 ? { tools: [{ name: "needs_answer", args: { question } }] } : { text: "Used option B." };
+		},
+		agentFiles: { "restricted.md": "---\nname: restricted\ndescription: read only\ntools: [Read]\n---\nInspect only." },
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Go", { source: "extension" });
+	await until(() => [...harness.children.keys()].some((id) => {
+		const runs = harness.engine.control.get(id)!.meta.runs;
+		return runs.length === 2 && runs[1].status === "completed";
+	}));
+	const [agentId] = harness.children.keys();
+	assert.equal(harness.children.size, 1);
+	assert.equal(harness.requests.children.get(agentId), 2, "no extra model request after needs_answer");
+	assert.deepEqual(harness.engine.control.get(agentId)!.meta.runs.map((run) => run.status), ["needs-answer", "completed"]);
+	assert.match(seen[1], /Use option B/);
+	const result = background
+		? String((harness.parent.messages.find((message) => (message as { customType?: string }).customType === "subagent-notification") as { content: string }).content)
+		: JSON.parse(toolResultText(harness.parent, "Agent")[0])[0].text;
+	assert.ok(result.startsWith(question));
+	assert.match(result, /Reply with SendMessage.*resume the same child/);
+});
+
+test("forks do not register needs_answer", { timeout: 20_000 }, async (t) => {
+	const harness = await createHarness({
+		env: { PI_SUBAGENT_FORK: "1" },
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Fork check", prompt: "Report once", subagent_type: "fork", run_in_background: false } }] } : { text: "Done" },
+		child: () => () => ({ text: "Fork report" }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Go", { source: "extension" });
+	assert.equal(harness.children.size, 1);
+	for (const child of harness.children.values()) assert.ok(!child.getAllTools().some((tool) => tool.name === "needs_answer"));
+});
+
 test("foreground Agent returns the child's report to the parent tool call", { timeout: 20_000 }, async (t) => {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
 	const harness = await createHarness({

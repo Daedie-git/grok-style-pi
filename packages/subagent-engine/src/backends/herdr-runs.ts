@@ -2,8 +2,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMeta, BackendEvent, DeliveryResult, Envelope, KilledBy, RunHandle, RunOutcome } from "../types.ts";
 import { launchResultText } from "../policy/text.ts";
 
-export type PanePhase = "queued" | "starting" | "running" | "blocked" | "completed" | "failed" | "stopped";
-export type PaneTerminalPhase = Extract<PanePhase, "completed" | "failed" | "stopped">;
+export type PanePhase = "queued" | "starting" | "running" | "blocked" | "completed" | "failed" | "stopped" | "needs-answer";
+export type PaneTerminalPhase = Extract<PanePhase, "completed" | "failed" | "stopped" | "needs-answer">;
 export interface PaneRead { phase: PanePhase; resultText: string; text: string; status: string; runId?: string }
 export interface PaneNotice { noticeId: string; agentId: string; herdrAgentId: string; runId: string; phase: PaneTerminalPhase; text: string; machine?: string }
 export interface PaneRequest {
@@ -67,7 +67,7 @@ interface LiveRun extends ReceiptRun {
 interface PendingCommit { run: ReceiptRun; attempts: number; next: number; processing?: Promise<void> }
 interface PendingNotice { notice: PaneNotice; attempts: number; next: number; processing?: Promise<void> }
 interface PendingAck { agentId: string; runId: string; committed: boolean; attempts: number; next: number; processing?: Promise<void> }
-const terminal = (phase: PanePhase): phase is PaneTerminalPhase => phase === "completed" || phase === "failed" || phase === "stopped";
+const terminal = (phase: PanePhase): phase is PaneTerminalPhase => phase === "completed" || phase === "failed" || phase === "stopped" || phase === "needs-answer";
 const key = (agentId: string, runId: string) => JSON.stringify([agentId, runId]);
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const positive = (value: number | undefined, fallback: number): number => value !== undefined && Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
@@ -161,7 +161,7 @@ export class HerdrRuns {
 	restoreTerminal(meta: AgentMeta, runId: string): void {
 		if (this.disposed) throw new Error("HerdrRuns is disposed");
 		const summary = meta.runs.find((run) => run.runId === runId);
-		if (meta.backend !== "herdr" || !summary || !["completed", "failed", "killed"].includes(summary.status)) throw new Error("Restoring a pane receipt requires a terminal Herdr run");
+		if (meta.backend !== "herdr" || !summary || !["completed", "failed", "killed", "needs-answer"].includes(summary.status)) throw new Error("Restoring a pane receipt requires a terminal Herdr run");
 		const ref = this.capturedReference(meta, runId);
 		const active = this.runs.get(runId);
 		const existing = active ?? this.terminalRuns.get(runId);
@@ -404,7 +404,7 @@ export class HerdrRuns {
 		try {
 			const value = await port.read(run.meta, { ...options, runId: run.identity.herdrRunId });
 			if (value.runId !== undefined && value.runId !== run.identity.herdrRunId) throw new Error("Herdr returned another run's result");
-			if (!["queued", "starting", "running", "blocked", "completed", "failed", "stopped"].includes(value.phase) || typeof value.resultText !== "string") throw new Error("Herdr must return a typed phase and a full resultText");
+			if (!["queued", "starting", "running", "blocked", "completed", "failed", "stopped", "needs-answer"].includes(value.phase) || typeof value.resultText !== "string") throw new Error("Herdr must return a typed phase and a full resultText");
 			return value;
 		} catch (error) {
 			if (this.port !== port && this.available() && !options.signal?.aborted) return this.readCaptured(run, options);
@@ -457,6 +457,7 @@ export class HerdrRuns {
 	}
 	private emit(run: LiveRun, event: BackendEvent): void { this.host.emit({ type: "run-event", agentId: run.identity.agentId, runId: run.identity.runId, event }); }
 	private render(agentId: string, read: PaneRead): string {
+		if (read.phase === "needs-answer") return `${read.resultText}\n\nAgent needs answer. Reply with SendMessage to ${agentId} to resume the same child with your answer.`;
 		return `${read.resultText || (read.phase === "blocked" ? "The pane needs attention before it can continue." : "No report text.")}\n\nagentId: ${agentId}; use SendMessage to continue this agent. ${terminal(read.phase) ? "Verify actual changes before reporting completion." : "You will be notified when it finishes."}`;
 	}
 }

@@ -6,7 +6,7 @@ export interface HerdrProxyNotice {
 	noticeId: string;
 	agentId: string;
 	runId: string;
-	phase: "completed" | "failed" | "stopped";
+	phase: "completed" | "failed" | "stopped" | "needs-answer";
 	text: string;
 	herdrAgentId: string;
 	machine?: string;

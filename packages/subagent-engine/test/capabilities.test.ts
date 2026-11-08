@@ -19,6 +19,14 @@ function surface(overrides: Partial<SurfaceInput> = {}, changes: Partial<AgentDe
 		maxDepth: 3, background: false, isFork: false, ...overrides });
 }
 
+test("needs_answer is a lifecycle tool for all children except forks", () => {
+	const tools = [...available, { name: "needs_answer" }];
+	for (const background of [false, true]) {
+		assert.deepEqual(surface({ available: tools, background }, { tools: [], isolated: true }).active, ["needs_answer"]);
+	}
+	assert.deepEqual(surface({ available: tools, isFork: true, parentTools: ["read", "needs_answer"] }).active, ["read"]);
+});
+
 test("an isolated definition keeps only built-in tools, even when it grants others", () => {
 	assert.deepEqual(surface({}, { isolated: true }).active.sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
 	assert.deepEqual(surface({}, { isolated: true, tools: ["read", "Agent", "mcp__repo"] }).active, ["read"]);

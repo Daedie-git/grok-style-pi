@@ -46,7 +46,7 @@ export function compileToolSurface(input: SurfaceInput): ToolSurface {
 	const names = new Set(available.map((tool) => tool.name));
 	const result: ToolSurface = { active: [], excluded: [], invalid: [], unavailable: [], memoryScoped: [] };
 	if (input.isFork) {
-		result.active = [...(input.parentTools ?? [])];
+		result.active = [...(input.parentTools ?? [])].filter((name) => name !== "needs_answer");
 		result.unavailable = unique(result.active.filter((name) => !names.has(name)));
 		result.excluded = unique([...names].filter((name) => !result.active.includes(name)));
 		return result;
@@ -103,6 +103,8 @@ export function compileToolSurface(input: SurfaceInput): ToolSurface {
 			}
 		}
 	}
+	// Lifecycle handback is available to every non-fork child, even read-only or isolated definitions.
+	if (names.has("needs_answer") && !result.active.includes("needs_answer")) result.active.push("needs_answer");
 	if (!result.active.includes("Agent")) delete result.allowedAgentTypes;
 	result.excluded = unique([...names].filter((name) => !result.active.includes(name)));
 	result.invalid = unique(result.invalid);

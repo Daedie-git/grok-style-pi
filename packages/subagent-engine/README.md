@@ -18,13 +18,13 @@ Grok users get the engine through `integrations/subagents.ts` instead. Load exac
 |---|---|
 | `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model`, `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` keeps a pane agent's pane open after it finishes; it does not select the pane backend or affect in-process agents. |
 | `SendMessage` | `{to, message, summary?}`. A running agent gets the message after its current tool round. A finished agent resumes the same conversation in a new run. `to: "main"` reaches the root conversation. |
-| `needs_answer` | Child-only, except forks: `{question}` ends the run as `needs-answer`. Include one concrete question and the current work state. The parent replies with `SendMessage` to resume the same child with the answer. |
+| `needs_answer` | Child-only, except forks and workflow agents: `{question}` ends the run as `needs-answer`. Include one concrete question and the current work state. The parent replies with `SendMessage` to resume the same child with the answer. |
 | `TaskStop` | Stop an agent. The main conversation can stop any agent; an agent can stop only itself. A stop by the user (Grok activity panel) also stops the agent's descendants, and none of them resume automatically. |
 | `TaskCreate` / `TaskGet` / `TaskList` / `TaskUpdate` | A shared task list. Every agent of the root session sees the same list. `owner` is a plain assignment; completed blockers are hidden in `TaskList`. |
 | `Workflow` (alias `RunWorkflow`) | Run a JavaScript orchestration script in the background (see below). Launched only on explicit request. |
 | `get_subagent_result`, `steer_subagent` | Compatibility aliases for earlier runners. Set `PI_SUBAGENT_ALIASES=0` to disable them. |
 
-Runs end as completed, failed, killed, or `needs-answer`. A `needs-answer` result is not completion or failure: its notice or foreground result leads with the question and directs the caller to reply with `SendMessage`. The activity view shows “needs answer”. Forks keep their no-follow-up-questions policy and lack this tool.
+Runs end as completed, failed, killed, or `needs-answer`. A `needs-answer` result is not completion or failure: its notice or foreground result leads with the question and directs the caller to reply with `SendMessage`. The activity view shows “needs answer”. Forks and unattended workflow agents cannot ask follow-up questions and lack this tool. A workflow agent reports any out-of-scope decision as a blocker in its final handback.
 
 Background agents report through a `subagent-notification` message. If the main conversation is idle, the notification starts a new turn; if it's busy, the notification arrives at the next safe point. A foreground `Agent` call returns the report directly, and the child's token usage counts toward the parent's session totals.
 
@@ -91,7 +91,7 @@ Where scripts come from and who approves them:
 
 How runs behave:
 
-- **Agents and concurrency.** Each `agent()` is a normal engine agent, but it can't use `Agent` or `Workflow` itself. At most `min(16, max(2, cores - 2))` agents run at once (`PI_WORKFLOW_CONCURRENCY`), and a run makes at most 1,000 agent calls.
+- **Agents and concurrency.** Each `agent()` is a normal engine agent, but it can't use `Agent`, `Workflow` or `needs_answer` itself. At most `min(16, max(2, cores - 2))` agents run at once (`PI_WORKFLOW_CONCURRENCY`), and a run makes at most 1,000 agent calls.
 - **Determinism.** `Date.now()`, `new Date()` without arguments, and `Math.random()` are unavailable, so a run can be replayed.
 - **Resume.** `resumeFromRunId` re-runs the script from the start. Completed `agent()` calls whose prompt and options haven't changed return their saved results instantly; edited or new calls run again. Stop the old run with `TaskStop` first.
 - **Not a sandbox.** Scripts run in a restricted VM inside the Pi process.

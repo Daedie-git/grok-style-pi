@@ -80,17 +80,6 @@ test("workflow child agents are nested, with attributed transcripts and run-fenc
 	assert.equal(h.entries.has("agent:ordinary"), true, "unrelated agents remain top-level");
 });
 
-test("workflow children retain needs answer instead of a failed slot", (t) => {
-	const h = fixture(); t.after(() => h.adapter.dispose());
-	const child = meta("child-1", "child-run");
-	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Decision" };
-	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
-	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: { ...outcome("completed", "Choose A or B?"), status: "needs-answer", classification: "needs-answer" } });
-	h.engine.progress({ type: "agent", logicalIndex: 1, label: "Decision", state: "failed", agentId: child.agentId });
-	assert.match(h.entry().output, /Decision · needs answer/);
-	assert.match(h.entry().detail!, /0 failed · 1 needs answer/);
-});
-
 test("workflow Stop routes to userStopWorkflow and stale callbacks never stop other tasks", async (t) => {
 	const h = fixture(); t.after(() => h.adapter.dispose()); h.adapter.workflowReceipt(receipt);
 	const stop = h.entry().stop!;

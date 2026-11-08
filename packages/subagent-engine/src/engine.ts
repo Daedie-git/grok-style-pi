@@ -999,7 +999,8 @@ export class Engine {
 	/** A child hands a decision back without failing or completing its assignment. */
 	needsAnswer(agentId: AgentId, question: string): void {
 		if (!question.trim()) throw new Error("needs_answer requires one concrete question.");
-		if (this.control.get(agentId)?.meta.isFork) throw new Error("Forks cannot ask follow-up questions.");
+		const meta = this.control.get(agentId)?.meta;
+		if (meta?.isFork || meta?.workflow) throw new Error("Forks and workflow agents cannot ask follow-up questions.");
 		this.requireBackend().needsAnswer(agentId, question.trim());
 	}
 
@@ -1017,7 +1018,7 @@ export class Engine {
 			projectTrusted: this.projectTrusted, depth: meta.spawnDepth,
 			systemPrompt: forkPrompt !== undefined
 				? { mode: "exact", text: forkPrompt }
-				: { mode: "preamble", text: childSystemPrompt({ definition, cwd: meta.cwd, isBackground: background, memoryIndex: memory ? memoryIndex(memory) : undefined }) },
+				: { mode: "preamble", text: childSystemPrompt({ definition, cwd: meta.cwd, isBackground: background, isWorkflow: Boolean(meta.workflow), memoryIndex: memory ? memoryIndex(memory) : undefined }) },
 			noContextFiles: policy === "none",
 			installers: [this.deps.childInstaller(this, caller)],
 			selectTools: (tools: ToolInfo[]) => {

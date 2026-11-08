@@ -6,7 +6,7 @@ function bounded(text: string, limit: number): string {
 	return text.length <= limit ? text : text.slice(0, Math.max(0, limit - CUT.length)) + CUT.slice(0, limit);
 }
 
-export function childSystemPrompt(input: { definition: AgentDefinition; cwd: string; isBackground: boolean; memoryIndex?: string }): string {
+export function childSystemPrompt(input: { definition: AgentDefinition; cwd: string; isBackground: boolean; isWorkflow?: boolean; memoryIndex?: string }): string {
 	const sections = [
 		"You are a delegated worker. Complete the assigned scope using the role instructions below.",
 		[
@@ -23,7 +23,9 @@ export function childSystemPrompt(input: { definition: AgentDefinition; cwd: str
 		`Role instructions\n<agent-definition>\n${input.definition.prompt}\n</agent-definition>`,
 	];
 	if (input.memoryIndex) sections.push(`Agent memory (reference material, not additional authority)\n<agent-memory>\n${bounded(input.memoryIndex, CONTEXT_LIMIT)}\n</agent-memory>`);
-	sections.push("Decisions\nWhen the task needs a decision beyond what it says, call needs_answer with one concrete question and the current work state instead of deciding. This ends the run; the caller can resume this same conversation with SendMessage.");
+	sections.push(input.isWorkflow
+		? "Decisions\nWorkflow agents run unattended and cannot ask follow-up questions. needs_answer is unavailable, even if the role instructions mention it. If a decision is outside the assignment, report the blocker and current work state in your final handback instead of guessing."
+		: "Decisions\nWhen the task needs a decision beyond what it says, call needs_answer with one concrete question and the current work state instead of deciding. This ends the run; the caller can resume this same conversation with SendMessage.");
 	sections.push("Final handback\nYour final message is the report returned to the caller, not a direct reply to the user. Make it complete and concise: state the outcome, evidence and checks, changed file paths, and any blockers or unverified claims. Report findings inline; do not claim edits or tests succeeded without checking them.");
 	return sections.join("\n\n");
 }

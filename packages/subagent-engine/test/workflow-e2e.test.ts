@@ -116,6 +116,27 @@ test("Workflow launches parallel/pipeline agents in the background and notifies 
 	assert.equal(journal.filter(event => event.type === "result").length, 4);
 });
 
+test("unattended Workflow children lack needs_answer and report decision blockers as their result", { timeout: 10_000 }, async t => {
+	noNetwork(t);
+	const harness = await createHarness({
+		env: { PI_WORKFLOW_APPROVE: "1" },
+		parent: ({ index }) => index === 0 ? launch(source("return await agent('Inspect and report any decision blocker');")) : { text: "Parent continues" },
+		child: () => () => ({ text: "Blocked: choosing A or B exceeds the assignment. Inspection is complete; no edits made." }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Run the requested unattended workflow", { source: "extension" });
+	const { snapshot } = await completion(harness, receiptFrom(harness.parent.messages));
+	assert.equal(snapshot.status, "completed");
+	assert.match(String(snapshot.result), /Blocked: choosing A or B/);
+	assert.equal(harness.children.size, 1);
+	assert.deepEqual([...harness.requests.children.values()], [1]);
+	for (const [agentId, session] of harness.children) {
+		assert.ok(!session.getAllTools().some(tool => tool.name === "needs_answer"), "the tool is not registered, not merely inactive");
+		assert.ok(!session.getActiveToolNames().includes("needs_answer"));
+		assert.throws(() => harness.engine.needsAnswer(agentId, "Choose A or B?"), /workflow agents cannot ask/);
+	}
+});
+
 test("schema agent returns the validated StructuredOutput tool value rather than final prose", { timeout: 10_000 }, async t => {
 	noNetwork(t);
 	const script = source("return await agent('Produce facts',{schema:{type:'object',properties:{ok:{type:'boolean'},count:{type:'integer'}},required:['ok','count'],additionalProperties:false}});");

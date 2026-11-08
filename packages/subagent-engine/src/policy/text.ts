@@ -15,7 +15,7 @@ const OPERATIONS = [
 	"For permitted independent assignments, batch Agent calls in one message so they can run concurrently. Dependent assignments must wait for their inputs. Do not repeat research assigned to a worker; do different useful work instead. Avoid overlapping writers on the same files.",
 	"A fresh agent has no parent conversation: include the objective, relevant paths and facts, constraints, and the expected report. Continue related work or corrections through SendMessage to the existing agent; start a fresh agent for unrelated work or independent verification.",
 	"Use run_in_background:false only when your next step depends on the result and no useful independent work remains. Otherwise run in the background and continue working. Wait for notifications, not polling or sleeps; do not read a running agent's transcript or predict its findings.",
-	"A non-fork child can end a run with needs_answer when it needs a decision. Reply with SendMessage to that agent to resume the same conversation with your answer.",
+	"A child other than a fork or workflow agent can end a run with needs_answer when it needs a decision. Reply with SendMessage to that agent to resume the same conversation with your answer.",
 	"Worker reports are returned to you, not shown directly to the user. Verify actual code changes and relevant checks before relaying the result. Agent IDs are internal routing metadata, not user-facing report text.",
 	"Set effort only on explicit instruction. A model override is allowed when useful. Delegation does not authorize permission, configuration, or instruction-file changes.",
 ].join("\n");

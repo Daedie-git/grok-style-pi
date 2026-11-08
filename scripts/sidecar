@@ -266,16 +266,6 @@ role_prompt_files() {
   fi
 }
 
-# Pi implementers get the shared protocol and the implementer role. Remote machines receive copies, so their
-# checkouts need no new runtime files.
-implementer_launch_args() {
-  local protocol="$SIDECAR_HOME/profile.md" role="$SIDECAR_HOME/implementer.md"
-  if [[ -n $MACHINE ]]; then
-    protocol=$(publish_file "$protocol" "$(agent_name).implementer-protocol.md") || return 1
-    role=$(publish_file "$role" "$(agent_name).implementer.md") || return 1
-  fi
-  PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$protocol" --append-system-prompt "$role")
-}
 
 # Materialize text locally and transfer it, never interpolate profile content into shell argv.
 # Skills are execution-machine paths, not local resources implicitly copied to another host.
@@ -340,7 +330,6 @@ resolve_backend() {
   local file saved=
   file="$STATE_DIR/$(agent_name).agent"
   if [[ -f $file ]]; then saved=$(<"$file"); fi
-  [[ $saved != codex ]] || die "slot ran Codex CLI, which is no longer supported; use a new slot"
   [[ -z $saved || $saved == pi || $saved == claude ]] || die "invalid slot agent in $file"
   if [[ -n $saved && -n $AGENT_ARG && $saved != "$AGENT_ARG" ]]; then
     die "slot already runs $saved; use a new slot for $AGENT_ARG"
@@ -504,7 +493,7 @@ resolve_machine() {
     # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files: a Windows checkout
     # holds them with CRLF endings, and rewriting identical content dirties it and blocks sync-machine.
     local runtime_file
-    for runtime_file in sidecar.ts reviewer.md reload.mjs windows-runtime.mjs; do
+    for runtime_file in sidecar.ts reviewer.md profile.md implementer.md reload.mjs windows-runtime.mjs; do
       remote_node 'const dest=args[0],data=fs.readFileSync(0),lf=b=>b.toString("utf8").replace(/\r\n/g,"\n");fs.mkdirSync(path.dirname(dest),{recursive:true});
         if(!fs.existsSync(dest)||lf(fs.readFileSync(dest))!==lf(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
     done
@@ -514,13 +503,13 @@ resolve_machine() {
   local home info status=0
   info=$(remote 'agent_home=${1:-"$HOME/$3"}
     printf "%s\n%s\n" "$HOME" "$agent_home"
-    test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" || exit 11
+    test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" && test -f "$agent_home/implementer.md" || exit 11
     test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" "$runtime_relative" </dev/null) || status=$?
   home=${info%%$'\n'*}
   AGENT_HOME=${info#*$'\n'}
   case $status in
     0) ;;
-    11) die "the claude-sidecar plugin is not at $AGENT_HOME on $MACHINE_LABEL; install it there or set SIDECAR_REMOTE_HOME to the directory containing sidecar.ts and reviewer.md (not the user home or plugin root)" ;;
+    11) die "the claude-sidecar plugin is not at $AGENT_HOME on $MACHINE_LABEL; install or sync it there (sidecar sync-machine) or set SIDECAR_REMOTE_HOME to the directory containing sidecar.ts and reviewer.md (not the user home or plugin root)" ;;
     12) die "$WORK_DIR does not exist on $MACHINE_LABEL; check out the repository there or pass --remote-cwd DIR" ;;
     *) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH (BatchMode: load its key in ssh-agent). Test: ssh $MACHINE_TARGET true" ;;
   esac
@@ -1029,7 +1018,9 @@ start_unlocked() {
   fi
   local attempt err allocation origin=given
   local PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/reviewer.md")
-  if [[ $ROLE == implementer ]]; then implementer_launch_args || die "could not prepare implementer launch"; fi
+  if [[ $ROLE == implementer ]]; then
+    PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/profile.md" --append-system-prompt "$AGENT_HOME/implementer.md")
+  fi
   if [[ -n $PROFILE_JSON ]]; then profile_launch_args || die "could not prepare role profile launch"; fi
   # A subsequent generic start is a real unprofiled conversation, not permission to adopt it later.
   rm -f -- "$STATE_DIR/$name.profile-fresh"

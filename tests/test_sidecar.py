@@ -1300,14 +1300,6 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("Claude's implementer sidecar", claude)
         self.assertNotIn('be adversarial', claude.lower())
 
-    def test_saved_codex_slot_is_refused(self):
-        state = self.home / '.cache/claude-sidecar'
-        state.mkdir(parents=True, exist_ok=True)
-        (state / 'sc-pane-1-2.agent').write_text('codex\n')
-        result = self.run_cli('--slot', '2', 'start', check=False)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('no longer supported', result.stderr)
-
     def test_claude_agent_starts_claude_and_resumes_its_session(self):
         self.run_cli('--agent', 'claude', 'start')
         start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
@@ -3020,6 +3012,7 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
         self.assertIn('ship', result.stdout)
         self.assertTrue((runtime / 'sidecar.ts').is_file())
         self.assertTrue((runtime / 'reviewer.md').is_file())
+        self.assertTrue((runtime / 'implementer.md').is_file())
         started = self.all_starts()[0]
         self.assertIn(str(runtime / 'sidecar.ts'), started)
         tab = next(c for c in self.remote_calls() if c[:2] == ['tab', 'create'])
@@ -3090,6 +3083,10 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
         starts = [c for c in self.remote_calls() if c[:2] == ['agent', 'start']]
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0][starts[0].index('--thinking') + 1], 'medium')
+        # Runtime copies, not one-off uploads, so reload rereads the current prompts.
+        runtime = self.remote_home() / self.plugin.relative_to(self.home) / 'sidecar'
+        prompts = [starts[0][i + 1] for i, flag in enumerate(starts[0]) if flag == '--append-system-prompt']
+        self.assertEqual(prompts, [str(runtime / 'profile.md'), str(runtime / 'implementer.md')])
 
     def test_remote_claude_agent_reads_its_prompt_and_writes_its_report_on_the_machine(self):
         self.add_machines()

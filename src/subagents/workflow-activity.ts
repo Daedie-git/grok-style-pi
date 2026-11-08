@@ -1,7 +1,7 @@
 import type { AgentSnapshot, EngineEvent } from "../../packages/subagent-engine/src/engine.ts";
 import { plainText, type Activity } from "../activity/ui.ts";
 
-type AgentState = "queued" | "running" | "cached" | "done" | "failed";
+type AgentState = "queued" | "running" | "cached" | "done" | "failed" | "needs answer";
 type Slot = { index: number; label?: string; phase?: string; state: AgentState; agentId?: string };
 type Workflow = {
 	taskId: string; runId: string; activity: Activity; slots: Map<number, Slot>; phases: Map<string, number>;
@@ -99,7 +99,7 @@ export class WorkflowActivities {
 					const previous = workflow.slots.get(progress.logicalIndex);
 					changed = this.slot(workflow, {
 						index: progress.logicalIndex, label: progress.label ?? previous?.label, phase: progress.phase ?? previous?.phase,
-						state: progress.state === "start" ? "running" : progress.state, agentId: progress.agentId ?? previous?.agentId,
+						state: previous?.state === "needs answer" && progress.state === "failed" ? "needs answer" : progress.state === "start" ? "running" : progress.state, agentId: progress.agentId ?? previous?.agentId,
 					});
 				}
 				if (changed) this.refresh(workflow, false, true);
@@ -119,7 +119,7 @@ export class WorkflowActivities {
 			else if (event.event.type === "tool") text = `${event.event.toolName} · ${event.event.phase}`;
 		} else if (event.type === "settled") {
 			const slot = workflow.slots.get(child.logicalIndex);
-			if (slot?.agentId === event.agentId && !workflow.terminal) changed = this.slot(workflow, { ...slot, state: event.outcome.status === "completed" ? "done" : "failed" });
+			if (slot?.agentId === event.agentId && !workflow.terminal) changed = this.slot(workflow, { ...slot, state: event.outcome.status === "needs-answer" ? "needs answer" : event.outcome.status === "completed" ? "done" : "failed" });
 			text = event.outcome.error ?? event.outcome.resultText;
 		}
 		if (text) changed = this.tail(workflow, "children", `[${line(event.agentId)}] ${text}\n`) || changed;
@@ -134,7 +134,7 @@ export class WorkflowActivities {
 	private outline(workflow: Workflow): void {
 		const slots = [...workflow.slots.values()].sort((a, b) => a.index - b.index);
 		const count = (state: AgentState) => slots.filter((slot) => slot.state === state).length;
-		const summary = `${count("done")}/${slots.length} done · ${count("cached")} cached · ${count("failed")} failed`;
+		const summary = `${count("done")}/${slots.length} done · ${count("cached")} cached · ${count("failed")} failed${count("needs answer") ? ` · ${count("needs answer")} needs answer` : ""}`;
 		workflow.activity.detail = summary;
 		const groups = new Map<string, Slot[]>();
 		for (const slot of slots) { const phase = slot.phase ?? "Ungrouped"; const group = groups.get(phase) ?? []; group.push(slot); groups.set(phase, group); }

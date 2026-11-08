@@ -1327,6 +1327,18 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('use a new slot', result.stderr)
 
+    def test_implementer_gets_the_implementer_prompt_on_every_backend(self):
+        for slot, agent in (('2', 'pi'), ('3', 'claude'), ('4', 'codex')):
+            self.run_cli('--slot', slot, '--agent', agent, '--role', 'implementer', 'start')
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        pi = [Path(starts[0][i + 1]).name for i, flag in enumerate(starts[0]) if flag == '--append-system-prompt']
+        self.assertEqual(pi, ['profile.md', 'implementer.md'])
+        claude = Path(starts[1][starts[1].index('--append-system-prompt-file') + 1]).read_text()
+        codex = [a for a in starts[2] if a.startswith('model_instructions_file=')][0].split('=', 1)[1]
+        for text in (claude, Path(json.loads(codex)).read_text()):
+            self.assertIn("Claude's implementer sidecar", text)
+            self.assertNotIn('be adversarial', text.lower())
+
     def test_claude_agent_starts_claude_and_resumes_its_session(self):
         self.run_cli('--agent', 'claude', 'start')
         start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])

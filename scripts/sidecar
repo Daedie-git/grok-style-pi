@@ -258,6 +258,26 @@ profile_skill_path() {
   fi
 }
 
+# Role prompt files, in order, for Claude Code and Codex, which take one instructions file.
+role_prompt_files() {
+  if [[ $ROLE == implementer ]]; then
+    printf '%s\n' "$SIDECAR_HOME/profile.md" "$SIDECAR_HOME/implementer.md"
+  else
+    printf '%s\n' "$SIDECAR_HOME/reviewer.md"
+  fi
+}
+
+# Pi implementers get the shared protocol and the implementer role. Remote machines receive copies, so their
+# checkouts need no new runtime files.
+implementer_launch_args() {
+  local protocol="$SIDECAR_HOME/profile.md" role="$SIDECAR_HOME/implementer.md"
+  if [[ -n $MACHINE ]]; then
+    protocol=$(publish_file "$protocol" "$(agent_name).implementer-protocol.md") || return 1
+    role=$(publish_file "$role" "$(agent_name).implementer.md") || return 1
+  fi
+  PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$protocol" --append-system-prompt "$role")
+}
+
 # Materialize text locally and transfer it, never interpolate profile content into shell argv.
 # Skills are execution-machine paths, not local resources implicitly copied to another host.
 profile_launch_args() {
@@ -1029,6 +1049,7 @@ start_unlocked() {
   fi
   local attempt err allocation origin=given
   local PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/reviewer.md")
+  if [[ $ROLE == implementer ]]; then implementer_launch_args || die "could not prepare implementer launch"; fi
   if [[ -n $PROFILE_JSON ]]; then profile_launch_args || die "could not prepare role profile launch"; fi
   # A subsequent generic start is a real unprofiled conversation, not permission to adopt it later.
   rm -f -- "$STATE_DIR/$name.profile-fresh"
@@ -1069,14 +1090,15 @@ start_unlocked() {
 CLAUDE_START_ERR=
 # Starts a Claude Code agent in PANE. The first start creates the session; later ones resume it.
 start_claude() {
-  local hname=$1 pane=$2 name=$3 uuid model session_flag=--session-id started="$STATE_DIR/$3.claude-started" prompt
+  local hname=$1 pane=$2 name=$3 uuid model session_flag=--session-id started="$STATE_DIR/$3.claude-started" prompt role
   uuid=$(claude_session_uuid)
   model=${SIDECAR_CLAUDE_MODEL:-opus}
   [[ $ROLE != implementer ]] || model=${SIDECAR_CLAUDE_MODEL:-sonnet}
   if [[ -f $started ]]; then session_flag=--resume; fi
   # Herdr refuses multi-line agent arguments, so the prompt travels as a file, read where the agent runs.
   prompt="$STATE_DIR/$name.claude-prompt.md"
-  cat "$SIDECAR_HOME/reviewer.md" "$SIDECAR_HOME/claude-delivery.md" >"$prompt"
+  mapfile -t role < <(role_prompt_files)
+  cat "${role[@]}" "$SIDECAR_HOME/claude-delivery.md" >"$prompt"
   # Called under &&, so errexit is off here: a failed copy must stop the start explicitly.
   if [[ -n $MACHINE ]] && ! prompt=$(publish_file "$prompt"); then
     CLAUDE_START_ERR="could not copy the Claude prompt to $MACHINE_LABEL"
@@ -1096,13 +1118,14 @@ start_claude() {
 
 CODEX_START_ERR=
 start_codex() {
-  local hname=$1 pane=$2 name=$3 session prompt config attempt live
+  local hname=$1 pane=$2 name=$3 session prompt config attempt live role
   local state_dir=${REMOTE_STATE:-$STATE_DIR}
   local resume=()
   session=$(codex_session_id)
   [[ -z $session ]] || resume=(resume "$session")
   prompt="$STATE_DIR/$name.codex-prompt.md"
-  if ! cat "$SIDECAR_HOME/reviewer.md" "$SIDECAR_HOME/codex-delivery.md" >"$prompt"; then
+  mapfile -t role < <(role_prompt_files)
+  if ! cat "${role[@]}" "$SIDECAR_HOME/codex-delivery.md" >"$prompt"; then
     CODEX_START_ERR="could not write the Codex prompt"
     return 1
   fi

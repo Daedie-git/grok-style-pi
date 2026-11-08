@@ -8,9 +8,8 @@ const now = atom({ plugin: 'claude-sidecar', key: 'now' } as const, 0)
 
 const POLL_MS = 3000
 
-// Claude Code's subagent palette (red, blue, green, yellow, purple, orange, pink, cyan), one per slot.
-const PALETTE = ['#dc2626', '#2563eb', '#16a34a', '#ca8a04', '#9333ea', '#ea580c', '#db2777', '#0891b2']
-const slotColor = (slot: string) => PALETTE[(Number(slot) - 1) % PALETTE.length] ?? PALETTE[0]
+// Claude Code's subagent red for reviewers, blue for implementers.
+const roleColor = (role: string) => (role === 'implementer' ? '#2563eb' : '#dc2626')
 
 function elapsed(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds))
@@ -93,7 +92,7 @@ export const register: Register = on => {
           const detail = row.waiting ? ' · needs an answer' : ` · ${row.role} · ${row.agent}${where} · ${row.kind} · ${elapsed(ms / 1000 - row.started)}`
           return (
             <Text key={row.slot}>
-              <Text color={slotColor(row.slot)}>{row.waiting ? '?' : '◆'} sidecar {row.slot}</Text>
+              <Text color={roleColor(row.role)}>{row.waiting ? '?' : '◆'} sidecar {row.slot}</Text>
               <Text color={row.waiting ? 'warning' : undefined} dimColor={!row.waiting}>{detail}</Text>
             </Text>
           )

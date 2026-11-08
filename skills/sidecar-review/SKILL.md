@@ -5,7 +5,7 @@ description: Second-opinion review by a persistent pi or Claude Code agent in He
 
 # Sidecar review
 
-Persistent pi or Claude Code agents in Herdr panes review or implement work and remember their own history: notes you sent, past reviews, findings you rejected. No agent starts at Claude startup; the first `note`, `plan`, `diff`, or `ask` starts the selected sidecar. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative.
+Persistent pi or Claude Code agents in Herdr panes review or implement work and remember their own history: notes you sent, past reviews, findings you rejected. No agent starts at Claude startup; the first `note`, `plan`, `diff`, or `ask` starts the selected sidecar. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative. Reviewers follow the repository's code-review skill when it has one; local pi slots also load the repository's `.claude/skills`.
 
 ## Notification safety
 

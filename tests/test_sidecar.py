@@ -1312,6 +1312,16 @@ class LauncherTests(unittest.TestCase):
         self.run_cli('--slot', '2', 'ask', 'Where is X handled?')
         self.assertNotIn('Completion contract', self.request_text('ask'))
 
+    def test_pi_loads_the_repositorys_claude_skills(self):
+        repo, _ = self.repo_with_change()
+        self.run_cli('start', cwd=repo)
+        (repo / '.claude/skills/x-review').mkdir(parents=True)
+        (repo / '.claude/skills/x-review/SKILL.md').write_text('---\nname: x-review\n---\n')
+        self.run_cli('--slot', '2', 'start', cwd=repo)
+        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
+        self.assertNotIn('--skill', starts[0])
+        self.assertEqual(starts[1][starts[1].index('--skill') + 1], str(repo / '.claude/skills'))
+
     def test_claude_agent_starts_claude_and_resumes_its_session(self):
         self.run_cli('--agent', 'claude', 'start')
         start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])

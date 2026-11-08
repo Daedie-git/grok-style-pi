@@ -1022,6 +1022,11 @@ start_unlocked() {
     PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/profile.md" --append-system-prompt "$AGENT_HOME/$ROLE.md")
   fi
   if [[ -n $PROFILE_JSON ]]; then profile_launch_args || die "could not prepare role profile launch"; fi
+  # Pi discovers .pi/skills and .agents/skills itself; Claude Code repositories keep theirs in .claude/skills.
+  local repo_root
+  if [[ -z $PROFILE_JSON && -z $MACHINE ]] && repo_root=$(git rev-parse --show-toplevel 2>/dev/null) && [[ -d $repo_root/.claude/skills ]]; then
+    PROFILE_LAUNCH_ARGS+=(--skill "$repo_root/.claude/skills")
+  fi
   # A subsequent generic start is a real unprofiled conversation, not permission to adopt it later.
   rm -f -- "$STATE_DIR/$name.profile-fresh"
   pane=${1:-}

@@ -35,6 +35,7 @@ Built-in types:
 - **`general-purpose`** has the parent's tools.
 - **`Explore`** locates code and is read-only.
 - **`Plan`** produces an implementation plan and is read-only.
+- **`researcher`** answers questions from high-trust primary sources and is read-only. It inherits an available `web_search` tool even in the background; the engine does not bundle a web lookup provider. Research findings include source URLs or absolute paths and verification limits.
 - **`fork`** inherits the conversation, system prompt, model and tools. It's off by default; enable it with `PI_SUBAGENT_FORK=1`.
 
 To add your own, write markdown files with frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `effort`, `skills`, `maxTurns`, `background`, `keep`, `isolation`, `memory`, `hooks`, `mcpServers`, `omitClaudeMd`, and `isolated` (or Herdr's legacy `extensions: false`), which limits the agent to built-in tools; `max_turns` is accepted for `maxTurns`. Definitions are found in these places, lowest priority first:

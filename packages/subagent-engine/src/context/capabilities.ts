@@ -56,6 +56,7 @@ export function compileToolSurface(input: SurfaceInput): ToolSurface {
 		if (tool.name === "Agent") return input.depth < input.maxDepth;
 		if (isMcp(tool)) return true;
 		if (MAIN_THREAD_ONLY.has(tool.name) || tool.name.startsWith("/")) return false;
+		if (definition.builtIn === "researcher" && tool.name === "web_search") return true;
 		return !input.background || BACKGROUND_ALLOWED.has(tool.name);
 	});
 	const poolNames = new Set(pool.map((tool) => tool.name));

@@ -135,9 +135,9 @@ test("MCP names, named inline configurations, and folded descriptions", () => {
 
 test("built-ins expose immutable-by-call contracts and gated fork", () => {
 	const definitions = builtInDefinitions({ forkEnabled: true });
-	assert.deepEqual(definitions.map((d) => d.agentType), ["general-purpose", "Explore", "Plan", "fork"]);
+	assert.deepEqual(definitions.map((d) => d.agentType), ["general-purpose", "Explore", "Plan", "researcher", "fork"]);
 	assert.equal(definitions[0].tools, undefined);
-	for (const name of ["Explore", "Plan"]) {
+	for (const name of ["Explore", "Plan", "researcher"]) {
 		const definition = definitions.find((d) => d.agentType === name)!;
 		assert.deepEqual(definition.disallowedTools, ["edit", "write", "Agent"]);
 		assert.equal(definition.omitClaudeMd, true);
@@ -145,8 +145,11 @@ test("built-ins expose immutable-by-call contracts and gated fork", () => {
 	}
 	assert.match(definitions[1].prompt, /quick.*medium.*very thorough/);
 	assert.match(definitions[2].prompt, /3–5 critical file paths/);
-	assert.equal(definitions[3].maxTurns, 200);
-	assert.equal(definitions[3].model, "inherit");
+	assert.match(definitions[1].prompt, /call needs_answer instead of deciding/);
+	assert.match(definitions[3].prompt, /high-trust primary sources/);
+	assert.match(definitions[3].prompt, /cite each claim's source with its URL or absolute path/);
+	assert.equal(definitions[4].maxTurns, 200);
+	assert.equal(definitions[4].model, "inherit");
 	assert.equal(builtInDefinitions({ forkEnabled: false }).some((d) => d.agentType === "fork"), false);
 	definitions[1].disallowedTools.push("read");
 	assert.deepEqual(builtInDefinitions({ forkEnabled: true })[1].disallowedTools, ["edit", "write", "Agent"]);

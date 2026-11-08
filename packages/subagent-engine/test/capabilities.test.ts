@@ -27,6 +27,12 @@ test("needs_answer is a lifecycle tool for all children except forks", () => {
 	assert.deepEqual(surface({ available: tools, isFork: true, parentTools: ["read", "needs_answer"] }).active, ["read"]);
 });
 
+test("background researchers inherit an available web_search tool without widening read-only denies", () => {
+	const result = surface({ background: true, available: [...available, { name: "web_search" }] }, { builtIn: "researcher", disallowedTools: ["edit", "write", "Agent"] });
+	assert.ok(result.active.includes("web_search"));
+	for (const name of ["edit", "write", "Agent"]) assert.ok(!result.active.includes(name));
+});
+
 test("an isolated definition keeps only built-in tools, even when it grants others", () => {
 	assert.deepEqual(surface({}, { isolated: true }).active.sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
 	assert.deepEqual(surface({}, { isolated: true, tools: ["read", "Agent", "mcp__repo"] }).active, ["read"]);

@@ -332,7 +332,7 @@ test("paneDefault sends Explore's prompt and read-only tool surface to its pane"
 	await harness.parent.prompt("Explore by default", { source: "extension" });
 	assert.equal(fake.spawns.length, 1);
 	const resolved = fake.spawns[0].resolved;
-	assert.match(resolved?.instructions ?? "", /Locate code rather than reviewing/);
+	assert.match(resolved?.instructions ?? "", /You find and explain code; you do not review or audit it/);
 	assert.ok(resolved?.allowedTools?.includes("read"));
 	for (const denied of ["edit", "write", "Agent"]) assert.ok(!resolved?.allowedTools?.includes(denied), `${denied} must stay denied in the pane`);
 });

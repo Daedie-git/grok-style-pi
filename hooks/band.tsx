@@ -50,6 +50,11 @@ export const register: Register = on => {
       $.fs.read(`${dir}/${name}`).then(t => (typeof t === 'string' ? t.trim() : fallback) || fallback, () => fallback)
 
     // A failed look still schedules the next one.
+    // Empty for a local slot. A remote binding's first line is the machine id; the launcher records its label.
+    const machineOf = async (name: string, label?: string) => {
+      const binding = (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local'
+      return binding === 'local' ? '' : label || binding
+    }
     const poll = () => scan().catch(() => undefined).finally(() => void schedule())
     const schedule = async () => {
       const fast = (await read($, rows)).length > 0 || (await $.clock.now()) < fastUntil
@@ -78,8 +83,7 @@ export const register: Register = on => {
           slot,
           role: await text(`${name}.role`, 'reviewer'),
           agent: await text(`${name}.agent`, 'pi'),
-          // The launcher records a remote machine's label; the binding's first line is its id (or 'local').
-          machine: request.machine || (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local',
+          machine: await machineOf(name, request.machine),
           kind: KIND_LABELS[request.id?.split('-')[2] ?? ''] ?? 'request',
           started: request.started ?? 0,
           waiting,
@@ -124,7 +128,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Text dimColor>{'─'.repeat(Math.max(0, e.props.bodyColumns))}</Text>
         {list.map(row => {
-          const where = row.machine === 'local' ? '' : ` @ ${row.machine}`
+          const where = row.machine ? ` @ ${row.machine}` : ''
           const detail = row.waiting ? ' · needs an answer' : ` · ${row.role} · ${row.agent}${where} · ${row.kind} · ${elapsed(ms / 1000 - row.started)}`
           return (
             <Text key={row.slot}>

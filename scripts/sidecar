@@ -1907,7 +1907,8 @@ implementer_contract() {
   echo "- First line of your report: \`Status: done\`, \`Status: partial\` or \`Status: blocked\`. Partial work is never done."
   echo "- Exercise the change through the real entry point a user or caller uses (the CLI command, editor action, app or service run), not only tests that call internals directly. A section \`## Verified\` quotes each command you ran and its result."
   echo "- A section \`## Not verified\` lists what you did not run (GPU, other platforms, slow suites) and why."
-  echo "- Change only what the task needs. List anything else you think should change under \`## Suggested follow-ups\` instead of doing it. A section \`## Files changed\` lists every file you touched."
+  echo "- Change only what the task needs, as the smallest diff in the surrounding code's style. List anything else you think should change under \`## Suggested follow-ups\` instead of doing it. A section \`## Files changed\` lists every file you touched."
+  echo "- A section \`## Additions\` names each new function, type, option, flag, fallback, file or dependency you added and the part of the task that required it, or says \`none\`. Remove any addition the task does not require before reporting."
   checks_match_request || return 0
   while IFS= read -r -d '' cmd; do
     echo "- After your report, the launcher runs \`$cmd\` itself in \`$(jq -r .cwd "$file")\` and shows its result to Claude. Run it first."

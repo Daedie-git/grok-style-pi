@@ -23,7 +23,7 @@ Use `--slot N` before the command to select an independent persistent sidecar (d
 
 For implementation tasks, select a fresh slot with `--role implementer` before `ask`. Pi and Claude Code default to medium reasoning for implementers and high for reviewers; Codex defaults to ultra for both. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides reasoning at startup.
 
-Implementer asks carry a completion contract: a `Status: done|partial|blocked` line, verification through the real entry point, and `Verified`, `Not verified`, `Files changed` and `Suggested follow-ups` sections. Run the ask from the implementer's checkout and give it launcher checks:
+Implementer asks carry a completion contract: a `Status: done|partial|blocked` line, verification through the real entry point, the smallest diff in the surrounding style, and `Verified`, `Not verified`, `Files changed`, `Additions` and `Suggested follow-ups` sections. `Additions` justifies each new function, option, fallback or dependency against the task; unjustified ones signal drift. Run the ask from the implementer's checkout and give it launcher checks:
 
 ```bash
 cd ../fury-wt && "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 4 --role implementer ask \

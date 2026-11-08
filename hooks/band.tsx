@@ -21,6 +21,7 @@ function elapsed(seconds: number): string {
 
 export const register: Register = on => {
   let timer: { cancel(): void } | undefined
+  let ticker: { cancel(): void } | undefined
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
@@ -66,15 +67,19 @@ export const register: Register = on => {
       found.sort((a, b) => Number(a.slot) - Number(b.slot))
       const before = await read($, rows)
       if (JSON.stringify(before) !== JSON.stringify(found)) await update($, rows, () => found)
-      // Tick elapsed times only while something is shown.
-      if (found.some(row => !row.waiting)) {
-        const ms = await $.clock.now()
-        await update($, now, () => ms)
-      }
+      await tick()
+    }
+    // Elapsed times redraw every second, only while a running row is shown.
+    const tick = async () => {
+      if (!(await read($, rows)).some(row => !row.waiting)) return
+      const ms = await $.clock.now()
+      await update($, now, () => ms)
     }
 
     timer?.cancel()
     timer = $.clock.every(POLL_MS, () => void poll())
+    ticker?.cancel()
+    ticker = $.clock.every(1000, () => void tick())
     await poll()
     return result
   })

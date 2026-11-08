@@ -6,7 +6,10 @@ import type { SlotRow } from '../types'
 const rows = atom({ plugin: 'claude-sidecar', key: 'rows' } as const, [] as SlotRow[])
 const now = atom({ plugin: 'claude-sidecar', key: 'now' } as const, 0)
 
-const POLL_MS = 3000
+// Fast while a row shows or right after this session runs the launcher; slow otherwise.
+const FAST_MS = 3000
+const SLOW_MS = 30000
+const LAUNCH_WINDOW_MS = 15000
 
 // Claude Code's subagent red for reviewers, blue for implementers, green for researchers, yellow for explorers.
 const ROLE_COLORS: Record<string, string> = { implementer: '#2563eb', researcher: '#16a34a', explorer: '#ca8a04' }
@@ -21,6 +24,8 @@ function elapsed(seconds: number): string {
 
 export const register: Register = on => {
   let timer: { cancel(): void } | undefined
+  let fastUntil = 0
+  let refresh: (() => void) | undefined
   let ticker: { cancel(): void } | undefined
 
   on('session.start', async ($, e, next) => {
@@ -35,7 +40,14 @@ export const register: Register = on => {
     const text = (name: string, fallback: string) =>
       $.fs.read(`${dir}/${name}`).then(t => (typeof t === 'string' ? t.trim() : fallback) || fallback, () => fallback)
 
-    const poll = async () => {
+    // A failed look still schedules the next one.
+    const poll = () => scan().catch(() => undefined).finally(() => void schedule())
+    const schedule = async () => {
+      const fast = (await read($, rows)).length > 0 || (await $.clock.now()) < fastUntil
+      timer?.cancel()
+      timer = $.clock.after(fast ? FAST_MS : SLOW_MS, () => void poll())
+    }
+    const scan = async () => {
       const entries = await $.fs.list(dir).catch(() => [])
       const names = new Set(entries.map(entry => entry.name))
       const found: SlotRow[] = []
@@ -76,12 +88,20 @@ export const register: Register = on => {
       await update($, now, () => ms)
     }
 
-    timer?.cancel()
-    timer = $.clock.every(POLL_MS, () => void poll())
+    refresh = () => void poll()
     ticker?.cancel()
     ticker = $.clock.every(1000, () => void tick())
     await poll()
     return result
+  })
+
+  // A launcher call starts or answers a request: look now and keep looking until it shows.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (refresh && /\bsidecar\b/.test(e.command)) {
+      fastUntil = (await $.clock.now()) + LAUNCH_WINDOW_MS
+      $.clock.after(1000, refresh)
+    }
+    return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

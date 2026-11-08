@@ -13,6 +13,15 @@ const LAUNCH_WINDOW_MS = 15000
 
 // Claude Code's subagent red for reviewers, blue for implementers, green for researchers, yellow for explorers.
 const ROLE_COLORS: Record<string, string> = { implementer: '#2563eb', researcher: '#16a34a', explorer: '#ca8a04' }
+// Plain labels for the launcher's request kinds (the third field of a request id).
+const KIND_LABELS: Record<string, string> = {
+  ask: 'task',
+  diff: 'code review',
+  plan: 'plan review',
+  answer: 'resumed with answer',
+  reject: 're-checking rejection',
+}
+
 const roleColor = (role: string) => ROLE_COLORS[role] ?? '#dc2626'
 
 function elapsed(seconds: number): string {
@@ -71,7 +80,7 @@ export const register: Register = on => {
           agent: await text(`${name}.agent`, 'pi'),
           // The launcher records a remote machine's label; the binding's first line is its id (or 'local').
           machine: request.machine || (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local',
-          kind: request.id?.split('-')[2] ?? 'request',
+          kind: KIND_LABELS[request.id?.split('-')[2] ?? ''] ?? 'request',
           started: request.started ?? 0,
           waiting,
         })

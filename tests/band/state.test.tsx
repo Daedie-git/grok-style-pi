@@ -46,3 +46,11 @@ test('a remote request shows its machine label, not the binding id', async ($, o
     records['sc-pane-1.request.json'] = '{"id":"20261108-215750-ask-sc-pane-1.x","started":1}'
   }
 })
+
+test('request kinds show plain labels', async ($, on) => {
+  setup(on, undefined)
+  await $.session.start({cwd:'/',surface:'terminal',isInteractive:true})
+  const ui = await mount($)
+  try { expect((await ui.find({type:'Text',text:/ · task · /}))?.text).toMatch(/ · task · /) }
+  finally { await ui.unmount() }
+})

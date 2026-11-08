@@ -23,6 +23,7 @@ export interface ChildSession {
 	noteStatus(status: "running" | "blocked"): Promise<void>;
 	noteLive(): Promise<void>;
 	noteSettled(outcome: "completed" | "aborted" | "error"): Promise<void>;
+	needsAnswer(question: string): Promise<void>;
 	noteExit(): Promise<void>;
 	noteTurn(): Promise<void>;
 	allows(toolName: string): boolean;
@@ -33,6 +34,7 @@ export function taskMessage(task: Pick<HerdrTask, "type" | "description" | "prom
 	return [
 		`You are a subagent running in your own ${task.runtime === "claude-code" ? "Claude Code" : "Pi"} pane. Finish the task below and reply with the result.`,
 		"Do not start other subagents unless the task explicitly asks you to.",
+		task.runtime !== "claude-code" ? "When the task needs a decision beyond what it says, call needs_answer with one concrete question and the work state. This ends your run; the parent can resume you with its answer." : undefined,
 		`Type: ${task.type}`,
 		`Task: ${task.description}`,
 		task.instructions?.trim(),
@@ -162,6 +164,15 @@ export async function createChildSession(store: HerdrStore, paneId: string, iden
 				});
 			});
 		},
+		needsAnswer(question) {
+			const ref = capture();
+			return enqueue(async () => {
+				if (!question.trim()) throw new Error("Provide one concrete question with the work state.");
+				if (!ref || !armed) throw new Error("No active Herdr child run.");
+				await finish(ref, { type: "needs-answer", result: question.trim() });
+				messenger.abort();
+			});
+		},
 		noteExit() {
 			const ref = capture();
 			return enqueue(async () => {
@@ -177,5 +188,5 @@ export async function createChildSession(store: HerdrStore, paneId: string, iden
 }
 
 function allows(agent: AgentRecord, toolName: string): boolean {
-	return agent.allowedTools === undefined || agent.allowedTools.includes(toolName);
+	return toolName === "needs_answer" || agent.allowedTools === undefined || agent.allowedTools.includes(toolName);
 }

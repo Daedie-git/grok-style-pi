@@ -372,6 +372,17 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				sessionFile: ctx.sessionManager.getSessionFile() ?? "",
 				sessionId: ctx.sessionManager.getSessionId(), checkpoint,
 			}, messenger);
+			if (child) pi.registerTool(defineTool({
+				name: "needs_answer",
+				label: "Needs answer",
+				description: "End this run immediately with one concrete question and the current work state. The parent can reply with SendMessage to resume this same agent.",
+				parameters: Type.Object({ question: Type.String({ minLength: 1 }) }),
+				async execute(_id, { question }) {
+					if (!child) throw new Error("Not a Herdr child session.");
+					await child.needsAnswer(question);
+					return { content: [{ type: "text", text: question }], details: undefined, terminate: true };
+				},
+			}));
 			if (timer) clearInterval(timer);
 			/** The last error per source ("" for this machine), so failing machines never alternate past deduplication. */
 			const lastErrors = new Map<string, string>();

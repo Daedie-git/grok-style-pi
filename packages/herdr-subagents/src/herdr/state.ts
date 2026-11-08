@@ -5,7 +5,7 @@ export interface RunRef {
 	runId: string;
 }
 
-export type RunPhase = "queued" | "starting" | "running" | "blocked" | "completed" | "failed" | "stopped";
+export type RunPhase = "queued" | "starting" | "running" | "blocked" | "completed" | "failed" | "stopped" | "needs-answer";
 
 export interface RunSnapshot extends RunRef {
 	phase: RunPhase;
@@ -26,10 +26,10 @@ export type ExecutionEvent =
 	| { type: "live" }
 	| { type: "blocked" | "unblocked" }
 	| { type: "turn"; maxTurns?: number }
-	| { type: "completed" | "failed" | "stopped"; result?: string; error?: string };
+	| { type: "completed" | "failed" | "stopped" | "needs-answer"; result?: string; error?: string };
 
 export function isTerminal(phase: RunPhase): boolean {
-	return phase === "completed" || phase === "failed" || phase === "stopped";
+	return phase === "completed" || phase === "failed" || phase === "stopped" || phase === "needs-answer";
 }
 
 export function expireUnaccepted(run: RunSnapshot, now: number): RunSnapshot {

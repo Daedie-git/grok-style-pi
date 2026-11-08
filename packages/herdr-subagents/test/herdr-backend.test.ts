@@ -168,7 +168,7 @@ test("backend mode retains child input authorization, tool filtering and settled
 	await child.handlers.get("agent_settled")!();
 	assert.equal((await f.observer.read(ref)).result, "Scoped child finished");
 	assert.equal((await f.observer.read(ref)).phase, "completed");
-	assert.deepEqual(child.tools, []);
+	assert.deepEqual(child.tools.map((tool: any) => tool.name), ["needs_answer"]);
 });
 
 test("backend cancellation reports a request before child acknowledgement and Claude steering is unsupported", { timeout: 15_000 }, async (t) => {
@@ -322,3 +322,35 @@ for (const surface of ["resume", "spawn"] as const) {
 		assert.equal(record.parentWorkspaceId, "current-workspace");
 	});
 }
+
+
+test("backend needs-answer carries the question and a typed notice, and resumes with the answer", { timeout: 15_000 }, async (t) => {
+	const f = fixture(t);
+	const parent = await install(f);
+	const notices: HerdrBackendNotice[] = [];
+	parent.backend.onNotice((notice) => notices.push(notice));
+	await parent.start();
+	const ref = await parent.backend.spawn({ ...request(f.root), resolved: { allowedTools: [] }, isolated: true }, parent.ctx);
+	const record = await f.observer.resolve(ref.agentId);
+	const sessionId = JSON.parse(readFileSync(record.sessionFile, "utf8").split("\n")[0]).id;
+	const child = await install(f, record.paneId, record.sessionFile, sessionId);
+	await child.start();
+	await until(() => child.sent.length === 1);
+	await child.handlers.get("agent_start")!();
+	const tool = child.tools.find((tool: any) => tool.name === "needs_answer") as any;
+	const question = "Changes saved. Which configuration should I use?";
+	assert.equal((await tool.execute("question", { question })).terminate, true);
+	await child.handlers.get("agent_settled")!();
+	const result = await parent.backend.read(ref.agentId, { wait: true });
+	assert.equal(result.phase, "needs-answer");
+	assert.equal(result.resultText, question);
+	assert.ok(result.text.startsWith(question));
+	await until(() => notices.length === 1);
+	assert.equal(notices[0].phase, "needs-answer");
+	assert.ok(notices[0].content.startsWith(question));
+	assert.match(notices[0].content, /Reply with SendMessage/);
+	const next = await parent.backend.resume(ref.agentId, "Use the project configuration.", parent.ctx);
+	assert.notEqual(next.runId, ref.runId);
+	await until(() => child.sent.length === 2);
+	assert.match(child.sent[1], /Use the project configuration/);
+});

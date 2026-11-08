@@ -13,7 +13,7 @@ import { defaultThinking, parseAgentFile } from "../src/herdr/agent-file.ts";
 import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
 import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { HerdrRunner, agentPresence, completionNotice, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
+import { HerdrRunner, agentPresence, completionNotice, formatStatus, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
 import { HerdrStore, type HerdrTask } from "../src/herdr/store.ts";
 import { isTerminal, type RunRef, type ExecutionEvent } from "../src/herdr/state.ts";
 
@@ -1503,4 +1503,38 @@ test("simultaneous first opens initialize WAL without losing a control worker", 
 	try {
 		assert.deepEqual(await Promise.all(stores.map((store) => store.listAgents())), Array.from({ length: 6 }, () => []));
 	} finally { await Promise.all(stores.map((store) => store.close())); rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("needs_answer ends a restricted child run, publishes the question and resumes the same conversation", async (t) => {
+	const f = fixture(t);
+	const ref = await f.runner.spawn(request({ resolved: { allowedTools: [] }, isolated: true }));
+	const c = await attach(f.runner, ref);
+	await c.start();
+	assert.equal(c.child.allows("needs_answer"), true);
+	assert.equal(c.child.allows("bash"), false);
+	await assert.rejects(c.child.needsAnswer("  "), /concrete question/);
+	const question = "Implementation is ready. Should the default be enabled?";
+	await c.child.needsAnswer(question);
+	assert.equal(c.aborted(), 1);
+	await c.finish("ignored after abort", "aborted");
+	const value = await f.runner.wait(ref);
+	assert.equal(value.phase, "needs-answer");
+	assert.equal(value.result, question);
+	assert.equal(c.checkpoint()?.event.type, "needs-answer");
+	const notice = (await f.runner.store.notices("w1:p1"))[0];
+	assert.equal(notice.run.phase, "needs-answer");
+	for (const text of [completionNotice(notice), formatStatus(notice.agent, value)]) {
+		assert.ok(text.startsWith(question));
+		assert.match(text, /Reply with SendMessage/);
+	}
+	c.setStreaming(false);
+	const next = await f.runner.resume(ref.agentId, "Yes, enable it.");
+	assert.equal(next.agentId, ref.agentId);
+	assert.notEqual(next.runId, ref.runId);
+	await c.start();
+	assert.match(c.sent.at(-1)!.text, /Yes, enable it/);
+	await c.finish("Enabled and checked.");
+	assert.equal((await f.runner.read(next)).phase, "completed");
+	assert.equal((await f.runner.read(ref)).phase, "needs-answer");
 });

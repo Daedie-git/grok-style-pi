@@ -644,7 +644,7 @@ const operations = {
 	notices(parentPaneId: string, parentSessionFile?: string, parentMachine?: string): CompletionNotice[] {
 		return db.prepare(`SELECT r.data,a.data AS agent_data FROM notices n JOIN runs r ON r.id=n.run JOIN agents a ON a.id=r.agent
 			WHERE n.acknowledged=0 AND (json_extract(a.data,'$.parentPaneId')=? OR json_extract(a.data,'$.parentSessionFile')=?)
-			AND json_extract(r.data,'$.phase') IN ('completed','failed','stopped')`).all(parentPaneId, parentSessionFile ?? null).flatMap((row) => {
+			AND json_extract(r.data,'$.phase') IN ('completed','failed','stopped','needs-answer')`).all(parentPaneId, parentSessionFile ?? null).flatMap((row) => {
 			const value = decode<RunSnapshot>(row)!;
 			const record = JSON.parse(String(row.agent_data)) as AgentRecord;
 			if (parentSessionFile && record.parentSessionFile && parentSessionFile !== record.parentSessionFile) return [];

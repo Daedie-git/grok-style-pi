@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatStatus, qualifiedAgentId, type HerdrRunner, type SpawnRequest, type ResumeCaller } from "./runner.ts";
 import type { CompletionNotice } from "./store.ts";
 import type { RunPhase } from "./state.ts";
-export type HerdrTerminalPhase = "completed" | "failed" | "stopped";
+export type HerdrTerminalPhase = "completed" | "failed" | "stopped" | "needs-answer";
 
 export type HerdrBackendRequest = Omit<SpawnRequest, "paneId" | "tabId" | "workspaceId" | "sessionFile" | "agentDir"> & { machine?: string; machineCwd?: string };
 export interface HerdrBackendNotice { noticeId: string; agentId: string; runId: string; phase: HerdrTerminalPhase; content: string; machine?: string }
@@ -110,7 +110,7 @@ export function createBackendController(host: BackendHost) {
 			for (const notice of await source.store.notices(parentPaneId, parentSessionFile, parentMachine)) {
 				if (!listeners.size || queued.has(notice.id)) continue;
 				const phase = notice.run.phase;
-				if (phase !== "completed" && phase !== "failed" && phase !== "stopped") continue;
+				if (phase !== "completed" && phase !== "failed" && phase !== "stopped" && phase !== "needs-answer") continue;
 				host.assertActive();
 				sources.set(notice.id, qualifiedAgentId(notice.agentId, source.machine));
 				const pi = notice.agent.runtime !== "claude-code";

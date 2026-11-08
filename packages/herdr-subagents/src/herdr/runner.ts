@@ -1160,6 +1160,7 @@ export async function steerHerdrAgent(root: string, agentId: string, messageText
 export function completionNotice(notice: CompletionNotice, machine?: string): string {
 	const preview = (notice.run.result || notice.run.error || "No output.").slice(0, 500);
 	const agentId = qualifiedAgentId(notice.agentId, machine);
+	if (notice.run.phase === "needs-answer") return `${notice.run.result ?? ""}\n\nAgent ${agentId} needs answer. Reply with SendMessage to agent "${agentId}" to resume it with your answer (standalone: Agent with resume "${agentId}").\nRun ID: ${notice.runId}`;
 	return `Background agent ${notice.run.phase}: ${notice.agent.description}\nAgent ID: ${agentId}\nRun ID: ${notice.runId}\nPane: ${paneText(notice.agent.paneId, machine)}\n\n${preview}\n\nUse get_subagent_result with agent_id "${agentId}" and run_id "${notice.runId}" for full output.`;
 }
 
@@ -1218,6 +1219,7 @@ function loadAgent(request: SpawnRequest) {
 
 export function formatStatus(record: AgentRecord, snapshot: RunSnapshot, machine?: string): string {
 	const pane = paneText(record.paneId, machine);
+	if (snapshot.phase === "needs-answer") return `${snapshot.result ?? ""}\n\nAgent ${qualifiedAgentId(record.id, machine)} needs answer. Reply with SendMessage to agent "${qualifiedAgentId(record.id, machine)}" to resume it with your answer (standalone: Agent with resume "${qualifiedAgentId(record.id, machine)}").\nRun: ${snapshot.runId}\nPane: ${pane}`;
 	const header = `Agent: ${qualifiedAgentId(record.id, machine)}\nRun: ${snapshot.runId}\nRuntime: ${record.runtime ?? "pi"}\nType: ${record.type} | Status: ${snapshot.phase}\nDescription: ${record.description}\nPane: ${pane}\n`;
 	if (snapshot.cancelRequested && !isTerminal(snapshot.phase)) return `${header}\nCancellation requested; waiting for the child to stop.`;
 	if (snapshot.phase === "blocked") return `${header}\nAgent is blocked in Herdr pane ${pane}. Answer the prompt there.`;

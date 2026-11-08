@@ -2,11 +2,11 @@
 # shellcheck disable=SC2016  # remote scripts are single-quoted on purpose: the machine expands them
 # Persistent review sidecars, hosted in Herdr panes beside Claude.
 #
-#   sidecar [--slot N] [--role reviewer|implementer] [--agent pi|claude|codex] [--profile-file FILE] [--machine NAME [--remote-cwd DIR]] COMMAND
+#   sidecar [--slot N] [--role reviewer|implementer] [--agent pi|claude] [--profile-file FILE] [--machine NAME [--remote-cwd DIR]] COMMAND
 #                                --profile-file binds a resolved version 1 Fleet role profile to a fresh pi conversation
 #                                select an independent persistent sidecar (default 1), optionally on a saved herdr
 #                                machine (herdr 0.9.1+); a slot stays on the machine it started on
-#                                native claude/codex agents support reports and answers; reload and busy steer require pi
+#                                native claude agents support reports and answers; reload and busy steer require pi
 #   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
 #   sidecar session-end          SessionEnd hook entry; stop this owner's panes unless clearing
 #   sidecar sweep                close local panes whose owner is gone
@@ -178,8 +178,7 @@ profile_check_unlocked() {
   name=$(agent_name)
   hname=$(herdr_agent)
   if [[ ! -f "$STATE_DIR/$name.profile.json" && ! -f "$STATE_DIR/$name.profile-fresh" ]]; then
-    if [[ -f "$STATE_DIR/$name.session" || -f "$STATE_DIR/$name.agent" || -f "$STATE_DIR/$name.role" || -f "$STATE_DIR/$name.claude-started" ||
-          -f "$STATE_DIR/$name.codex-session" ]] || [[ $(agent_status "$hname") != missing ]]; then
+    if [[ -f "$STATE_DIR/$name.session" || -f "$STATE_DIR/$name.agent" || -f "$STATE_DIR/$name.role" || -f "$STATE_DIR/$name.claude-started" ]] || [[ $(agent_status "$hname") != missing ]]; then
       die "cannot attach a profile to an unprofiled conversation; use stop --fresh first"
     fi
   fi
@@ -258,7 +257,7 @@ profile_skill_path() {
   fi
 }
 
-# Role prompt files, in order, for Claude Code and Codex, which take one instructions file.
+# Role prompt files, in order, for Claude Code, which takes one instructions file.
 role_prompt_files() {
   if [[ $ROLE == implementer ]]; then
     printf '%s\n' "$SIDECAR_HOME/profile.md" "$SIDECAR_HOME/implementer.md"
@@ -341,7 +340,8 @@ resolve_backend() {
   local file saved=
   file="$STATE_DIR/$(agent_name).agent"
   if [[ -f $file ]]; then saved=$(<"$file"); fi
-  [[ -z $saved || $saved == pi || $saved == claude || $saved == codex ]] || die "invalid slot agent in $file"
+  [[ $saved != codex ]] || die "slot ran Codex CLI, which is no longer supported; use a new slot"
+  [[ -z $saved || $saved == pi || $saved == claude ]] || die "invalid slot agent in $file"
   if [[ -n $saved && -n $AGENT_ARG && $saved != "$AGENT_ARG" ]]; then
     die "slot already runs $saved; use a new slot for $AGENT_ARG"
   fi
@@ -349,7 +349,6 @@ resolve_backend() {
   if [[ -z $saved && $BACKEND != pi && $(agent_status "$(herdr_agent)") != missing ]]; then
     die "slot already has a running pi; use a new slot for $BACKEND"
   fi
-  [[ $BACKEND != codex ]] || THINKING=${SIDECAR_THINKING:-ultra}
 }
 
 # Claude needs a UUID session id; derive it from the slot's session id so restarts resume the same conversation.
@@ -691,16 +690,10 @@ agent_session_file() {
   hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null || true
 }
 
-codex_session_id() {
-  local file
-  file="$STATE_DIR/$(agent_name).codex-session"
-  if [[ -s $file ]]; then head -n 1 "$file"; fi
-}
-
 # True when the pi in the sidecar's pane runs the session this sidecar was started with. herdr relaunches a bare `pi`
 # (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
 agent_runs_sidecar_session() {
-  local session attempt expected
+  local session attempt
   if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
     windows_pid "$1" >/dev/null 2>&1
     return
@@ -709,19 +702,6 @@ agent_runs_sidecar_session() {
   if [[ $BACKEND == claude ]]; then
     [[ $(hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent // empty' 2>/dev/null) == claude ]]
     return
-  fi
-  if [[ $BACKEND == codex ]]; then
-    expected=$(codex_session_id)
-    [[ -n $expected ]] || return 1
-    for ((attempt = 0; attempt < 20; attempt++)); do
-      session=$(hd agent get "$1" 2>/dev/null | jq -r 'if .result.agent.agent == "codex" then .result.agent.agent_session.value // empty else "foreign" end' 2>/dev/null) || true
-      if [[ -n $session ]]; then
-        [[ $session == "$expected" ]]
-        return
-      fi
-      sleep 0.5
-    done
-    return 1
   fi
   # Herdr can report a newly launched pi before its session path is published (notably on Windows).
   # An empty path is not evidence that a different pi owns the pane.
@@ -933,7 +913,7 @@ stop_unlocked() {
       flock 7
       # Preserve baseline unprofiled machine/check/question bindings. A profiled reset,
       # or an explicit --profile-file rebind, may clear the expanded Fleet identity.
-      rm -f -- "$STATE_DIR/$name.codex-session" "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session" "$STATE_DIR/$name.keep"
+      rm -f -- "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session" "$STATE_DIR/$name.keep"
       if [[ -f "$STATE_DIR/$name.profile.json" || -n $PROFILE_ARG ]]; then
         rm -f -- "$STATE_DIR/$name.profile.json" "$STATE_DIR/$name.profile.sha256" "$STATE_DIR/$name.profile-prompt.md" \
           "$STATE_DIR/$name.cwd" "$STATE_DIR/$name.machine" "$STATE_DIR/$name.startup.json" \
@@ -1063,9 +1043,6 @@ start_unlocked() {
     if [[ $BACKEND == claude ]]; then
       start_claude "$hname" "$pane" "$name" && return
       err=$CLAUDE_START_ERR
-    elif [[ $BACKEND == codex ]]; then
-      start_codex "$hname" "$pane" "$name" && return
-      err=$CODEX_START_ERR
     elif err=$(hd agent start "$hname" --kind pi --pane "$pane" --timeout 60000 -- \
       --session-id "$session" -n claude-sidecar \
       --model "$MODEL" --thinking "$THINKING" \
@@ -1116,53 +1093,6 @@ start_claude() {
   return 1
 }
 
-CODEX_START_ERR=
-start_codex() {
-  local hname=$1 pane=$2 name=$3 session prompt config attempt live role
-  local state_dir=${REMOTE_STATE:-$STATE_DIR}
-  local resume=()
-  session=$(codex_session_id)
-  [[ -z $session ]] || resume=(resume "$session")
-  prompt="$STATE_DIR/$name.codex-prompt.md"
-  mapfile -t role < <(role_prompt_files)
-  if ! cat "${role[@]}" "$SIDECAR_HOME/codex-delivery.md" >"$prompt"; then
-    CODEX_START_ERR="could not write the Codex prompt"
-    return 1
-  fi
-  if [[ -n $MACHINE ]] && ! prompt=$(publish_file "$prompt"); then
-    CODEX_START_ERR="could not copy the Codex prompt to $MACHINE_LABEL"
-    return 1
-  fi
-  if [[ -n $HOST_WINDOWS && -z $MACHINE ]]; then
-    prompt=$(cygpath -m "$prompt")
-    state_dir=$(cygpath -m "$state_dir")
-  fi
-  config=$(jq -Rn --arg path "$prompt" '$path')
-  if ! CODEX_START_ERR=$(hd agent start "$hname" --kind codex --pane "$pane" --timeout 60000 -- \
-    "${resume[@]}" --yolo --model "${SIDECAR_CODEX_MODEL:-gpt-6.1-sol}" \
-    -c "model_reasoning_effort=\"$THINKING\"" -c "model_instructions_file=$config" \
-    --add-dir "$state_dir" 2>&1 >/dev/null); then
-    return 1
-  fi
-  # Herdr's Codex SessionStart hook runs on the first turn, including after a resume.
-  if ! CODEX_START_ERR=$(hd agent prompt "$hname" "[note] Initialize this sidecar; reply noted." 2>&1 >/dev/null); then
-    CODEX_START_ERR="could not initialize Codex in $pane: $CODEX_START_ERR"
-    return 1
-  fi
-  # Codex assigns the UUID. Save the exact session Herdr reports; never resume another slot via --last.
-  for ((attempt = 0; attempt < 20; attempt++)); do
-    live=$(hd agent get "$hname" 2>/dev/null | jq -r 'select(.result.agent.agent == "codex") | .result.agent.agent_session.value // empty' 2>/dev/null) || true
-    if [[ $live =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-      [[ -z $session || $live == "$session" ]] || die "$hname resumed Codex session $live instead of $session; inspect its pane"
-      printf '%s\n' "$live" >"$STATE_DIR/$name.codex-session"
-      echo "$hname started in $pane (codex session $live)"
-      return 0
-    fi
-    sleep 0.5
-  done
-  die "cannot identify the Codex session in $pane; check its pane and Herdr's Codex integration before retrying"
-}
-
 # Preserve a foreign session under another name and resume the sidecar in a new pane.
 restart_unlocked() {
   require_herdr
@@ -1194,8 +1124,8 @@ cmd_session_start() {
       exit 0
     fi
   done
-  if ! command -v pi >/dev/null 2>&1 && ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; then
-    echo "sidecar: missing agent CLI (pi, claude or codex); skipping startup" >&2
+  if ! command -v pi >/dev/null 2>&1 && ! command -v claude >/dev/null 2>&1; then
+    echo "sidecar: missing agent CLI (pi or claude); skipping startup" >&2
     exit 0
   fi
   interactive_claude_owner || ancestry=$?
@@ -1226,7 +1156,7 @@ cmd_session_start() {
   } 7>"$STATE_DIR/$SIDECAR_AGENT.identity.lock"
   schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
   jq -n --arg machines "$(machine_guidance)" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext:
-    ("Persistent pi, Claude Code and Codex sidecars are available on demand in Herdr; none is started at startup. Follow the claude-sidecar:sidecar-review skill. Requests start their sidecar automatically. Use --agent codex on a fresh slot for Codex CLI with ultra reasoning. Use --slot N before a command for independent parallel sidecars; reuse that slot for follow-ups and answers." + $machines)}}'
+    ("Persistent pi and Claude Code sidecars are available on demand in Herdr; none is started at startup. Follow the claude-sidecar:sidecar-review skill. Requests start their sidecar automatically. Use --slot N before a command for independent parallel sidecars; reuse that slot for follow-ups and answers." + $machines)}}'
 }
 
 # 0: identified interactive owner; 1: excluded Claude; 2: ancestry unavailable or unidentified.
@@ -1501,15 +1431,9 @@ $(remote_notice)"
   if [[ -n $MACHINE ]]; then prompt_path=$(publish_file "$req"); fi
   wait_until_ready "$hname"
   # Requests may run for hours: wait without a deadline until a report arrives or the sidecar settles without one.
-  local finish="Finish by calling submit_review with request_id $id." agent_report=$report
-  if [[ $BACKEND == codex && -n $HOST_WINDOWS && -z $MACHINE ]]; then
-    prompt_path=$(cygpath -m "$prompt_path")
-    agent_report=$(cygpath -m "$report")
-  fi
+  local finish="Finish by calling submit_review with request_id $id."
   if [[ $BACKEND == claude ]]; then
     finish="Finish by writing your report to $report with the Write tool; for a blocking question, first write it to ${report%.md}.needs-answer."
-  elif [[ $BACKEND == codex ]]; then
-    finish="Finish by writing your complete Markdown report to $agent_report; for a blocking question, first write the one-line question to ${agent_report%.md}.needs-answer, then the report."
   fi
   if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
     if [[ -z $MACHINE ]]; then prompt_path=$(cygpath -m "$prompt_path"); fi
@@ -1582,8 +1506,6 @@ cmd_plan() {
     copy=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-planfile-$(agent_name).XXXXXX.md")
     cp -- "$file" "$copy"
     file=$(publish_file "$copy")
-  elif [[ $BACKEND == codex && -n $HOST_WINDOWS ]]; then
-    file=$(cygpath -m "$file")
   fi
   request plan "# Plan review
 
@@ -1814,9 +1736,6 @@ cmd_diff() {
     # The machine's checkout of the same repository: WORK_DIR is the counterpart of this directory.
     rel=${PWD#"$root"}
     repo=${WORK_DIR%"$rel"}
-  elif [[ $BACKEND == codex && -n $HOST_WINDOWS ]]; then
-    diff_path=$(cygpath -m "$diff_path")
-    repo=$(cygpath -m "$repo")
   fi
   rejected=$(rejections_unsettled)
   if [[ -n $rejected ]]; then
@@ -2680,7 +2599,6 @@ cmd_status() {
   name=$(herdr_agent)
   case $BACKEND in
     claude) session=$(claude_session_uuid) ;;
-    codex) session=$(codex_session_id) ;;
     *) session=$(pi_session_id) ;;
   esac
   local live
@@ -2894,7 +2812,7 @@ while [[ ${1:-} == --* ]]; do
       [[ ${2:-} == reviewer || ${2:-} == implementer ]] || die "--role requires reviewer or implementer"
       ROLE_ARG=$2 ;;
     --agent)
-      [[ ${2:-} == pi || ${2:-} == claude || ${2:-} == codex ]] || die "--agent requires pi, claude or codex"
+      [[ ${2:-} == pi || ${2:-} == claude ]] || die "--agent requires pi or claude"
       AGENT_ARG=$2 ;;
     --profile-file)
       [[ -n ${2:-} ]] || die "--profile-file requires a JSON file"

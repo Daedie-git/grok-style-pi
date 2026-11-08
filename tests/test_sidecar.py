@@ -154,16 +154,10 @@ elif args[:2] == ['agent', 'start']:
     kind = args[args.index('--kind') + 1] if '--kind' in args else 'pi'
     target['agent'] = kind
     panes_path.write_text(json.dumps(panes))
-    if kind == 'codex':
-        session = args[args.index('resume') + 1] if 'resume' in args else str(uuid.uuid4())
-        session_value = ''
-    else:
-        session = args[args.index('--session-id' if '--session-id' in args else '--resume') + 1]
-        session_value = '/tmp/time_' + session + '.jsonl'
+    session = args[args.index('--session-id' if '--session-id' in args else '--resume') + 1]
+    session_value = '/tmp/time_' + session + '.jsonl'
     record = {'agent': kind, 'agent_status': 'idle', 'pane_id': target['pane_id'],
               'agent_session': {'value': session_value}}
-    if kind == 'codex':
-        record['_codex_session'] = session
     if kind == 'claude':
         flag = '--session-id' if '--session-id' in args else '--resume'
         record['_argv'] = ['claude', flag, session]
@@ -218,21 +212,6 @@ elif args[:2] == ['agent', 'rename']:
     state_path.unlink()
 elif args[:2] == ['agent', 'prompt']:
     prompt = args[3]
-    # Codex's SessionStart hook publishes its UUID on the first turn, after TUI readiness.
-    if '_codex_session' in state:
-        state['agent_session']['value'] = state.pop('_codex_session')
-        state_path.write_text(json.dumps(state))
-    if state['agent'] == 'codex' and prompt.startswith('[note] Initialize') and os.environ.get('FAKE_CODEX_BOOTSTRAP_DELAY'):
-        state['agent_status'] = 'working'
-        state_path.write_text(json.dumps(state))
-        import subprocess
-        subprocess.Popen([sys.executable, '-c', (
-            'import json,pathlib,time,sys;time.sleep(float(sys.argv[2]));'
-            'p=pathlib.Path(sys.argv[1]);s=json.loads(p.read_text());'
-            's["agent_status"]="idle";q=p.with_suffix(".bootstrap");'
-            'q.write_text(json.dumps(s));q.replace(p)'),
-            str(state_path), os.environ['FAKE_CODEX_BOOTSTRAP_DELAY']],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if prompt == '/reload' or prompt.startswith('/sidecar-reload '):
         if not os.environ.get('FAKE_NO_RELOAD'):
             session = state['agent_session']['value'].split('time_', 1)[1][:-6]
@@ -337,7 +316,7 @@ class LauncherTests(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:/usr/bin:/bin:{NODE_DIR}',
                         HERDR_ENV='1', HERDR_PANE_ID='PANE:1', HERDR_WORKSPACE_ID='workspace-1',
                         SIDECAR_CLOSE_WHEN_DONE='0')
-        for key in ('SIDECAR_AGENT', 'SIDECAR_PI_SESSION', 'SIDECAR_MODEL', 'SIDECAR_CODEX_MODEL',
+        for key in ('SIDECAR_AGENT', 'SIDECAR_PI_SESSION', 'SIDECAR_MODEL',
                     'SIDECAR_THINKING', 'CLAUDE_ENV_FILE',
                     'SIDECAR_MACHINE', 'SIDECAR_REMOTE_HOME', 'GROK_STEER_DIR', 'XDG_STATE_HOME',
                     'SIDECAR_TEST_ANCESTRY_PID'):
@@ -710,19 +689,14 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(claude_path.exists())
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
 
-    def test_sweep_closes_ownerless_claude_and_codex_slots(self):
+    def test_sweep_closes_ownerless_claude_slots(self):
         state = self.lifecycle_state()
         self.run_cli('--agent', 'claude', 'ask', 'Claude request')
-        self.run_cli('--slot', '2', '--agent', 'codex', 'ask', 'Codex request')
-        files = ['sc-pane-1.session', 'sc-pane-1.claude-started', 'sc-pane-1-2.codex-session']
+        files = ['sc-pane-1.session', 'sc-pane-1.claude-started']
         sessions = {name: (state / name).read_text() for name in files}
         self.remove_owner()
-        codex = self.home / 'sc-pane-1-2.agent.json'
-        record = json.loads(codex.read_text())
-        record['agent_status'] = 'done'
-        codex.write_text(json.dumps(record))
         self.run_cli('sweep')
-        self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 2)
+        self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 1)
         for name, session in sessions.items():
             self.assertEqual((state / name).read_text(), session)
 
@@ -1296,20 +1270,9 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.calls()))
         self.assertTrue(agent.exists())
 
-    def test_stop_fresh_drops_the_codex_session(self):
-        self.run_cli('--agent', 'codex', 'start')
-        session_file = self.home / '.cache/claude-sidecar/sc-pane-1.codex-session'
-        old = session_file.read_text().strip()
-        self.run_cli('stop', '--fresh')
-        self.assertFalse(session_file.exists())
-        self.run_cli('start')
-        last = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
-        self.assertNotIn('resume', last)
-        self.assertNotEqual(session_file.read_text().strip(), old)
-
     def test_stop_all_stops_every_slot(self):
         self.run_cli('start')
-        self.run_cli('--slot', '3', '--agent', 'codex', 'start')
+        self.run_cli('--slot', '3', '--agent', 'claude', 'start')
         result = self.run_cli('stop', '--all')
         self.assertEqual(sum(c[:2] == ['pane', 'close'] for c in self.calls()), 2)
         self.assertIn('sc-pane-1 stopped', result.stdout)
@@ -1328,16 +1291,22 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('use a new slot', result.stderr)
 
     def test_implementer_gets_the_implementer_prompt_on_every_backend(self):
-        for slot, agent in (('2', 'pi'), ('3', 'claude'), ('4', 'codex')):
+        for slot, agent in (('2', 'pi'), ('3', 'claude')):
             self.run_cli('--slot', slot, '--agent', agent, '--role', 'implementer', 'start')
         starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
         pi = [Path(starts[0][i + 1]).name for i, flag in enumerate(starts[0]) if flag == '--append-system-prompt']
         self.assertEqual(pi, ['profile.md', 'implementer.md'])
         claude = Path(starts[1][starts[1].index('--append-system-prompt-file') + 1]).read_text()
-        codex = [a for a in starts[2] if a.startswith('model_instructions_file=')][0].split('=', 1)[1]
-        for text in (claude, Path(json.loads(codex)).read_text()):
-            self.assertIn("Claude's implementer sidecar", text)
-            self.assertNotIn('be adversarial', text.lower())
+        self.assertIn("Claude's implementer sidecar", claude)
+        self.assertNotIn('be adversarial', claude.lower())
+
+    def test_saved_codex_slot_is_refused(self):
+        state = self.home / '.cache/claude-sidecar'
+        state.mkdir(parents=True, exist_ok=True)
+        (state / 'sc-pane-1-2.agent').write_text('codex\n')
+        result = self.run_cli('--slot', '2', 'start', check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no longer supported', result.stderr)
 
     def test_claude_agent_starts_claude_and_resumes_its_session(self):
         self.run_cli('--agent', 'claude', 'start')
@@ -1368,192 +1337,6 @@ class LauncherTests(unittest.TestCase):
         prompt = next(c for c in self.calls() if c[:2] == ['agent', 'prompt'])[3]
         self.assertIn('with the Write tool', prompt)
         self.assertNotIn('submit_review', prompt)
-
-    @staticmethod
-    def codex_config(start):
-        return dict(start[index + 1].split('=', 1)
-                    for index, arg in enumerate(start[:-1]) if arg in ('-c', '--config'))
-
-    def test_codex_starts_with_ultra_and_remembers_its_session(self):
-        self.run_cli('--agent', 'codex', 'start')
-        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
-        self.assertEqual(start[start.index('--kind') + 1], 'codex')
-        self.assertEqual(start[start.index('--model') + 1], 'gpt-6.1-sol')
-        config = self.codex_config(start)
-        self.assertEqual(json.loads(config['model_reasoning_effort']), 'ultra')
-        prompt = Path(json.loads(config['model_instructions_file']))
-        self.assertTrue(prompt.is_absolute())
-        self.assertIn('codex-prompt', prompt.name)
-        self.assertIn('Codex', prompt.read_text())
-        self.assertIn('.needs-answer', prompt.read_text())
-        self.assertNotIn('with the Write tool', prompt.read_text())
-        self.assertEqual(start[start.index('--add-dir') + 1], str(self.home / '.cache/claude-sidecar'))
-        self.assertNotIn('--session-id', start)
-        self.assertNotIn('resume', start)
-        self.assertIn('--yolo', start)
-        session = (self.home / '.cache/claude-sidecar/sc-pane-1.codex-session').read_text().strip()
-        self.assertRegex(session, r'^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
-        self.assertEqual(json.loads((self.home / 'agent.json').read_text())['agent_session']['value'], session)
-        self.run_cli('start')
-        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
-        self.assertEqual((self.home / '.cache/claude-sidecar/sc-pane-1.agent').read_text().strip(), 'codex')
-
-    def test_codex_implementer_also_defaults_to_ultra(self):
-        self.run_cli('--slot', '2', '--agent', 'codex', '--role', 'implementer', 'start')
-        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
-        self.assertEqual(json.loads(self.codex_config(start)['model_reasoning_effort']), 'ultra')
-        self.run_cli('--slot', '2', 'ask', 'Continue implementing')
-        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
-
-    def test_codex_windows_converts_agent_paths_and_keeps_local_report_paths(self):
-        env = self.windows_env(FAKE_QUESTION='Which target?')
-        (self.home / 'bin/cygpath').write_text('#!/bin/sh\nprintf "C:%s\\n" "$2"\n')
-        result = self.run_cli('--agent', 'codex', 'ask', 'Windows Codex task', env=env, check=False)
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn('NEEDS_ANSWER: Which target?', result.stdout)
-        state = self.home / '.cache/claude-sidecar'
-        report = self.report_path(result.stdout)
-        self.assertEqual(report.parent, state / 'reports')
-        self.assertIn('ship', report.read_text())
-        self.assertEqual((state / 'sc-pane-1.report').read_text().strip(), str(report))
-        request = next((state / 'requests').glob('*.md'))
-        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
-        config = self.codex_config(start)
-        self.assertEqual(json.loads(config['model_instructions_file']),
-                         f'C:{state / "sc-pane-1.codex-prompt.md"}')
-        self.assertEqual(start[start.index('--add-dir') + 1], f'C:{state}')
-        prompts = [c[3] for c in self.calls() if c[:2] == ['agent', 'prompt']]
-        self.assertEqual(len(prompts), 2)
-        self.assertTrue(prompts[0].startswith('[note] Initialize this sidecar'))
-        self.assertIn(f'Read C:{request} and', prompts[1])
-        self.assertIn(f'report to C:{report};', prompts[1])
-        self.assertIn(f'to C:{report.with_suffix(".needs-answer")},', prompts[1])
-        session = (state / 'sc-pane-1.codex-session').read_text().strip()
-        self.assertEqual(json.loads((self.home / 'agent.json').read_text())['agent_session']['value'], session)
-        self.run_cli('start', env=env)
-        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
-        self.assertFalse(any(c[:2] == ['pane', 'process-info'] for c in self.calls()))
-        self.assertFalse((state / 'windows').exists())
-
-    def test_codex_model_and_reasoning_overrides(self):
-        self.run_cli('--agent', 'codex', '--role', 'implementer', 'start',
-                     env=dict(self.env, SIDECAR_CODEX_MODEL='custom-codex', SIDECAR_THINKING='high'))
-        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
-        self.assertEqual(start[start.index('--model') + 1], 'custom-codex')
-        self.assertEqual(json.loads(self.codex_config(start)['model_reasoning_effort']), 'high')
-
-    def test_codex_closed_pane_resumes_the_saved_session(self):
-        self.run_cli('--agent', 'codex', 'start')
-        session_file = self.home / '.cache/claude-sidecar/sc-pane-1.codex-session'
-        session = session_file.read_text().strip()
-        start = next(c for c in self.calls() if c[:2] == ['agent', 'start'])
-        pane = start[start.index('--pane') + 1]
-        (self.home / 'agent.json').unlink()
-        panes_file = self.home / 'panes.json'
-        panes = json.loads(panes_file.read_text())
-        panes_file.write_text(json.dumps([p for p in panes if p['pane_id'] != pane]))
-        self.run_cli('ask', 'Continue after closing the pane')
-        starts = [c for c in self.calls() if c[:2] == ['agent', 'start']]
-        self.assertEqual(len(starts), 2)
-        self.assertEqual(starts[-1][starts[-1].index('resume') + 1], session)
-        self.assertNotIn('--last', starts[-1])
-        self.assertEqual(session_file.read_text().strip(), session)
-        self.assertEqual(json.loads((self.home / 'agent.json').read_text())['agent_session']['value'], session)
-
-    def test_codex_replaces_foreign_kind_or_session_without_losing_its_session(self):
-        self.run_cli('--agent', 'codex', 'start')
-        session_file = self.home / '.cache/claude-sidecar/sc-pane-1.codex-session'
-        session = session_file.read_text().strip()
-        for kind, value in (('pi', session), ('codex', 'ffffffff-ffff-4fff-afff-ffffffffffff')):
-            with self.subTest(kind=kind):
-                state_file = self.home / 'agent.json'
-                state = json.loads(state_file.read_text())
-                state.update(agent=kind, agent_session={'value': value})
-                state_file.write_text(json.dumps(state))
-                result = self.run_cli('start')
-                self.assertNotIn('already running', result.stdout)
-                start = [c for c in self.calls() if c[:2] == ['agent', 'start']][-1]
-                self.assertEqual(start[start.index('resume') + 1], session)
-                self.assertEqual(session_file.read_text().strip(), session)
-        self.assertEqual(sum(c[:2] == ['agent', 'rename'] for c in self.calls()), 2)
-
-    def test_codex_waits_for_a_delayed_session_identity(self):
-        result = self.run_cli('--agent', 'codex', 'ask', 'Task',
-                              env=dict(self.env, FAKE_DELAYED_SESSION='1'))
-        self.assertIn('ship', result.stdout)
-        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
-        self.assertFalse(any(c[:2] == ['agent', 'rename'] for c in self.calls()))
-
-    def test_codex_foreign_session_waits_for_restart_bootstrap_before_the_request(self):
-        self.run_cli('--agent', 'codex', 'start')
-        state_file = self.home / 'agent.json'
-        state = json.loads(state_file.read_text())
-        state['agent_session']['value'] = 'ffffffff-ffff-4fff-afff-ffffffffffff'
-        state_file.write_text(json.dumps(state))
-        previous = len(self.calls())
-        result = self.run_cli('ask', 'Continue after restore',
-                              env=dict(self.env, FAKE_CODEX_BOOTSTRAP_DELAY='0.5'))
-        self.assertIn('ship', result.stdout)
-        calls = self.calls()[previous:]
-        renamed = next(index for index, call in enumerate(calls) if call[:2] == ['agent', 'rename'])
-        waited = next(index for index, call in enumerate(calls) if call[:2] == ['agent', 'wait'])
-        requested = next(index for index, call in enumerate(calls)
-                         if call[:2] == ['agent', 'prompt'] and call[3].startswith('[request '))
-        self.assertLess(renamed, waited)
-        self.assertLess(waited, requested)
-
-    def test_codex_request_writes_a_report_and_answers_a_question(self):
-        result = self.run_cli('--agent', 'codex', 'ask', 'Look at x',
-                              env=dict(self.env, FAKE_QUESTION='Which option?'), check=False)
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertIn('NEEDS_ANSWER: Which option?', result.stdout)
-        report = self.report_path(result.stdout)
-        self.assertIn('ship', report.read_text())
-        prompts = [c[3] for c in self.calls() if c[:2] == ['agent', 'prompt']]
-        self.assertEqual(len(prompts), 2)
-        self.assertTrue(prompts[0].startswith('[note] Initialize this sidecar'))
-        self.assertTrue(prompts[1].startswith('[request '))
-        prompt = prompts[1]
-        self.assertIn(str(report), prompt)
-        self.assertIn(str(report.with_suffix('.needs-answer')), prompt)
-        self.assertNotIn('submit_review', prompt)
-        self.assertNotIn('Write tool', prompt)
-        answered = self.run_cli('answer', 'Use option A')
-        self.assertIn('ship', answered.stdout)
-        answer = next((self.home / '.cache/claude-sidecar/requests').glob('*-answer-*.md')).read_text()
-        self.assertIn('Use option A', answer)
-        self.assertEqual(len([c for c in self.calls() if c[:2] == ['agent', 'start']]), 1)
-        self.assertEqual(sum(c[:2] == ['agent', 'prompt'] and c[3].startswith('[note]')
-                             for c in self.calls()), 1)
-        self.assertFalse((self.home / '.cache/claude-sidecar/sc-pane-1.pending').exists())
-
-    def test_codex_settled_without_report_exits_two(self):
-        result = self.run_cli('--agent', 'codex', 'ask', 'Task',
-                              env=dict(self.env, FAKE_NO_REPORT='1', SIDECAR_SETTLE_GRACE_S='0'), check=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn('no report submitted', result.stderr)
-
-    def test_codex_slot_rejects_backend_switch_and_reload(self):
-        self.run_cli('--agent', 'codex', 'start')
-        prompts = [c for c in self.calls() if c[:2] == ['agent', 'prompt']]
-        switched = self.run_cli('--agent', 'pi', 'start', check=False)
-        self.assertEqual(switched.returncode, 1)
-        self.assertIn('use a new slot', switched.stderr)
-        reloaded = self.run_cli('reload', check=False)
-        self.assertEqual(reloaded.returncode, 1)
-        self.assertIn('pi sidecars only', reloaded.stderr)
-        self.assertEqual([c for c in self.calls() if c[:2] == ['agent', 'prompt']], prompts)
-
-    def test_codex_idle_steer_reports_and_busy_steer_refuses(self):
-        self.run_cli('--agent', 'codex', 'start')
-        idle = self.run_cli('steer', 'Review x')
-        self.assertIn('ship', idle.stdout)
-        prompts = [c for c in self.calls() if c[:2] == ['agent', 'prompt']]
-        busy = self.run_cli('steer', 'Change direction', env=dict(self.env, FAKE_AGENT_WORKING='1'), check=False)
-        self.assertEqual(busy.returncode, 1)
-        self.assertIn('busy codex sidecar cannot be steered', busy.stderr)
-        self.assertEqual([c for c in self.calls() if c[:2] == ['agent', 'prompt']], prompts)
-        self.assertFalse((self.home / '.local/state/grok-style-pi/steer').exists())
 
     def test_slot_cannot_switch_agent(self):
         self.run_cli('--agent', 'claude', 'start')
@@ -1809,18 +1592,8 @@ class LauncherTests(unittest.TestCase):
         # Do not fall through to a real pi installed beside Node on the developer's PATH.
         env = dict(self.env, PATH=self.path_without_agents())
         result = self.run_cli('session-start', input='{}', env=env)
-        self.assertIn('pi, claude or codex', result.stderr)
+        self.assertIn('(pi or claude)', result.stderr)
         self.assertEqual(result.stdout, '')
-
-    def test_hook_accepts_codex_without_pi(self):
-        (self.home / 'bin/pi').unlink()
-        codex = self.home / 'bin/codex'
-        codex.write_text('#!/bin/sh\nexit 0\n')
-        codex.chmod(0o755)
-        env = dict(self.env, PATH=self.path_without_agents())
-        result = self.run_cli('session-start', input='{"session_id":"codex-only"}', env=env)
-        self.assertIn('claude-sidecar:sidecar-review', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
-        self.assertEqual(result.stderr, '')
 
     def test_hook_reuses_live_session(self):
         self.run_cli('start')
@@ -2686,7 +2459,7 @@ class LauncherTests(unittest.TestCase):
     def test_profile_role_and_backend_mismatches_are_rejected(self):
         path, _ = self.write_profile()
         self.assert_profile_rejected(path, '--role', 'implementer')
-        for backend in ('claude', 'codex'):
+        for backend in ('claude',):
             with self.subTest(backend=backend):
                 self.assert_profile_rejected(path, '--agent', backend)
 
@@ -3348,48 +3121,6 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
         self.assertIn('could not copy the Claude prompt to laptop', result.stderr)
         self.assertFalse([c for c in self.remote_calls() if c[:2] == ['agent', 'start']])
         self.assertFalse(list((self.home / '.cache/claude-sidecar').glob('*.claude-started')))
-
-    def test_remote_codex_reads_its_prompt_and_writes_its_report_on_the_machine(self):
-        self.add_machines()
-        for slot, transport in (('2', 'sh'), ('3', 'node')):
-            with self.subTest(transport=transport):
-                config = self.home / 'sidecar-machines.json'
-                config.write_text(json.dumps({'laptop': {'transport': transport}}))
-                env = dict(self.remote_env, SIDECAR_MACHINES_FILE=str(config))
-                result = self.remote_run('--slot', slot, '--agent', 'codex', '--role', 'implementer',
-                                         '--machine', 'laptop', 'ask', 'Task', env=env)
-                self.assertIn('ship', result.stdout)
-                self.assertIn('# Sidecar report (laptop:' + str(self.remote_home()), result.stdout)
-                self.assertEqual(self.local_calls(), [])
-                name = 'sc-tt01-pane-1-' + slot
-                calls = [c for c in self.remote_calls() if c[0] == 'agent' and c[2] == name]
-                start = next(c for c in calls if c[:2] == ['agent', 'start'])
-                self.assertEqual(start[start.index('--kind') + 1], 'codex')
-                self.assertEqual(start[start.index('--add-dir') + 1],
-                                 str(self.remote_home() / '.cache/claude-sidecar'))
-                prompt = Path(json.loads(self.codex_config(start)['model_instructions_file']))
-                self.assertTrue(prompt.is_relative_to(self.remote_home()))
-                self.assertIn('Codex', prompt.read_text())
-                request = next(c for c in calls if c[:2] == ['agent', 'prompt'] and c[3].startswith('[request '))[3]
-                self.assertIn(str(self.remote_home() / '.cache/claude-sidecar/reports'), request)
-                self.assertNotIn('submit_review', request)
-                self.assertNotIn('Write tool', request)
-                self.assertIn('ship', self.report_path(result.stdout).read_text())
-                saved = self.home / ('.cache/claude-sidecar/sc-pane-1-' + slot + '.codex-session')
-                remote = self.home / ('remote-state/m1/' + name + '.agent.json')
-                self.assertEqual(saved.read_text().strip(), json.loads(remote.read_text())['agent_session']['value'])
-
-    def test_remote_codex_prompt_copy_failure_starts_nothing(self):
-        self.add_machines()
-        ssh = self.home / 'bin/ssh'
-        original = ssh.read_text()
-        ssh.write_text(original.replace("if os.environ.get('FAKE_SSH_DOWN'):",
-                                        "if os.environ.get('FAKE_SSH_DOWN') or 'codex-prompt' in command:", 1))
-        result = self.remote_run('--agent', 'codex', '--machine', 'laptop', 'start', check=False)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('could not copy the Codex prompt to laptop', result.stderr)
-        self.assertFalse([c for c in self.remote_calls() if c[:2] == ['agent', 'start']])
-        self.assertFalse(list((self.home / '.cache/claude-sidecar').glob('*.codex-session')))
 
     def test_machine_routes_every_herdr_call_and_files(self):
         self.add_machines()

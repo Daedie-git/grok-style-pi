@@ -1,6 +1,6 @@
 # Pane lifecycle: close panes like finished subagents
 
-A slot's conversation lives in its session record (`<agent>.session`, `.claude-started`, `.codex-session`), not in its pane: `stop` closes the pane and the next request resumes the session. A sidecar's task ends when it delivers its report, so the launcher closes the pane then, as Claude Code ends a subagent whose result returned. A later request resumes it, as `SendMessage` continues a finished subagent. There is no idle timer.
+A slot's conversation lives in its session record (`<agent>.session`, `.claude-started`), not in its pane: `stop` closes the pane and the next request resumes the session. A sidecar's task ends when it delivers its report, so the launcher closes the pane then, as Claude Code ends a subagent whose result returned. A later request resumes it, as `SendMessage` continues a finished subagent. There is no idle timer.
 
 ## Rules
 

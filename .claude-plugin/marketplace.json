@@ -1,13 +1,13 @@
 {
   "name": "daedie-sidecar",
   "owner": { "name": "Daedie-git" },
-  "metadata": { "version": "0.15.2", "description": "Persistent pi, Claude Code, and Codex CLI sidecars." },
+  "metadata": { "version": "0.15.2", "description": "Persistent pi and Claude Code sidecars." },
   "plugins": [
     {
       "name": "claude-sidecar",
       "version": "0.15.2",
       "source": "./",
-      "description": "Persistent pi, Claude Code, and Codex CLI sidecars in Herdr."
+      "description": "Persistent pi and Claude Code sidecars in Herdr."
     }
   ]
 }

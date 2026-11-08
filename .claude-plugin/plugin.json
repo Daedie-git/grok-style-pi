@@ -1,8 +1,8 @@
 {
   "name": "claude-sidecar",
   "version": "0.15.2",
-  "description": "Persistent pi, Claude Code, and Codex CLI sidecars in Herdr.",
+  "description": "Persistent pi and Claude Code sidecars in Herdr.",
   "author": { "name": "Daedie-git" },
   "repository": "https://github.com/Daedie-git/claude-sidecar",
-  "keywords": ["review", "sidecar", "pi", "codex", "herdr"]
+  "keywords": ["review", "sidecar", "pi", "herdr"]
 }

@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, test, mock } from 'claude-code/testing'
 
 test('a Herdr app terminal owns the slots named after it', async ($, on) => {
   on('session.start', (_, e) => ({ cwd:e.cwd }))
@@ -37,5 +37,21 @@ test('SIDECAR_MUX=hc shows the hc slots although a herdr pane ID is inherited', 
     props:{hasSurvey:false,isWorking:false,maxRows:10,bodyColumns:50,scroll:{offset:0,bodyRows:10},view:{}} })
   expect((await ui.find({type:'Text',text:/sidecar 2/}))?.text).toMatch(/sidecar 2/)
   expect(await ui.find({type:'Text',text:/sidecar 9/})).toBe(undefined)
+  await ui.unmount()
+})
+
+test('on Windows without HOME the band reads the user profile', async ($, on) => {
+  on('session.start', (_, e) => ({ cwd:e.cwd }))
+  const env = { USERPROFILE:'C:\\Users\\Bjorn', HC_TERMINAL_ID:'t6' }
+  on('env.get', (_, e) => ({ value:env[e.name] }))
+  // The harness runs on Linux, where a Windows profile path is resolved against the working directory.
+  on('fs.list', (_, e) => ({ value:e.path.endsWith('C:\\Users\\Bjorn/.cache/claude-sidecar')
+    ? ['sc-hc-t6-11.request.json'].map(name => ({ name, kind:'file', size:0, mtimeMs:0, isLink:false })) : [] }))
+  on('fs.read', (_, e) => ({ value:e.path.endsWith('request.json') ? '{"id":"a-b-ask","started":1}' : 'implementer' }))
+  mock.clock(on, { now:10000 })
+  await $.session.start({ cwd:'/', surface:'terminal', isInteractive:true })
+  const ui = await $.ui.mount({ plugin:'claude-sidecar', component:'AbovePrompt', requestId:'band', surface:'terminal',
+    props:{hasSurvey:false,isWorking:false,maxRows:10,bodyColumns:50,scroll:{offset:0,bodyRows:10},view:{}} })
+  expect((await ui.find({type:'Text',text:/sidecar 11/}))?.text).toMatch(/implementer/)
   await ui.unmount()
 })

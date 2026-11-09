@@ -39,7 +39,8 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
-    const home = await $.env.get('HOME')
+    // Claude on Windows often has no HOME; the launcher's Git Bash HOME is the user profile.
+    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
     // The launcher's owner name: SIDECAR_AGENT, else sc-<herdr pane id, lowercased, ':' as '-'>, else sc-hc-<hc terminal>.
     // SIDECAR_MUX picks the host when both IDs are inherited.
     const forced = await $.env.get('SIDECAR_MUX')

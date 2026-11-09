@@ -14,7 +14,7 @@ import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFrom
 import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
 import { HerdrRunner, agentPresence, completionNotice, formatStatus, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
-import { HerdrStore, type HerdrTask } from "../src/herdr/store.ts";
+import { HerdrStore, agentNumbers, numberedAgentName, type HerdrTask } from "../src/herdr/store.ts";
 import { isTerminal, type RunRef, type ExecutionEvent } from "../src/herdr/state.ts";
 
 function request(extra: Partial<SpawnRequest> = {}): SpawnRequest {
@@ -1537,4 +1537,79 @@ test("needs_answer ends a restricted child run, publishes the question and resum
 	await c.finish("Enabled and checked.");
 	assert.equal((await f.runner.read(next)).phase, "completed");
 	assert.equal((await f.runner.read(ref)).phase, "needs-answer");
+});
+
+/** Records holding these names, as earlier launches leave them; they stay resumable, so their names are never reused. */
+async function seedAgents(store: HerdrStore, ids: string[]) {
+	const sessionFile = await store.createSession({ type: "session", version: 3, id: "seed", cwd: "/work" });
+	for (const id of ids) {
+		const task: HerdrTask = { id, herdrName: id, paneId: "", type: "Explore", description: "earlier", prompt: "earlier", depth: 1, createdAt: new Date().toISOString() };
+		assert.ok(await store.reserveAgent(task, sessionFile, "earlier-owner", 1), id);
+	}
+}
+
+test("agent numbering continues past every recorded name of its type", async (t) => {
+	const { runner } = fixture(t);
+	await seedAgents(runner.store, ["explore", ...Array.from({ length: 99 }, (_, index) => `explore-${index + 2}`)]);
+	const ref = await runner.spawn(request());
+	assert.equal(ref.agentId, "explore-101");
+	assert.equal((await runner.spawn(request())).agentId, "explore-102");
+	assert.equal((await runner.resolve("explore-100")).id, "explore-100", "earlier agents stay resumable by name");
+});
+
+test("agent numbering fills the lowest free number first", async (t) => {
+	const { runner } = fixture(t);
+	await seedAgents(runner.store, ["explore", "explore-2", "explore-4", "explore-10", "explorer", "explore-x"]);
+	assert.deepEqual((await runner.store.agentNumbers("explore")).sort((a, b) => a - b), [1, 2, 4, 10]);
+	assert.equal((await runner.spawn(request())).agentId, "explore-3");
+	assert.equal((await runner.spawn(request())).agentId, "explore-5");
+});
+
+test("a name taken while reserving moves on to the next free number", async (t) => {
+	let runner!: HerdrRunner;
+	const probed: string[] = [];
+	const f = fixture(t, {
+		async isAlive(name) {
+			probed.push(name);
+			// Another runner reserves explore-2 between this check and the reservation; a live Herdr agent holds explore-3.
+			if (name === "explore-2") await seedAgents(runner.store, ["explore-2"]);
+			return name === "explore-3";
+		},
+	});
+	runner = f.runner;
+	await seedAgents(runner.store, ["explore"]);
+	assert.equal((await runner.spawn(request())).agentId, "explore-4");
+	assert.deepEqual(probed, ["explore-2", "explore-3", "explore-4"], "one host check per candidate, none for recorded names");
+});
+
+test("long bases stay within 31 characters for any number and never collide", async (t) => {
+	const base = "a-very-long-agent-type-name-xyz";
+	assert.equal(base.length, 31);
+	const numbers = [1, 2, 9, 10, 99, 100, 101, 12_345, 9_999_999, Number.MAX_SAFE_INTEGER];
+	const names = numbers.map((n) => numberedAgentName(base, n));
+	for (const name of names) assert.ok(name.length <= 31, name);
+	assert.equal(new Set(names).size, names.length);
+	assert.deepEqual(agentNumbers(base, names), numbers, "each name parses back to its own number");
+	assert.deepEqual(agentNumbers(base, [numberedAgentName("other-type", 5), "a-very-long-agent-type-name-5", "a-very-long-agent-type-name-x-05"]), [], "other bases, wrong cuts and padded numbers are not counted");
+	const { runner } = fixture(t);
+	await seedAgents(runner.store, [numberedAgentName(base, 1), ...Array.from({ length: 120 }, (_, index) => numberedAgentName(base, index + 2))]);
+	const ref = await runner.spawn(request({ name: base }));
+	assert.equal(ref.agentId, numberedAgentName(base, 122));
+	assert.equal(ref.agentId, "a-very-long-agent-type-name-122");
+});
+
+test("a machine whose older worker lacks the numbering operation answers from its full listing", async () => {
+	const operations: string[] = [];
+	const store = new HerdrStore((events) => ({
+		post(request) {
+			operations.push(request.operation);
+			queueMicrotask(() => events.reply(request.operation === "listAgents"
+				? { id: request.id, value: ["explore", "explore-2", "explore-7", "explorer"].map((id) => ({ id })) }
+				: { id: request.id, error: "Unknown Herdr control operation" }));
+		},
+		hold() {},
+		async close() {},
+	}));
+	assert.deepEqual(await store.agentNumbers("explore"), [1, 2, 7]);
+	assert.deepEqual(operations, ["agentNumbers", "listAgents"]);
 });

@@ -7,7 +7,7 @@ import { createInterface } from "node:readline";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
-import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, type MaintenanceObservation } from "./store.ts";
+import { HERDR_REMOTE_PROTOCOL, agentNamePrefix, agentNumbers, herdrSubagentRoot, type MaintenanceObservation } from "./store.ts";
 import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, AgentOwnership, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 import { piSessionReady } from "./session-ready.ts";
@@ -302,6 +302,11 @@ const operations = {
 		});
 	},
 	findAgent: agent,
+	agentNumbers(base: string): number[] {
+		const prefix = agentNamePrefix(base);
+		const ids = db.prepare("SELECT id FROM agents WHERE substr(id,1,?)=?").all(prefix.length, prefix).map((row) => String(row.id));
+		return agentNumbers(base, ids);
+	},
 	agentForSession(paneId: string, sessionFile: string): AgentRecord | undefined {
 		return decode<AgentRecord>(db.prepare("SELECT data FROM agents WHERE pane=? AND session_file=?").get(paneId, resolve(sessionFile)));
 	},

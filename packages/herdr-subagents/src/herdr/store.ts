@@ -103,6 +103,32 @@ export interface CompletionNotice extends RunRef {
 /** Raised whenever the parent and a remote worker would disagree on store operations; both ends must match. */
 export const HERDR_REMOTE_PROTOCOL = 4;
 
+/** Agent IDs stay within 31 characters, Herdr's name limit. */
+const AGENT_ID_LENGTH = 31;
+
+/** Agent `n` of a base: the base itself, then `base-2`, `base-3` and on without limit, the base cut so the ID fits. */
+export function numberedAgentName(base: string, n: number): string {
+	const suffix = n <= 1 ? "" : `-${n}`;
+	return `${base.slice(0, AGENT_ID_LENGTH - suffix.length)}${suffix}`;
+}
+
+/** The numbers of `base` that these agent IDs hold. */
+export function agentNumbers(base: string, ids: Iterable<string>): number[] {
+	const taken: number[] = [];
+	for (const id of ids) {
+		if (id === numberedAgentName(base, 1)) { taken.push(1); continue; }
+		const n = Number(/-(\d+)$/.exec(id)?.[1]);
+		if (Number.isSafeInteger(n) && n >= 2 && numberedAgentName(base, n) === id) taken.push(n);
+	}
+	return taken;
+}
+
+/** Every numbered name of a base shares this prefix, for any safe-integer number. */
+export function agentNamePrefix(base: string): string {
+	// Room for the longest suffix: a hyphen and Number.MAX_SAFE_INTEGER's 16 digits.
+	return base.slice(0, AGENT_ID_LENGTH - 17);
+}
+
 /** One run's liveness, with the run state it was listed against. */
 export interface MaintenanceObservation {
 	ref: RunRef;
@@ -275,6 +301,15 @@ export class HerdrStore {
 	createSession(header: Record<string, unknown>, copyFrom?: string) { return this.call("createSession", header, copyFrom); }
 	reserveAgent(task: HerdrTask, sessionFile: string, owner: string, now: number) { return this.call("reserveAgent", task, sessionFile, owner, now); }
 	findAgent(id: string) { return this.call("findAgent", id); }
+	/** The numbers of `base` that agent records already hold, in one store call. */
+	async agentNumbers(base: string): Promise<number[]> {
+		try { return await this.call("agentNumbers", base); }
+		catch (error) {
+			// A machine's older worker lacks the operation; its full listing answers the same question.
+			if (!(error instanceof Error && error.message === "Unknown Herdr control operation")) throw error;
+			return agentNumbers(base, (await this.listAgents()).map((record) => record.id));
+		}
+	}
 	agentForSession(paneId: string, sessionFile: string) { return this.call("agentForSession", paneId, sessionFile); }
 	claimMaintenance(token: string, now: number, leaseMs?: number) { return this.call("claimMaintenance", token, now, leaseMs); }
 	activeRuns() { return this.call("activeRuns"); }

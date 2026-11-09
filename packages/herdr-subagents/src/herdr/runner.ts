@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { herdrServerDown, herdrSessionName, paneCreationRejected, type HerdrClient, type HerdrAgentRef, type HerdrPaneLayout } from "./client.ts";
 import { defaultThinking, parseAgentFile } from "./agent-file.ts";
 import { isHcSessionTag } from "./hc.ts";
-import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask, type MaintenanceObservation } from "./store.ts";
+import { HerdrStore, numberedAgentName, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask, type MaintenanceObservation } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
 import { claudeArgs, claudeEnforceable, claudePrompt, claudeTools } from "./claude.ts";
@@ -14,6 +14,8 @@ export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 export const MAX_AGENTS_PER_TAB = 4;
 const POLL_MS = 200;
+/** Contention bound per launch, not a limit on numbering: each try is a fresh free name. */
+const MAX_NAME_ATTEMPTS = 100;
 /** A machine's pass makes many SSH calls of several seconds each. */
 const MAINTENANCE_LEASE_MS = 5000;
 const MACHINE_MAINTENANCE_LEASE_MS = 60_000;
@@ -557,10 +559,15 @@ export class HerdrRunner {
 		let ref: RunRef | undefined;
 		let task: HerdrTask | undefined;
 		let sessionFile: string | undefined;
-		for (let attempt = 0; attempt < 100; attempt++) {
+		// Records stay resumable by name, so numbering continues past every name a record holds. Only the lowest free
+		// number is tried; a live Herdr name or a concurrent reservation moves on to the next free one.
+		const taken = new Set(await this.store.agentNumbers(base));
+		let number = 1;
+		for (let attempt = 0; attempt < MAX_NAME_ATTEMPTS; attempt++) {
 			check(signal);
-			const suffix = attempt === 0 ? "" : `-${attempt + 1}`;
-			const id = `${base.slice(0, 31 - suffix.length)}${suffix}`;
+			while (taken.has(number)) number++;
+			taken.add(number);
+			const id = numberedAgentName(base, number);
 			if (await this.deps.client.isAlive(id)) continue;
 			check(signal);
 			task = {
@@ -588,7 +595,7 @@ export class HerdrRunner {
 			ref = await this.store.reserveAgent(task, sessionFile, this.owner, this.now());
 			if (ref) break;
 		}
-		if (!ref || !task) throw new Error(`Could not reserve a Herdr agent name for ${base}`);
+		if (!ref || !task) throw new Error(`Could not reserve a Herdr agent name for ${base}: ${MAX_NAME_ATTEMPTS} free names in a row were taken while reserving.`);
 		let paneId: string | undefined;
 		let published = false;
 		let creationIssued = false;

@@ -6,7 +6,7 @@ function setup(on, active=false) {
   on('session.start', (_,e) => ({cwd:e.cwd}))
   on('env.get',(_,e)=>({value:e.name==='HOME'?'/fake-home':e.name==='HERDR_PANE_ID'?'PANE:1':undefined}))
   on('fs.list',()=>{scans++;return {value:active?(active==='pending'?['sc-pane-1.request.json','sc-pane-1.pending']:['sc-pane-1.request.json']).map(name=>({name,kind:'file',size:0,mtimeMs:0,isLink:false})):[]}})
-  on('fs.read',(_,e)=>({value:e.path.endsWith('request.json')?(active==='pending'?'{"id":"a-b-ask","started":1,"finished":2}':'{"id":"a-b-ask","started":1}'):e.path.endsWith('.machine')?'local':'reviewer'}))
+  on('fs.read',(_,e)=>({value:e.path.endsWith('.pending')?'{"id":"a-b-ask"}':e.path.endsWith('request.json')?(active==='pending'?'{"id":"a-b-ask","started":1,"finished":2}':'{"id":"a-b-ask","started":1}'):e.path.endsWith('.machine')?'local':'reviewer'}))
   on('ui.render',($,e)=>{const {Text}=$.ui.resolve(e);return <Text>below</Text>})
   on('tool.call',()=>({result:{}}))
   const clock=mock.clock(on,{now:10000})

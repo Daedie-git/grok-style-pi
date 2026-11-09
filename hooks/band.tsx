@@ -60,6 +60,10 @@ export const register: Register = on => {
       const binding = (await text(`${name}.machine`, 'local')).split('\n')[0] || 'local'
       return binding === 'local' ? '' : label || binding
     }
+    // {id, generation, answered?}; older launchers wrote the bare request id, never answered.
+    const answered = async (name: string) => {
+      try { return Boolean(JSON.parse(await text(`${name}.pending`, '')).answered) } catch { return false }
+    }
     const poll = () => scan().catch(() => undefined).finally(() => void schedule())
     const schedule = async () => {
       const fast = (await read($, rows)).length > 0 || (await $.clock.now()) < fastUntil
@@ -82,8 +86,9 @@ export const register: Register = on => {
           continue
         }
         const busy = request.finished === undefined
-        // A stopped slot keeps its question for a later answer, but nobody is waiting on it.
-        const waiting = !busy && names.has(`${name}.pending`) && !names.has(`${name}.stopped`)
+        // A stopped slot keeps its question for a later answer, but nobody is waiting on it. Neither is anyone waiting
+        // on a question whose answer reached the sidecar: the launcher marks it, keeping the file for a retry.
+        const waiting = !busy && names.has(`${name}.pending`) && !names.has(`${name}.stopped`) && !(await answered(name))
         if (!busy && !waiting) continue
         found.push({
           slot,

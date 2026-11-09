@@ -220,6 +220,10 @@ elif args[:2] == ['agent', 'prompt']:
             request = json.loads(marker.read_text())
             (directory / (request['id'] + '.ack')).write_text(json.dumps({'status': 'reloaded'}))
             marker.unlink()
+    elif prompt.startswith('[request ') and os.environ.get('FAKE_PROMPT_REJECT'):
+        # The host refuses the submission after the agent looked ready.
+        print('error: connection lost', file=sys.stderr)
+        sys.exit(1)
     elif prompt.startswith('[request '):
         request_id = prompt.split(']', 1)[0].split()[1]
         reports = data_home / '.cache/claude-sidecar/reports'
@@ -1772,6 +1776,26 @@ class LauncherTests(unittest.TestCase):
         request_files = sorted((self.home / '.cache/claude-sidecar/requests').glob('*-answer-*.md'))
         self.assertIn('Yes, with constraint Y', request_files[0].read_text())
         self.assertFalse(self.run_cli('answer', 'again', check=False).returncode == 0)
+
+    def test_a_delivered_answer_marks_its_question_and_a_refused_one_does_not(self):
+        pending = self.home / '.cache/claude-sidecar/sc-pane-1.pending'
+        self.run_cli('ask', 'Do the work', env=dict(self.env, FAKE_QUESTION='May I add X?'), check=False)
+        asked = json.loads(pending.read_text())['id']
+        # A pane blocked on an approval refuses the answer before it reaches the sidecar.
+        state_path = self.home / 'agent.json'
+        state = json.loads(state_path.read_text())
+        state_path.write_text(json.dumps(dict(state, agent_status='blocked')))
+        self.assertEqual(self.run_cli('answer', 'Yes', check=False).returncode, 1)
+        self.assertNotIn('answered', json.loads(pending.read_text()))
+        state_path.write_text(json.dumps(state))
+        # A ready sidecar whose host then rejects the prompt did not get the answer either.
+        self.run_cli('answer', 'Yes', env=dict(self.env, FAKE_PROMPT_REJECT='1', SIDECAR_SETTLE_GRACE_S='0'), check=False)
+        self.assertNotIn('answered', json.loads(pending.read_text()))
+        # Delivered, but the turn ends without a report: the question stays answerable and is marked answered.
+        self.assertEqual(self.run_cli('answer', 'Yes', env=dict(self.env, FAKE_NO_REPORT='1', SIDECAR_SETTLE_GRACE_S='0'), check=False).returncode, 2)
+        record = json.loads(pending.read_text())
+        self.assertEqual(record['id'], asked)
+        self.assertIn('-answer-', record['answered'])
 
     def test_answer_without_pending_question(self):
         result = self.run_cli('answer', 'hello', check=False)

@@ -1,6 +1,6 @@
 {
   "name": "claude-sidecar",
-  "version": "0.19.1",
+  "version": "0.19.2",
   "description": "Persistent pi and Claude Code sidecars in Herdr.",
   "author": {
     "name": "Daedie-git"

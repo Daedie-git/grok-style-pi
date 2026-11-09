@@ -1194,7 +1194,19 @@ wait_with_progress() {
     last=$(mux_read "$name" 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
     echo "sidecar: $id still working ($((elapsed / 60))m$((elapsed % 60))s)${last:+; last output: $last}" >&2
   done
-  wait "$pid" || true
+  PROMPT_STATUS=0
+  wait "$pid" || PROMPT_STATUS=$?
+}
+
+PROMPT_STATUS=
+# Once an answer reached the sidecar, mark its question answered; the band stops showing it. The file stays so an answer
+# whose turn ends without a report can be retried. An answer the host refused leaves the question open.
+mark_answered() {
+  local kind=$1 name=$2 id=$3 tmp
+  [[ $kind == answer ]] && jq -e 'type == "object"' "$STATE_DIR/$name.pending" >/dev/null 2>&1 || return 0
+  tmp=$(mktemp "$STATE_DIR/$name.pending.XXXXXX")
+  jq --arg id "$id" '.answered = $id' "$STATE_DIR/$name.pending" >"$tmp"
+  mv -f -- "$tmp" "$STATE_DIR/$name.pending"
 }
 
 # Appended to every request of a remote slot: the sidecar cannot see Claude's machine.
@@ -1316,11 +1328,14 @@ $(remote_notice)"
     local result=0
     windows_control request "[request $id] Read $prompt_path and do what it asks. $finish" "$report" "$id" || result=$?
     [[ $result == 0 || $result == 2 ]] || exit "$result"
+    mark_answered "$kind" "$name" "$id"
   else
     mux_prompt_detached "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" >/dev/null 9>&- &
     PROMPT_PID=$!
     wait_with_progress "$PROMPT_PID" "$hname" "$id"
     PROMPT_PID=
+    # The client exits 0 only once the host took the prompt.
+    if [[ $PROMPT_STATUS == 0 ]]; then mark_answered "$kind" "$name" "$id"; fi
     await_report "$hname" "$report"
   fi
   if report_exists "$report"; then

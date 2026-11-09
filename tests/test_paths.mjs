@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-const launcher = fs.readFileSync(new URL('../scripts/sidecar', import.meta.url), 'utf8');
-const hd = launcher.match(/^hd\(\) \{[\s\S]*?^\}/m)?.[0];
-assert.ok(hd, 'the launcher must define its Herdr invocation boundary');
+const backend = fs.readFileSync(new URL('../scripts/mux/herdr', import.meta.url), 'utf8');
+const hd = backend.match(/^hd\(\) \{[\s\S]*?^\}/m)?.[0];
+assert.ok(hd, 'the herdr backend must define its Herdr invocation boundary');
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 
 test('Herdr preserves remote arguments without changing local paths or Linux behavior', t => {

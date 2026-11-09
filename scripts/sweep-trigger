@@ -1,20 +1,24 @@
 # shellcheck shell=bash
 # Shared by the launcher and the Bash hook. The recent-sweep path uses only builtins.
+# Each host sweeps only its own slots, so each keeps its own rate limit; the launcher picks the host the same way.
 schedule_sweep() {
-  [[ ${HERDR_ENV:-} == 1 ]] || return 0
-  local state="$HOME/.cache/claude-sidecar" now last=0 launcher=$1
+  local state="$HOME/.cache/claude-sidecar" now last=0 launcher=$1 host=${SIDECAR_MUX:-} stamp
+  if [[ -z $host ]]; then
+    if [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]]; then host=herdr; elif [[ -n ${HC_TERMINAL_ID:-} ]]; then host=hc; fi
+  fi
+  case $host in herdr) stamp=sweep ;; hc) stamp=sweep-hc ;; *) return 0 ;; esac
   printf -v now '%(%s)T' -1
-  if [[ -r $state/sweep.timestamp ]]; then read -r last <"$state/sweep.timestamp" || true; fi
+  if [[ -r $state/$stamp.timestamp ]]; then read -r last <"$state/$stamp.timestamp" || true; fi
   [[ $last =~ ^[0-9]+$ ]] || last=0
   (( now - last >= 60 )) || return 0
   mkdir -p "$state"
   (
-    exec 6>"$state/sweep.lock"
+    exec 6>"$state/$stamp.lock"
     flock -n 6 || exit 0
-    if [[ -r $state/sweep.timestamp ]]; then read -r last <"$state/sweep.timestamp" || true; fi
+    if [[ -r $state/$stamp.timestamp ]]; then read -r last <"$state/$stamp.timestamp" || true; fi
     [[ $last =~ ^[0-9]+$ ]] || last=0
     (( now - last >= 60 )) || exit 0
-    printf '%s\n' "$now" >"$state/sweep.timestamp"
+    printf '%s\n' "$now" >"$state/$stamp.timestamp"
     # Keep the rate-limit lock until the sweep finishes.
     if command -v setsid >/dev/null 2>&1; then
       exec setsid "$launcher" sweep

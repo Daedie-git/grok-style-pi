@@ -85,11 +85,25 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o Ser
 
 die() { echo "sidecar: $*" >&2; exit 1; }
 
-# Every command that talks to herdr starts here, so the target machine is resolved once before any herdr call.
-require_herdr() {
-  [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || die "not running inside a herdr pane"
+# Slots run in the innermost terminal host: a herdr TUI pane, else a Herdr app (hc) terminal. SIDECAR_MUX forces one.
+MUX=${SIDECAR_MUX:-}
+if [[ -z $MUX ]]; then
+  if [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]]; then MUX=herdr; elif [[ -n ${HC_TERMINAL_ID:-} ]]; then MUX=hc; fi
+fi
+case $MUX in
+  herdr) [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || MUX= ;;
+  hc) [[ -n ${HC_TERMINAL_ID:-} ]] || MUX= ;;
+  '') ;;
+  *) die "SIDECAR_MUX must be herdr or hc" ;;
+esac
+# shellcheck source=scripts/mux/herdr disable=SC1090,SC1091
+source "$PLUGIN_ROOT/scripts/mux/${MUX:-herdr}"
+
+# Every command that talks to the terminal host starts here, so the target machine is resolved once before any call.
+require_mux() {
+  [[ -n $MUX ]] || die "not running inside a herdr pane or Herdr app terminal"
   local dependency
-  for dependency in herdr jq flock; do
+  for dependency in "$MUX_CLI" jq flock; do
     type -P "$dependency" >/dev/null || die "missing dependency $dependency; install it on PATH before using sidecar"
   done
   {
@@ -347,20 +361,6 @@ claude_session_uuid() {
   echo "${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
 }
 
-# The one place herdr is invoked: a remote slot routes every call to its machine's herdr server over SSH. Pane, tab and
-# agent IDs are scoped to that server, so they must never be mixed with local ones.
-hd() {
-  if [[ -n $MACHINE && -n $HOST_WINDOWS ]]; then
-    # These arguments belong to the remote OS, not Git Bash's local Windows filesystem.
-    # Scope conversion suppression to this native invocation; local Herdr still needs its usual paths.
-    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' herdr --machine "$MACHINE" "$@"
-  elif [[ -n $MACHINE ]]; then
-    herdr --machine "$MACHINE" "$@"
-  else
-    herdr "$@"
-  fi
-}
-
 shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
 
 # Replace a background subshell with the client so its PID remains directly cancellable, including in Git Bash.
@@ -401,21 +401,19 @@ run_node() {
   "${invoke[@]}" node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script")"
 }
 
-# Saved herdr machines as a JSON array; fails on herdr older than 0.9 or when herdr does not answer in time.
-list_machines() {
-  timeout "${1:-10}" herdr machine list --json 2>/dev/null | jq -ce 'if type == "array" then . else empty end'
-}
-
 machine_binding_file() { echo "$STATE_DIR/$(agent_name).machine"; }
 
 # Finds a saved machine the way `herdr --machine` does: profile ID first, then a unique label.
 find_machine() {
   local selector=$1 machines found
-  machines=$(list_machines) || die "cannot list herdr machines; --machine needs herdr 0.9.1+ (herdr machine list --json)"
+  if ! machines=$(mux_list_machines); then
+    [[ $MUX == hc ]] && die "cannot list hc machines (hc machine ls)"
+    die "cannot list herdr machines; --machine needs herdr 0.9.1+ (herdr machine list --json)"
+  fi
   found=$(jq -c --arg s "$selector" '(map(select(.id == $s)) | first) // (map(select(.label == $s)) | if length > 1 then "ambiguous" else first end)' <<<"$machines")
-  [[ $found != null ]] || die "unknown herdr machine '$selector'; add it with: herdr machine add TARGET (see herdr machine list)"
-  [[ $found != '"ambiguous"' ]] || die "herdr machine label '$selector' is ambiguous; use its profile ID"
-  [[ $(jq -r '.enabled' <<<"$found") == true ]] || die "herdr machine '$selector' is disabled"
+  [[ $found != null ]] || die "unknown $MUX_CLI machine '$selector'; add it with: $MUX_CLI machine add TARGET (see $MUX_MACHINE_LIST)"
+  [[ $found != '"ambiguous"' ]] || die "$MUX_CLI machine label '$selector' is ambiguous; use its profile ID"
+  [[ $(jq -r '.enabled' <<<"$found") == true ]] || die "$MUX_CLI machine '$selector' is disabled"
   echo "$found"
 }
 
@@ -464,7 +462,7 @@ resolve_machine() {
   TARGET_WINDOWS=
   MACHINE_LABEL=$(jq -r '.label' <<<"$record")
   MACHINE_TARGET=$(jq -r '.target' <<<"$record")
-  [[ -n $MACHINE_TARGET ]] || die "herdr machine '$MACHINE_LABEL' has no SSH target"
+  [[ -n $MACHINE_TARGET ]] || die "$MUX_CLI machine '$MACHINE_LABEL' has no SSH target"
   command -v ssh >/dev/null || die "ssh is required for --machine"
   # Per-machine settings avoid repeating checkout paths and support Windows without a POSIX SSH shell.
   local config='{}' config_file=${SIDECAR_MACHINES_FILE:-$HOME/.config/claude-sidecar/machines.json} mapped=
@@ -562,7 +560,7 @@ fetch_file() {
 
 # Sidecars belong to the Claude pane; numbered slots keep independent context.
 owner_name() {
-  echo "${SIDECAR_AGENT:-sc-$(tr 'A-Z:' 'a-z-' <<<"$HERDR_PANE_ID")}"
+  echo "${SIDECAR_AGENT:-sc-$(mux_owner_id | tr 'A-Z:' 'a-z-')}"
 }
 
 agent_name() {
@@ -571,7 +569,7 @@ agent_name() {
   if [[ $SLOT == 1 ]]; then echo "$owner"; else echo "$owner-$SLOT"; fi
 }
 
-# The name herdr knows the agent by. Agent names are scoped to one herdr server, and a Claude on the machine may start its
+# The name the terminal host knows the agent by. Agent names are scoped to one machine, and a Claude on the machine may start its
 # own sidecars there, so remote names carry a short tag of this machine.
 herdr_agent() {
   local name
@@ -604,7 +602,7 @@ pi_session_id() {
   else
     base=${SIDECAR_PI_SESSION:-}
     if [[ -z $base && -s "$owner_marker" ]]; then base=$(head -n 1 "$owner_marker"); fi
-    base=${base:-cc-pane-$(tr 'A-Z:' 'a-z-' <<<"$HERDR_PANE_ID")}
+    base=${base:-cc-pane-$(mux_owner_id | tr 'A-Z:' 'a-z-')}
     if [[ $SLOT != 1 ]]; then base="$base-$SLOT"; fi
     if [[ -n $fresh && $base == *"$fresh" ]]; then echo "$base"; else echo "$base$fresh"; fi
   fi
@@ -612,12 +610,11 @@ pi_session_id() {
 
 # Verify the actual Windows pane process, not a name reused by a restored bare pi.
 windows_pid() {
-  local pane processes session wrapper
-  pane=$(hd agent get "$1" | jq -er '.result.agent | select(.agent == "pi") | .pane_id') || return 1
-  processes=$(hd pane process-info --pane "$pane") || return 1
+  local processes session wrapper
+  processes=$(mux_processes "$1" pi) || return 1
   session=$(pi_session_id)
   if jq -er --arg session "$session" '
-    [.result.process_info.foreground_processes[] | select(
+    [.[] | select(
       .argv as $a | any(range(0; ($a | length) - 1); $a[.] == "--session-id" and $a[. + 1] == $session)) | .pid]
     | if length == 1 then .[0] else empty end' <<<"$processes"; then
     return
@@ -625,7 +622,7 @@ windows_pid() {
   # A pi installed as pi.cmd runs under `cmd.exe /c "…pi.cmd --session-id ID …"`: the foreground process is cmd.exe and
   # its command line is one string. The pi process, whose pid the runtime records, is its node.exe child.
   wrapper=$(jq -er --arg session "$session" '
-    [.result.process_info.foreground_processes[]
+    [.[]
       | select(((.cmdline // ((.argv // []) | join(" "))) + " ") | contains(" --session-id " + $session + " ")) | .pid]
     | if length == 1 then .[0] else empty end' <<<"$processes") || return 1
   run_node 'const out=require("child_process").execFileSync("powershell.exe",["-NoProfile","-NonInteractive","-Command",
@@ -642,7 +639,7 @@ windows_control() {
     startup_timeout=${SIDECAR_STARTUP_TIMEOUT_S:-300}
     [[ $startup_timeout =~ ^[1-9][0-9]*$ ]] || die "SIDECAR_STARTUP_TIMEOUT_S must be a positive integer"
   fi
-  pid=$(windows_pid "$(herdr_agent)") || die "cannot verify the Windows pi process in this Herdr pane; nothing was sent"
+  pid=$(windows_pid "$(herdr_agent)") || die "cannot verify the Windows pi process of this sidecar; nothing was sent"
   if [[ -z $MACHINE && -n $report ]]; then report=$(cygpath -m "$report"); fi
   options=$(jq -cn --arg action "$action" --arg session "$(pi_session_id)" --argjson pid "$pid" \
     --arg report "$report" --arg requestId "$request_id" --argjson progress "$PROGRESS_S" --argjson startupTimeout "$((startup_timeout * 1000))" \
@@ -675,120 +672,29 @@ windows_control() {
 
 agent_status() {
   local status runtime
-  status=$(hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null) || true
+  status=$(mux_status "$1")
   if [[ -n $TARGET_WINDOWS && $BACKEND == pi && -n $status ]]; then
     if runtime=$(windows_control status 2>/dev/null); then status=$(jq -r '.status' <<<"$runtime"); else status=unknown; fi
   fi
   echo "${status:-missing}"
 }
 
-agent_session_file() {
-  hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null || true
-}
+agent_session_file() { mux_session_file "$1"; }
 
 # True when the pi in the sidecar's pane runs the session this sidecar was started with. herdr relaunches a bare `pi`
 # (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
 agent_runs_sidecar_session() {
-  local session attempt
   if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
     windows_pid "$1" >/dev/null 2>&1
     return
   fi
-  # Herdr publishes no session file for Claude Code agents; the name and the agent kind are the identity.
+  # No session file is published for Claude Code agents; the name and the agent kind are the identity.
   if [[ $BACKEND == claude ]]; then
-    [[ $(hd agent get "$1" 2>/dev/null | jq -r '.result.agent.agent // empty' 2>/dev/null) == claude ]]
+    [[ $(mux_kind "$1") == claude ]]
     return
   fi
-  # Herdr can report a newly launched pi before its session path is published (notably on Windows).
-  # An empty path is not evidence that a different pi owns the pane.
-  for ((attempt = 0; attempt < 20; attempt++)); do
-    session=$(agent_session_file "$1")
-    if [[ -n $session ]]; then
-      [[ $session == *"_$(pi_session_id).jsonl" ]]
-      return
-    fi
-    sleep 0.5
-  done
-  # Still unpublished after the wait: treat as not ours so a bare relaunched pi gets restarted.
-  return 1
+  mux_runs_pi_session "$1" "$(pi_session_id)"
 }
-
-# Sidecars fill the active tab, initially Claude's, to four panes, counting
-# every pane in it; then they overflow into new tabs. Capacity comes from
-# Herdr's live layout, so panes opened or closed by hand or by another Claude
-# pane count. One lock serializes topology changes from every owner and slot.
-# Allocated panes are kept even if agent startup fails, so retries can reuse
-# them. Prints the pane and whether it was "reused" or "new"; "fresh" skips
-# the cached pane.
-# On a remote machine Claude's tab is not there: the first pane opens a "Sidecars" tab in the workspace that already has
-# a pane in the work directory (herdr picks one when none does), and later ones fill that tab the same way.
-allocate_pane() (
-  local fresh=${1:-} file layout panes name cached tab count workspace target w h direction result pane tmp tab_args
-  flock 6
-  file=$(layout_file)
-  layout=$(if [[ -s $file ]]; then jq -c . "$file"; else echo '{}'; fi)
-  panes=$(hd pane list | jq -c '[.result.panes[] | {pane_id, tab_id, workspace_id, agent, cwd}]')
-  name=$(agent_name)
-  cached=$(jq -r --arg n "$name" '.agents[$n] // empty' <<<"$layout")
-  # Reuse a cached pane only while no other agent has taken it over.
-  if [[ -z $fresh && -n $cached ]] &&
-    jq -e --arg p "$cached" 'any(.[]; .pane_id == $p and .agent == null)' <<<"$panes" >/dev/null; then
-    echo "$cached reused"
-    return
-  fi
-  # Start in Claude's tab; this also migrates layouts from earlier launchers.
-  tab=$(jq -r '.tab // empty' <<<"$layout")
-  if [[ -z $MACHINE && -z $tab ]]; then
-    tab=$(jq -r --arg p "$HERDR_PANE_ID" '.[] | select(.pane_id == $p) | .tab_id' <<<"$panes")
-  fi
-  count=$(jq --arg t "$tab" 'map(select(.tab_id == $t)) | length' <<<"$panes")
-  if (( count == 0 || count >= 4 )); then
-    tab_args=(--cwd "$WORK_DIR" --label "Sidecars" --no-focus)
-    if [[ -z $MACHINE ]]; then
-      workspace=$(jq -r --arg p "$HERDR_PANE_ID" '.[] | select(.pane_id == $p) | .workspace_id' <<<"$panes")
-      [[ -n $workspace ]] || die "cannot find the workspace of pane $HERDR_PANE_ID"
-    else
-      workspace=$(jq -r --arg t "$tab" --arg d "$WORK_DIR" \
-        '(map(select(.tab_id == $t)) | first | .workspace_id) // (map(select(.cwd == $d)) | first | .workspace_id) // empty' <<<"$panes")
-    fi
-    if [[ -n $workspace ]]; then tab_args+=(--workspace "$workspace"); fi
-    result=$(hd tab create "${tab_args[@]}")
-    pane=$(jq -er '.result.root_pane.pane_id' <<<"$result")
-    tab=$(hd pane get "$pane" | jq -er '.result.pane.tab_id')
-  else
-    # Halve the largest pane (the first on ties): left/right when it is wide,
-    # top/bottom otherwise. Terminal cells are about twice as tall as wide.
-    read -r target w h < <(hd pane layout --pane "$(jq -r --arg t "$tab" 'first(.[] | select(.tab_id == $t)) | .pane_id' <<<"$panes")" |
-      jq -r '.result.layout.panes | (map(.rect.width * .rect.height) | max) as $m |
-        first(.[] | select(.rect.width * .rect.height == $m)) | "\(.pane_id) \(.rect.width) \(.rect.height)"')
-    [[ -n ${target:-} ]] || die "cannot read the layout of tab $tab"
-    if (( w > 2 * h + h / 5 )); then direction=right; else direction=down; fi
-    pane=$(hd pane split --pane "$target" --direction "$direction" --ratio 0.5 \
-      --cwd "$WORK_DIR" --no-focus | jq -er '.result.pane.pane_id')
-  fi
-  tmp=$(mktemp "$file.XXXXXX")
-  jq --arg p "$pane" --arg n "$name" --arg t "$tab" \
-    'del(.panes, .caller_tab_initialized) | .tab = $t | .agents[$n] = $p' <<<"$layout" >"$tmp"
-  mv -f -- "$tmp" "$file"
-  echo "$pane new"
-) 6>"$STATE_DIR/layout.lock"
-
-# Layouts are per machine: pane and tab IDs of one herdr server mean nothing on another.
-layout_file() {
-  if [[ -z $MACHINE ]]; then echo "$STATE_DIR/$(owner_name).layout.json"; else echo "$STATE_DIR/$(owner_name).${MACHINE//[^A-Za-z0-9._-]/_}.layout.json"; fi
-}
-
-# Drop an agent's cached pane, e.g. when another pi keeps running in it.
-forget_pane() (
-  local file tmp
-  flock 6
-  file=$(layout_file)
-  if [[ -s $file ]]; then
-    tmp=$(mktemp "$file.XXXXXX")
-    jq --arg n "$1" 'del(.agents[$n])' "$file" >"$tmp"
-    mv -f -- "$tmp" "$file"
-  fi
-) 6>"$STATE_DIR/layout.lock"
 
 # Call while holding the per-agent identity lock. Atomic replacement also
 # protects readers that only need the already-published session identifier.
@@ -814,28 +720,28 @@ ${REMOTE_CWD}"
   printf '%s\n' "${want%$'\n'}" >"$marker"
   mv -f -- "$marker" "$file"
   owner_name >"$STATE_DIR/$(agent_name).owner"
-  printf '%s\n' "$HERDR_PANE_ID" >"$STATE_DIR/$(agent_name).owner-pane"
+  mux_owner_id >"$STATE_DIR/$(agent_name).owner-pane"
+  echo "$MUX" >"$STATE_DIR/$(agent_name).mux"
 }
 
 cmd_start() {
-  require_herdr
+  require_mux
   ( flock 8; start_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
 }
 
 cmd_restart() {
-  require_herdr
+  require_mux
   ( flock 8; restart_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
 }
 
-# Herdr publishes no session for Claude agents, so before a destructive action prove the pane's Claude runs this slot's
+# No session is published for Claude agents, so before a destructive action prove the pane's Claude runs this slot's
 # conversation: its foreground process must carry the slot's UUID. Other backends are already verified by session.
 owns_pane_process() {
   [[ $BACKEND == claude ]] || return 0
-  local pane uuid
+  local uuid
   uuid=$(claude_session_uuid)
-  pane=$(hd agent get "$1" | jq -er '.result.agent.pane_id') || return 1
-  hd pane process-info --pane "$pane" 2>/dev/null | jq -e --arg uuid "$uuid" '
-    any(.result.process_info.foreground_processes[]; .argv as $a |
+  mux_processes "$1" 2>/dev/null | jq -e --arg uuid "$uuid" '
+    any(.[]; .argv as $a |
       any(range(0; ($a | length) - 1); ($a[.] == "--session-id" or $a[.] == "--resume") and $a[. + 1] == $uuid))' >/dev/null
 }
 
@@ -868,7 +774,7 @@ cmd_stop() {
     return "$code"
   fi
   local PROFILE_RESET=$fresh
-  require_herdr
+  require_mux
   ( flock 8; stop_unlocked "$force" "$fresh"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
 }
 
@@ -891,19 +797,20 @@ stop_unlocked() {
   if [[ $(agent_status "$hname") == missing ]]; then
     echo "$hname is not running"
   elif agent_runs_sidecar_session "$hname" && owns_pane_process "$hname"; then
-    pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || die "cannot find the pane of $hname"
+    # Every later check and the close act on this location: the name may move to another agent meanwhile.
+    pane=$(mux_locate "$hname") || die "cannot find the pane of $hname"
     if [[ ${3:-} == sweep ]]; then
       # Refresh live state after the session checks, which can take time.
       [[ $(agent_status "$hname") == @(idle|done) ]] || return 0
-      hd pane get "$pane" | jq -e '.result.pane.focused == false' >/dev/null || return 0
+      mux_unfocused "$pane" || return 0
     fi
-    hd pane close "$pane" >/dev/null || die "could not close pane $pane of $hname"
+    mux_close "$pane" || die "could not close pane $pane of $hname"
     echo "$hname stopped (closed $pane)"
   else
     # Another session took the pane over; it is not ours to close.
     echo "$hname: its pane runs $(agent_session_file "$hname"), not the sidecar session; left it running" >&2
   fi
-  forget_pane "$name"
+  mux_forget "$name"
   if [[ -n $fresh ]]; then
     {
       flock 7
@@ -924,7 +831,7 @@ stop_unlocked() {
 }
 
 cmd_reload() {
-  require_herdr
+  require_mux
   [[ $# == 0 ]] || die "usage: sidecar reload"
   [[ $BACKEND == pi ]] || die "reload applies to pi sidecars only; use restart"
   local name hname session session_file dir id mode native_reload=
@@ -944,7 +851,7 @@ cmd_reload() {
       windows_control wait
       native_reload=1
     else
-      echo "sidecar: upgrading an older Windows runtime through Herdr; if it is busy, retry reload once its work finishes" >&2
+      echo "sidecar: upgrading an older Windows runtime through $MUX_CLI; if it is busy, retry reload once its work finishes" >&2
     fi
     if [[ -z $MACHINE ]]; then dir=$(cygpath -m "$dir"); fi
     # Older Windows runtimes already publish reload receipts. Verify against the pane's actual native PID.
@@ -970,9 +877,9 @@ cmd_reload() {
   if [[ $mode == command && -n $native_reload ]]; then
     windows_control reload "/sidecar-reload $id" >/dev/null
   elif [[ $mode == command ]]; then
-    hd agent prompt "$hname" "/sidecar-reload $id" >/dev/null || true
+    mux_prompt "$hname" "/sidecar-reload $id" || true
   else
-    hd agent prompt "$hname" "/reload" >/dev/null || true
+    mux_prompt "$hname" "/reload" || true
   fi
   if ! run_node 'const ack=path.join(args[0],args[2]+".ack"),pending=path.join(args[0],args[1]+".pending");
     (async()=>{
@@ -991,7 +898,7 @@ cmd_reload() {
 
 # These helpers run with the startup lock held; recursive calls keep that lock.
 start_unlocked() {
-  require_herdr
+  require_mux
   local name hname session pane
   name=$(agent_name)
   hname=$(herdr_agent)
@@ -1023,7 +930,6 @@ start_unlocked() {
     fi
     return
   fi
-  local attempt err allocation origin=given
   local PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/reviewer.md")
   if [[ $ROLE != reviewer ]]; then
     PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/profile.md" --append-system-prompt "$AGENT_HOME/$ROLE.md")
@@ -1036,39 +942,18 @@ start_unlocked() {
   fi
   # A subsequent generic start is a real unprofiled conversation, not permission to adopt it later.
   rm -f -- "$STATE_DIR/$name.profile-fresh"
-  pane=${1:-}
-  if [[ -z $pane ]]; then
-    allocation=$(allocate_pane)
-    read -r pane origin <<<"$allocation"
+  if [[ $BACKEND == claude ]]; then
+    start_claude "$hname" "${1:-}" "$name"
+    return
   fi
-  # A fresh pane is busy until its shell reaches the prompt.
-  for ((attempt = 0; attempt < 20; attempt++)); do
-    if [[ $BACKEND == claude ]]; then
-      start_claude "$hname" "$pane" "$name" && return
-      err=$CLAUDE_START_ERR
-    elif err=$(hd agent start "$hname" --kind pi --pane "$pane" --timeout 60000 -- \
-      --session-id "$session" -n claude-sidecar \
-      --model "$MODEL" --thinking "$THINKING" \
-      "${PROFILE_LAUNCH_ARGS[@]}" 2>&1 >/dev/null); then
-      # Herdr can detect Pi before asynchronous session_start handlers publish the receiver.
-      if [[ -n $TARGET_WINDOWS ]]; then windows_control ready >/dev/null || return $?; fi
-      echo "$hname started in $pane (pi session $session)"
-      return
-    fi
-    [[ $err == *agent_pane_busy* ]] || die "$err"
-    # A long-idle cached pane that is busy now runs something else; leave it alone.
-    if [[ $origin == reused ]]; then
-      allocation=$(allocate_pane fresh)
-      read -r pane origin <<<"$allocation"
-      continue
-    fi
-    sleep 0.5
-  done
-  die "$err"
+  pane=$(mux_launch "$hname" pi "${1:-}" --session-id "$session" -n claude-sidecar \
+    --model "$MODEL" --thinking "$THINKING" "${PROFILE_LAUNCH_ARGS[@]}") || exit 1
+  # The host can detect Pi before asynchronous session_start handlers publish the receiver.
+  if [[ -n $TARGET_WINDOWS ]]; then windows_control ready >/dev/null || return $?; fi
+  echo "$hname started in $pane (pi session $session)"
 }
 
-CLAUDE_START_ERR=
-# Starts a Claude Code agent in PANE. The first start creates the session; later ones resume it.
+# Starts a Claude Code agent in PANE (empty: a new one). The first start creates the session; later ones resume it.
 start_claude() {
   local hname=$1 pane=$2 name=$3 uuid model session_flag=--session-id started="$STATE_DIR/$3.claude-started" prompt role
   uuid=$(claude_session_uuid)
@@ -1079,26 +964,18 @@ start_claude() {
   prompt="$STATE_DIR/$name.claude-prompt.md"
   mapfile -t role < <(role_prompt_files)
   cat "${role[@]}" "$SIDECAR_HOME/claude-delivery.md" >"$prompt"
-  # Called under &&, so errexit is off here: a failed copy must stop the start explicitly.
-  if [[ -n $MACHINE ]] && ! prompt=$(publish_file "$prompt"); then
-    CLAUDE_START_ERR="could not copy the Claude prompt to $MACHINE_LABEL"
-    return 1
-  fi
+  if [[ -n $MACHINE ]]; then prompt=$(publish_file "$prompt") || die "could not copy the Claude prompt to $MACHINE_LABEL"; fi
   local permission=()
   if [[ -n ${SIDECAR_CLAUDE_PERMISSION_MODE:-} ]]; then permission=(--permission-mode "$SIDECAR_CLAUDE_PERMISSION_MODE"); fi
-  if CLAUDE_START_ERR=$(hd agent start "$hname" --kind claude --pane "$pane" --timeout 60000 -- \
-    "$session_flag" "$uuid" -n claude-sidecar --model "$model" --effort "$THINKING" "${permission[@]}" \
-    --append-system-prompt-file "$prompt" 2>&1 >/dev/null); then
-    : >"$started"
-    echo "$hname started in $pane (claude session $uuid)"
-    return 0
-  fi
-  return 1
+  pane=$(mux_launch "$hname" claude "$pane" "$session_flag" "$uuid" -n claude-sidecar --model "$model" \
+    --effort "$THINKING" "${permission[@]}" --append-system-prompt-file "$prompt") || exit 1
+  : >"$started"
+  echo "$hname started in $pane (claude session $uuid)"
 }
 
 # Preserve a foreign session under another name and resume the sidecar in a new pane.
 restart_unlocked() {
-  require_herdr
+  require_mux
   local name hname other
   name=$(agent_name)
   hname=$(herdr_agent)
@@ -1107,9 +984,9 @@ restart_unlocked() {
     return
   fi
   other="$hname-other-$(date +%H%M%S)"
-  hd agent rename "$hname" "$other" >/dev/null || die "could not rename $hname"
+  mux_rename "$hname" "$other" || die "could not rename $hname"
   # The renamed agent still owns its pane; allocate a different one.
-  forget_pane "$name"
+  mux_forget "$name"
   echo "$hname: the agent in that pane runs $(agent_session_file "$other"), not the sidecar session; left it running as $other and starting the sidecar in a new pane" >&2
   start_unlocked
 }
@@ -1119,9 +996,9 @@ restart_unlocked() {
 cmd_session_start() {
   local input sid ancestry=0
   input=$(cat)
-  [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || exit 0
+  [[ -n $MUX ]] || exit 0
   local dependency
-  for dependency in herdr jq flock; do
+  for dependency in "$MUX_CLI" jq flock; do
     if ! type -P "$dependency" >/dev/null 2>&1; then
       echo "sidecar: missing dependency $dependency; skipping startup" >&2
       exit 0
@@ -1198,9 +1075,9 @@ interactive_claude_owner() {
 # than 0.9) or has none; bounded because the hook has a short deadline.
 machine_guidance() {
   local list
-  list=$(list_machines 5 | jq -r '[.[] | select(.enabled == true) | if .label == .target then .label else "\(.label) (\(.target))" end] | join(", ")' 2>/dev/null) || return 0
+  list=$(mux_list_machines 5 | jq -r '[.[] | select(.enabled == true) | if .label == .target then .label else "\(.label) (\(.target))" end] | join(", ")' 2>/dev/null) || return 0
   [[ -n $list ]] || return 0
-  echo " Use --machine NAME before a command to run that slot's sidecar on a saved herdr machine, only when the user asks; the slot then stays on that machine, and edits it makes land in that machine's checkout. Saved machines: $list."
+  echo " Use --machine NAME before a command to run that slot's sidecar on a saved $MUX_CLI machine, only when the user asks; the slot then stays on that machine, and edits it makes land in that machine's checkout. Saved machines: $list."
 }
 
 # Wait until the sidecar can take a prompt; the human may be talking to it.
@@ -1222,14 +1099,14 @@ wait_until_ready() {
     status=$(agent_status "$name")
   fi
   if [[ $status == working || $status == unknown ]]; then
-    hd agent wait "$name" --timeout "$REVIEW_TIMEOUT_MS" >/dev/null || true
+    mux_wait "$name" "$REVIEW_TIMEOUT_MS" >/dev/null || true
     status=$(agent_status "$name")
   fi
   if [[ $status != missing ]] && ! agent_runs_sidecar_session "$name"; then
     cmd_restart >&2
     status=$(agent_status "$name")
     if [[ $status == working || $status == unknown ]]; then
-      hd agent wait "$name" --timeout "$REVIEW_TIMEOUT_MS" >/dev/null || true
+      mux_wait "$name" "$REVIEW_TIMEOUT_MS" >/dev/null || true
       status=$(agent_status "$name")
     fi
   fi
@@ -1242,11 +1119,11 @@ wait_until_ready() {
 
 send() {
   local name=$1 text=$2 timeout=$3
-  hd agent prompt "$name" "$text" --wait --timeout "$timeout" >/dev/null
+  mux_prompt_wait "$name" "$text" "$timeout"
 }
 
 cmd_note() {
-  require_herdr
+  require_mux
   [[ $# -ge 1 ]] || die "usage: sidecar note TEXT"
   local name hname
   name=$(agent_name)
@@ -1269,7 +1146,7 @@ await_report() {
   while ! report_exists "$report"; do
     status=$(agent_status "$name")
     case $status in
-      working|unknown) hd agent wait "$name" >/dev/null 2>&1 || sleep 5 ;;
+      working|unknown) mux_wait "$name" >/dev/null 2>&1 || sleep 5 ;;
       blocked)
         echo "sidecar: $name is blocked on a question or approval in its pane; ask the user to handle it" >&2
         exit 5 ;;
@@ -1283,11 +1160,6 @@ await_report() {
 
 PROMPT_PID=
 CONTROL_PROGRAM=
-# Like hd, but replaces the background subshell with the directly cancellable client.
-hd_detached() {
-  if [[ -n $MACHINE ]]; then exec_detached herdr --machine "$MACHINE" "$@"; else exec_detached herdr "$@"; fi
-}
-
 # shellcheck disable=SC2329  # run from the EXIT trap
 stop_prompt() {
   [[ -z $PROGRESS_TIMER ]] || kill "$PROGRESS_TIMER" 2>/dev/null || true
@@ -1319,7 +1191,7 @@ wait_with_progress() {
     PROGRESS_TIMER=
     kill -0 "$pid" 2>/dev/null || break
     elapsed=$((SECONDS - start))
-    last=$(hd agent read "$name" --source recent-unwrapped --lines 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
+    last=$(mux_read "$name" 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
     echo "sidecar: $id still working ($((elapsed / 60))m$((elapsed % 60))s)${last:+; last output: $last}" >&2
   done
   wait "$pid" || true
@@ -1445,7 +1317,7 @@ $(remote_notice)"
     windows_control request "[request $id] Read $prompt_path and do what it asks. $finish" "$report" "$id" || result=$?
     [[ $result == 0 || $result == 2 ]] || exit "$result"
   else
-    hd_detached agent prompt "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" --wait >/dev/null 9>&- &
+    mux_prompt_detached "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" >/dev/null 9>&- &
     PROMPT_PID=$!
     wait_with_progress "$PROMPT_PID" "$hname" "$id"
     PROMPT_PID=
@@ -1489,7 +1361,7 @@ $(remote_notice)"
   fi
   status=$(agent_status "$hname")
   echo "sidecar: no report submitted for $id (status: $status). Recent pane output:" >&2
-  hd agent read "$hname" --source recent-unwrapped --lines 60 >&2 || true
+  mux_read "$hname" 60 >&2 || true
   if ! agent_runs_sidecar_session "$hname"; then
     echo "sidecar: $hname runs a different session '$(agent_session_file "$hname")'; run: sidecar restart" >&2
   fi
@@ -1500,7 +1372,7 @@ $(remote_notice)"
 }
 
 cmd_plan() {
-  require_herdr
+  require_mux
   [[ $# -ge 1 && -f "$1" ]] || die "usage: sidecar plan FILE [CONTEXT]"
   local file copy sha=
   file=$(realpath "$1")
@@ -1595,7 +1467,7 @@ unreviewed_since() {
 # SIDECAR_REVIEW_SKIP=<why> in their environment assignments.
 cmd_push_gate() {
   local input command cwd dir repo latest reason reasons=()
-  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || return 0
+  [[ -n $MUX ]] || return 0
   input=$(cat)
   command=$(jq -r '.tool_input.command // empty' <<<"$input")
   # Cheap filter first: this hook runs for every Bash call.
@@ -1703,7 +1575,7 @@ untracked_diff() {
 }
 
 cmd_diff() {
-  require_herdr
+  require_mux
   local base=${1:-HEAD} id diff root diff_path repo sha head rel manifest label fork rejected
   [[ $base != *..* ]] || die "diff takes a single base ref, not a range ($base). Use: sidecar --slot $SLOT diff ${base%%..*} CONTEXT; it reviews that base through the working tree"
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
@@ -1783,7 +1655,7 @@ cmd_ask() {
       --keep) keep=1; shift ;;
     esac
   done
-  require_herdr
+  require_mux
   [[ $# -ge 1 ]] || die "usage: sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-"
   [[ -z $keep ]] || set_keep keep
   schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
@@ -1991,7 +1863,7 @@ cmd_reject() {
     echo "sidecar: $2 overruled; tell the user, with the reviewer's failure scenario and your reason"
     return
   fi
-  require_herdr
+  require_mux
   [[ $# -ge 1 ]] || die "usage: sidecar reject 'FINDING: REASON' | --overrule R<n> REASON"
   local id
   id=$(rejection_add "$*")
@@ -2387,7 +2259,7 @@ coop_incomplete() {
 }
 
 cmd_answer() {
-  require_herdr
+  require_mux
   [[ $# -ge 1 ]] || die "usage: sidecar answer TEXT"
   local name prev
   name=$(agent_name)
@@ -2425,7 +2297,7 @@ Continue that original task to completion with this answer; do not restart finis
 # 4 not picked up, and the message was withdrawn (safe to resend); 6 outcome unknown: claimed but not confirmed by pi,
 # so it may still be delivered (do not resend blindly).
 cmd_steer() {
-  require_herdr
+  require_mux
   [[ $# -ge 1 ]] || die "usage: sidecar steer TEXT"
   local hname session session_file attempt script payload result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000)) grace_ms=$((${SIDECAR_STEER_CLAIM_GRACE_S:-7} * 1000))
   hname=$(herdr_agent)
@@ -2454,7 +2326,7 @@ $*" held
   fi
   [[ -z $PROFILE_JSON ]] || die "busy steering is unavailable for profiled Linux pi workers (ambient steering extensions are disabled); nothing was sent. Wait for the report, then ask"
   session=$(pi_session_id)
-  # Herdr can publish a new pi's session file late (notably on Windows); the owner check needs it.
+  # The host can publish a new pi's session file late (notably on Windows); the owner check needs it.
   for ((attempt = 0; attempt < 10; attempt++)); do
     session_file=$(agent_session_file "$hname")
     [[ -z $session_file ]] || break
@@ -2472,7 +2344,7 @@ $*" held
       if(!rec)out({status:"owner",reason:"no steering receiver owns this session inbox: the sidecar pi predates steering (update grok-style-pi, then /reload in its pane) or is not running"},7);
       let live=true;try{process.kill(rec.pid,0)}catch(e){live=e.code==="EPERM"}
       if(!live)out({status:"owner",reason:"the inbox receiver (pid "+rec.pid+") is gone; restart or /reload the sidecar pi"},7);
-      if(!args[3])out({status:"owner",reason:"cannot tell which session file herdr runs for this sidecar, so the receiver cannot be verified; nothing was sent"},7);
+      if(!args[3])out({status:"owner",reason:"cannot tell which session file this sidecar runs, so the receiver cannot be verified; nothing was sent"},7);
       if(norm(rec.sessionFile)!==norm(args[3]))out({status:"owner",reason:"the inbox is owned by pi pid "+rec.pid+" running "+rec.sessionFile+", not by this sidecar ("+args[3]+"); nothing was sent"},7);
       const msg=JSON.parse(fs.readFileSync(0,"utf8"));msg.sentAt=Date.now();msg.owner=rec.token;
       fs.mkdirSync(dir,{recursive:true});
@@ -2517,14 +2389,14 @@ $*" held
 
 # Machine maintenance is independent of the current slot's binding and does not deploy or reload a live sidecar.
 cmd_sync_machine() {
-  [[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_PANE_ID:-}" ]] || die "not running inside a herdr pane"
+  [[ -n $MUX ]] || die "not running inside a herdr pane or Herdr app terminal"
   [[ $# == 1 ]] || die "usage: sidecar sync-machine NAME"
   local record config='{}' config_file=${SIDECAR_MACHINES_FILE:-$HOME/.config/claude-sidecar/machines.json} options status=0
   record=$(find_machine "$1")
   MACHINE=$(jq -r '.id' <<<"$record")
   MACHINE_LABEL=$(jq -r '.label' <<<"$record")
   MACHINE_TARGET=$(jq -r '.target' <<<"$record")
-  [[ -n $MACHINE_TARGET && $MACHINE_TARGET != null ]] || die "herdr machine '$MACHINE_LABEL' has no SSH target"
+  [[ -n $MACHINE_TARGET && $MACHINE_TARGET != null ]] || die "$MUX_CLI machine '$MACHINE_LABEL' has no SSH target"
   command -v ssh >/dev/null || die "ssh is required for sync-machine"
   if [[ -f $config_file ]]; then
     config=$(jq -ce --arg id "$MACHINE" --arg label "$MACHINE_LABEL" '.[$id] // .[$label] // {}' "$config_file") || die "invalid machine configuration: $config_file"
@@ -2544,7 +2416,7 @@ cmd_sync_machine() {
 
 # Report recovery is entirely local and intentionally does not resolve/deploy a remote runtime.
 require_identity() {
-  [[ -n ${SIDECAR_AGENT:-} || -n ${HERDR_PANE_ID:-} ]] || die "no slot identity; run from the owning herdr pane"
+  [[ -n ${SIDECAR_AGENT:-} || -n $MUX ]] || die "no slot identity; run from the owning herdr pane or Herdr app terminal"
 }
 
 # Older launcher versions saved local reports without a latest-report pointer or printed markers.
@@ -2598,7 +2470,7 @@ age_ago() {
 }
 
 cmd_status() {
-  require_herdr
+  require_mux
   local name state started finished code report printed session
   name=$(herdr_agent)
   case $BACKEND in
@@ -2640,21 +2512,8 @@ owner_ended() {
      $(<"$STATE_DIR/$1.ended") == "$(<"$STATE_DIR/$1.claude-owner-session")" ]]
 }
 
-# Only a structured pane_not_found error proves absence; transport failures are unknown.
-owner_presence() {
-  local response code=0
-  response=$(timeout 10 herdr pane get "$1" 2>&1) || code=$?
-  if (( code == 0 )) && jq -se 'length == 1 and (.[0].result.pane.pane_id | type == "string" and length > 0)' <<<"$response" >/dev/null 2>&1; then
-    echo alive
-  elif (( code == 1 )) && jq -se 'length == 1 and .[0].error.code == "pane_not_found"' <<<"$response" >/dev/null 2>&1; then
-    echo gone
-  else
-    echo unknown
-  fi
-}
-
 # Whether the slot's task is over: its owner ended or is gone, or (for done-close) its request delivered a report and it
-# is not pinned. Reads only local state and Claude's own herdr, so remote slots cost no SSH unless this holds.
+# is not pinned. Reads only local state and Claude's own terminal host, so remote slots cost no SSH unless this holds.
 sweep_decided() {
   local name=$1 owner candidate owner_pane presence other
   if [[ -n ${SWEEP_REQUEST:-} ]]; then
@@ -2670,18 +2529,16 @@ sweep_decided() {
   fi
   if owner_ended "$owner"; then return 0; fi
   if [[ ! -s $STATE_DIR/$name.owner ]] && owner_ended "$candidate"; then return 0; fi
-  if ! jq -e --arg owner "$owner" --arg candidate "$candidate" '
-    any(.result.panes[]; ("sc-" + (.pane_id | ascii_downcase | gsub(":"; "-"))) as $n |
-      $n == $owner or $n == $candidate)' <<<"$SWEEP_PANES" >/dev/null; then
+  if ! mux_owner_listed "$owner" "$candidate"; then
     if [[ -s $STATE_DIR/$name.owner-pane ]]; then
       owner_pane=$(<"$STATE_DIR/$name.owner-pane")
-      presence=$(owner_presence "$owner_pane")
+      presence=$(mux_owner_presence "$owner_pane")
     else
       # Old Herdr public IDs use wN:pN; preserve aliases for legacy slot records too.
       owner_pane=${owner#sc-}
-      presence=$(owner_presence "${owner_pane/-p/:p}")
+      presence=$(mux_owner_presence "${owner_pane/-p/:p}")
       owner_pane=${candidate#sc-}
-      other=$(owner_presence "${owner_pane/-p/:p}")
+      other=$(mux_owner_presence "${owner_pane/-p/:p}")
       if [[ $presence == alive || $other == alive ]]; then presence=alive
       elif [[ $presence != gone || $other != gone ]]; then presence=unknown; fi
     fi
@@ -2694,17 +2551,16 @@ sweep_decided() {
 
 # Runs under the slot's startup and request locks, immediately before stop's ownership checks.
 sweep_eligible() {
-  local name=$1 hname=$2 pane status
+  local name=$1 hname=$2 status pane
   sweep_decided "$name" || return 1
   status=$(agent_status "$hname")
   [[ $status == idle || $status == 'done' ]] || return 1
   [[ ! -s $STATE_DIR/$name.pending ]] || return 1
-  # The slot's own herdr: pane IDs of a remote server mean nothing in Claude's pane list.
-  pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || return 1
-  hd pane get "$pane" | jq -e '.result.pane.focused == false' >/dev/null
+  pane=$(mux_locate "$hname") || return 1
+  mux_unfocused "$pane"
 }
 
-# Points herdr calls at the slot's machine. Resolution costs SSH round trips, so a machine stays resolved across calls.
+# Points host calls at the slot's machine. Resolution costs SSH round trips, so a machine stays resolved across calls.
 sweep_resolve() {
   local name=$1 binding=$2
   if [[ $binding == local ]]; then MACHINE=''; TARGET_WINDOWS=$HOST_WINDOWS; return; fi
@@ -2713,13 +2569,16 @@ sweep_resolve() {
 }
 
 cmd_sweep() {
-  local file name binding slot owner candidate
-  SWEEP_PANES=$(herdr pane list) || die "cannot list herdr panes"
-  jq -e '.result.panes | type == "array"' <<<"$SWEEP_PANES" >/dev/null || die "invalid herdr pane list"
+  local file name binding slot owner candidate host
+  mux_snapshot
   shopt -s nullglob
   for file in "$STATE_DIR"/sc-*.agent; do
     name=${file##*/}; name=${name%.agent}
     [[ $# == 0 || $name == "$1" ]] || continue
+    # Only the host a slot started in can tell whether its owner lives; slots from before hc support are herdr's.
+    host=herdr
+    if [[ -s $STATE_DIR/$name.mux ]]; then read -r host <"$STATE_DIR/$name.mux"; fi
+    [[ $host == "${MUX:-herdr}" ]] || continue
     if [[ -n ${SWEEP_OWNER:-} ]]; then
       slot=${name#"$SWEEP_OWNER"-}
       [[ $name == "$SWEEP_OWNER" || ( $name == "$SWEEP_OWNER"-* && $slot =~ ^[1-9][0-9]*$ ) ]] || continue
@@ -2801,7 +2660,7 @@ set_keep() {
 cmd_session_end() {
   local input reason sid owner
   input=$(cat)
-  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || return 0
+  [[ -n $MUX ]] || return 0
   reason=$(jq -r '.reason // empty' <<<"$input")
   [[ $reason != clear ]] || return 0
   interactive_claude_owner || return 0
@@ -2842,7 +2701,7 @@ while [[ ${1:-} == --* ]]; do
       [[ -n ${2:-} ]] || die "--profile-file requires a JSON file"
       if [[ $2 == /* || $2 =~ ^[A-Za-z]:[/\\] ]]; then PROFILE_ARG=$2; else PROFILE_ARG="$PWD/$2"; fi ;;
     --machine)
-      [[ -n ${2:-} ]] || die "--machine requires a saved herdr machine label or ID"
+      [[ -n ${2:-} ]] || die "--machine requires a saved herdr or hc machine label or ID"
       MACHINE_ARG=$2 ;;
     --remote-cwd)
       [[ ${2:-} == /* || ${2:-} =~ ^[A-Za-z]:[/\\] ]] || die "--remote-cwd requires an absolute path on the machine"

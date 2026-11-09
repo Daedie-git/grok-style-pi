@@ -319,7 +319,7 @@ class LauncherTests(unittest.TestCase):
         for key in ('SIDECAR_AGENT', 'SIDECAR_PI_SESSION', 'SIDECAR_MODEL',
                     'SIDECAR_THINKING', 'CLAUDE_ENV_FILE',
                     'SIDECAR_MACHINE', 'SIDECAR_REMOTE_HOME', 'GROK_STEER_DIR', 'XDG_STATE_HOME',
-                    'SIDECAR_TEST_ANCESTRY_PID'):
+                    'SIDECAR_TEST_ANCESTRY_PID', 'SIDECAR_MUX', 'HC_TERMINAL_ID', 'HC_SCOPE', 'HC_TERMINAL_SOCKET'):
             self.env.pop(key, None)
 
     def run_cli(self, *args, input='', env=None, cwd=None, check=True):
@@ -3762,7 +3762,7 @@ os.execv({real_flock!r},['flock',*sys.argv[1:]])
         state.write_text(json.dumps(data))
         result = self.run_cli('steer', 'Hello', check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn('cannot tell which session file herdr runs', result.stderr)
+        self.assertIn('cannot tell which session file this sidecar runs', result.stderr)
 
     def test_steer_accepts_windows_style_session_paths_from_herdr(self):
         self.env['FAKE_AGENT_WORKING'] = '1'

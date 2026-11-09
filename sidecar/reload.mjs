@@ -20,10 +20,13 @@ export function installReloadControl(pi, stateDir) {
   let ready;
   pi.on('session_start', async (event, ctx) => {
     const session = ctx.sessionManager.getSessionId();
-    if (!safeId.test(session)) return;
+    const next = safeId.test(session) ? join(dir, `${session}.ready`) : undefined;
+    // A receipt names the session this pi runs now; the launcher trusts it to identify the sidecar.
+    if (ready && ready !== next) await rm(ready, { force: true });
+    ready = next;
+    if (!ready) return;
     const sessionFile = ctx.sessionManager.getSessionFile();
     await mkdir(dir, { recursive: true });
-    ready = join(dir, `${session}.ready`);
     await publish(ready, { pid: process.pid, sessionFile });
     if (event.reason !== 'reload') return;
     const path = join(dir, `${session}.pending`);

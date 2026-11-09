@@ -1,6 +1,6 @@
 # Claude Sidecar
 
-A Claude Code plugin that runs persistent [pi](https://github.com/badlogic/pi-mono) or Claude Code sidecar agents on demand in Herdr panes. The reviewer remembers notes and earlier reviews, reviews plans and diffs, and returns Markdown reports to Claude.
+A Claude Code plugin that runs persistent [pi](https://github.com/badlogic/pi-mono) or Claude Code sidecar agents on demand in Herdr: panes of the herdr TUI, or terminals of the Herdr app. The reviewer remembers notes and earlier reviews, reviews plans and diffs, and returns Markdown reports to Claude.
 
 The default backend is pi with `openai-codex/gpt-6.1-sol` and `high` thinking.
 
@@ -8,7 +8,7 @@ The default backend is pi with `openai-codex/gpt-6.1-sol` and `high` thinking.
 
 - Linux with Bash, Git, jq, and util-linux (`flock`), or Windows with Git Bash, Node.js, jq, and a Git-Bash-compatible `flock` on `PATH`.
 - Claude Code with plugin support.
-- Herdr with `pane` and `agent` commands on `PATH`; start interactive Claude inside a Herdr pane.
+- Herdr with `pane` and `agent` commands on `PATH`, with interactive Claude in a Herdr pane; or the Herdr app with `hc` on `PATH`, with Claude in an app terminal. [scripts/mux/README.md](scripts/mux/README.md) describes both hosts.
 - The selected agent CLI on `PATH`, authenticated: pi (`@earendil-works/pi-coding-agent`) or Claude Code with access to the selected model.
 - To run sidecars on another machine: see [Sidecars on another machine](#sidecars-on-another-machine).
 
@@ -68,7 +68,7 @@ A local pane closes as soon as its request delivers a report (exit 0), like a fi
 
 After the report, a detached check waits for the launcher to release the slot and for the agent to settle (up to 2 minutes), then closes the pane unless a newer request took the slot, on whichever machine it runs. `sidecar sweep` closes slots whose owner is gone, using one pane list and non-blocking locks. Launcher commands and the Bash hook schedule it in the background at most once per minute, logging to `~/.cache/claude-sidecar/sweep.log`. SessionEnd marks the registered owning Claude session ended and sweeps its slots unless the reason is `clear`. Busy, blocked, pending and focused slots stay open then; later sweeps reclaim them once they become idle. Nested, headless or unidentified Claude sessions leave the owner's slots alone.
 
-`sidecar [--slot N] stop` closes the slot's pane after checking that it runs the sidecar's own session; a pane another agent took over is left running. The session, role, agent and machine binding are kept, so the next request resumes the conversation in a new pane, and `status` shows `stopped` meanwhile. It refuses with exit 7 while a request holds the slot; `--force` stops anyway, ending that request without a report. `--fresh` also removes the pin and saved pi or Claude session, so the next start begins a new one. `--all` stops every slot of the calling Claude pane. A slot on a machine is stopped there.
+`sidecar [--slot N] stop` closes the slot's pane after checking that it runs the sidecar's own session; a pane another agent took over is left running. The session, role, agent and machine binding are kept, so the next request resumes the conversation in a new pane, and `status` shows `stopped` meanwhile. It refuses with exit 7 while a request holds the slot; `--force` stops anyway, ending that request without a report. `--fresh` also removes the pin and saved pi or Claude session, so the next start begins a new one. `--all` stops every slot of the calling Claude pane. A slot on a machine is stopped there. A stopped slot keeps an unanswered question for `answer`, but leaves the band.
 
 ## Steering a sidecar
 

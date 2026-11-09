@@ -1,0 +1,188 @@
+# shellcheck shell=bash disable=SC2034
+# Herdr app backend: each slot is an hc terminal, a child of Claude's terminal that outlives it, on this machine or a
+# saved hc machine. hc has no rename, so a slot's terminal is found by its sidecar.agent label, not by an hc name.
+# The launcher sources one backend; scripts/mux/README.md lists the contract.
+MUX_CLI=hc
+MUX_MACHINE_LIST="hc machine ls"
+
+mux_owner_id() { echo "hc-$HC_TERMINAL_ID"; }
+
+hcx() {
+  # Remote arguments belong to the remote OS, not Git Bash's local Windows filesystem.
+  if [[ -n $MACHINE && -n $HOST_WINDOWS ]]; then MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' hc "$@"; else hc "$@"; fi
+}
+
+# A send from a terminal reaches an agent wrapped as <hc from=...>, which turns a slash command into chat text and hides
+# the [request ...] prefix. Without the caller's identity the text arrives as typed.
+hc_send() { (unset HC_TERMINAL_ID HC_SCOPE; hcx send --json "$@"); }
+
+# Saved hc machines in herdr's shape. hc addresses a machine by its name, which becomes the label.
+mux_list_machines() {
+  timeout "${1:-10}" hc machine ls --json 2>/dev/null |
+    jq -ce '[.machines[] | {id, label: .name, target, enabled: true}]'
+}
+
+# The live terminal labelled NAME on the slot's machine; remote addresses are machine/tN.
+mux_address() {
+  hcx ls --json --label "sidecar.agent=$1" 2>/dev/null | jq -er --arg m "${MACHINE:+$MACHINE_LABEL/}" '
+    first(.terminals[] | select(.state == "live") | .address |
+      select(if $m == "" then (contains("/") | not) else startswith($m) end)) // empty'
+}
+
+mux_get() {
+  local address
+  address=$(mux_address "$1") || return 1
+  hcx get --json "$address" 2>/dev/null
+}
+
+# A live terminal whose program has not reported a status yet is unknown, which callers wait out.
+mux_status() {
+  mux_get "$1" | jq -r 'if .state == "live" then (.status.state // "unknown") else empty end' 2>/dev/null || true
+}
+
+mux_kind() {
+  mux_get "$1" | jq -r '.status.app // empty | if . == "claude-code" then "claude" else . end' 2>/dev/null || true
+}
+
+mux_processes() {
+  local info
+  info=$(mux_get "$1") || return 1
+  if [[ -n ${2:-} ]]; then
+    [[ $(jq -r '.status.app // empty | if . == "claude-code" then "claude" else . end' <<<"$info") == "$2" ]] || return 1
+  fi
+  # The actual process: Windows resolves a pi.cmd wrapper from it. pi retitles itself to a bare "pi" on Linux, so pi's
+  # session is checked through its receipt instead.
+  jq -ce '[.foreground | select(. != null) | {pid, argv}]' <<<"$info"
+}
+
+# hc publishes no session file: pi's reload receipt names it, trusted only when its PID is the terminal's foreground.
+mux_session_file() {
+  local pid
+  pid=$(mux_processes "$1" | jq -er 'first(.[].pid)') || return 0
+  run_node 'try{const r=JSON.parse(fs.readFileSync(path.join(args[0],args[1]+".ready"),"utf8"));
+    if(r.pid===Number(args[2]))console.log(r.sessionFile)}catch(e){}' \
+    "${REMOTE_STATE:-$STATE_DIR}/reload" "$(pi_session_id)" "$pid" </dev/null || true
+}
+
+# The extension's receipt for SESSION must name this terminal's pi; it moves when pi switches sessions (/new, /resume).
+# A new pi publishes it shortly after startup.
+mux_runs_pi_session() {
+  local attempt
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    [[ -z $(mux_session_file "$1") ]] || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+mux_locate() { mux_address "$1"; }
+
+# Without a window, nothing is focused.
+mux_unfocused() {
+  local focused
+  focused=$(herdr-app status 2>/dev/null | jq -r '.agent // empty' 2>/dev/null) || true
+  [[ $focused != "$1" ]]
+}
+
+mux_close() {
+  hcx kill --json "$1" >/dev/null || return 1
+  hcx rm --json "$1" >/dev/null 2>&1 || true
+}
+
+mux_forget() { :; }
+
+mux_rename() {
+  local address
+  address=$(mux_address "$1") || return 1
+  hcx label --json "$address" "sidecar.agent=$2" >/dev/null
+}
+
+mux_prompt() {
+  local address
+  address=$(mux_address "$1") || return 1
+  hc_send "$address" "$2" >/dev/null
+}
+
+mux_prompt_wait() {
+  local address
+  address=$(mux_address "$1") || return 1
+  hc_send --wait --timeout "$(( ($3 + 999) / 1000 ))" "$address" "$2" >/dev/null
+}
+
+# hc's wait checks in after its default timeout; callers then poll the status until the report arrives.
+mux_prompt_detached() {
+  local address
+  address=$(mux_address "$1") || exit 1
+  unset HC_TERMINAL_ID HC_SCOPE
+  if [[ -n $MACHINE && -n $HOST_WINDOWS ]]; then export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'; fi
+  exec_detached hc send --json --wait "$address" "$2"
+}
+
+mux_wait() {
+  local address
+  address=$(mux_address "$1") || return 1
+  if [[ -n ${2:-} ]]; then hcx wait --json "$address" --timeout "$(( ($2 + 999) / 1000 ))"; else hcx wait --json "$address"; fi
+}
+
+mux_read() {
+  local address
+  address=$(mux_address "$1") || return 1
+  hcx read "$address" --lines "$2"
+}
+
+# Starts NAME as a child of Claude's terminal that outlives it, so the reaper decides when it ends, and prints its address.
+# The app lists it under Claude by its hc name: machine, role and slot. hc's default parent is the calling terminal, also for
+# --on; an explicit --parent would be resolved on the other machine.
+# SIDECAR_HC_PLACE (right, down or tab) gives it a pane relative to the focused one.
+mux_launch() {
+  local name=$1 kind=$2 address result where=() display candidate named
+  [[ -z $3 ]] || die "hc terminals take no pane; run start without one"
+  shift 3
+  [[ -z $MACHINE ]] || where=(--on "$MACHINE_LABEL")
+  display="${MACHINE:+$MACHINE_LABEL-}$ROLE"
+  [[ $SLOT == 1 ]] || display+="-$SLOT"
+  display=${display,,}
+  display=${display//[^a-z0-9_-]/-}
+  # hc names are unique among live terminals: another Claude's sidecar may hold this one. Only that refusal is retried;
+  # any other failure may hide a started terminal, and a retry would start a second one on the same session.
+  for candidate in "$display" "$display-$HC_TERMINAL_ID" ''; do
+    named=()
+    [[ -z $candidate ]] || named=(--name "${candidate:0:32}")
+    result=$(hcx run --json --bg --no-notify --outlive-parent "${where[@]}" "${named[@]}" --cwd "$WORK_DIR" \
+      --label "sidecar.agent=$name" --label "sidecar.owner=$(owner_name)" -- "$kind" "$@" 2>&1) && break
+    jq -e '.error.kind == "name_taken"' <<<"$result" >/dev/null 2>&1 || break
+  done
+  address=$(jq -er '.address' <<<"$result") || die "could not start $name: $result"
+  # Startup idle ends the wait; a trust dialog shows as blocked.
+  hcx wait --json "$address" --timeout 60 >/dev/null || true
+  [[ -n $(mux_status "$name") ]] || die "$name exited during startup: $(hcx read "$address" --lines 20 2>&1 | tail -n 5)"
+  if [[ -n ${SIDECAR_HC_PLACE:-} ]]; then
+    herdr-app 'do' terminal.keep --terminal "$address" --place "$SIDECAR_HC_PLACE" >/dev/null 2>&1 ||
+      echo "sidecar: could not give $address a pane; it stays listed under Claude" >&2
+  fi
+  echo "$address"
+}
+
+# One listing of every live terminal for a whole sweep.
+mux_snapshot() {
+  SWEEP_PANES=$(hc ls --json) || die "cannot list hc terminals"
+  jq -e '.terminals | type == "array"' <<<"$SWEEP_PANES" >/dev/null || die "invalid hc terminal list"
+}
+
+mux_owner_listed() {
+  jq -e --arg owner "$1" --arg candidate "$2" '
+    any(.terminals[]; ("sc-hc-" + .address) as $n | $n == $owner or $n == $candidate)' <<<"$SWEEP_PANES" >/dev/null
+}
+
+# alive, gone or unknown. Only not_found or a finished terminal proves absence.
+mux_owner_presence() {
+  local response code=0
+  response=$(timeout 10 hc get --json "${1#hc-}" 2>&1) || code=$?
+  if (( code == 0 )) && jq -e '.state == "live"' <<<"$response" >/dev/null 2>&1; then
+    echo alive
+  elif jq -e '.state == "finished" or .error.kind == "not_found"' <<<"$response" >/dev/null 2>&1; then
+    echo gone
+  else
+    echo unknown
+  fi
+}

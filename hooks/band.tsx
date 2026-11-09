@@ -40,9 +40,13 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     const home = await $.env.get('HOME')
-    const pane = await $.env.get('HERDR_PANE_ID')
-    // The launcher's owner name: SIDECAR_AGENT, else sc-<pane id, lowercased, ':' as '-'>.
-    const owner = (await $.env.get('SIDECAR_AGENT')) || (pane ? `sc-${pane.toLowerCase().replace(/:/g, '-')}` : undefined)
+    // The launcher's owner name: SIDECAR_AGENT, else sc-<herdr pane id, lowercased, ':' as '-'>, else sc-hc-<hc terminal>.
+    // SIDECAR_MUX picks the host when both IDs are inherited.
+    const forced = await $.env.get('SIDECAR_MUX')
+    const pane = forced === 'hc' ? undefined : await $.env.get('HERDR_PANE_ID')
+    const terminal = forced === 'herdr' ? undefined : await $.env.get('HC_TERMINAL_ID')
+    const id = pane || (terminal ? `hc-${terminal}` : undefined)
+    const owner = (await $.env.get('SIDECAR_AGENT')) || (id ? `sc-${id.toLowerCase().replace(/:/g, '-')}` : undefined)
     if (!home || !owner) return result
     const dir = `${home}/.cache/claude-sidecar`
     const pattern = new RegExp(`^${owner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:-(\\d+))?\\.request\\.json$`)
@@ -77,7 +81,8 @@ export const register: Register = on => {
           continue
         }
         const busy = request.finished === undefined
-        const waiting = !busy && names.has(`${name}.pending`)
+        // A stopped slot keeps its question for a later answer, but nobody is waiting on it.
+        const waiting = !busy && names.has(`${name}.pending`) && !names.has(`${name}.stopped`)
         if (!busy && !waiting) continue
         found.push({
           slot,

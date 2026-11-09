@@ -1,6 +1,6 @@
 ---
 name: sidecar-review
-description: Second-opinion review by a persistent pi or Claude Code agent in Herdr. Use after implementation, before complex plans, and at milestones to brief the reviewer. Requires HERDR_ENV=1.
+description: Second-opinion review by a persistent pi or Claude Code agent in Herdr. Use after implementation, before complex plans, and at milestones to brief the reviewer. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
 ---
 
 # Sidecar review
@@ -21,7 +21,7 @@ Use `--slot N` before the command to select an independent persistent sidecar (d
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 answer "Yes, preserve backward compatibility."
 ```
 
-For implementation tasks, select a fresh slot with `--role implementer` before `ask`. For read-only work, use `--role explorer` to find code and explain how it connects, or `--role researcher` to answer a question from primary sources (docs, specs, release notes). Implementers, explorers and researchers default to medium reasoning, reviewers to high. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides reasoning at startup.
+Pick the role by the work, on a fresh slot: the default reviewer for reviews, audits, bug or security scans and anything that writes findings files; `--role implementer` for code changes; `--role explorer` only to find code and explain how it connects; `--role researcher` only to answer a question from primary sources (docs, specs, release notes). Explorers and researchers report inline and write nothing, so they refuse audits and file output. Implementers, explorers and researchers default to medium reasoning, reviewers to high. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides reasoning at startup.
 
 Implementer asks carry a completion contract: a `Status: done|partial|blocked` line, verification through the real entry point, the smallest diff in the surrounding style, and `Verified`, `Not verified`, `Files changed`, `Additions` and `Suggested follow-ups` sections. `Additions` justifies each new function, option, fallback or dependency against the task; unjustified ones signal drift. Run the ask from the implementer's checkout and give it launcher checks:
 
@@ -34,7 +34,7 @@ After the report, the launcher runs each `--accept` command itself (`SIDECAR_ACC
 
 `--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for the other roles, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). It returns reports by writing a file, and the slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there; `SIDECAR_CLAUDE_PERMISSION_MODE=bypassPermissions` lets it work unattended). It cannot be reloaded, and a busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
 
-Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. Herdr fills Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus.
+Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. In the herdr TUI, sidecars fill Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus. In the Herdr app, sidecars are listed under Claude's terminal.
 
 ## Sidecars on another machine
 
@@ -145,7 +145,7 @@ When the sidecar is blocked on a decision only you or the user can make, the com
 
 ## When it misbehaves
 
-- Outside Herdr (`HERDR_ENV` is not `1`): explain that the sidecar requires an interactive Claude session inside Herdr, and continue without a sidecar review.
+- Outside Herdr (`HERDR_ENV` is not `1` and `HC_TERMINAL_ID` is unset): explain that the sidecar requires an interactive Claude session inside Herdr, and continue without a sidecar review.
 - `blocked`: the sidecar is waiting on a question in its pane. Ask the user to answer it there; do not send keys to it yourself.
 - `no report submitted`: the command prints the pane's recent output. Retry once with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" ask`; after that, report the failure to the user and continue with your own review.
 - `sidecar status` shows its state; `sidecar start` restarts it, resuming the same agent session.

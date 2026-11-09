@@ -700,16 +700,29 @@ class LauncherTests(unittest.TestCase):
         for name, session in sessions.items():
             self.assertEqual((state / name).read_text(), session)
 
-    def test_sweep_skips_remote_slots_but_stop_all_closes_them(self):
+    def test_remote_delivered_report_closes_its_pane_on_the_machine(self):
         self.lifecycle_state()
         self.add_machines()
         self.remote_run('--machine', 'm1', 'ask', 'Remote request',
                         env=dict(self.remote_env, SIDECAR_CLOSE_WHEN_DONE='1'))
-        (self.home / '.cache/claude-sidecar/sc-pane-1.ended').write_text('gone\n')
-        self.run_cli('sweep')
-        self.assertFalse(any('close' in c for c in self.calls()))
-        self.remote_run('stop', '--all')
+        deadline = time.monotonic() + 10
+        while not any(c[:2] == ['pane', 'close'] for c in self.remote_calls()):
+            self.assertLess(time.monotonic(), deadline, 'delivered remote report did not close its pane')
+            time.sleep(0.05)
+        self.wait_lifecycle_workers()
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.local_calls()))
+
+    def test_sweep_closes_remote_slots_only_when_their_owner_is_gone(self):
+        self.lifecycle_state()
+        self.add_machines()
+        self.remote_run('--machine', 'm1', 'ask', 'Remote request')
+        before = len(self.calls())
+        self.run_cli('sweep', env=self.remote_env)
+        self.assertEqual(self.calls()[before:], [['pane', 'list']])
+        (self.home / 'panes.json').write_text('[]')
+        self.run_cli('sweep', env=self.remote_env)
         self.assertTrue(any(c[:2] == ['pane', 'close'] for c in self.remote_calls()))
+        self.assertFalse(any(c[:2] == ['pane', 'close'] for c in self.local_calls()))
 
     def test_sweep_visits_other_owners_and_slots(self):
         self.lifecycle_state()

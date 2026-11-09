@@ -9,7 +9,7 @@
 #                                native claude agents support reports and answers; reload and busy steer require pi
 #   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
 #   sidecar session-end          SessionEnd hook entry; stop this owner's panes unless clearing
-#   sidecar sweep                close local panes whose owner is gone
+#   sidecar sweep                close panes whose owner is gone
 #   sidecar keep|unkeep          pin or unpin this slot's pane against closing after its report
 #   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
 #   sidecar restart              start the sidecar in a new pane when its name belongs to another session
@@ -479,6 +479,8 @@ resolve_machine() {
   # Checkouts outside our home have no home-relative counterpart; use the conventional checkout layout.
   [[ $SIDECAR_HOME == "$HOME/"* ]] || runtime_relative=git/claude-sidecar/sidecar
   WORK_DIR=${REMOTE_CWD:-${mapped:-$PWD}}
+  # A sweep only closes the pane, so it needs no checkout; the sweeper's directory may not exist there.
+  [[ -z ${SWEEPING:-} ]] || WORK_DIR=.
   # Persist the mapped checkout too: changing settings must not silently move an existing slot.
   if [[ -n $mapped || $REMOTE_TRANSPORT == node ]]; then REMOTE_CWD=$WORK_DIR; fi
   if [[ $REMOTE_TRANSPORT == node ]]; then
@@ -490,6 +492,8 @@ resolve_machine() {
     AGENT_HOME=$(jq -r '.agentHome' <<<"$info")
     [[ $(jq -r '.windows' <<<"$info") != true ]] || TARGET_WINDOWS=1
     REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
+    # A sweep only stops an agent; deploying could overwrite remote runtime edits.
+    [[ -z ${SWEEPING:-} ]] || return 0
     # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files: a Windows checkout
     # holds them with CRLF endings, and rewriting identical content dirties it and blocks sync-machine.
     local runtime_file
@@ -503,8 +507,11 @@ resolve_machine() {
   local home info status=0
   info=$(remote 'agent_home=${1:-"$HOME/$3"}
     printf "%s\n%s\n" "$HOME" "$agent_home"
-    test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" && test -f "$agent_home/implementer.md" && test -f "$agent_home/researcher.md" && test -f "$agent_home/explorer.md" || exit 11
-    test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" "$runtime_relative" </dev/null) || status=$?
+    # A sweep ($4) only stops an agent, which needs no runtime files.
+    if [ -z "$4" ]; then
+      test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" && test -f "$agent_home/implementer.md" && test -f "$agent_home/researcher.md" && test -f "$agent_home/explorer.md" || exit 11
+    fi
+    test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" "$runtime_relative" "${SWEEPING:-}" </dev/null) || status=$?
   home=${info%%$'\n'*}
   AGENT_HOME=${info#*$'\n'}
   case $status in
@@ -2646,17 +2653,13 @@ owner_presence() {
   fi
 }
 
-# Runs under the slot's startup and request locks, immediately before stop's ownership checks.
-sweep_eligible() {
-  local name=$1 hname=$2 pane status owner candidate owner_pane presence other
+# Whether the slot's task is over: its owner ended or is gone, or (for done-close) its request delivered a report and it
+# is not pinned. Reads only local state and Claude's own herdr, so remote slots cost no SSH unless this holds.
+sweep_decided() {
+  local name=$1 owner candidate owner_pane presence other
   if [[ -n ${SWEEP_REQUEST:-} ]]; then
     [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 1
   fi
-  status=$(agent_status "$hname")
-  [[ $status == idle || $status == 'done' ]] || return 1
-  [[ ! -s $STATE_DIR/$name.pending ]] || return 1
-  pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || return 1
-  jq -e --arg pane "$pane" 'any(.result.panes[]; .pane_id == $pane and .focused == true)' <<<"$SWEEP_PANES" >/dev/null && return 1
   owner=$name
   if [[ -s $STATE_DIR/$name.owner ]]; then
     owner=$(<"$STATE_DIR/$name.owner")
@@ -2689,8 +2692,28 @@ sweep_eligible() {
   [[ $(jq -r '.exit_code // empty' "$STATE_DIR/$name.request.json") == 0 ]]
 }
 
+# Runs under the slot's startup and request locks, immediately before stop's ownership checks.
+sweep_eligible() {
+  local name=$1 hname=$2 pane status
+  sweep_decided "$name" || return 1
+  status=$(agent_status "$hname")
+  [[ $status == idle || $status == 'done' ]] || return 1
+  [[ ! -s $STATE_DIR/$name.pending ]] || return 1
+  # The slot's own herdr: pane IDs of a remote server mean nothing in Claude's pane list.
+  pane=$(hd agent get "$hname" | jq -er '.result.agent.pane_id') || return 1
+  hd pane get "$pane" | jq -e '.result.pane.focused == false' >/dev/null
+}
+
+# Points herdr calls at the slot's machine. Resolution costs SSH round trips, so a machine stays resolved across calls.
+sweep_resolve() {
+  local name=$1 binding=$2
+  if [[ $binding == local ]]; then MACHINE=''; TARGET_WINDOWS=$HOST_WINDOWS; return; fi
+  [[ $MACHINE != "$binding" ]] || return 0
+  SIDECAR_AGENT=$name SLOT=1 MACHINE_ARG='' REMOTE_CWD='' KEEP_PWD='' SWEEPING=1 resolve_machine
+}
+
 cmd_sweep() {
-  local file name binding slot owner candidate MACHINE=''
+  local file name binding slot owner candidate
   SWEEP_PANES=$(herdr pane list) || die "cannot list herdr panes"
   jq -e '.result.panes | type == "array"' <<<"$SWEEP_PANES" >/dev/null || die "invalid herdr pane list"
   shopt -s nullglob
@@ -2704,12 +2727,13 @@ cmd_sweep() {
     fi
     binding=local
     if [[ -s $STATE_DIR/$name.machine ]]; then read -r binding <"$STATE_DIR/$name.machine"; fi
-    [[ $binding == local ]] || continue
     (
       export SIDECAR_AGENT=$name
       unset SIDECAR_PI_SESSION SIDECAR_MACHINE
       SLOT=1 ROLE_ARG='' AGENT_ARG='' MACHINE_ARG='' REMOTE_CWD='' RESOLVED=1
       flock -n 8 || exit 0
+      sweep_decided "$name" || exit 0
+      sweep_resolve "$name" "$binding"
       owner=$name
       if [[ -s $STATE_DIR/$name.owner ]]; then
         owner=$(<"$STATE_DIR/$name.owner")
@@ -2730,7 +2754,7 @@ cmd_sweep() {
 # Takes the request ID that permits closing; defaults to the current request.
 schedule_done_close() {
   local name id=${1:-}
-  [[ -z $MACHINE && ${SIDECAR_CLOSE_WHEN_DONE:-1} != 0 ]] || return 0
+  [[ ${SIDECAR_CLOSE_WHEN_DONE:-1} != 0 ]] || return 0
   name=$(agent_name)
   [[ -n $id ]] || id=$(jq -r '.id' "$STATE_DIR/$name.request.json")
   (
@@ -2740,8 +2764,11 @@ schedule_done_close() {
 
 # Waits for the launcher to release the slot, then up to DONE_CLOSE_WAIT_S for the agent to settle after its report.
 cmd_done_close() {
-  local name=$1 SWEEP_REQUEST=$2 deadline
+  local name=$1 SWEEP_REQUEST=$2 deadline binding=local
   flock "$STATE_DIR/$name.lock" true
+  # Resolve a remote machine once, not on every retry.
+  if [[ -s $STATE_DIR/$name.machine ]]; then read -r binding <"$STATE_DIR/$name.machine"; fi
+  sweep_resolve "$name" "$binding"
   deadline=$((SECONDS + ${DONE_CLOSE_WAIT_S:-120}))
   while [[ ! -e $STATE_DIR/$name.keep && ! -e $STATE_DIR/$name.stopped ]] && (( SECONDS < deadline )); do
     # A newer request owns the slot now; its own completion decides.
@@ -2755,7 +2782,7 @@ cmd_keep() {
   require_identity
   [[ $# == 1 ]] || die "usage: sidecar [--slot N] keep|unkeep"
   set_keep "$1"
-  # Unpinning after a delivered report closes the pane as that completion would have; done-close skips remote slots.
+  # Unpinning after a delivered report closes the pane as that completion would have.
   local id
   # One read: the ID must belong to the completion that permits closing, or done-close cannot detect a newer request.
   if [[ $1 == unkeep ]] && id=$(jq -er 'select(.exit_code == 0) | .id' "$STATE_DIR/$(agent_name).request.json" 2>/dev/null); then

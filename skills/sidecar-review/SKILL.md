@@ -67,7 +67,7 @@ After updating sidecar or Pi extension files, run `sidecar [--slot N] reload` in
 
 ## Pane lifecycle
 
-A local pane closes once its request delivers a report, and when this Claude pane ends; the next request to the slot resumes the same conversation in a new pane, so keep using the slot for follow-ups. Panes with a pending question, a request that ended without a report, or user focus stay open. Pass `ask --keep` only when the user watches the pane; `sidecar [--slot N] keep|unkeep` changes the pin later. Remote panes need explicit `stop`. Clearing Claude keeps panes open.
+A pane closes once its request delivers a report, and when this Claude pane ends; the next request to the slot resumes the same conversation in a new pane, so keep using the slot for follow-ups. Panes with a pending question, a request that ended without a report, or user focus stay open. Pass `ask --keep` only when the user watches the pane; `sidecar [--slot N] keep|unkeep` changes the pin later. Clearing Claude keeps panes open.
 
 For immediate closure, use `sidecar [--slot N] stop`; `stop --all` stops every slot of this Claude pane. While a request runs it refuses with exit 7; `--force` stops it anyway, ending that request without a report. `--fresh` removes the pin and saved session so the next start begins a new conversation. A pane taken over by another agent is left running.
 

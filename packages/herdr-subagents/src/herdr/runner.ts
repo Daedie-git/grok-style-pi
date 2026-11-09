@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { herdrServerDown, herdrSessionName, paneCreationRejected, type HerdrClient, type HerdrAgentRef, type HerdrPaneLayout } from "./client.ts";
 import { defaultThinking, parseAgentFile } from "./agent-file.ts";
+import { isHcSessionTag } from "./hc.ts";
 import { HerdrStore, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask, type MaintenanceObservation } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
@@ -248,7 +249,7 @@ export class HerdrRunner {
 				let record = await this.resolve(agentId);
 				check(combined);
 				// Resuming adopts the caller as owner, and an owner in another session could not be checked from the child's.
-				if (sessionOf(record) !== this.herdrSession) throw new Error(`Agent ${record.id} belongs to Herdr session ${sessionOf(record)}. Resume it from there.`);
+				if (sessionOf(record) !== this.herdrSession) throw new Error(`Agent ${record.id} belongs to ${isHcSessionTag(sessionOf(record)) ? "another Herdr app session" : `Herdr session ${sessionOf(record)}`}. Resume it from there.`);
 				if (record.paneClose) {
 					await this.recoverPaneClose(record, undefined, combined);
 					record = await this.resolve(agentId);
@@ -398,7 +399,8 @@ export class HerdrRunner {
 	private clientOf(item: { herdrSession?: string }): HerdrClient | undefined {
 		const session = sessionOf(item);
 		if (session === this.herdrSession) return this.deps.client;
-		if (this.machine || !this.deps.client.forSession) return undefined;
+		// Another host's records (the Herdr app's are tagged `@hc:<session>`) are settled by that host's runners.
+		if (this.machine || !this.deps.client.forSession || session.startsWith("@")) return undefined;
 		let client = this.sessionClients.get(session);
 		if (!client) this.sessionClients.set(session, client = this.deps.client.forSession(session));
 		return client;
@@ -590,11 +592,22 @@ export class HerdrRunner {
 		let paneId: string | undefined;
 		let published = false;
 		let creationIssued = false;
+		const launch = this.deps.client.launch;
+		const args = claude ? claudeArgs(task, sessionId, this.deps.root) : piArgs(task, sessionFile!);
 		try {
 			check(signal);
 			await this.withPlacement(async () => {
 				await this.recoverLaunches();
 				check(signal);
+				if (launch) {
+					// The host places the terminal and starts the agent with it.
+					await this.store.recordLaunch(ref!, this.owner, "creating", {}, this.now());
+					check(signal);
+					creationIssued = true;
+					paneId = (await launch({ name: task!.id, kind: claude ? "claude" : "pi", args, cwd: request.cwd, role: request.subagentType }, signal)).paneId;
+					await this.store.recordLaunch(ref!, this.owner, "pane-created", { paneId }, this.now());
+					return;
+				}
 				const target = await this.choosePlacement(request, signal);
 				await this.store.recordLaunch(ref!, this.owner, "creating", { tabId: target.tabId, direction: target.direction, column: target.column, workspaceId: request.workspaceId }, this.now());
 				check(signal);
@@ -613,10 +626,11 @@ export class HerdrRunner {
 			await this.store.recordLaunch(ref, this.owner, "starting-pi", {}, this.now());
 			check(signal);
 			task.paneId = paneId!;
+			// Claude's hooks report through this binding; nothing reaches them before its first prompt.
 			if (claude) {
 				await this.store.attach(paneId!, sessionFile!, sessionId);
-				await this.deps.client.startClaude!({ name: task.id, paneId: paneId!, args: claudeArgs(task, sessionId, this.deps.root) }, signal);
-			} else await this.deps.client.startPi({ name: task.id, paneId: paneId!, args: piArgs(task, sessionFile!) }, signal);
+				if (!launch) await this.deps.client.startClaude!({ name: task.id, paneId: paneId!, args }, signal);
+			} else if (!launch) await this.deps.client.startPi({ name: task.id, paneId: paneId!, args }, signal);
 			check(signal);
 			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now(), this.startTimeoutMs);
 			published = true;
@@ -659,12 +673,16 @@ export class HerdrRunner {
 			const suffix = `-r${attempt + 1}`;
 			herdrName = `${record.id.slice(0, 31 - suffix.length)}${suffix}`;
 		}
-		const target = await this.choosePlacement(request, signal);
+		const open = this.deps.client.launch;
+		const target: Partial<Placement> = open ? {} : await this.choosePlacement(request, signal);
 		check(signal);
 		let paneId: string | undefined;
 		let rebound = false;
 		let creationIssued = false;
 		let startupIssued = false;
+		const claude = record.runtime === "claude-code";
+		const args = claude ? claudeArgs(record, record.sessionId!, this.deps.root) : piArgs(record, record.sessionFile);
+		if (claude) args[0] = "--resume";
 		try {
 			// The original launch retains this fleet's grid history across all of its runs.
 			if (launch) {
@@ -677,6 +695,16 @@ export class HerdrRunner {
 			}
 			await this.assertColdResumeAllowed(record.id);
 			creationIssued = true;
+			if (open) {
+				startupIssued = true;
+				paneId = (await open({ name: herdrName, kind: claude ? "claude" : "pi", args, cwd: request.cwd, role: record.type }, signal)).paneId;
+				await this.store.rebindPane(record.id, record.currentRunId, paneId, herdrName);
+				rebound = true;
+				if (launch) await this.store.recordLaunch(launch, launch.owner, "pane-created", { paneId }, this.now());
+				if (claude) await this.store.attach(paneId, record.sessionFile, record.sessionId!);
+				if (launch) await this.store.recordLaunch(launch, launch.owner, "published", {}, this.now());
+				return;
+			}
 			const created = target.newTab
 				? await this.deps.client.createTab({ cwd: request.cwd, label: record.description, workspaceId: request.workspaceId })
 				: await this.deps.client.split({ paneId: target.paneId!, direction: target.direction!, cwd: request.cwd });
@@ -689,15 +717,13 @@ export class HerdrRunner {
 				workspaceId: request.workspaceId ?? (created as { workspaceId?: string }).workspaceId,
 			}, this.now());
 			check(signal);
-			if (record.runtime === "claude-code") {
+			if (claude) {
 				await this.store.attach(paneId, record.sessionFile, record.sessionId!);
-				const args = claudeArgs(record, record.sessionId!, this.deps.root);
-				args[0] = "--resume";
 				startupIssued = true;
 				await this.deps.client.startClaude!({ name: herdrName, paneId, args }, signal);
 			} else {
 				startupIssued = true;
-				await this.deps.client.startPi({ name: herdrName, paneId, args: piArgs(record, record.sessionFile) }, signal);
+				await this.deps.client.startPi({ name: herdrName, paneId, args }, signal);
 			}
 			check(signal);
 			if (launch) await this.store.recordLaunch(launch, launch.owner, "published", {}, this.now());

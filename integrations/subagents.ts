@@ -7,7 +7,7 @@ import type { HerdrBackendHandle } from "../packages/herdr-subagents/src/herdr/b
 import { HerdrBackendAdapter } from "../packages/subagent-engine/src/backends/herdr.ts";
 import type { Engine } from "../packages/subagent-engine/src/engine.ts";
 import { createSubagentEngine, inChildContext, type SubagentEngineOptions } from "../packages/subagent-engine/src/extension.ts";
-import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
+import { selectSubagentRuntime, withoutTerminalHost } from "../src/subagents/runtime.ts";
 import { registerStyledSubagents } from "../src/subagents/result-style.ts";
 import { createHerdrNotificationRenderer } from "../src/subagents/notification-style.ts";
 
@@ -18,7 +18,7 @@ export async function loadSubagentExtension(
 	styling: boolean,
 	styleTool?: ToolTransform,
 ) {
-	const herdr = selectSubagentRuntime(env) === "herdr";
+	const herdr = selectSubagentRuntime(env) !== "engine";
 	if (styling) {
 		for (const type of herdr ? ["herdr-subagent-notification"] : ["subagent-notification", "subagent-message", "agent-message", "subagent-stop-feedback"]) {
 			pi.registerMessageRenderer(type, createHerdrNotificationRenderer());
@@ -41,10 +41,10 @@ export function createGrokSubagents(options: { engine?: SubagentEngineOptions; s
 		if (inChildContext()) return;
 		const { runtime, features, activity } = await installGrokStyle(pi, options.style);
 		const env = options.env ?? process.env;
-		const inHerdr = selectSubagentRuntime(env) === "herdr";
-		// Inside Herdr the engine stays the runner; Herdr becomes its pane backend for general-purpose agents (the `panes`
-		// feature) and for calls that ask for a pane, a saved machine or the Claude Code runtime. Its headless mode also keeps
-		// this Pi working as a pane child (child lifecycle, tool scope) for parents that launch it.
+		const inHerdr = selectSubagentRuntime(env) !== "engine";
+		// Inside Herdr, the TUI or the app, the engine stays the runner; Herdr becomes its pane backend for general-purpose
+		// agents (the `panes` feature) and for calls that ask for a pane, a saved machine or the Claude Code runtime. Its
+		// headless mode also keeps this Pi working as a pane child (child lifecycle, tool scope) for parents that launch it.
 		let current: Engine | undefined;
 		let handle: HerdrBackendHandle | undefined;
 		let detach: (() => void) | undefined;
@@ -63,7 +63,7 @@ export function createGrokSubagents(options: { engine?: SubagentEngineOptions; s
 			autonomy: features.autonomy ? "positive" : "explicit",
 			onEngine(created) { activity?.attachEngine(created); current = created; connect(); options.engine?.onEngine?.(created); },
 		});
-		await loadSubagentExtension(pi, { ...env, HERDR_ENV: undefined }, { herdr: unavailable, current: engine }, features.toolStyling, runtime.styleTool);
+		await loadSubagentExtension(pi, withoutTerminalHost(env), { herdr: unavailable, current: engine }, features.toolStyling, runtime.styleTool);
 		if (inHerdr && features.toolStyling) pi.registerMessageRenderer("herdr-subagent-notification", createHerdrNotificationRenderer());
 	};
 }

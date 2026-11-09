@@ -58,6 +58,24 @@ function isBusy(error: unknown): boolean {
 	return (error as { errcode?: number } | null)?.errcode === 5;
 }
 
+function settleMaintenance(token: string, observations: MaintenanceObservation[], now: number): boolean {
+	return transaction(() => {
+		const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
+		if (lease.token !== token || Number(lease.expires) <= now) return false;
+		for (const { ref, alive, seen } of observations) {
+			if (!current(ref) || agent(ref.agentId)?.paneClose) continue;
+			const value = run(ref);
+			if (isTerminal(value.phase)) continue;
+			// A pass can span many slow calls. A run that advanced since its listing proves the child is alive.
+			if (!alive && seen && !isDeepStrictEqual(seen, value)) continue;
+			const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: departureError(value, ref) }, now);
+			if (next !== value) saveRun(next);
+		}
+		db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
+		return true;
+	});
+}
+
 function transaction<T>(body: () => T): T {
 	db.exec("BEGIN IMMEDIATE");
 	try {
@@ -304,21 +322,9 @@ const operations = {
 			.map((row) => ({ agent: JSON.parse(String(row.agent_data)), run: JSON.parse(String(row.run_data)) }));
 	},
 	finishMaintenance(token: string, observations: MaintenanceObservation[], now: number): boolean {
-		return transaction(() => {
-			const lease = db.prepare("SELECT token,expires FROM maintenance WHERE id=1").get()!;
-			if (lease.token !== token || Number(lease.expires) <= now) return false;
-			for (const { ref, alive, seen } of observations) {
-				if (!current(ref) || agent(ref.agentId)?.paneClose) continue;
-				const value = run(ref);
-				if (isTerminal(value.phase)) continue;
-				// A pass can span many slow calls. A run that advanced since its listing proves the child is alive.
-				if (!alive && seen && !isDeepStrictEqual(seen, value)) continue;
-				const next = alive ? expireUnaccepted(value, now) : transition(value, { type: "failed", error: departureError(value, ref) }, now);
-				if (next !== value) saveRun(next);
-			}
-			db.prepare("UPDATE maintenance SET expires=0,next_at=? WHERE id=1 AND token=?").run(now + 1000, token);
-			return true;
-		});
+		// Best-effort like the claim: on a busy database the lease lapses and a later tick redoes the pass.
+		try { return settleMaintenance(token, observations, now); }
+		catch (error) { if (isBusy(error)) return false; throw error; }
 	},
 	/** `extendMs` renews a valid lease, so a pass may outlast one lease while it keeps making progress. */
 	maintenanceValid(token: string, now: number, extendMs?: number): boolean {

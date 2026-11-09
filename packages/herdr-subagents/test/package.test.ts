@@ -11,7 +11,10 @@ import standalone from "../extensions/index.ts";
 import { herdrSubagentRoot } from "../src/herdr/store.ts";
 
 function environment(t: { after(fn: () => void): void }, inside: boolean) {
-	const before = { HERDR_ENV: process.env.HERDR_ENV, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH };
+	const before = { HERDR_ENV: process.env.HERDR_ENV, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH, HC_TERMINAL_ID: process.env.HC_TERMINAL_ID, HERDR_SUBAGENTS_HOST: process.env.HERDR_SUBAGENTS_HOST };
+	// A test run inside the Herdr app must not count as inside Herdr.
+	delete process.env.HC_TERMINAL_ID;
+	delete process.env.HERDR_SUBAGENTS_HOST;
 	process.env.HERDR_ENV = inside ? "1" : "0";
 	process.env.HERDR_BIN_PATH = join(tmpdir(), "missing-herdr-for-package-test");
 	t.after(() => {

@@ -31,6 +31,21 @@ export interface HerdrPaneLayout {
 	panes: { paneId: string; x: number; y: number; width: number; height: number }[];
 }
 
+/** Starts an agent program in a terminal of its own. */
+export interface AgentLaunch {
+	/** The agent's Herdr name, which later lookups use. */
+	name: string;
+	kind: "pi" | "claude";
+	args: string[];
+	cwd: string;
+	/** Its subagent type, for the host's display. */
+	role: string;
+}
+
+/**
+ * One terminal host's commands: a herdr server (createHerdrCli), whose panes open before an agent starts in them, or the
+ * Herdr app's hc (createHcCli in hc.ts), whose terminals start with their program through `launch`.
+ */
 export interface HerdrClient {
 	/** The same commands against another session of this server's machine. */
 	forSession?(session: string): HerdrClient;
@@ -53,6 +68,12 @@ export interface HerdrClient {
 	/** Every physical pane, including shells whose agent has exited. */
 	listPanes(options?: { workspaceId?: string; signal?: AbortSignal }): Promise<HerdrAgentRef[]>;
 	createTab(options: { cwd: string; label?: string; workspaceId?: string }): Promise<{ tabId: string; paneId: string; workspaceId?: string }>;
+	/** Opens a terminal running the agent, in place of placing a pane and starting it there. */
+	launch?(options: AgentLaunch, signal?: AbortSignal): Promise<{ paneId: string }>;
+	/** The permanent id of the host these commands reach, for hosts whose sessions the environment cannot name reliably. */
+	hostId?(): Promise<string>;
+	/** Records which conversation this process runs in its pane, for hosts that cannot see it; undefined withdraws it. */
+	publishSession?(paneId: string, sessionFile: string | undefined): Promise<void>;
 }
 
 export function paneIdFromSplit(payload: unknown): string {
@@ -334,7 +355,7 @@ export function herdrServerDown(error: unknown): boolean {
 
 /** Only explicit pre-effect validation failures prove that no pane was created. */
 export function paneCreationRejected(error: unknown): boolean {
-	return error instanceof HerdrCliError && ["workspace_not_found", "tab_not_found", "pane_not_found", "invalid_params", "invalid_request"].includes(error.code ?? "");
+	return error instanceof HerdrCliError && ["workspace_not_found", "tab_not_found", "pane_not_found", "invalid_params", "invalid_request", "machine_unknown", "invalid_template"].includes(error.code ?? "");
 }
 
 function errorPayload(text: string): Record<string, unknown> | undefined {

@@ -10,7 +10,7 @@ From this checkout:
 pi install /path/to/grok-style-pi/packages/herdr-subagents
 ```
 
-Install it in Pi's user settings on every machine where children run, so new Pi processes load it too. Run `/reload` in existing sessions. The standalone entrypoint activates only inside Herdr (`HERDR_ENV=1`); outside Herdr it registers nothing.
+Install it in Pi's user settings on every machine where children run, so new Pi processes load it too. Run `/reload` in existing sessions. The standalone entrypoint activates only inside Herdr, a herdr pane (`HERDR_ENV=1`) or a Herdr app terminal (`HC_TERMINAL_ID`); outside Herdr it registers nothing. See [Herdr app](#herdr-app).
 
 The directory is a complete Pi package with its own manifest, dependencies, entrypoint, and license. It can be copied out of this repository, installed with `pi install /path/to/herdr-subagents`, or packed with `npm pack` from this directory. It is not yet published to npm.
 
@@ -69,6 +69,12 @@ Occupancy includes unrelated panes and shells left behind by exited children. Th
 A layout already containing three straight rows or columns cannot become four quadrants through splitting alone. The runner preserves those terminals and opens a new grid tab instead of adding another strip; it never replaces a tab's layout, which would destroy its running terminals. Unknown layouts without usable placement history, unknown occupancy, or a caller without `HERDR_WORKSPACE_ID` also open a new tab. Unrelated Herdr clients can still exceed the cap.
 
 Sidebar names drop a leading `herdr-` and append the model and reasoning level, for example `review · gpt-6-astra-xhigh`.
+
+## Herdr app
+
+Inside a Herdr app terminal, subagents run as hc child terminals of their parent, listed under it in the app's Agents list instead of being placed in panes. Each is named for its machine when remote, then its type, such as `hermes-reviewer` or `explore-2`; it is found by its `herdr-subagents.agent` label, because hc cannot rename. Every Pi running this runner labels its terminal with `herdr-subagents.session` so runners can tell which conversation it holds. Closing, resume, owner cleanup, Claude Code and saved machines (`hc machine ls`) work as with panes; the app's focused terminal counts as focused.
+
+The innermost host wins: a herdr TUI started inside an app terminal uses herdr panes. Set `HERDR_SUBAGENTS_HOST=herdr` or `hc` to pick one of the hosts present. Agents keep the host and hc core session they started in; resume them from there. A saved machine that hc cannot reach leaves its agents' state unknown until it reconnects.
 
 ## Claude Code
 

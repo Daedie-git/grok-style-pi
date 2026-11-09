@@ -9,7 +9,7 @@ import type { HerdrClient } from "../packages/herdr-subagents/src/herdr/client.t
 import { Worker } from "node:worker_threads";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { selectSubagentRuntime } from "../src/subagents/runtime.ts";
+import { selectSubagentRuntime, withoutTerminalHost } from "../src/subagents/runtime.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -34,6 +34,18 @@ test("Herdr availability enables the standalone loader; the combined entrypoint 
 	const factory = (name: string): ExtensionFactory => () => { loaded.push(name); };
 	await loadSubagentExtension(pi, { HERDR_ENV: "1" }, { herdr: factory("herdr"), current: factory("current") }, false);
 	await loadSubagentExtension(pi, {}, { herdr: factory("herdr"), current: factory("current") }, false);
+	assert.deepEqual(loaded, ["herdr", "current"]);
+});
+
+test("a Herdr app terminal selects the runner; without its host the engine loads", async () => {
+	const app = { HC_TERMINAL_ID: "t7", HERDR_SUBAGENTS_HOST: "hc" };
+	assert.equal(selectSubagentRuntime(app), "hc");
+	assert.equal(selectSubagentRuntime(withoutTerminalHost({ ...app, HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" })), "engine");
+	const loaded: string[] = [];
+	const pi = { registerTool() {} } as unknown as ExtensionAPI;
+	const factory = (name: string): ExtensionFactory => () => { loaded.push(name); };
+	await loadSubagentExtension(pi, app, { herdr: factory("herdr"), current: factory("current") }, false);
+	await loadSubagentExtension(pi, withoutTerminalHost(app), { herdr: factory("herdr"), current: factory("current") }, false);
 	assert.deepEqual(loaded, ["herdr", "current"]);
 });
 

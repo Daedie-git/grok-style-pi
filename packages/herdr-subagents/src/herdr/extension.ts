@@ -22,6 +22,8 @@ import {
 import { EXPLICIT_SUBAGENT_REQUEST } from "./policy.ts";
 import { machineDefaultCwd, readHerdrSettings } from "./config.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
+import { createHcCli, hcConnect, hcSessionTag, listHcMachines } from "./hc.ts";
+import { hostPaneId, terminalHost, type TerminalHost } from "./host.ts";
 
 export interface HerdrSubagentDeps {
 	env: NodeJS.ProcessEnv;
@@ -63,29 +65,45 @@ const POLL_MS = 200;
 
 export interface HerdrSubagentOptions extends Partial<HerdrSubagentDeps> {
 	mode?: "backend";
+	/** Defaults to the host this process runs in, else herdr. */
+	host?: TerminalHost;
 	onBackend?: (handle: HerdrBackendHandle) => void;
 }
 
 export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): ExtensionFactory {
 	const env = overrides.env ?? process.env;
+	const hc = (overrides.host ?? terminalHost(env) ?? "herdr") === "hc";
+	const hcCall = hcConnect(env);
+	/** Saved machines of this host, selected by profile ID or unique label. */
+	const findMachine = async (selector: string): Promise<HerdrMachine> => {
+		if (!hc) return findHerdrMachine(selector, env);
+		const machine = pickHerdrMachine(await listHcMachines(hcCall), selector);
+		if (!machine) throw new Error(`Unknown hc machine '${selector}'. Add it with hc machine add, then check hc machine ls.`);
+		return machine;
+	};
 	const deps: HerdrSubagentDeps = {
 		env,
 		root: overrides.root ?? herdrSubagentRoot(env),
-		client: overrides.client ?? createHerdrCli(env),
+		client: overrides.client ?? (hc ? createHcCli(env, { call: hcCall }) : createHerdrCli(env)),
 		agentDir: overrides.agentDir ?? getAgentDir(),
 		sleep: overrides.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
 		now: overrides.now ?? Date.now,
-		machineClient: overrides.machineClient ?? ((machine, exec) => createHerdrCli(env, undefined, machine, undefined, exec)),
+		machineClient: overrides.machineClient ?? ((machine, exec) => hc
+			? createHcCli(env, { machine, call: hcCall })
+			: createHerdrCli(env, undefined, machine, undefined, exec)),
 		machineChannel: overrides.machineChannel ?? (async (machine) => sshChannel({
-			target: (await findHerdrMachine(machine, env)).target,
+			target: (await findMachine(machine)).target,
 			node: env.HERDR_SUBAGENTS_REMOTE_NODE || env.GROK_HERDR_REMOTE_NODE,
 			entry: remoteWorkerEntry(env),
 		})),
 		hostname: overrides.hostname ?? hostname(),
 		// Older Herdr has no saved machines, and an unavailable listing only leaves them unnamed.
-		listMachines: overrides.listMachines ?? (() => listHerdrMachines(env, 2500).catch(() => [])),
+		listMachines: overrides.listMachines ?? (() => (hc ? listHcMachines(hcCall, 2500) : listHerdrMachines(env, 2500)).catch(() => [])),
 	};
-	const paneId = deps.env.HERDR_PANE_ID ?? "";
+	const paneId = hostPaneId(deps.env, hc ? "hc" : "herdr");
+	// App terminals have no tab or workspace; their subagents nest under them.
+	const localTab = hc ? undefined : deps.env.HERDR_TAB_ID;
+	const localWorkspace = hc ? undefined : deps.env.HERDR_WORKSPACE_ID;
 	// Remote stores key notices by this pane; a bare pane ID could name one of that machine's own panes.
 	const parentKey = (machine?: string) => machine && paneId ? `${deps.hostname}/${paneId}` : paneId;
 	return async (pi: ExtensionAPI) => {
@@ -94,7 +112,16 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const savedMachines = machineGuidance(profiles);
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
-		const getRunner = () => runner ??= new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone, herdrSession: herdrSessionName(deps.env) });
+		let opening: Promise<HerdrRunner> | undefined;
+		/** hc records are tagged by the core this client reaches; without its id, no runner opens and nothing is maintained. */
+		const hostSession = async (client: HerdrClient) => {
+			if (!client.hostId) throw new Error("This hc client cannot identify its core.");
+			return hcSessionTag(await client.hostId());
+		};
+		const getRunner = async (): Promise<HerdrRunner> => runner ?? (opening ??= (async () => {
+			const herdrSession = hc ? await hostSession(deps.client) : herdrSessionName(deps.env);
+			return runner = new HerdrRunner({ ...deps, closeWhenDone: settings.closeWhenDone, herdrSession });
+		})().finally(() => { opening = undefined; }));
 		/** One runner, and one SSH store channel, per saved machine used by this session. */
 		const machines = new Map<string, Promise<HerdrRunner>>();
 		const machineRunners = new Map<string, HerdrRunner>();
@@ -110,14 +137,20 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		const machineRunner = (machine: string): Promise<HerdrRunner> => {
 			let pending = machines.get(machine);
 			if (!pending) {
-				const session = pickHerdrMachine(profiles, machine)?.session;
-				const connected = deps.machineChannel(machine).then((channel) => {
+				const profile = pickHerdrMachine(profiles, machine);
+				const session = hc ? undefined : profile?.session;
+				const open = (herdrSession: string | undefined, hcClient?: HerdrClient) => deps.machineChannel(machine).then((channel) => {
 					// Herdr calls share the store's channel: `--machine` runs SSH twice per call, and PowerShell too on Windows.
 					// Only a known session may: a bare command would reach whichever session the worker inherited, where pane IDs repeat.
 					const exec: HerdrExec | undefined = session ? (args, timeout, signal) => runner.store.herdr(["--session", session, ...args], timeout, signal) : undefined;
-					const runner: HerdrRunner = new HerdrRunner({ ...deps, root: "", client: deps.machineClient(machine, exec), channel, machine, herdrSession: session, closeWhenDone: settings.closeWhenDone });
+					const client = hcClient ?? deps.machineClient(machine, exec);
+					const runner: HerdrRunner = new HerdrRunner({ ...deps, root: "", client, channel, machine, herdrSession, closeWhenDone: settings.closeWhenDone });
 					return runner;
 				});
+				// hc addresses a machine by its name, and needs that core's id before opening its store channel, so a failure
+				// leaves nothing open.
+				const hcClient = hc ? deps.machineClient(profile?.label ?? machine) : undefined;
+				const connected = hcClient ? hostSession(hcClient).then((tag) => open(tag, hcClient)) : open(session);
 				pending = connected.then(async (opened) => {
 					// Refuse a mismatched package before any launch or owner retirement runs on that store.
 					// An unverified store is closed without retiring anything: its operations are not established.
@@ -170,7 +203,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		};
 		const route = async (agentId: string) => {
 			const { id, machine } = splitAgentId(agentId);
-			return { id, runner: machine ? await machineRunner(machine) : getRunner() };
+			return { id, runner: machine ? await machineRunner(machine) : await getRunner() };
 		};
 		const remoteWorkspace = async (machine: string, source: HerdrRunner, cwd: string) => {
 			let panes: HerdrAgentRef[] = [];
@@ -188,7 +221,15 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		};
 		let child: ChildSession | undefined;
 		let stopped = false;
+		/** Label writes in order, so a late one cannot restore a conversation this Pi has left. */
+		let publication = Promise.resolve();
+		const publish = (sessionFile: string | undefined, report: (error: unknown) => void = () => undefined) =>
+			publication = publication.then(() => deps.client.publishSession?.(paneId, sessionFile)).catch(report);
 		let tick: Promise<void> | undefined;
+		/** Sessions started in this load; a retry for an earlier one begins nothing. */
+		let sessions = 0;
+		let retry: ReturnType<typeof setTimeout> | undefined;
+		let initializing: Promise<void> | undefined;
 		let receiptCursor = 0;
 		let timer: ReturnType<typeof setInterval> | undefined;
 		let streaming = false;
@@ -223,8 +264,8 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 			},
 			async caller(ctx, current, cwd) {
 				return {
-					paneId: parentKey(current.machine), tabId: current.machine ? undefined : deps.env.HERDR_TAB_ID,
-					workspaceId: current.machine ? await remoteWorkspace(current.machine, current, cwd) : deps.env.HERDR_WORKSPACE_ID,
+					paneId: parentKey(current.machine), tabId: current.machine ? undefined : localTab,
+					workspaceId: current.machine ? await remoteWorkspace(current.machine, current, cwd) : localWorkspace,
 					sessionFile: ctx.sessionManager.getSessionFile(),
 				};
 			},
@@ -233,17 +274,17 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				const target = request.resume ? await route(request.resume) : undefined;
 				const machine = target ? target.runner.machine : request.machine?.trim() || undefined;
 				if (machine && request.inheritContext) throw new Error("inherit_context cannot clone this session onto another machine.");
-				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
+				const current = target?.runner ?? (machine ? await machineRunner(machine) : await getRunner());
 				const cwd = machine ? request.machineCwd?.trim() || machineDefaultCwd(machine, profiles, settings.machines) || ctx.cwd : request.cwd || ctx.cwd;
 				if (machine) remember(machine);
 				const ref = target ? await current.resume(target.id, request.prompt, signal, request.runInBackground, {
-					paneId: parentKey(machine), tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
-					workspaceId: machine ? await remoteWorkspace(machine, current, (await current.resolve(target.id)).cwd ?? cwd) : deps.env.HERDR_WORKSPACE_ID,
+					paneId: parentKey(machine), tabId: machine ? undefined : localTab,
+					workspaceId: machine ? await remoteWorkspace(machine, current, (await current.resolve(target.id)).cwd ?? cwd) : localWorkspace,
 					sessionFile: ctx.sessionManager.getSessionFile(),
 				}) : await current.spawn({
 					...request, cwd, definitionsCwd: ctx.cwd, paneId: parentKey(machine),
-					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
-					workspaceId: machine ? await remoteWorkspace(machine, current, cwd) : deps.env.HERDR_WORKSPACE_ID,
+					tabId: machine ? undefined : localTab,
+					workspaceId: machine ? await remoteWorkspace(machine, current, cwd) : localWorkspace,
 					sessionFile: ctx.sessionManager.getSessionFile(), agentDir: deps.agentDir,
 					projectTrusted: ctx.isProjectTrusted(),
 				}, signal);
@@ -279,7 +320,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 				const target = params.resume ? await route(params.resume) : undefined;
 				const machine = target ? target.runner.machine : params.machine?.trim() || undefined;
 				if (machine && params.inherit_context) throw new Error("inherit_context cannot clone this session onto another machine.");
-				const current = target?.runner ?? (machine ? await machineRunner(machine) : getRunner());
+				const current = target?.runner ?? (machine ? await machineRunner(machine) : await getRunner());
 				const cwd = machine ? params.machine_cwd?.trim() || machineDefaultCwd(machine, profiles, settings.machines) || ctx.cwd : ctx.cwd;
 				const request: SpawnRequest = {
 					runtime: params.runtime,
@@ -300,8 +341,8 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 					definitionsCwd: ctx.cwd,
 					paneId: parentKey(machine),
 					// The caller's tab and workspace are local; remote agents fill grid tabs on that machine.
-					tabId: machine ? undefined : deps.env.HERDR_TAB_ID,
-					workspaceId: !machine ? deps.env.HERDR_WORKSPACE_ID : await remoteWorkspace(machine, current, target ? (await current.resolve(target.id)).cwd ?? cwd : cwd),
+					tabId: machine ? undefined : localTab,
+					workspaceId: !machine ? localWorkspace : await remoteWorkspace(machine, current, target ? (await current.resolve(target.id)).cwd ?? cwd : cwd),
 					sessionFile: ctx.sessionManager.getSessionFile(),
 					agentDir: deps.agentDir,
 				};
@@ -357,118 +398,169 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 			pendingReceipts.clear();
 			receiptCursor = 0;
 			messenger.abort = () => { void ctx.abort(); };
-			const current = getRunner();
-			const entries = ctx.sessionManager.getEntries();
-			let checkpoint: ChildIdentity["checkpoint"];
-			for (const entry of entries) {
-				if (entry.type === "custom" && entry.customType === "herdr-execution-checkpoint") checkpoint = entry.data as ChildIdentity["checkpoint"];
-				const used = entry.type === "custom" && entry.customType === "herdr-remote-machine" ? (entry.data as { machine?: unknown } | undefined)?.machine : undefined;
-				if (typeof used === "string") recordedMachines.add(used);
-			}
-			const messages = ctx.sessionManager.getBranch().flatMap((entry) => entry.type === "message" ? [entry.message] : []);
-			assistant = messages.map(assistantText).filter(Boolean).at(-1) ?? "";
-			outcome = runOutcome(messages);
-			child = await createChildSession(current.store, deps.env.HERDR_PANE_ID ?? "", {
-				sessionFile: ctx.sessionManager.getSessionFile() ?? "",
-				sessionId: ctx.sessionManager.getSessionId(), checkpoint,
-			}, messenger);
-			if (child) pi.registerTool(defineTool({
-				name: "needs_answer",
-				label: "Needs answer",
-				description: "End this run immediately with one concrete question and the current work state. The parent can reply with SendMessage to resume this same agent.",
-				parameters: Type.Object({ question: Type.String({ minLength: 1 }) }),
-				async execute(_id, { question }) {
-					if (!child) throw new Error("Not a Herdr child session.");
-					await child.needsAnswer(question);
-					return { content: [{ type: "text", text: question }], details: undefined, terminate: true };
-				},
-			}));
-			if (timer) clearInterval(timer);
-			/** The last error per source ("" for this machine), so failing machines never alternate past deduplication. */
-			const lastErrors = new Map<string, string>();
-			const health = new Map<HerdrRunner, Promise<void>>();
-			// Each machine polls on its own, so a stalled SSH call never delays local coordination or other machines.
-			const machinePolls = new Map<string, Promise<void>>();
-			const reconnectAt = new Map<string, number>();
-			const reportError = (error: unknown, source = "") => {
-				const message = error instanceof Error ? error.message : String(error);
-				if (!stopped && message !== lastErrors.get(source)) ctx.ui.notify(`Herdr coordination: ${message}`, "error");
-				lastErrors.set(source, message);
-			};
-			const deliver = async (source: HerdrRunner) => {
-				if (stopped) return;
-				const ownerSession = ctx.sessionManager.getSessionFile();
-				const ownerMachine = source.machine ? current.machineId : undefined;
-				if (backend) return backend.deliver(source, parentKey(source.machine), ownerSession, ownerMachine);
-				for (const notice of await source.store.notices(parentKey(source.machine), ownerSession, ownerMachine)) {
-					if (stopped || queuedNotices.has(notice.id)) continue;
-					pi.sendMessage({
-						customType: "herdr-subagent-notification", content: completionNotice(notice, source.machine), display: true,
-						details: { noticeId: notice.id, agentId: qualifiedAgentId(notice.agentId, source.machine), runId: notice.runId, machine: source.machine },
-					}, { deliverAs: "steer", triggerTurn: true });
-					queuedNotices.add(notice.id);
-				}
-			};
-			const poll = async () => {
-				await child?.poll();
-				if (stopped) return;
-				// Reopen machines this session used. A lost SSH channel is retried every ten seconds, not every tick.
-				for (const machine of recordedMachines) {
-					if (machines.has(machine) || (reconnectAt.get(machine) ?? 0) > deps.now()) continue;
-					reconnectAt.set(machine, deps.now() + 10_000);
-					// A machine that reconnects reports its next failure again.
-					machineRunner(machine).then(() => lastErrors.delete(machine), (error) => reportError(error, machine));
-				}
-				// Slow Herdr calls must not delay the child's command/cancellation polling.
-				for (const source of [current, ...machineRunners.values()]) {
-					if (!health.has(source)) health.set(source, source.maintain().catch((error) => reportError(error, source.machine ?? "")).finally(() => health.delete(source)));
-				}
-				// A sendMessage call may only queue a message. Acknowledge only evidence actually in Pi's session.
-				const saved = ctx.sessionManager.getEntries();
-				for (const entry of backend ? [] : saved.slice(receiptCursor)) {
-					if (entry.type !== "custom_message" || entry.customType !== "herdr-subagent-notification") continue;
-					const details = entry.details as { noticeId?: string; machine?: string } | undefined;
-					if (details?.noticeId) pendingReceipts.set(details.noticeId, details.machine ?? "");
-				}
-				receiptCursor = saved.length;
-				for (const [machine, source] of machineRunners) {
-					if (machinePolls.has(machine)) continue;
-					machinePolls.set(machine, pollMachine(machine, source).finally(() => machinePolls.delete(machine)));
-				}
-				await acknowledge("", current);
-				await deliver(current);
-			};
-			const acknowledge = async (machine: string, source: HerdrRunner) => {
-				for (const [noticeId, owner] of pendingReceipts) {
-					if (owner !== machine) continue;
-					await source.store.acknowledgeNotice(noticeId);
-					pendingReceipts.delete(noticeId);
-					queuedNotices.delete(noticeId);
-				}
-			};
-			const pollMachine = async (machine: string, source: HerdrRunner) => {
+			const generation = ++sessions;
+			const live = () => !stopped && generation === sessions;
+			let lastFailure: string | undefined;
+			let answering = false;
+			// hc tags its records by the core's id. Until that answers, nothing is maintained; identification is retried with
+			// backoff while this session lasts, and the session's coordination begins once it succeeds.
+			// Every failure, including a store that cannot open, is reported and retried; this never rejects.
+			const initialize = async (attempt: number): Promise<void> => {
+				let current: HerdrRunner | undefined;
 				try {
-					await acknowledge(machine, source);
-					await deliver(source);
+					current = await getRunner();
+					if (live()) await begin(current);
+					return;
 				} catch (error) {
-					reportError(new Error(`${machine}: ${error instanceof Error ? error.message : String(error)}`), machine);
-					if (source.store.failed) await dropMachine(machine);
+					// Herdr's runner opens synchronously, so its setup failures reach Pi as before.
+					if (!hc) throw error;
+					await abandon(current);
+					if (!live()) return;
+					const message = error instanceof Error ? error.message : String(error);
+					if (message !== lastFailure) ctx.ui.notify(`Herdr coordination: ${message}`, "error");
+					lastFailure = message;
+					retry = setTimeout(() => { retry = undefined; initializing = initialize(attempt + 1); }, Math.min(POLL_MS * 2 ** attempt, 5000));
+					retry.unref();
 				}
 			};
-			timer = setInterval(() => {
-				if (stopped || tick) return;
-				tick = poll().catch((error) => reportError(error)).finally(() => { tick = undefined; });
-			}, POLL_MS);
-			timer.unref();
+			/** A failed start leaves nothing behind: its child binding, timer, and a runner whose store may not have opened. */
+			const abandon = async (failed: HerdrRunner | undefined) => {
+				if (timer) clearInterval(timer);
+				timer = undefined;
+				await child?.dispose().catch(() => undefined);
+				child = undefined;
+				if (failed && runner === failed) {
+					runner = undefined;
+					await failed.close().catch(() => undefined);
+				}
+			};
+			const begin = async (current: HerdrRunner) => {
+				const entries = ctx.sessionManager.getEntries();
+				let checkpoint: ChildIdentity["checkpoint"];
+				for (const entry of entries) {
+					if (entry.type === "custom" && entry.customType === "herdr-execution-checkpoint") checkpoint = entry.data as ChildIdentity["checkpoint"];
+					const used = entry.type === "custom" && entry.customType === "herdr-remote-machine" ? (entry.data as { machine?: unknown } | undefined)?.machine : undefined;
+					if (typeof used === "string") recordedMachines.add(used);
+				}
+				const messages = ctx.sessionManager.getBranch().flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+				assistant = messages.map(assistantText).filter(Boolean).at(-1) ?? "";
+				outcome = runOutcome(messages);
+				const identity = { sessionFile: ctx.sessionManager.getSessionFile() ?? "", sessionId: ctx.sessionManager.getSessionId(), checkpoint };
+				const attachChild = async () => {
+					child = await createChildSession(current.store, paneId, identity, messenger);
+					if (child && !answering) { answering = true; registerNeedsAnswer(); }
+				};
+				const registerNeedsAnswer = () => pi.registerTool(defineTool({
+					name: "needs_answer",
+					label: "Needs answer",
+					description: "End this run immediately with one concrete question and the current work state. The parent can reply with SendMessage to resume this same agent.",
+					parameters: Type.Object({ question: Type.String({ minLength: 1 }) }),
+					async execute(_id, { question }) {
+						if (!child) throw new Error("Not a Herdr child session.");
+						await child.needsAnswer(question);
+						return { content: [{ type: "text", text: question }], details: undefined, terminate: true };
+					},
+				}));
+				await attachChild();
+				// hc starts a subagent's Pi before its runner records the terminal, so the first attach can come too early.
+				const attachUntil = hc && !child && paneId ? deps.now() + 15_000 : 0;
+				if (timer) clearInterval(timer);
+				/** The last error per source ("" for this machine), so failing machines never alternate past deduplication. */
+				const lastErrors = new Map<string, string>();
+				const health = new Map<HerdrRunner, Promise<void>>();
+				// Each machine polls on its own, so a stalled SSH call never delays local coordination or other machines.
+				const machinePolls = new Map<string, Promise<void>>();
+				const reconnectAt = new Map<string, number>();
+				const reportError = (error: unknown, source = "") => {
+					const message = error instanceof Error ? error.message : String(error);
+					if (!stopped && message !== lastErrors.get(source)) ctx.ui.notify(`Herdr coordination: ${message}`, "error");
+					lastErrors.set(source, message);
+				};
+				const deliver = async (source: HerdrRunner) => {
+					if (stopped) return;
+					const ownerSession = ctx.sessionManager.getSessionFile();
+					const ownerMachine = source.machine ? current.machineId : undefined;
+					if (backend) return backend.deliver(source, parentKey(source.machine), ownerSession, ownerMachine);
+					for (const notice of await source.store.notices(parentKey(source.machine), ownerSession, ownerMachine)) {
+						if (stopped || queuedNotices.has(notice.id)) continue;
+						pi.sendMessage({
+							customType: "herdr-subagent-notification", content: completionNotice(notice, source.machine), display: true,
+							details: { noticeId: notice.id, agentId: qualifiedAgentId(notice.agentId, source.machine), runId: notice.runId, machine: source.machine },
+						}, { deliverAs: "steer", triggerTurn: true });
+						queuedNotices.add(notice.id);
+					}
+				};
+				const poll = async () => {
+					if (!child && attachUntil > deps.now()) await attachChild();
+					await child?.poll();
+					if (stopped) return;
+					// Reopen machines this session used. A lost SSH channel is retried every ten seconds, not every tick.
+					for (const machine of recordedMachines) {
+						if (machines.has(machine) || (reconnectAt.get(machine) ?? 0) > deps.now()) continue;
+						reconnectAt.set(machine, deps.now() + 10_000);
+						// A machine that reconnects reports its next failure again.
+						machineRunner(machine).then(() => lastErrors.delete(machine), (error) => reportError(error, machine));
+					}
+					// Slow Herdr calls must not delay the child's command/cancellation polling.
+					for (const source of [current, ...machineRunners.values()]) {
+						if (!health.has(source)) health.set(source, source.maintain().catch((error) => reportError(error, source.machine ?? "")).finally(() => health.delete(source)));
+					}
+					// A sendMessage call may only queue a message. Acknowledge only evidence actually in Pi's session.
+					const saved = ctx.sessionManager.getEntries();
+					for (const entry of backend ? [] : saved.slice(receiptCursor)) {
+						if (entry.type !== "custom_message" || entry.customType !== "herdr-subagent-notification") continue;
+						const details = entry.details as { noticeId?: string; machine?: string } | undefined;
+						if (details?.noticeId) pendingReceipts.set(details.noticeId, details.machine ?? "");
+					}
+					receiptCursor = saved.length;
+					for (const [machine, source] of machineRunners) {
+						if (machinePolls.has(machine)) continue;
+						machinePolls.set(machine, pollMachine(machine, source).finally(() => machinePolls.delete(machine)));
+					}
+					await acknowledge("", current);
+					await deliver(current);
+				};
+				const acknowledge = async (machine: string, source: HerdrRunner) => {
+					for (const [noticeId, owner] of pendingReceipts) {
+						if (owner !== machine) continue;
+						await source.store.acknowledgeNotice(noticeId);
+						pendingReceipts.delete(noticeId);
+						queuedNotices.delete(noticeId);
+					}
+				};
+				const pollMachine = async (machine: string, source: HerdrRunner) => {
+					try {
+						await acknowledge(machine, source);
+						await deliver(source);
+					} catch (error) {
+						reportError(new Error(`${machine}: ${error instanceof Error ? error.message : String(error)}`), machine);
+						if (source.store.failed) await dropMachine(machine);
+					}
+				};
+				// The app cannot see which conversation a Pi runs; its subagents' runners read it from this terminal's labels.
+				if (hc && paneId) publish(identity.sessionFile || undefined, reportError);
+				timer = setInterval(() => {
+					if (stopped || tick) return;
+					tick = poll().catch((error) => reportError(error)).finally(() => { tick = undefined; });
+				}, POLL_MS);
+				timer.unref();
+			};
+			await (initializing = initialize(0));
 		});
 		pi.on("session_shutdown", async (event) => {
 			stopped = true;
+			if (retry) clearTimeout(retry);
+			retry = undefined;
+			// A retry already identifying finishes first, and then begins nothing.
+			await initializing?.catch(() => undefined);
 			if (timer) clearInterval(timer);
 			timer = undefined;
 			await tick;
+			if (hc && paneId) await publish(undefined);
 			if (event?.reason !== "reload") await child?.noteExit();
 			await child?.dispose();
 			child = undefined;
+			await opening?.catch(() => undefined);
 			await runner?.close();
 			runner = undefined;
 			for (const machine of new Set([...machines.keys(), ...connecting.keys()])) await dropMachine(machine);

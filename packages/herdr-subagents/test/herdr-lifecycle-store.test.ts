@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { HerdrStore, type HerdrTask } from "../src/herdr/store.ts";
 
@@ -91,4 +92,23 @@ test("Claude readiness requires an intact transcript containing its own saved co
 	assert.equal(await store.coldResumeReady(claude.id), true);
 	await store.requestCancellation(ref, 4);
 	assert.equal(await store.coldResumeReady(claude.id), false);
+});
+
+test("a busy database ends a maintenance pass quietly; the lease lapses and a later pass settles", { timeout: 30_000 }, async (t) => {
+	const { root, store, ref } = await fixture(t);
+	assert.equal(await store.claimMaintenance("first", 10, 1000), true);
+	// Another pane holds the write lock for longer than the store waits.
+	const other = new DatabaseSync(join(root, "control.sqlite"));
+	other.exec("BEGIN IMMEDIATE");
+	try {
+		assert.equal(await store.finishMaintenance("first", [{ ref, alive: false }], 20), false);
+	} finally {
+		other.exec("ROLLBACK");
+		other.close();
+	}
+	assert.notEqual((await store.read(ref)).phase, "failed", "the busy pass changed nothing");
+	assert.equal(await store.claimMaintenance("second", 20, 1000), false, "the unfinished lease still holds");
+	assert.equal(await store.claimMaintenance("second", 1011, 1000), true, "it lapses");
+	assert.equal(await store.finishMaintenance("second", [{ ref, alive: false }], 1020), true);
+	assert.equal((await store.read(ref)).phase, "failed");
 });

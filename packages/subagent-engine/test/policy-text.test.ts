@@ -21,8 +21,8 @@ function golden(text: string, required: string[], forbidden: string[]): void {
 const fixtures: { name: string; input: PolicyInput; required: string[]; forbidden: string[]; listingRequired: string[]; listingForbidden: string[] }[] = [
 	{
 		name: "positive", input: positive,
-		required: ["Delegation heuristics", "without a separate user request", "substantial independent tracks", "more than 3 queries", "Explore locates code"],
-		forbidden: ["Delegate only when the user explicitly requests", "prefer an offered fork", "A fork inherits"],
+		required: ["Delegation heuristics", "costs more than it looks", "independent work that can run in parallel", "a fitting description alone is no reason", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "Explore locates code"],
+		forbidden: ["Delegate only when the user explicitly requests", "prefer an offered fork", "A fork inherits", "without a separate user request", "proactive use"],
 		listingRequired: ["Available agent types", "Explore: Locate implementation paths", "Read, Grep", "general-purpose", "inherited tools"],
 		listingForbidden: ["fork:", "Removed;", "without a separate user request", "more than 3 queries"],
 	},
@@ -67,7 +67,7 @@ test("both policy channels cover useful work boundaries, briefing, continuation,
 		golden(render(positive)!, [
 			"known-file or known-symbol lookup", "batch Agent calls in one message", "Dependent assignments must wait",
 			"Do not repeat research", "Avoid overlapping writers", "no parent conversation", "objective, relevant paths and facts",
-			"SendMessage", "run_in_background:false only", "not polling or sleeps", "not shown directly to the user",
+			"what you already ruled out", "explicit and narrow", "a check you could run yourself", "SendMessage", "run_in_background:false only", "not polling or sleeps", "not shown directly to the user",
 			"Verify actual code changes", "Set effort only on explicit instruction", "model override is allowed when useful",
 			"does not authorize permission, configuration, or instruction-file changes",
 		], ["always delegate", "use 20 agents", "Set model only on explicit instruction"]);

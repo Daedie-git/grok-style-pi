@@ -80,8 +80,8 @@ test("autonomy feature controls the engine's actual system guidance", { timeout:
 			const h = await fixture(inner, () => ({ text: "done" }), () => ({ text: "unused" }), autonomy);
 			await h.session.prompt("Inspect guidance");
 			const system = (h.modelInput() as { messages: { role: string; content: unknown }[] }).messages.filter((message) => message.role === "system").map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content)).join("\n");
-			if (autonomy) { assert.match(system, /proactive use without a separate user request/); assert.doesNotMatch(system, /Delegate only when the user explicitly requests/); }
-			else { assert.match(system, /Delegate only when the user explicitly requests/); assert.doesNotMatch(system, /proactive use without a separate user request/); }
+			if (autonomy) { assert.match(system, /When in doubt, do not spawn/); assert.doesNotMatch(system, /Delegate only when the user explicitly requests/); }
+			else { assert.match(system, /Delegate only when the user explicitly requests/); assert.doesNotMatch(system, /When in doubt, do not spawn/); }
 		});
 	}
 });
@@ -140,7 +140,7 @@ test("autonomy changes on reload reach newly created child tool policy", { timeo
 	assert.equal(h.children.length, 1);
 	const description = h.children[0].getAllTools().find((tool) => tool.name === "Agent")?.description ?? "";
 	assert.match(description, /Delegate only when the user explicitly requests/);
-	assert.doesNotMatch(description, /proactive use without a separate user request/);
+	assert.doesNotMatch(description, /When in doubt, do not spawn/);
 });
 
 test("adapter run identity fences late events and old Stop closures across continuations", async () => {

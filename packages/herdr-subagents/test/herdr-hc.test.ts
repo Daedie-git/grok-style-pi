@@ -202,8 +202,9 @@ test("hc connect sends one request and drops the terminal identity for anonymous
 	const bin = join(dir, "hc");
 	const trace = join(dir, "trace.json");
 	writeFileSync(bin, `#!/usr/bin/env node
-import { readFileSync, writeFileSync } from 'node:fs';
-const request = JSON.parse(readFileSync(0, 'utf8'));
+import { writeFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+const request = await new Promise((resolve) => createInterface({ input: process.stdin }).once('line', (line) => resolve(JSON.parse(line))));
 writeFileSync(process.env.HC_TEST_TRACE, JSON.stringify({ args: process.argv.slice(2), request, terminal: process.env.HC_TERMINAL_ID ?? null, scope: process.env.HC_SCOPE ?? null }));
 process.stdout.write(request.method === 'terminal.get'
 	? JSON.stringify({ id: 1, jsonrpc: '2.0', error: { code: -32000, message: 'no terminal', data: { kind: 'not_found' } } }) + '\\n'
@@ -218,6 +219,24 @@ process.stdout.write(request.method === 'terminal.get'
 	assert.deepEqual(JSON.parse(readFileSync(trace, "utf8")).scope, null);
 	await assert.rejects(call("terminal.get", { terminal: "t9" }), (error) => error instanceof HcError && error.code === "not_found");
 	await assert.rejects(hcConnect({ HC_BIN_PATH: join(dir, "missing") })("terminal.list", {}), { code: "ENOENT" });
+});
+
+test("hc connect keeps its input open until a slow reply arrives, as Windows hc exits when input closes", {
+	skip: process.platform === "win32" ? "Fixture requires executable shebang scripts" : false,
+}, async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-hc-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const bin = join(dir, "hc");
+	writeFileSync(bin, `#!/usr/bin/env node
+import { createInterface } from 'node:readline';
+process.stdin.on('end', () => process.exit(0));
+createInterface({ input: process.stdin }).once('line', (line) => {
+	const request = JSON.parse(line);
+	setTimeout(() => process.stdout.write(JSON.stringify({ id: 1, jsonrpc: '2.0', result: { method: request.method } }) + '\\n'), 200);
+});
+`);
+	chmodSync(bin, 0o755);
+	assert.deepEqual(await hcConnect({ ...process.env, HC_BIN_PATH: bin })("terminal.label", { terminal: "t7", labels: {} }), { method: "terminal.label" });
 });
 
 /** An hc runner whose parent Pi runs in t1 and whose subagents attach when their program starts. */
@@ -441,8 +460,8 @@ test("a machine hc cannot reach is unknown, and its completed agent closes once 
 function routingHc(dir: string) {
 	const bin = join(dir, "hc");
 	writeFileSync(bin, `#!/usr/bin/env node
-import { readFileSync } from 'node:fs';
-const request = JSON.parse(readFileSync(0, 'utf8'));
+import { createInterface } from 'node:readline';
+const request = await new Promise((resolve) => createInterface({ input: process.stdin }).once('line', (line) => resolve(JSON.parse(line))));
 const socket = (path) => path && path.split('/').pop().replace(/\\.sock$/, '');
 const core = socket(process.env.HC_SOCKET) || process.env.HC_SESSION || socket(process.env.HC_TERMINAL_SOCKET) || 'default';
 const reply = (result) => process.stdout.write(JSON.stringify({ id: 1, jsonrpc: '2.0', result }) + '\\n');

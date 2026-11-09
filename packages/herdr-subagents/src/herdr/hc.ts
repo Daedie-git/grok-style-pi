@@ -63,7 +63,12 @@ export function hcConnect(env: NodeJS.ProcessEnv = process.env): HcCall {
 		const timer = setTimeout(() => child.kill("SIGKILL"), options.timeout ?? CALL_TIMEOUT_MS);
 		let stdout = "";
 		let stderr = "";
-		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+		// On Windows, hc connect exits when its input closes, even before a slower reply (terminal.label) is written.
+		// Keep the input open until the reply arrives.
+		child.stdout.on("data", (chunk: Buffer) => {
+			stdout += chunk.toString();
+			if (stdout.split("\n").some((line) => { try { return JSON.parse(line)?.id === 1; } catch { return false; } })) child.stdin.end();
+		});
 		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 		child.on("error", (error) => { clearTimeout(timer); reject(error); });
 		child.on("close", (code) => {
@@ -80,7 +85,7 @@ export function hcConnect(env: NodeJS.ProcessEnv = process.env): HcCall {
 			else reject(new HcError(stderr.trim() || `hc connect exited ${code} without answering ${method}`));
 		});
 		child.stdin.on("error", () => undefined);
-		child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
+		child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
 	});
 }
 

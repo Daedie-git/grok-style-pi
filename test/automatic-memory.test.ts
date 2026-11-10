@@ -16,6 +16,14 @@ async function fixture(t: TestContext) {
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	return { directory, store: new MemoryStore(directory) };
 }
+async function optionalFileSymlink(t: TestContext, target: string, path: string): Promise<boolean> {
+	try { await symlink(target, path); return true; }
+	catch (error) {
+		if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+		t.diagnostic("File-symlink sub-check unavailable: this Windows account has no symlink privilege. Other assertions still run.");
+		return false;
+	}
+}
 const signal = () => new AbortController().signal;
 const usage = { input: 1, output: 1, totalTokens: 2, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 function response(content: any[]): any { return { role: "assistant", content, usage, stopReason: "stop", timestamp: Date.now() }; }
@@ -32,8 +40,9 @@ test("memory filesystem rejects traversal, symlinks, special files and stale wri
 	for (const path of ["../escape.md", "/absolute.md", "nested/../escape.md", "note.json", ".settings.md", "a\\b.md"]) await assert.rejects(store.read(path));
 	await mkdir(join(directory, "folder.md"));
 	await assert.rejects(store.read("folder.md"), /regular/);
-	await symlink(join(directory, "note.md"), join(directory, "alias.md"));
-	await assert.rejects(store.read("alias.md"), /regular/);
+	if (await optionalFileSymlink(t, join(directory, "note.md"), join(directory, "alias.md"))) {
+		await assert.rejects(store.read("alias.md"), /regular/);
+	}
 	await store.mutate("note.md", null, "original");
 	assert.equal(await store.read("note.md"), undefined);
 	await assert.rejects(store.mutate("big.md", "x".repeat(100_001), undefined), /100,000/);
@@ -44,7 +53,7 @@ test("candidate discovery is recursive, recent-first, bounded and ignores symlin
 	await mkdir(join(directory, "nested"));
 	await writeFile(join(directory, "MEMORY.md"), "index");
 	await writeFile(join(directory, "nested", "topic.md"), "---\ndescription: nested fact\n---\nbody");
-	await symlink(join(directory, "nested", "topic.md"), join(directory, "alias.md"));
+	await optionalFileSymlink(t, join(directory, "nested", "topic.md"), join(directory, "alias.md"));
 	for (let i = 0; i < 205; i++) await writeFile(join(directory, `note-${i}.md`), `---\ndescription: note ${i}\n---`);
 	const candidates = await store.candidates();
 	assert.equal(candidates.length, 200);
@@ -207,6 +216,7 @@ test("consolidation reads bounded session prose, not tool output or symlinked fi
 	const sessions = await recentMemorySessions([{ id: "other", path, modified: new Date() }], 0, "current", signal());
 	assert.equal(sessions.length, 1);
 	assert.equal(sessions[0].text, "user: Correction worth remembering");
-	await symlink(path, join(directory, "alias.jsonl"));
-	assert.deepEqual(await recentMemorySessions([{ id: "alias", path: join(directory, "alias.jsonl"), modified: new Date() }], 0, "current", signal()), []);
+	if (await optionalFileSymlink(t, path, join(directory, "alias.jsonl"))) {
+		assert.deepEqual(await recentMemorySessions([{ id: "alias", path: join(directory, "alias.jsonl"), modified: new Date() }], 0, "current", signal()), []);
+	}
 });

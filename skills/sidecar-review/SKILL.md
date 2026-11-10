@@ -1,11 +1,18 @@
 ---
 name: sidecar-review
-description: Second-opinion review by a persistent pi or Claude Code agent in Herdr. Use after implementation, before complex plans, and at milestones to brief the reviewer. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
+description: Second-opinion review by a persistent pi or Claude Code agent in Herdr. Use after your own implementation, before complex plans, at milestones to brief the reviewer, and when the user asks for a sidecar review. A plain user request to review code is not a sidecar request; do that review yourself. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
 ---
 
 # Sidecar review
 
 Persistent pi or Claude Code agents in Herdr panes review or implement work and remember their own history: notes you sent, past reviews, findings you rejected. No agent starts at Claude startup; the first `note`, `plan`, `diff`, or `ask` starts the selected sidecar. You drive it with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar"`. It can edit files and commit anywhere, including your checkout, when you or the user ask it to change code (`sidecar ask`, naming the checkout or worktree). When you or the user ask, it can also push and comment on, approve or merge GitLab/GitHub merge requests; it does not do so on its own initiative. Reviewers follow the repository's code-review skill when it has one; local pi slots also load the repository's `.claude/skills`.
+
+## Which review to run
+
+- The user asks you to review something: run your own review process (the repository's code-review skill or your own), not a sidecar.
+- The user asks for a sidecar review: run `diff` (or `plan`) on a pi reviewer slot.
+- The user asks for a co-op review: run `coop-review`.
+- You finished an implementation: have a pi reviewer `diff` it (see Implementation review).
 
 ## Notification safety
 
@@ -109,7 +116,7 @@ A PreToolUse hook enforces this: in a repository with a recorded diff review fro
 
 ## Co-op review
 
-Use `coop-review` only when the user asks for it or the change warrants a thorough review. It costs about three single reviews. Run it in the background like `diff`:
+Run `coop-review` only when the user asks for a co-op review. It costs about three single reviews. Run it in the background like `diff`:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" coop-review [--pi-slot N] [--claude-slot M] <base> "Intent of the change"

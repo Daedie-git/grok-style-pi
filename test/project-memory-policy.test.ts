@@ -73,7 +73,7 @@ test("policy retains selective ordinary tools, exclusions, explicit controls, pe
 	const value = content();
 	for (const phrase of [
 		"root session", "not a task log", "ordinary read, edit, and write file tools",
-		"No topic files have been read automatically", "relevant to the current request",
+		"This index loader does not read topic files", "relevant to the current request",
 		"rather than loading every topic", "do not follow symlinks or links outside it",
 		"separate from subagent-engine memory", "only as Markdown files in this directory",
 		"never modify AGENTS.md, CLAUDE.md, or skills", "Existing tool permissions and restrictions remain unchanged",

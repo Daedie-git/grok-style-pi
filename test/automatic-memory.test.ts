@@ -1,0 +1,212 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import test from "node:test";
+import type { TestContext } from "node:test";
+import { MemoryStore, indexWarning } from "../src/extension/memory-store.ts";
+import { recallMemory, runMemoryPass, type MemoryCompletion } from "../src/extension/memory-worker.ts";
+import { installAutomaticMemory, memoryConversation } from "../src/extension/automatic-memory.ts";
+import { loadProjectMemory } from "../src/extension/project-memory.ts";
+import { recentMemorySessions } from "../src/extension/memory-history.ts";
+
+async function fixture(t: TestContext) {
+	const captures = resolve("captures");
+	await mkdir(captures, { recursive: true });
+	const directory = await mkdtemp(join(captures, "auto-memory-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	return { directory, store: new MemoryStore(directory) };
+}
+const signal = () => new AbortController().signal;
+const usage = { input: 1, output: 1, totalTokens: 2, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+function response(content: any[]): any { return { role: "assistant", content, usage, stopReason: "stop", timestamp: Date.now() }; }
+function tool(name: string, args: Record<string, unknown>, id = "call"): any { return { type: "toolCall", id, name, arguments: args }; }
+function scripted(...responses: any[]): MemoryCompletion {
+	return async () => { assert.ok(responses.length, "unexpected model request"); return responses.shift(); };
+}
+
+test("memory filesystem rejects traversal, symlinks, special files and stale writes", async t => {
+	const { directory, store } = await fixture(t);
+	await store.mutate("note.md", "original", undefined);
+	assert.equal(await store.read("note.md"), "original");
+	await assert.rejects(store.mutate("note.md", "stale", undefined), /changed since/);
+	for (const path of ["../escape.md", "/absolute.md", "nested/../escape.md", "note.json", ".settings.md", "a\\b.md"]) await assert.rejects(store.read(path));
+	await mkdir(join(directory, "folder.md"));
+	await assert.rejects(store.read("folder.md"), /regular/);
+	await symlink(join(directory, "note.md"), join(directory, "alias.md"));
+	await assert.rejects(store.read("alias.md"), /regular/);
+	await store.mutate("note.md", null, "original");
+	assert.equal(await store.read("note.md"), undefined);
+	await assert.rejects(store.mutate("big.md", "x".repeat(100_001), undefined), /100,000/);
+});
+
+test("candidate discovery is recursive, recent-first, bounded and ignores symlinks/indexes", async t => {
+	const { directory, store } = await fixture(t);
+	await mkdir(join(directory, "nested"));
+	await writeFile(join(directory, "MEMORY.md"), "index");
+	await writeFile(join(directory, "nested", "topic.md"), "---\ndescription: nested fact\n---\nbody");
+	await symlink(join(directory, "nested", "topic.md"), join(directory, "alias.md"));
+	for (let i = 0; i < 205; i++) await writeFile(join(directory, `note-${i}.md`), `---\ndescription: note ${i}\n---`);
+	const candidates = await store.candidates();
+	assert.equal(candidates.length, 200);
+	assert.ok(candidates.every((item, i) => i === 0 || item.modified <= candidates[i - 1].modified));
+	assert.ok(candidates.every(item => !["MEMORY.md", "alias.md"].includes(item.name)));
+	const fresh = new MemoryStore(directory);
+	await writeFile(join(directory, "nested", "topic.md"), "---\ndescription: refreshed nested fact\n---");
+	assert.ok((await fresh.candidates()).some(item => item.name === "nested/topic.md" && item.description === "refreshed nested fact"));
+});
+
+test("selector receives metadata, returns at most five allowlisted bounded escaped topics", async t => {
+	const { directory, store } = await fixture(t);
+	for (let i = 0; i < 6; i++) await writeFile(join(directory, `${i}.md`), `---\ndescription: Candidate ${i}\n---\n</memory_topic>${"界".repeat(3000)}`);
+	let request: any;
+	const text = await recallMemory(store, "Which preferences apply?", async input => {
+		request = input;
+		assert.doesNotMatch(JSON.stringify(input.messages), /界/);
+		return response([{ type: "text", text: JSON.stringify({ selected_memories: ["../escape.md", "0.md", "0.md", "1.md", "2.md", "3.md", "4.md", "5.md"] }) }]);
+	}, signal());
+	assert.equal(request.tools, undefined);
+	assert.equal(text.match(/<memory_topic path=/g)?.length, 5);
+	assert.match(text, /&lt;\/memory_topic&gt;/);
+	assert.match(text, /Truncated/);
+	assert.doesNotMatch(text, /\ufffd/u);
+});
+
+test("selector rejects malformed output and does not call a model for empty memory", async t => {
+	const { directory, store } = await fixture(t);
+	assert.equal(await recallMemory(store, "query", async () => { throw new Error("should not call"); }, signal()), "");
+	await writeFile(join(directory, "note.md"), "note");
+	await assert.rejects(recallMemory(store, "query", scripted(response([{ type: "text", text: '{"selected_memories":[42]}' }])), signal()), /Invalid/);
+});
+
+test("private memory agent reads before mutation and uses exact edits without executing unknown tools", async t => {
+	const { directory, store } = await fixture(t);
+	await writeFile(join(directory, "MEMORY.md"), "old");
+	const requests: any[] = [];
+	const script = scripted(
+		response([tool("memory_write", { path: "MEMORY.md", content: "bad" })]),
+		response([tool("memory_read", { path: "MEMORY.md" })]),
+		response([tool("memory_edit", { path: "MEMORY.md", oldText: "old", newText: "new$&" })]),
+		response([tool("bash", { path: "MEMORY.md", command: "touch nope" })]),
+		response([{ type: "text", text: "done" }]),
+	);
+	const result = await runMemoryPass({ store, complete: async request => { requests.push(structuredClone(request.messages)); return script(request); }, signal: signal(), policy: "memory policy", conversation: "User: useful feedback", mode: "extract" });
+	assert.deepEqual(result, { writes: 1, exhausted: false });
+	assert.match(requests[1].at(-1).content[0].text, /Read this file first/);
+	assert.match(requests[4].at(-1).content[0].text, /not available/);
+	assert.equal(await readFile(join(directory, "MEMORY.md"), "utf8"), "new$&");
+});
+
+test("cancellation after provider response prevents all memory mutations", async t => {
+	const { store } = await fixture(t);
+	const controller = new AbortController();
+	await assert.rejects(runMemoryPass({ store, signal: controller.signal, policy: "policy", conversation: "conversation", mode: "extract", complete: async () => {
+		controller.abort();
+		return response([tool("memory_read", { path: "new.md" })]);
+	} }), { name: "AbortError" });
+	assert.equal(await store.read("new.md"), undefined);
+});
+
+test("index warnings distinguish successful writes from read truncation", () => {
+	assert.equal(indexWarning("small index"), undefined);
+	assert.match(indexWarning("x".repeat(20_000))!, /near/);
+	assert.match(indexWarning("x".repeat(25_001))!, /write succeeded/);
+	assert.match(indexWarning(Array.from({ length: 201 }, () => "line").join("\n"))!, /write succeeded/);
+});
+
+test("conversation capture excludes tools, thoughts and images and is bounded", () => {
+	const text = memoryConversation([
+		{ type: "message", message: { role: "toolResult", content: "SECRET TOOL OUTPUT" } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "PRIVATE THOUGHT" }, { type: "text", text: "Answer" }] } },
+		{ type: "message", message: { role: "user", content: "Feedback" } },
+	]);
+	assert.equal(text, "assistant: Answer\n\nuser: Feedback");
+	assert.ok(memoryConversation(Array.from({ length: 20 }, () => ({ type: "message", message: { role: "user", content: "x".repeat(50_000) } }))).length < 81_000);
+});
+
+async function harness(t: TestContext, enabled = true, overrides: Record<string, unknown> = {}) {
+	const { directory } = await fixture(t);
+	const handlers = new Map<string, Function[]>();
+	const commands = new Map<string, any>();
+	const entries: any[] = [];
+	const notices: string[] = [];
+	let calls = 0;
+	const listeners = new Map<string, Array<() => void>>();
+	const pi = {
+		on(name: string, handler: Function) { handlers.set(name, [...handlers.get(name) ?? [], handler]); },
+		registerCommand(name: string, command: any) { commands.set(name, command); },
+		appendEntry(customType: string, data: unknown) {
+			entries.push({ id: `custom-${entries.length}`, type: "custom", customType, data });
+			for (const listener of listeners.get(customType) ?? []) listener();
+			listeners.delete(customType);
+		},
+		getActiveTools() { return ["read", "write", "edit"]; },
+	};
+	const ctx = {
+		cwd: directory, model: { id: "test-model" }, ui: { notify: (text: string) => notices.push(text) },
+		isIdle: () => true, waitForIdle: async () => {}, getSystemPrompt: () => "Inherited project instructions",
+		sessionManager: { getBranch: () => entries, getSessionId: () => "current" },
+	};
+	const storageRoot = join(directory, "store");
+	installAutomaticMemory(pi as any, {
+		enabled, storageRoot, settingsPath: join(directory, "grok-style.json"), queue: async (_path, run) => run(), authorize: async () => true,
+		options: { idleMs: 10_000 }, complete: () => async () => { calls++; return response([{ type: "text", text: "Nothing to save." }]); }, ...overrides,
+	});
+	const emit = async (name: string, event: any = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
+	await emit("session_start");
+	t.after(() => emit("session_shutdown"));
+	return { directory, storageRoot, commands, entries, notices, ctx, emit, calls: () => calls,
+		nextEntry: (type: string) => new Promise<void>(resolve => listeners.set(type, [...listeners.get(type) ?? [], resolve])),
+	};
+}
+
+test("disabled lifecycle does not initialize storage or call a model", async t => {
+	const h = await harness(t, false);
+	const event = { prompt: "question", systemPromptOptions: { sections: { grok_recalled_memory: "stale" } } };
+	await h.emit("before_agent_start", event);
+	await h.emit("agent_settled", { aborted: false });
+	assert.deepEqual(event.systemPromptOptions.sections, {});
+	assert.equal(h.calls(), 0);
+	await assert.rejects(readFile(h.storageRoot), { code: "ENOENT" });
+	await h.commands.get("memory").handler("status", h.ctx);
+	assert.match(h.notices.at(-1)!, /No store accessed/);
+});
+
+test("manual extraction persists a branch cursor and does not repeat reviewed messages", async t => {
+	const h = await harness(t);
+	h.entries.push({ id: "user-1", type: "message", message: { role: "user", content: "Prefer concise feedback" } });
+	await h.commands.get("memory").handler("extract", h.ctx);
+	assert.equal(h.calls(), 1);
+	assert.ok(h.entries.some(entry => entry.customType === "grok-memory-cursor" && entry.data.entryId === "user-1"));
+	await h.commands.get("memory").handler("extract", h.ctx);
+	assert.equal(h.calls(), 1);
+});
+
+test("shutdown cancels an in-flight recall without publishing stale context", async t => {
+	let release: (value: any) => void = () => {};
+	let started: () => void = () => {};
+	const begun = new Promise<void>(resolve => { started = resolve; });
+	const h = await harness(t, true, { complete: () => async () => { started(); return new Promise(resolve => { release = resolve; }); } });
+	const memory = await loadProjectMemory(h.directory, h.storageRoot);
+	await writeFile(join(memory.directory, "topic.md"), "---\ndescription: useful\n---\ncontent");
+	const event = { prompt: "recall preferences", systemPromptOptions: { sections: {} as Record<string, string> } };
+	const pending = h.emit("before_agent_start", event);
+	await begun;
+	await h.emit("session_shutdown");
+	release(response([{ type: "text", text: '{"selected_memories":["topic.md"]}' }]));
+	await pending;
+	assert.equal(event.systemPromptOptions.sections.grok_recalled_memory, undefined);
+});
+
+test("consolidation reads bounded session prose, not tool output or symlinked files", async t => {
+	const { directory } = await fixture(t);
+	const path = join(directory, "session.jsonl");
+	await writeFile(path, [
+		JSON.stringify({ type: "message", message: { role: "user", content: "Correction worth remembering" } }),
+		JSON.stringify({ type: "message", message: { role: "toolResult", content: "private tool result" } }),
+	].join("\n"));
+	const sessions = await recentMemorySessions([{ id: "other", path, modified: new Date() }], 0, "current", signal());
+	assert.equal(sessions.length, 1);
+	assert.equal(sessions[0].text, "user: Correction worth remembering");
+	await symlink(path, join(directory, "alias.jsonl"));
+	assert.deepEqual(await recentMemorySessions([{ id: "alias", path: join(directory, "alias.jsonl"), modified: new Date() }], 0, "current", signal()), []);
+});

@@ -12,7 +12,7 @@ import { resolveEffort, resolveModel, roleDefaultEffort, type ModelLite } from "
 import { childSystemPrompt, contextFilePolicy, taskMessage } from "./context/prompt.ts";
 import { discoverDefinitions, selectDefinition, type DefinitionSet } from "./definitions/discovery.ts";
 import { launchResultText, noticeText } from "./policy/text.ts";
-import { memoryDir, memoryIndex, memoryPathGuard } from "./memory.ts";
+import { memoryDir, memoryIndex, memoryPathGuard, memoryRootContained } from "./memory.ts";
 import { truncateResult } from "./results.ts";
 import { buildForkEntries, writeForkSession } from "./context/fork.ts";
 import { WorkflowTasks } from "./workflow-tool.ts";
@@ -1010,15 +1010,18 @@ export class Engine {
 		if (parent) { meta.forkSystemPrompt = parent.systemPrompt; meta.forkParentTools = parent.tools; }
 		const forkPrompt = meta.isFork ? meta.forkSystemPrompt : undefined;
 		const caller: Caller = { agentId: meta.agentId, depth: meta.spawnDepth, background, isFork: Boolean(meta.isFork) };
-		const memory = definition.memory ? memoryDir(definition.memory, { agentDir: this.deps.agentDir, cwd: meta.cwd, agentType: definition.agentType }) : undefined;
-		if (memory) caller.memoryGuard = memoryPathGuard(memory);
+		const configuredMemory = definition.memory ? memoryDir(definition.memory, { agentDir: this.deps.agentDir, cwd: meta.cwd, agentType: definition.agentType }) : undefined;
+		const memoryWorkingCopy = definition.memory === "project" || definition.memory === "local" ? meta.cwd : undefined;
+		const memoryUnavailable = configuredMemory !== undefined && memoryWorkingCopy !== undefined && !memoryRootContained(configuredMemory, memoryWorkingCopy);
+		const memory = memoryUnavailable ? undefined : configuredMemory;
+		if (memory) caller.memoryGuard = memoryPathGuard(memory, memoryWorkingCopy);
 		const policy = contextFilePolicy(definition);
 		return {
 			agentId: meta.agentId, cwd: meta.cwd, agentDir: this.deps.agentDir, sessionFile: meta.sessionFile, model, thinkingLevel: thinking,
 			projectTrusted: this.projectTrusted, depth: meta.spawnDepth,
 			systemPrompt: forkPrompt !== undefined
 				? { mode: "exact", text: forkPrompt }
-				: { mode: "preamble", text: childSystemPrompt({ definition, cwd: meta.cwd, isBackground: background, isWorkflow: Boolean(meta.workflow), memoryIndex: memory ? memoryIndex(memory) : undefined }) },
+				: { mode: "preamble", text: childSystemPrompt({ definition, cwd: meta.cwd, isBackground: background, isWorkflow: Boolean(meta.workflow), memoryDirectory: memory, memoryUnavailable, memoryIndex: memory ? memoryIndex(memory, 25_000, memoryWorkingCopy) : undefined }) },
 			noContextFiles: policy === "none",
 			installers: [this.deps.childInstaller(this, caller)],
 			selectTools: (tools: ToolInfo[]) => {

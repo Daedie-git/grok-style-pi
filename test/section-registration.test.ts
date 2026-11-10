@@ -104,7 +104,7 @@ test("either runner shares the installed core, with one chrome lifecycle and opt
 			};
 			await loadSubagentExtension(h.pi, env, { current: factory("current"), herdr: factory("herdr") }, features.toolStyling, runtime.styleTool);
 			assert.deepEqual(runners, [env.HERDR_ENV ? "herdr" : "current"]);
-			assert.equal(h.handlers.get("session_start")!.length, enabled ? 4 : 3); // chrome + fast mode + steering, plus shared media when styled
+			assert.equal(h.handlers.get("session_start")!.length, enabled ? 5 : 4); // chrome + fast mode + steering + memory, plus shared media when styled
 			assert.equal(h.commands.filter(name => name === "grok-style").length, 1);
 			assert.equal(h.commands.filter(name => name === "fast").length, 1);
 			assert.equal(constructed, enabled ? 1 : 0);

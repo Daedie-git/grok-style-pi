@@ -5,7 +5,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(fileURLToPath(new URL("..", import.meta.url)));
-const SKIP_DIRS = new Set(["node_modules", ".git"]);
+// Test captures are concurrently created/removed artifacts, not shipped sources.
+const SKIP_DIRS = new Set(["node_modules", ".git", "captures", ".scratch"]);
 const SOURCE_EXTS = new Set([".ts", ".js", ".mjs", ".cjs", ".md"]);
 
 const FORBIDDEN = [

@@ -148,4 +148,5 @@ When the sidecar is blocked on a decision only you or the user can make, the com
 - Outside Herdr (`HERDR_ENV` is not `1` and `HC_TERMINAL_ID` is unset): explain that the sidecar requires an interactive Claude session inside Herdr, and continue without a sidecar review.
 - `blocked`: the sidecar is waiting on a question in its pane. Ask the user to answer it there; do not send keys to it yourself.
 - `no report submitted`: the command prints the pane's recent output. Retry once with `"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" ask`; after that, report the failure to the user and continue with your own review.
+- A sidecar whose turns keep ending without a report while its context is nearly full (compaction in the pane output, or a context figure near its limit) cannot finish in that conversation, and plain `stop` resumes it. Run `sidecar --slot N stop --fresh`, then resend the task with a complete briefing: the new conversation remembers nothing.
 - `sidecar status` shows its state; `sidecar start` restarts it, resuming the same agent session.

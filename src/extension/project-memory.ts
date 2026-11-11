@@ -44,14 +44,71 @@ async function optionalStat(path: string, signal?: AbortSignal): Promise<Stats |
 	}
 }
 
+// Git metadata is untrusted: bound reads and refuse symlinks/special files,
+// including replacements between lstat and open.
+async function gitMetadata(path: string, signal?: AbortSignal): Promise<string> {
+	const before = await checkedIO(signal, () => lstat(path));
+	if (!before.isFile() || before.size > 16_384) throw new Error("Invalid Git metadata.");
+	signal?.throwIfAborted();
+	const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	try {
+		signal?.throwIfAborted();
+		const opened = await checkedIO(signal, () => file.stat());
+		if (!opened.isFile() || !sameFile(before, opened)) throw new Error("Git metadata changed.");
+		const buffer = Buffer.alloc(16_385);
+		let bytes = 0;
+		while (bytes < buffer.length) {
+			const result = await checkedIO(signal, () => file.read(buffer, bytes, buffer.length - bytes, bytes));
+			if (!result.bytesRead) break;
+			bytes += result.bytesRead;
+		}
+		const after = await checkedIO(signal, () => lstat(path));
+		if (bytes > 16_384 || !sameFile(opened, after) || after.isSymbolicLink()) throw new Error("Invalid Git metadata.");
+		const text = buffer.subarray(0, bytes).toString("utf8").trim();
+		if (!text || /[\x00-\x1f\x7f]/u.test(text)) throw new Error("Invalid Git metadata path.");
+		return text;
+	} finally {
+		await file.close();
+	}
+}
+
+async function linkedRepository(root: string, signal?: AbortSignal): Promise<string> {
+	try {
+		const marker = join(root, ".git");
+		// The marker may itself be a safe alias; registration metadata must be
+		// regular files, but directory aliases do not change repository identity.
+		const pointer = await gitMetadata(await checkedIO(signal, () => realpath(marker)), signal);
+		if (!pointer.startsWith("gitdir:")) return root;
+		const target = pointer.slice(7).trim();
+		if (!target) return root;
+		const gitDir = resolve(root, target);
+		const common = resolve(gitDir, await gitMetadata(join(gitDir, "commondir"), signal));
+		// Only a registered linked worktree may share memory. A submodule's
+		// gitdir (modules/...) or an arbitrary pointer is not enough.
+		if (dirname(gitDir) !== join(common, "worktrees")) return root;
+		const backlink = resolve(gitDir, await gitMetadata(join(gitDir, "gitdir"), signal));
+		if (backlink !== marker) return root;
+		const canonicalCommon = await checkedIO(signal, () => realpath(common));
+		const commonStat = await checkedIO(signal, () => lstat(canonicalCommon));
+		if (!commonStat.isDirectory()) return root;
+		if (basename(common) === ".git") return dirname(canonicalCommon);
+		// A bare repository is itself the shared root, unless it is actually
+		// inside a different working tree (the same fallback as Claude Code).
+		if (await optionalStat(join(common, ".git"), signal)) return root;
+		return canonicalCommon;
+	} catch {
+		signal?.throwIfAborted();
+		return root;
+	}
+}
+
 async function projectIdentity(cwd: string, signal?: AbortSignal): Promise<string> {
 	const canonical = await checkedIO(signal, () => realpath(resolve(cwd)));
 	if (!(await checkedIO(signal, () => lstat(canonical))).isDirectory()) throw new Error("Project memory requires a directory cwd.");
 	for (let candidate = canonical; ; candidate = dirname(candidate)) {
 		const marker = await optionalStat(join(candidate, ".git"), signal);
-		// A marker identifies this root only. Never trust .git pointers as authority
-		// to share another repository's memory, including linked worktrees.
-		if (marker && (marker.isDirectory() || marker.isFile() || marker.isSymbolicLink())) return candidate;
+		if (marker?.isFile() || marker?.isSymbolicLink()) return linkedRepository(candidate, signal);
+		if (marker && (marker.isDirectory() || marker.isSymbolicLink())) return candidate;
 		if (dirname(candidate) === candidate) return canonical;
 	}
 }

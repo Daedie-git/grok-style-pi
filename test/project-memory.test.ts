@@ -77,7 +77,7 @@ test("same-basename projects are isolated and no-repository identity uses canoni
 	assert.notEqual(one.directory, three.directory);
 });
 
-test("linked worktrees stay isolated without trusting gitdir, commondir, or symlink markers", async (t) => {
+test("registered linked worktrees share memory but invalid pointers and symlink markers stay isolated", async (t) => {
 	const { base, cwd, storage } = fixture(t);
 	mkdirSync(join(cwd, ".git", "worktrees", "linked"), { recursive: true });
 	const linked = join(base, "linked");
@@ -87,12 +87,114 @@ test("linked worktrees stay isolated without trusting gitdir, commondir, or syml
 	writeFileSync(join(cwd, ".git", "worktrees", "linked", "gitdir"), `${join(linked, ".git")}\n`);
 	const main = await loadProjectMemory(cwd, storage);
 	const worktree = await loadProjectMemory(linked, storage);
-	assert.equal(worktree.projectRoot, realpathSync(linked));
-	assert.notEqual(worktree.directory, main.directory);
+	assert.equal(worktree.projectRoot, main.projectRoot);
+	assert.equal(worktree.directory, main.directory);
+	writeFileSync(main.indexPath, "Shared repository memory");
+	assert.equal(indexData((await loadProjectMemory(linked, storage)).content), "Shared repository memory");
+	const nested = join(linked, "src", "deep");
+	mkdirSync(nested, { recursive: true });
+	assert.equal((await loadProjectMemory(nested, storage)).directory, main.directory);
+	const registration = join(cwd, ".git", "worktrees", "linked");
+	writeFileSync(join(registration, "gitdir"), `${join(base, "wrong", ".git")}\n`);
+	assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+	writeFileSync(join(registration, "gitdir"), `${join(linked, ".git")}\n`);
+	writeFileSync(join(registration, "commondir"), `${cwd}\n`);
+	assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
 	const forged = join(base, "forged");
 	mkdirSync(forged);
 	symlinkSync(join(cwd, ".git"), join(forged, ".git"), "dir");
 	assert.notEqual((await loadProjectMemory(forged, storage)).directory, main.directory);
+});
+
+test("real Git worktrees share memory across relative pointers, aliases, moves, and removal", async (t) => {
+	const { base, cwd, storage } = fixture(t);
+	const git = (...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	git("init");
+	git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial");
+	const linked = join(base, "linked");
+	git("worktree", "add", "-b", "linked", linked);
+	const main = await loadProjectMemory(cwd, storage);
+	assert.equal((await loadProjectMemory(linked, storage)).directory, main.directory);
+	// Git also supports relative gitdir/backlink paths.
+	writeFileSync(join(linked, ".git"), "gitdir: ../project/.git/worktrees/linked\n");
+	writeFileSync(join(cwd, ".git", "worktrees", "linked", "gitdir"), "../../../../linked/.git\n");
+	assert.equal((await loadProjectMemory(linked, storage)).directory, main.directory);
+	const alias = join(base, "alias");
+	symlinkSync(linked, alias, "dir");
+	assert.equal((await loadProjectMemory(alias, storage)).directory, main.directory);
+	const repositoryAlias = join(base, "repository-alias");
+	symlinkSync(cwd, repositoryAlias, "dir");
+	writeFileSync(join(linked, ".git"), `gitdir: ${join(repositoryAlias, ".git", "worktrees", "linked")}\n`);
+	assert.equal((await loadProjectMemory(linked, storage)).directory, main.directory);
+	// A symlink to a pointer file still needs the same valid registration.
+	const pointerFile = join(base, "pointer");
+	writeFileSync(pointerFile, `gitdir: ${join(cwd, ".git", "worktrees", "linked")}\n`);
+	rmSync(join(linked, ".git"));
+	symlinkSync(pointerFile, join(linked, ".git"));
+	assert.equal((await loadProjectMemory(linked, storage)).directory, main.directory);
+	rmSync(join(linked, ".git"));
+	writeFileSync(join(linked, ".git"), `gitdir: ${join(cwd, ".git", "worktrees", "linked")}\n`);
+	const moved = join(base, "moved");
+	git("worktree", "move", linked, moved);
+	assert.equal((await loadProjectMemory(moved, storage)).directory, main.directory);
+	git("worktree", "remove", moved);
+	mkdirSync(moved);
+	assert.notEqual((await loadProjectMemory(moved, storage)).directory, main.directory);
+});
+
+test("linked worktrees of a bare repository share its canonical root", async (t) => {
+	const { base, cwd, storage } = fixture(t);
+	const bare = join(base, "bare.git");
+	execFileSync("git", ["-C", cwd, "init"], { stdio: "ignore" });
+	execFileSync("git", ["-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"], { stdio: "ignore" });
+	execFileSync("git", ["clone", "--bare", cwd, bare], { stdio: "ignore" });
+	const linked = join(base, "linked");
+	const second = join(base, "second");
+	execFileSync("git", ["--git-dir", bare, "worktree", "add", "-b", "first", linked, "HEAD"], { stdio: "ignore" });
+	execFileSync("git", ["--git-dir", bare, "worktree", "add", "-b", "second", second, "first"], { stdio: "ignore" });
+	const first = await loadProjectMemory(linked, storage);
+	assert.equal(first.projectRoot, realpathSync(bare));
+	assert.equal((await loadProjectMemory(second, storage)).directory, first.directory);
+	// A common directory which is itself a checkout is not a bare root.
+	mkdirSync(join(bare, ".git"));
+	assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+	assert.notEqual((await loadProjectMemory(cwd, storage)).directory, first.directory);
+});
+
+test("unsafe or unreadable worktree metadata falls back without blocking", async (t) => {
+	const { base, cwd, storage } = fixture(t);
+	const registration = join(cwd, ".git", "worktrees", "linked");
+	mkdirSync(registration, { recursive: true });
+	const linked = join(base, "linked");
+	mkdirSync(linked);
+	const marker = join(linked, ".git");
+	const pointer = `gitdir: ${registration}\n`;
+	writeFileSync(marker, pointer);
+	writeFileSync(join(registration, "gitdir"), `${marker}\n`);
+	const common = join(registration, "commondir");
+	for (const invalid of ["", "../..\nextra", "../..\0", "x".repeat(16_385)]) {
+		writeFileSync(common, invalid);
+		assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+	}
+	rmSync(common);
+	const outside = join(base, "commondir");
+	writeFileSync(outside, "../..\n");
+	symlinkSync(outside, common);
+	assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+	rmSync(common);
+	mkdirSync(common);
+	assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+	rmSync(common, { recursive: true });
+	if (process.platform !== "win32") {
+		execFileSync("mkfifo", [common]);
+		assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+		rmSync(common);
+	}
+	writeFileSync(common, "../..\n");
+	for (const invalid of ["gitdir:", "not a pointer", "gitdir: /missing/gitdir"]) {
+		writeFileSync(marker, invalid);
+		assert.equal((await loadProjectMemory(linked, storage)).projectRoot, realpathSync(linked));
+	}
 });
 
 test("every load reads the current index and does not eagerly read topics", async (t) => {

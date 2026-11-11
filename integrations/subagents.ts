@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { installGrokStyle, type InstallDeps } from "../extensions/install.ts";
 import type { ToolTransform } from "../src/tools/register-extension.ts";
@@ -10,6 +11,7 @@ import { createSubagentEngine, inChildContext, type SubagentEngineOptions } from
 import { selectSubagentRuntime, withoutTerminalHost } from "../src/subagents/runtime.ts";
 import { registerStyledSubagents } from "../src/subagents/result-style.ts";
 import { createHerdrNotificationRenderer } from "../src/subagents/notification-style.ts";
+import { loadSubagentSettings } from "../src/subagents/settings.ts";
 
 export async function loadSubagentExtension(
 	pi: ExtensionAPI,
@@ -62,6 +64,7 @@ export function createGrokSubagents(options: {
 		const engineMemory = options.engine?.memoryEnabled;
 		const engine = createSubagentEngine({
 			...options.engine,
+			agentDefaults: options.engine?.agentDefaults ?? loadSubagentSettings(options.engine?.agentDir ? join(options.engine.agentDir, "grok-style.json") : undefined),
 			memoryEnabled: () => features.memory && !/^(?:1|true|yes|on)$/i.test(process.env.PI_DISABLE_AUTO_MEMORY ?? "")
 				&& (typeof engineMemory === "function" ? engineMemory() : engineMemory ?? true),
 			panes: inHerdr || options.engine?.panes,

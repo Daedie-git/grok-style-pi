@@ -6,7 +6,7 @@ import {
 } from "../src/policy/text.ts";
 import type { NoticePayload } from "../src/types.ts";
 
-const explore = { agentType: "Explore", description: "Locate implementation paths", tools: ["Read", "Grep"] };
+const explore = { agentType: "explore", description: "Locate implementation paths", tools: ["Read", "Grep"] };
 const general = { agentType: "general-purpose", description: "Carry out bounded assignments" };
 const fork = { agentType: "fork", description: "Perform one inherited-context directive" };
 const positive: PolicyInput = { autonomy: "positive", forkEnabled: false, offered: [explore, general], exploreAvailable: true };
@@ -21,16 +21,16 @@ function golden(text: string, required: string[], forbidden: string[]): void {
 const fixtures: { name: string; input: PolicyInput; required: string[]; forbidden: string[]; listingRequired: string[]; listingForbidden: string[] }[] = [
 	{
 		name: "positive", input: positive,
-		required: ["Delegation heuristics", "costs more than it looks", "independent work that can run in parallel", "a fitting description alone is no reason", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "Explore locates code"],
+		required: ["Delegation heuristics", "costs more than it looks", "independent work that can run in parallel", "a fitting description alone is no reason", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "The explore agent locates code"],
 		forbidden: ["Delegate only when the user explicitly requests", "prefer an offered fork", "A fork inherits", "without a separate user request", "proactive use"],
-		listingRequired: ["Available agent types", "Explore: Locate implementation paths", "Read, Grep", "general-purpose", "inherited tools"],
+		listingRequired: ["Available agent types", "explore: Locate implementation paths", "Read, Grep", "general-purpose", "inherited tools"],
 		listingForbidden: ["fork:", "Removed;", "without a separate user request", "more than 3 queries"],
 	},
 	{
 		name: "explicit-only", input: { ...positive, autonomy: "explicit" },
 		required: ["Delegate only when the user explicitly requests agents or names an offered agent type", "overrides proactive wording", "thoroughness or several subtasks"],
 		forbidden: ["without a separate user request", "Delegation heuristics", "prefer an offered fork", "more than 3 queries", "use a matching specialist"],
-		listingRequired: ["Available agent types", "Explore", "current delegation policy", "descriptions do not override its restrictions"],
+		listingRequired: ["Available agent types", "explore", "current delegation policy", "descriptions do not override its restrictions"],
 		listingForbidden: ["without a separate user request", "more than 3 queries", "prefer an offered fork"],
 	},
 	{
@@ -45,7 +45,7 @@ const fixtures: { name: string; input: PolicyInput; required: string[]; forbidde
 		required: ["No agent types are currently offered"],
 		forbidden: ["without a separate user request", "more than 3 queries", "prefer an offered fork", "batch Agent calls"],
 		listingRequired: ["Available agent types", "No agent types are currently offered"],
-		listingForbidden: ["Explore:", "general-purpose:", "fork:", "batch Agent calls"],
+		listingForbidden: ["explore:", "general-purpose:", "fork:", "batch Agent calls"],
 	},
 ];
 for (const fixture of fixtures) {
@@ -87,14 +87,14 @@ test("Agent description is stable prose; dynamic names and descriptions live onl
 	const input = { ...positive, offered: [{ agentType: "custom-agent", description: "SPECIAL-DYNAMIC-TEXT" }] };
 	assert(!agentToolDescription(input).includes("SPECIAL-DYNAMIC-TEXT"));
 	assert(!sessionGuidance(input)!.includes("custom-agent"));
-	golden(listingText(input.offered, [], true), ["custom-agent: SPECIAL-DYNAMIC-TEXT"], ["Explore:"]);
+	golden(listingText(input.offered, [], true), ["custom-agent: SPECIAL-DYNAMIC-TEXT"], ["explore:"]);
 });
 
 test("listings report additions, removals and declared tools without inventing executable types", () => {
 	const delta = listingText([{ agentType: "empty", description: "No tools", tools: [] }, { agentType: "wild", description: "Wildcard", tools: ["*"] }], ["old"], false);
 	golden(delta, ["Agent type changes", "empty: No tools (Declared tools: no tools", "wild: Wildcard (Declared tools: inherited tools", "Removed; no longer executable: old"], ["Available agent types", "old:", "code-reviewer"]);
-	const removal = listingText([], ["Explore"], false);
-	golden(removal, ["Removed; no longer executable: Explore"], ["Explore:", "No agent types are currently offered"]);
+	const removal = listingText([], ["explore"], false);
+	golden(removal, ["Removed; no longer executable: explore"], ["explore:", "No agent types are currently offered"]);
 });
 
 test("proactive custom descriptions reach the listing but cannot supersede explicit-only policy", () => {

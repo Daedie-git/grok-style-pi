@@ -133,9 +133,121 @@ test("RR02: Agent -> Agent(Explore) revokes general-purpose in live and retained
 		const result = retained.messages.find(message => message.role === "toolResult" && message.toolName === "Agent");
 		assert.ok(result && result.role === "toolResult");
 		assert.equal(result.isError, true);
-		assert.match(JSON.stringify(result.content), /only launch: Explore/);
+		assert.match(JSON.stringify(result.content), /only launch: explore/);
 		assert.equal(h.children.size, 1);
 		assert.equal(h.engine.agentSnapshots().filter(agent => agent.depth === 2).length, 0);
+	});
+});
+
+test("legacy caller type grants admit canonical aliases without widening permission", { timeout: 20_000 }, async t => {
+	offline(t);
+	const h = await createHarness({ parent: () => ({ text: "root ready" }), child: () => () => ({ text: "legacy grant admitted" }) });
+	t.after(() => h.close());
+	for (const [legacy, canonical] of [["Explore", "explore"], ["Plan", "plan"], ["adversarial-review", "review"]]) {
+		const caller = { ...ROOT_CALLER, allowedAgentTypes: [legacy] };
+		const result = await h.engine.spawn({ description: "Legacy grant", prompt: "Report", subagent_type: canonical, run_in_background: false }, caller, {
+			toolCallId: `legacy-grant-${canonical}`, ctx: h.parent.extensionRunner.createContext(),
+		});
+		assert.notEqual(result.isError, true, JSON.stringify(result));
+		assert.match(result.text, /legacy grant admitted/);
+		assert.equal([...h.engine.control.conversations.values()].at(-1)!.meta.agentType, canonical);
+		const count = h.children.size;
+		const denied = await h.engine.spawn({ description: "Outside grant", prompt: "Report", subagent_type: "general-purpose", run_in_background: false }, caller, {
+			toolCallId: `legacy-denied-${canonical}`, ctx: h.parent.extensionRunner.createContext(),
+		});
+		assert.equal(denied.isError, true);
+		assert.match(denied.text, /only launch:/);
+		assert.equal(h.children.size, count, "alias admission must not widen the grant");
+	}
+});
+
+test("retained legacy alias metadata resolves current user definitions and still narrows tools", { timeout: 20_000 }, async t => {
+	offline(t);
+	for (const [legacy, canonical] of [["Explore", "explore"], ["Plan", "plan"], ["adversarial-review", "review"]]) await t.test(legacy, async t => {
+		let now = 10_000;
+		const source = (tools: string) => `---\nname: ${legacy}\ndescription: legacy user agent\ntools: ${tools}\n---\nReport only.`;
+		const h = await createHarness({ now: () => now,
+			parent: ({ index }) => index === 0
+				? { tools: [{ name: "Agent", args: { description: "Legacy user agent", prompt: "Report", subagent_type: canonical, run_in_background: false } }] }
+				: { text: "root done" },
+			agentFiles: { "legacy.md": source("[read, write]") },
+			child: () => ({ index }) => index === 1
+				? { tools: [{ name: "write", args: { path: join(h.root, "FORBIDDEN_LEGACY_WRITE.txt"), content: "must not be written" } }] }
+				: { text: "legacy user report" },
+		});
+		t.after(() => h.close());
+		await h.parent.prompt("go", { source: "extension" });
+		const id = [...h.children.keys()][0];
+		const idle = () => !h.engine.control.get(id)?.active && !h.engine.control.get(id)?.exiting;
+		await until(idle);
+		const retained = h.children.get(id)!;
+		const meta = h.engine.control.get(id)!.meta;
+		assert.equal(meta.definition.source, "user");
+		// Simulate a pre-rename record retained across reload, not a fresh canonical launch.
+		meta.agentType = legacy;
+		meta.definition.agentType = legacy;
+		assert.equal(await h.engine.toolRevocation(id, "read"), undefined, "legacy identity must resolve the current user definition");
+		assert.equal(await h.engine.toolRevocation(id, "write"), undefined);
+		writeFileSync(join(h.root, "agent", "agents", "legacy.md"), source("[read]"));
+		now += 2_001;
+		assert.equal(await h.engine.toolRevocation(id, "read"), undefined);
+		assert.match((await h.engine.toolRevocation(id, "write"))!, /no longer allows write/);
+		const sent = await h.engine.sendMessage({ to: id, message: "Report with the narrowed definition" }, ROOT_CALLER, `legacy-resume-${canonical}`);
+		assert.equal(sent.success, true, JSON.stringify(sent));
+		await until(idle);
+		assert.equal(h.requests.children.get(id), 3, JSON.stringify(meta.runs));
+		assert.equal(h.children.get(id), retained);
+		const writeResult = retained.messages.find(message => message.role === "toolResult" && message.toolName === "write");
+		assert.ok(writeResult && writeResult.role === "toolResult");
+		assert.equal(writeResult.isError, true);
+		assert.match(JSON.stringify(writeResult.content), /no longer allows write/);
+		assert.equal(existsSync(join(h.root, "FORBIDDEN_LEGACY_WRITE.txt")), false);
+		assert.equal(meta.runs.at(-1)!.status, "completed");
+	});
+});
+
+test("evicted legacy alias agents recreate with the current narrowed definition", { timeout: 20_000 }, async t => {
+	offline(t);
+	for (const [legacy, canonical] of [["Explore", "explore"], ["Plan", "plan"], ["adversarial-review", "review"]]) await t.test(legacy, async t => {
+		let now = 10_000;
+		let creations = 0;
+		let recreatedTools: string[] = [];
+		const source = (tools: string) => `---\nname: ${legacy}\ndescription: legacy user agent\ntools: ${tools}\n---\nReport only.`;
+		const h = await createHarness({ now: () => now,
+			parent: ({ index }) => index === 0
+				? { tools: [{ name: "Agent", args: { description: "Legacy user agent", prompt: "Report", subagent_type: canonical, run_in_background: false } }] }
+				: { text: "root done" },
+			agentFiles: { "legacy.md": source("[read, write]") },
+			child: (_id, session) => {
+				const recreated = ++creations > 1;
+				return () => {
+					if (recreated) recreatedTools = session.agent.state.tools.map(tool => tool.name);
+					return { text: "legacy user report" };
+				};
+			},
+		});
+		t.after(() => h.close());
+		await h.parent.prompt("go", { source: "extension" });
+		const id = [...h.children.keys()][0];
+		const conversation = h.engine.control.get(id)!;
+		const idle = () => !conversation.active && !conversation.exiting;
+		await until(idle);
+		const original = h.children.get(id)!;
+		conversation.meta.agentType = legacy;
+		conversation.meta.definition.agentType = legacy;
+		writeFileSync(join(h.root, "agent", "agents", "legacy.md"), source("[read]"));
+		conversation.notified = true;
+		now += 60_000;
+		assert.ok(h.engine.control.evictable().includes(conversation));
+		await (h.engine as unknown as { sweep(): Promise<void> }).sweep();
+		const sent = await h.engine.sendMessage({ to: id, message: "Report after eviction" }, ROOT_CALLER, `legacy-recreate-${canonical}`);
+		assert.equal(sent.success, true, JSON.stringify(sent));
+		await until(idle);
+		assert.equal(creations, 2);
+		assert.notEqual(h.children.get(id), original);
+		assert.ok(recreatedTools.includes("read"));
+		assert.ok(!recreatedTools.includes("write"), "currentDefinition must narrow a recreated historical surface");
+		assert.equal(conversation.meta.runs.at(-1)!.status, "completed");
 	});
 });
 

@@ -7,6 +7,7 @@ import { registerTaskTools } from "./tasks/tools.ts";
 import { installStopHooks } from "./hook-integration.ts";
 import { sessionGuidance, type PolicyInput } from "./policy/text.ts";
 import { installListingBridge } from "./listing.ts";
+import { canonicalAgentType } from "./definitions/names.ts";
 
 export function childInstaller(policy: () => PolicyInput) {
 	return (engine: Engine, caller: Caller) => (pi: ExtensionAPI) => {
@@ -25,7 +26,7 @@ export function childInstaller(policy: () => PolicyInput) {
 		const offered = async () => {
 			if (!caller.allowedTools?.has("Agent")) return [];
 			const list = (await engine.definitions()).list
-				.filter((definition) => !caller.allowedAgentTypes || caller.allowedAgentTypes.includes(definition.agentType));
+				.filter((definition) => !caller.allowedAgentTypes || caller.allowedAgentTypes.some((type) => canonicalAgentType(type) === canonicalAgentType(definition.agentType)));
 			return list.map((definition) => ({ agentType: definition.agentType, description: definition.description, tools: definition.tools }));
 		};
 		pi.on("before_agent_start", async (event) => {

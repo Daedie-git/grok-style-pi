@@ -28,8 +28,8 @@ function routing(input: PolicyInput): string | undefined {
 		return input.autonomy === "explicit" ? mechanics : `For research or multi-step implementation that would crowd the parent context, prefer an offered fork. ${mechanics}`;
 	}
 	if (input.autonomy === "explicit") return undefined;
-	if (!input.forkEnabled && input.exploreAvailable && input.offered.some((type) => type.agentType === "Explore")) {
-		return "As a heuristic, route broad code-location research likely to require more than 3 queries to Explore. Explore locates code; it is not for reviews, audits, consistency checks, or open-ended analysis. Specify quick, medium, or very thorough breadth and request paths and findings inline, not report files.";
+	if (!input.forkEnabled && input.exploreAvailable && input.offered.some((type) => type.agentType === "explore")) {
+		return "As a heuristic, route broad code-location research likely to require more than 3 queries to explore. The explore agent locates code; it is not for reviews, audits, consistency checks, or open-ended analysis. Specify quick, medium, or very thorough breadth and request paths and findings inline, not report files.";
 	}
 	return undefined;
 }

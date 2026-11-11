@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { BACKGROUND_ALLOWED, compileToolSurface, type SurfaceInput, type ToolLite } from "../src/context/capabilities.ts";
 import type { AgentDefinition } from "../src/types.ts";
+import { builtInDefinitions } from "../src/definitions/builtins.ts";
 
 const definition: AgentDefinition = {
 	agentType: "custom", description: "test", prompt: "test", source: "user",
@@ -31,6 +32,15 @@ test("background researchers inherit an available web_search tool without wideni
 	const result = surface({ background: true, available: [...available, { name: "web_search" }] }, { builtIn: "researcher", disallowedTools: ["edit", "write", "Agent"] });
 	assert.ok(result.active.includes("web_search"));
 	for (const name of ["edit", "write", "Agent"]) assert.ok(!result.active.includes(name));
+});
+
+test("built-in review keeps only read-only file and shell tools in either execution mode", () => {
+	const review = builtInDefinitions({ forkEnabled: false }).find((item) => item.agentType === "review")!;
+	for (const background of [false, true]) {
+		const result = surface({ definition: review, background, available: [...available, { name: "needs_answer" }] });
+		assert.deepEqual(result.active, ["read", "grep", "find", "ls", "bash", "needs_answer"]);
+		assert.equal(result.allowedAgentTypes, undefined);
+	}
 });
 
 test("an isolated definition keeps only built-in tools, even when it grants others", () => {
@@ -84,6 +94,11 @@ test("Agent type grants union, but plain Agent or inheritance grants unrestricte
 	assert.equal(surface({}, { tools: ["Agent(a)", "Agent"] }).allowedAgentTypes, undefined);
 	assert.equal(surface({}, { tools: ["*", "Agent(a)"] }).allowedAgentTypes, undefined);
 	assert.deepEqual(surface({ depth: 3 }, { tools: ["Agent(a)"] }).unavailable, ["Agent(a)"]);
+});
+
+test("Agent type grants canonicalize renamed built-ins and preserve custom names", () => {
+	const result = surface({}, { tools: ["Agent(Explore, Plan, adversarial-review, REVIEW, My_Custom)"] });
+	assert.deepEqual(result.allowedAgentTypes, ["explore", "plan", "review", "My_Custom"]);
 });
 
 test("MCP server expansion uses names and server metadata, with server and individual denies", () => {

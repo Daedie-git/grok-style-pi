@@ -10,7 +10,7 @@ import { Control, limitsFromEnv, type Conversation } from "./control.ts";
 import { compileToolSurface, type ToolLite } from "./context/capabilities.ts";
 import { resolveEffort, resolveModel, roleDefaultEffort, type ModelLite } from "./context/model.ts";
 import { childSystemPrompt, contextFilePolicy, taskMessage } from "./context/prompt.ts";
-import { discoverDefinitions, selectDefinition, type DefinitionSet } from "./definitions/discovery.ts";
+import { canonicalAgentType, discoverDefinitions, selectDefinition, type DefinitionSet } from "./definitions/discovery.ts";
 import { launchResultText, noticeText } from "./policy/text.ts";
 import { memoryDir, memoryIndex, memoryPathGuard, memoryRootContained } from "./memory.ts";
 import { truncateResult } from "./results.ts";
@@ -94,10 +94,15 @@ function piUsage(totals: import("./types.ts").UsageTotals): PiUsage {
 	};
 }
 
+/** Host-configured model and reasoning defaults, keyed by canonical agent type. */
+export type AgentDefaults = Readonly<Record<string, { model?: string; effort?: ThinkingLevel }>>;
+
 export interface EngineDeps {
 	env: Record<string, string | undefined>;
 	agentDir: string;
 	modelRuntime: () => Promise<ModelRuntime>;
+	/** Overrides definition model/effort defaults, but not explicit launch settings or forced environment settings. */
+	agentDefaults?: AgentDefaults;
 	/** Host master switch for definition-scoped memory; standalone engines default to enabled. */
 	memoryEnabled?: boolean | (() => boolean);
 	now?: () => number;
@@ -167,7 +172,7 @@ export class Engine {
 	 * Rebind runtime-scoped dependencies after a reload handover: children created from now on must use the new runtime's
 	 * policy (autonomy) and installers, not closures captured by the runtime that created this engine.
 	 */
-	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault" | "memoryEnabled">>): void {
+	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault" | "memoryEnabled" | "agentDefaults">>): void {
 		this.deps = { ...this.deps, ...deps };
 		this.tasks = undefined;
 	}
@@ -370,12 +375,16 @@ export class Engine {
 		if (skill && "error" in skill) return error(skill.error);
 		const selected = skill ? { definition: skill.definition } : selectDefinition(set, requestedType);
 		if (!selected.definition) return error(("error" in selected && selected.error) || `Unknown agent type "${requestedType}".`);
-		const definition = invocation.internal
-			? { ...selected.definition, disallowedTools: [...selected.definition.disallowedTools, ...invocation.internal.extraDenied] }
-			: selected.definition;
+		const defaults = this.deps.agentDefaults?.[selected.definition.agentType];
+		const definition = {
+			...selected.definition,
+			...(defaults?.model !== undefined ? { model: defaults.model } : {}),
+			...(defaults?.effort !== undefined ? { effort: defaults.effort } : {}),
+			...(invocation.internal ? { disallowedTools: [...selected.definition.disallowedTools, ...invocation.internal.extraDenied] } : {}),
+		};
 		if (skill) params = { ...params, prompt: [skill.skill.content, params.prompt ?? ""].filter((part) => part.trim()).join("\n\n") };
 		if (!params.prompt?.trim()) return error("Agent needs a prompt.");
-		if (caller.allowedAgentTypes && !caller.allowedAgentTypes.includes(definition.agentType)) {
+		if (caller.allowedAgentTypes && !caller.allowedAgentTypes.some((type) => canonicalAgentType(type) === canonicalAgentType(definition.agentType))) {
 			return error(`This agent may only launch: ${caller.allowedAgentTypes.join(", ")}.`);
 		}
 		// The caller's current definition can only narrow the subtypes it launched with (re-review RR02).
@@ -384,7 +393,7 @@ export class Engine {
 			if (decision && "error" in decision) return error(decision.error);
 			if (decision && !decision.surface.active.includes("Agent")) return error(`The current definition of "${decision.agentType}" no longer allows Agent.`);
 			const current = decision?.surface.allowedAgentTypes;
-			if (current && !current.includes(definition.agentType)) return error(`This agent may only launch: ${current.join(", ") || "no agent types"}.`);
+			if (current && !current.some((type) => canonicalAgentType(type) === canonicalAgentType(definition.agentType))) return error(`This agent may only launch: ${current.join(", ") || "no agent types"}.`);
 		}
 		const isFork = definition.builtIn === "fork";
 		if (isFork && caller.isFork) return error("A fork cannot start another fork.");
@@ -437,7 +446,8 @@ export class Engine {
 		if (pane) meta.backend = "herdr";
 		// The local resolution says nothing about a machine's Pi, which runs the named model or its own default.
 		if (pane && params.machine?.trim() && params.runtime !== "claude-code") {
-			if (params.model) meta.model = { requested: params.model, effective: params.model };
+			const requestedModel = params.model ?? (definition.model === "inherit" ? undefined : definition.model);
+			if (requestedModel) meta.model = { requested: requestedModel, effective: requestedModel };
 			else delete meta.model;
 		}
 		const reserved = this.control.reserveSpawn({ meta, background, uncapped: Boolean(invocation.internal) });
@@ -754,7 +764,7 @@ export class Engine {
 		}
 		if (definition.source === "built-in") return undefined;
 		const set = await this.definitions();
-		const current = set.active.get(definition.agentType);
+		const current = set.active.get(canonicalAgentType(definition.agentType));
 		if (!current) return `The agent type "${definition.agentType}" is no longer available, so this agent cannot continue.`;
 		if (current.source !== definition.source) return `The agent type "${definition.agentType}" now comes from a different source; start a new agent instead.`;
 		return undefined;
@@ -861,11 +871,11 @@ export class Engine {
 			runtime: params.runtime, name: meta.name, projectTrusted: this.projectTrusted, resolved: this.paneDefinition(definition, meta),
 			maxTurns: definition.maxTurns, keep: params.keep ?? definition.keep,
 			// A local Pi pane runs the engine's resolved model and effort, as an in-process child would.
-			// A machine's providers are unknown here, so its Pi uses its own default unless the caller names a model.
+			// A machine's providers are unknown here. Send a requested/configured model verbatim, otherwise use its Pi default.
 			...(params.runtime === "claude-code"
 				? { model: params.model ?? (definition.model === "inherit" ? undefined : definition.model), thinking: params.effort ?? definition.effort }
 				: params.machine?.trim()
-					? { model: params.model, thinking: params.effort ?? definition.effort }
+					? { model: params.model ?? (definition.model === "inherit" ? undefined : definition.model), thinking: params.effort ?? definition.effort }
 					: { model: meta.model?.effective, thinking: meta.effort?.effective }),
 			definitionsCwd: invocation.ctx.cwd, machine: params.machine?.trim() || undefined, machineCwd: params.machine_cwd,
 		}, invocation.ctx, { background, signal: invocation.signal });
@@ -1343,7 +1353,7 @@ export class Engine {
 	private async currentDefinition(meta: AgentMeta): Promise<AgentDefinition> {
 		const historical = meta.definition;
 		if (historical.source === "built-in" || meta.isFork || meta.skill) return historical;
-		const current = (await this.definitions()).active.get(historical.agentType);
+		const current = (await this.definitions()).active.get(canonicalAgentType(historical.agentType));
 		if (!current || current.source !== historical.source) return historical;
 		const tools = historical.tools === undefined ? current.tools
 			: current.tools === undefined ? historical.tools
@@ -1380,7 +1390,7 @@ export class Engine {
 		} catch {
 			return { error: "The agent's current definition could not be verified, so the tool call was blocked." };
 		}
-		const current = set.active.get(historical.agentType);
+		const current = set.active.get(canonicalAgentType(historical.agentType));
 		if (!current || current.source !== historical.source) return { error: "This agent's definition is no longer available, so it can no longer use tools." };
 		const mcp = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName)?.[1];
 		const surface = compileToolSurface({

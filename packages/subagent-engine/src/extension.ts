@@ -85,12 +85,12 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 			autonomy: options.autonomy ?? (env.PI_SUBAGENT_AUTONOMY === "explicit" ? "explicit" : "positive"),
 			forkEnabled: engine.forkEnabled(),
 			offered,
-			exploreAvailable: offered.some((agent) => agent.agentType === "Explore"),
+			exploreAvailable: offered.some((agent) => agent.agentType === "explore"),
 		});
 		const create = (): Engine => {
 			const created = new Engine({
 				env, agentDir, homeDir: options.homeDir ?? homedir(), now: options.now, onSessionCreated: options.onSessionCreated, paneDefault: options.paneDefault,
-				memoryEnabled: options.memoryEnabled,
+				memoryEnabled: options.memoryEnabled, agentDefaults: options.agentDefaults,
 				modelRuntime: options.modelRuntime ?? (() => ModelRuntime.create({
 					authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), modelsStorePath: join(agentDir, "models-store.json"),
 				})),
@@ -124,7 +124,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 					childInstaller: options.childInstaller ?? childInstaller(policy),
 					taskHooks: options.taskHooks ?? ((owner) => taskHooks(owner.hookEnvironment(), () => owner.rootHookContext())),
 					paneDefault: options.paneDefault,
-					memoryEnabled: options.memoryEnabled,
+					memoryEnabled: options.memoryEnabled, agentDefaults: options.agentDefaults,
 				});
 				// Integrations (activity panel) must follow the adopted engine, not the fresh one this runtime created.
 				options.onEngine?.(adopted);

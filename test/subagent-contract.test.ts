@@ -11,16 +11,18 @@ import { createGrokStyleExtension } from "../src/extension.ts";
 import { defaultFeatures } from "../src/extension/features.ts";
 import { SubagentAdapter } from "../src/subagents/adapter.ts";
 import { runInChildScope } from "../packages/subagent-engine/src/child-context.ts";
-import type { Engine } from "../packages/subagent-engine/src/engine.ts";
+import type { AgentDefaults, Engine } from "../packages/subagent-engine/src/engine.ts";
 import type { Activity } from "../src/activity/ui.ts";
 import { scripted, until, type Script } from "../packages/subagent-engine/test/fixtures/harness.ts";
 import { FakeEngine } from "./fixtures/engine-activity.ts";
 
-async function fixture(t: TestContext, parent: Script, child: Script, autonomy = true) {
+async function fixture(t: TestContext, parent: Script, child: Script, autonomy = true, options: { subagents?: AgentDefaults; env?: Record<string, string> } = {}) {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
 	mkdirSync(resolve("captures"), { recursive: true });
 	const root = mkdtempSync(join(resolve("captures"), "grok-engine-"));
 	const agentDir = join(root, "agent"); mkdirSync(agentDir);
+	const settingsPath = join(agentDir, "grok-style.json");
+	if (options.subagents) writeFileSync(settingsPath, JSON.stringify({ subagents: options.subagents }));
 	// Real child discovery loads the actual file entrypoint; its child-context guard must make it inert.
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: [fileURLToPath(new URL("../integrations/subagents.ts", import.meta.url))] }));
 	const runtime = await ModelRuntime.create({ authPath: join(root, "auth.json"), modelsPath: null, modelsStorePath: join(root, "models"), refreshOnCreate: false });
@@ -34,7 +36,7 @@ async function fixture(t: TestContext, parent: Script, child: Script, autonomy =
 	const loader = new DefaultResourceLoader({
 		cwd: root, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 		extensionFactories: [createGrokSubagents({ env: {}, style: { features }, engine: {
-			env: {}, agentDir, homeDir: root, modelRuntime: async () => runtime,
+			env: options.env ?? {}, agentDir, homeDir: root, modelRuntime: async () => runtime,
 			onEngine(created) { engine = created; adapter?.dispose(); adapter = new SubagentAdapter(created, (entry) => { if (!activity.includes(entry)) activity.push(entry); }); },
 			onSessionCreated(session) { children.push(session); session.agent.streamFunction = scripted(child, () => {}) as never; },
 		} })],
@@ -57,7 +59,7 @@ async function fixture(t: TestContext, parent: Script, child: Script, autonomy =
 		if (oldSteer === undefined) delete process.env.GROK_STEER_DIR; else process.env.GROK_STEER_DIR = oldSteer;
 		rmSync(root, { recursive: true, force: true });
 	});
-	return { session, get engine() { return engine; }, get adapter() { return adapter; }, activity, children, features, extensionErrors, modelInput: () => modelInput };
+	return { session, get engine() { return engine; }, get adapter() { return adapter; }, activity, children, features, settingsPath, extensionErrors, modelInput: () => modelInput };
 }
 
 test("real Grok integration dispatches Agent in a Pi tool loop and records completion", { timeout: 15000 }, async (t) => {
@@ -73,6 +75,64 @@ test("real Grok integration dispatches Agent in a Pi tool loop and records compl
 	assert.equal(h.activity[0].stop, undefined);
 	for (const name of ["Agent", "SendMessage", "TaskStop", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "get_subagent_result", "steer_subagent"]) assert.ok(h.session.getAllTools().some((tool) => tool.name === name));
 	assert.equal(h.children[0].getAllTools().some((tool) => tool.name === "show_image"), false, "Grok user extension stays inert in a real engine child");
+});
+
+test("grok-style.json configures each canonical agent type without changing explicit launch overrides", { timeout: 15000 }, async (t) => {
+	const types = ["explore", "plan", "review", "general-purpose", "researcher"];
+	const subagents = Object.fromEntries(types.map((type) => [type, { model: "anthropic/claude-opus-4-5", effort: "low" as const }]));
+	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [
+		...types.map((type) => ({ name: "Agent", args: { subagent_type: type, description: type, prompt: "Complete the assignment", run_in_background: false } })),
+		{ name: "Agent", args: { subagent_type: "explore", description: "explicit override", prompt: "Find code", model: "anthropic/claude-sonnet-4-5", effort: "high", run_in_background: false } },
+	] } : { text: "Done" }, () => ({ text: "Agent report" }), true, { subagents });
+	await h.session.prompt("Launch the configured agents");
+	assert.deepEqual(h.extensionErrors, []);
+	assert.equal(h.children.length, 6);
+	const snapshots = h.engine.agentSnapshots();
+	for (const type of types) {
+		const snapshot = snapshots.find((agent) => agent.description === type)!;
+		assert.equal(snapshot.agentType, type);
+		assert.equal(snapshot.model, "anthropic/claude-opus-4-5");
+		assert.equal(snapshot.effort, "low");
+	}
+	const explicit = snapshots.find((agent) => agent.description === "explicit override")!;
+	assert.equal(explicit.model, "anthropic/claude-sonnet-4-5");
+	assert.equal(explicit.effort, "high");
+	assert.equal(h.children.filter((child) => child.model?.id === "claude-opus-4-5" && child.thinkingLevel === "low").length, 5);
+});
+
+test("forced environment settings still override Grok agent defaults", { timeout: 15000 }, async (t) => {
+	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: {
+		subagent_type: "explore", description: "forced settings", prompt: "Find code", run_in_background: false,
+	} }] } : { text: "Done" }, () => ({ text: "Report" }), true, {
+		subagents: { explore: { model: "anthropic/claude-opus-4-5", effort: "low" } },
+		env: { PI_SUBAGENT_MODEL_FORCE: "anthropic/claude-sonnet-4-5", PI_SUBAGENT_EFFORT: "high" },
+	});
+	await h.session.prompt("Launch the agent");
+	assert.equal(h.children.length, 1);
+	assert.equal(h.children[0].model?.id, "claude-sonnet-4-5");
+	assert.equal(h.children[0].thinkingLevel, "high");
+});
+
+test("reload applies edited agent defaults to new children and removing them restores role defaults", { timeout: 15000 }, async (t) => {
+	const h = await fixture(t, ({ index }) => index % 2 === 0 ? { tools: [{ name: "Agent", args: {
+		subagent_type: "explore", description: "configured child", prompt: "Find code", run_in_background: false,
+	} }] } : { text: "Done" }, () => ({ text: "Report" }), true, { subagents: { explore: { effort: "low" } } });
+	await h.session.prompt("Launch before reload");
+	const engine = h.engine;
+	assert.equal(h.children[0].thinkingLevel, "low");
+	writeFileSync(h.settingsPath, JSON.stringify({ subagents: { explore: { model: "anthropic/claude-opus-4-5", effort: "high" } } }));
+	await h.session.reload();
+	await h.session.prompt("Launch after reload");
+	assert.equal(h.engine, engine);
+	assert.equal(h.children[0].thinkingLevel, "low", "existing conversations keep their launch preferences");
+	assert.equal(h.children[1].model?.id, "claude-opus-4-5");
+	assert.equal(h.children[1].thinkingLevel, "high");
+	writeFileSync(h.settingsPath, "{}");
+	await h.session.reload();
+	await h.session.prompt("Launch with defaults restored");
+	assert.equal(h.children[2].model?.id, "claude-sonnet-4-5");
+	assert.equal(h.children[2].thinkingLevel, "medium");
+	assert.deepEqual(h.extensionErrors, []);
 });
 
 test("autonomy feature controls the engine's actual system guidance", { timeout: 15000 }, async (t) => {

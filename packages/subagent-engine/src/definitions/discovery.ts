@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { AgentDefinition, DefinitionSource } from "../types.ts";
 import { builtInDefinitions } from "./builtins.ts";
+import { canonicalAgentType } from "./names.ts";
+export { canonicalAgentType } from "./names.ts";
 import { parseDefinitionData, parseDefinitionFile } from "./parse.ts";
 import { isMapping } from "./yaml.ts";
 
@@ -36,13 +38,14 @@ function missing(error: unknown): boolean {
 	return isMapping(error) && (error.code === "ENOENT" || error.code === "ENOTDIR");
 }
 
-/** Discover from low to high priority; every exact-name assignment replaces the previous one. */
+/** Discover from low to high priority; assignments replace the previous canonical name. */
 export async function discoverDefinitions(options: DiscoveryOptions): Promise<DefinitionSet> {
 	const active = new Map<string, AgentDefinition>();
 	const diagnostics: string[] = [];
 	const seenPaths = new Set<string>();
 	const seenInodes = new Set<string>();
 	const add = (definition: AgentDefinition) => {
+		definition = { ...definition, agentType: canonicalAgentType(definition.agentType) };
 		if (definition.agentType === "fork" && definition.source !== "built-in" && active.get("fork")?.builtIn === "fork") {
 			diagnostics.push(`Built-in fork removed: ${definition.source} definition named fork takes precedence and has no built-in semantics`);
 		}
@@ -107,10 +110,10 @@ export async function discoverDefinitions(options: DiscoveryOptions): Promise<De
 }
 
 export function selectDefinition(set: DefinitionSet, name: string): { definition?: AgentDefinition; error?: string } {
-	const exact = set.active.get(name);
+	const exact = set.active.get(canonicalAgentType(name));
 	if (exact) return { definition: exact };
 	const normalize = (value: string) => value.toLowerCase().replace(/[_ ]/g, "-");
-	const matches = set.list.filter((definition) => normalize(definition.agentType) === normalize(name));
+	const matches = set.list.filter((definition) => normalize(definition.agentType) === normalize(canonicalAgentType(name)));
 	if (matches.length === 1) return { definition: matches[0] };
 	if (matches.length > 1) return { error: `Ambiguous agent name ${JSON.stringify(name)}; candidates: ${matches.map((definition) => definition.agentType).join(", ")}` };
 	return { error: `Unknown agent type: ${name}` };

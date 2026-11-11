@@ -62,7 +62,7 @@ function harness(_unused?: undefined, mode = "tui") {
 test("engine activity follows live events and Stop requests a user-source stop", async (t) => {
 	const h = harness(); t.after(() => h.emit("session_shutdown"));
 	h.engine.spawn();
-	assert.match(h.panel().render(100).join("\n"), /Explore: inspect build/);
+	assert.match(h.panel().render(100).join("\n"), /explore: inspect build/);
 	assert.match(h.panel().render(100).join("\n"), /grok-4.6 · high/);
 	const viewing = h.commands.get("activity").handler();
 	await flush();
@@ -116,7 +116,7 @@ test("engine attachment restores already-running agents from public snapshots", 
 		agentSnapshots: () => [agentSnapshot()],
 	});
 	assert.equal(h.controller.list().length, 1);
-	assert.match(h.panel().render(100).join("\n"), /Explore: inspect build/);
+	assert.match(h.panel().render(100).join("\n"), /explore: inspect build/);
 	await h.controller.list()[0].stop!();
 	assert.deepEqual(engine.stops, ["one"]);
 	engine.settle("killed");
@@ -274,7 +274,7 @@ test("viewer follows live output, pauses on scroll, and strips terminal control 
 });
 
 test("viewer frame and header Close survive resizing without stopping the agent", () => {
-	const entry: Activity = { id: "a", kind: "agent", title: "Explore: 中文 very long task title", status: "running", startedAt: 0, output: "Live output" };
+	const entry: Activity = { id: "a", kind: "agent", title: "explore: 中文 very long task title", status: "running", startedAt: 0, output: "Live output" };
 	let closed = 0, stopped = 0, rows = 24;
 	const viewer = new ActivityViewer(entry, theme, () => rows, () => {}, () => closed++, () => stopped++);
 	for (const width of [80, 20, 10, 6, 4]) {

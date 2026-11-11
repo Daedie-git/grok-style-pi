@@ -135,9 +135,9 @@ test("MCP names, named inline configurations, and folded descriptions", () => {
 
 test("built-ins expose immutable-by-call contracts and gated fork", () => {
 	const definitions = builtInDefinitions({ forkEnabled: true });
-	assert.deepEqual(definitions.map((d) => d.agentType), ["general-purpose", "Explore", "Plan", "researcher", "fork"]);
+	assert.deepEqual(definitions.map((d) => d.agentType), ["general-purpose", "explore", "plan", "researcher", "review", "fork"]);
 	assert.equal(definitions[0].tools, undefined);
-	for (const name of ["Explore", "Plan", "researcher"]) {
+	for (const name of ["explore", "plan", "researcher", "review"]) {
 		const definition = definitions.find((d) => d.agentType === name)!;
 		assert.deepEqual(definition.disallowedTools, ["edit", "write", "Agent"]);
 		assert.equal(definition.omitClaudeMd, true);
@@ -148,8 +148,13 @@ test("built-ins expose immutable-by-call contracts and gated fork", () => {
 	assert.match(definitions[1].prompt, /call needs_answer instead of deciding/);
 	assert.match(definitions[3].prompt, /high-trust primary sources/);
 	assert.match(definitions[3].prompt, /cite each claim's source with its URL or absolute path/);
-	assert.equal(definitions[4].maxTurns, 200);
-	assert.equal(definitions[4].model, "inherit");
+	assert.match(definitions[4].description, /Use only when asked for a review/);
+	assert.match(definitions[4].prompt, /Do not implement changes/);
+	assert.match(definitions[4].prompt, /evidence and severity/);
+	assert.deepEqual(definitions[4].tools, ["read", "grep", "find", "ls", "bash"]);
+	assert.equal(definitions[4].isolated, true);
+	assert.equal(definitions[5].maxTurns, 200);
+	assert.equal(definitions[5].model, "inherit");
 	assert.equal(builtInDefinitions({ forkEnabled: false }).some((d) => d.agentType === "fork"), false);
 	definitions[1].disallowedTools.push("read");
 	assert.deepEqual(builtInDefinitions({ forkEnabled: true })[1].disallowedTools, ["edit", "write", "Agent"]);
@@ -234,6 +239,54 @@ test("exact selection precedes normalized selection and ambiguous errors list ca
 	const ambiguous = selectDefinition(set, "MY AGENT");
 	assert.match(ambiguous.error!, /Ambiguous.*My_Agent.*my-agent/);
 	assert.match(selectDefinition(set, "missing").error!, /Unknown/);
+});
+
+test("renamed built-ins accept legacy invocation casing without duplicate types", async (t) => {
+	const { options } = await fixture(t);
+	const set = await discoverDefinitions(options);
+	for (const [legacy, name] of [["Explore", "explore"], ["Plan", "plan"], ["adversarial-review", "review"]]) {
+		assert.equal(selectDefinition(set, legacy).definition?.agentType, name);
+		assert.equal(selectDefinition(set, legacy.toUpperCase()).definition?.agentType, name);
+		assert.equal(set.active.has(legacy), false);
+		assert.equal(set.active.get(name)?.builtIn, name);
+	}
+});
+
+test("legacy Explore and Plan overrides normalize only reserved unnamespaced names", async (t) => {
+	const { root, agentDir, options, file } = await fixture(t);
+	await file(join(agentDir, "agents"), "explore.md", markdown("Explore", "user explore"));
+	await file(join(agentDir, "agents"), "plan.md", markdown("Plan", "user plan"));
+	const packageDir = join(root, "package");
+	await file(packageDir, "review.md", markdown("adversarial-review", "package review"));
+	const set = await discoverDefinitions({ ...options, packageDirs: [{ dir: packageDir, namespace: "pkg" }] });
+	assert.equal(set.active.get("explore")?.description, "user explore");
+	assert.equal(set.active.get("plan")?.description, "user plan");
+	assert.equal(set.active.has("Explore"), false);
+	assert.equal(set.active.has("Plan"), false);
+	assert.equal(set.active.get("pkg:adversarial-review")?.description, "package review");
+	assert.equal(set.active.get("review")?.builtIn, "review");
+});
+
+test("legacy review definitions share the canonical slot with normal source precedence", async (t) => {
+	const { cwd, agentDir, options, file } = await fixture(t);
+	await file(join(agentDir, "agents"), "adversarial-review.md", markdown("adversarial-review", "user review", "tools: [read, bash]\nextensions: false\n", "Custom review prompt"));
+	let set = await discoverDefinitions(options);
+	assert.equal(set.active.has("adversarial-review"), false);
+	assert.equal(set.list.filter((d) => d.agentType === "review").length, 1);
+	assert.equal(set.active.get("review")?.source, "user");
+	assert.equal(set.active.get("review")?.builtIn, undefined);
+	assert.equal(set.active.get("review")?.prompt, "Custom review prompt");
+	assert.deepEqual(set.active.get("review")?.tools, ["read", "bash"]);
+	assert.equal(set.active.get("review")?.isolated, true);
+	await file(join(cwd, ".pi/agents"), "review.md", markdown("review", "project review"));
+	set = await discoverDefinitions(options);
+	assert.equal(selectDefinition(set, "adversarial-review").definition?.description, "project review");
+	const policyDir = join(cwd, "policy");
+	await file(policyDir, "review.md", markdown("adversarial-review", "policy review", "tools: []\n"));
+	set = await discoverDefinitions({ ...options, policyDir, flagJson: '{"review":{"description":"flag review"}}' });
+	assert.equal(set.active.get("review")?.source, "policy");
+	assert.deepEqual(set.active.get("review")?.tools, []);
+	assert.equal(set.active.has("adversarial-review"), false);
 });
 
 test("user and project fork collision replaces the built-in without fork semantics", async (t) => {

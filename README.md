@@ -204,6 +204,30 @@ Use `/grok-style autonomy off` to require an explicit user request before in-pro
 
 Diff and comment colors are optional `#rrggbb` values under `colors` in the same file. The keys are `diffInsert` (`#063806`), `diffDelete` (`#420e14`), `diffInsertChar` (`#0c5b10`), `diffDeleteChar` (`#6c1a22`), `comment` (`#a0a8b8`), `commentDoc` (`#aab4c6`), and `commentDocEmphasized` (`#b4bed4`). Set one with `/grok-style color diffInsertChar #0c5b10`, or `/grok-style color comment reset` to restore its default. Comment colors apply when `bat` is available. Run `/reload` after changing them.
 
+### Subagent models and reasoning
+
+With `integrations/subagents.ts`, configure each agent's defaults under `subagents` in the same `~/.pi/agent/grok-style.json` file. Merge this into your existing settings; this example shows the defaults:
+
+```json
+{
+  "subagents": {
+    "explore": { "model": "inherit", "effort": "medium" },
+    "plan": { "model": "inherit", "effort": "high" },
+    "review": { "model": "inherit", "effort": "high" },
+    "general-purpose": { "model": "inherit", "effort": "medium" },
+    "researcher": { "model": "inherit", "effort": "high" }
+  }
+}
+```
+
+`model` accepts `inherit`, a model alias such as `sonnet`, or `provider/model-id`. `effort` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; the selected model may clamp unsupported levels. Either field is optional; remove it to restore the agent definition's default. Custom agent types can use the same mapping. Invalid entries report a configuration error instead of silently ignoring misspelled fields.
+
+Run `/reload` after editing. New launches use the changed defaults; existing agent conversations retain their model and effort. These preferences override agent-definition defaults, while explicit launch parameters still win. `PI_SUBAGENT_MODEL_FORCE` and `PI_SUBAGENT_EFFORT` retain their forced-override behavior for in-process agents and local Pi panes. Conversation forks always inherit the parent's model and effort. Remote Pi panes receive an explicitly launched or configured model name; without one, they use the remote Pi default. The standalone Herdr extension does not read these Grok settings.
+
+The canonical type names are `explore`, `plan`, and `review` (formerly `Explore`, `Plan`, and `adversarial-review`); old names remain accepted for compatibility.
+
+### Communication Style
+
 Communication style adds Grok Build's reply rules: complete sentences, lead with the answer, and a standalone final message. It also asks for standalone inline-code file references such as `src/app.ts:42`. On Linux, those references use this extension's `grok-pi-file://` URL handler. Clicks return to their owning Pi session. Image, video, and HTML file references (such as `screenshots/result.png`, `clips/demo.mp4`, and `preview.html`) open in the desktop's default application via `xdg-open`; other file references call the same Cursor workspace opener as code-row Ctrl+click, `/open`, and `ctrl+alt+o`: it reuses the workspace window, opens the workspace root when needed, and shares the once-per-session `compile_commands.json` refresh. Code links preserve their line and column, and neither kind of link replaces the last-edited target. Web links and Cursor's own URL association are unchanged. No Pi modifications are required.
 
 The extension refreshes that handler when a session starts. Its `Exec` line is unquoted, because `xdg-open` keeps quote marks and otherwise opens the link in the web browser. Run `npm run setup:file-links` once from this checkout if a session has not started yet, then `/reload` in Pi. This installs a user-level desktop URL handler pointing to this checkout and the current Node executable; rerun setup if either moves. It works with Pi's fullscreen link activation and terminal-owned links in regular mode. The helper communicates over a private, user-owned Unix socket and can only open targets already rendered by the owning extension instance. It never launches an application independently; the owning Pi session opens the target. Links expire when their Pi session closes or reloads; use the freshly rendered links after `/reload`. Other platforms retain `cursor://` links through the system handler.
@@ -222,7 +246,7 @@ The centered viewer has a full border and a top-right **Close** button. In the v
 
 ### Combined and standalone Herdr
 
-Inside Herdr, a herdr pane (`HERDR_ENV=1`) or a Herdr app terminal (`HC_TERMINAL_ID`), the combined entrypoint additionally attaches [herdr-subagents](packages/herdr-subagents/README.md) as a headless pane backend, not a second set of tools. `Agent` calls from the top-level session run in a Herdr pane; `backend: "in-process"` keeps one in-process. The engine sends the pane its resolved definition: prompt, model and effort, and for a restricted definition such as Explore or Plan, the tool allow-list compiled against this session's tools. An `Agent(type)` grant drops `Agent`; Claude Code keeps only the built-in tools it can enforce. The pane loads its own context files. Definitions with preloaded skills, agent memory, hooks or MCP servers, and forks, worktree, workflow, skill and nested agents, including a pane child's own agents, run in-process; an explicit pane request for such a definition is refused. `/grok-style panes off` runs every agent in-process unless a call requests `backend: "pane"`, a saved `machine`, or `runtime: "claude-code"`. Request those only when the user asks for the corresponding pane, remote machine or Claude Code runtime. The combined setup uses the engine's schema and autonomy guidance; `/grok-style autonomy off` selects explicit-only delegation guidance. The standalone runner's policy does not replace it. The combined `Agent` tool retains the runner's saved-machine names and remote-launch guidance. In the Herdr app, use `hc ls --json` to discover existing remote working directories, then pass the saved machine and its confirmed absolute project path to `Agent`; the backend owns SSH and startup.
+Inside Herdr, a herdr pane (`HERDR_ENV=1`) or a Herdr app terminal (`HC_TERMINAL_ID`), the combined entrypoint additionally attaches [herdr-subagents](packages/herdr-subagents/README.md) as a headless pane backend, not a second set of tools. `Agent` calls from the top-level session run in a Herdr pane; `backend: "in-process"` keeps one in-process. The engine sends the pane its resolved definition: prompt, model and effort, and for a restricted definition such as explore, plan, or review, the tool allow-list compiled against this session's tools. An `Agent(type)` grant drops `Agent`; Claude Code keeps only the built-in tools it can enforce. The pane loads its own context files. Definitions with preloaded skills, agent memory, hooks or MCP servers, and forks, worktree, workflow, skill and nested agents, including a pane child's own agents, run in-process; an explicit pane request for such a definition is refused. `/grok-style panes off` runs every agent in-process unless a call requests `backend: "pane"`, a saved `machine`, or `runtime: "claude-code"`. Request those only when the user asks for the corresponding pane, remote machine or Claude Code runtime. The combined setup uses the engine's schema and autonomy guidance; `/grok-style autonomy off` selects explicit-only delegation guidance. The standalone runner's policy does not replace it. The combined `Agent` tool retains the runner's saved-machine names and remote-launch guidance. In the Herdr app, use `hc ls --json` to discover existing remote working directories, then pass the saved machine and its confirmed absolute project path to `Agent`; the backend owns SSH and startup.
 
 To use the runner without Grok styling:
 

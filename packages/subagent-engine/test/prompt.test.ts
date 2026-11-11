@@ -65,9 +65,9 @@ test("unsafe memory gives an unavailable warning without index or save instructi
 
 test("built-in role constraints survive the system wrapper without being supplied to custom namesakes", () => {
 	const builtins = builtInDefinitions({ forkEnabled: false });
-	const explore = childSystemPrompt({ definition: builtins.find((item) => item.agentType === "Explore")!, cwd: "/repo", isBackground: true });
+	const explore = childSystemPrompt({ definition: builtins.find((item) => item.agentType === "explore")!, cwd: "/repo", isBackground: true });
 	for (const required of ["never create report files", "quick", "medium", "very thorough", "you do not review or audit it", "Do not change files or delegate"]) assert(explore.includes(required));
-	const plan = childSystemPrompt({ definition: builtins.find((item) => item.agentType === "Plan")!, cwd: "/repo", isBackground: false });
+	const plan = childSystemPrompt({ definition: builtins.find((item) => item.agentType === "plan")!, cwd: "/repo", isBackground: false });
 	assert(plan.includes("3–5 critical file paths"));
 	assert(plan.includes("ordered implementation sequence"));
 	const custom = childSystemPrompt({ definition: { ...definition, agentType: "Explore" }, cwd: "/repo", isBackground: false });

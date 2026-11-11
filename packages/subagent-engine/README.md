@@ -33,8 +33,9 @@ Background agents report through a `subagent-notification` message. If the main 
 Built-in types:
 
 - **`general-purpose`** has the parent's tools.
-- **`Explore`** locates code and is read-only.
-- **`Plan`** produces an implementation plan and is read-only.
+- **`explore`** locates code and is read-only.
+- **`plan`** produces an implementation plan and is read-only.
+- **`review`** provides read-only adversarial review of a change or plan: assumptions, missing tests and incorrect claims. Use it only when asked for a review, not to self-review work a separate reviewer will check. It does not implement changes.
 - **`researcher`** answers questions from high-trust primary sources and is read-only. It inherits an available `web_search` tool even in the background; the engine does not bundle a web lookup provider. Research findings include source URLs or absolute paths and verification limits.
 - **`fork`** inherits the conversation, system prompt, model and tools. It's off by default; enable it with `PI_SUBAGENT_FORK=1`.
 
@@ -47,9 +48,11 @@ To add your own, write markdown files with frontmatter: `name`, `description`, `
 5. Command line: `PI_AGENTS_JSON`
 6. Managed policy: `PI_AGENTS_POLICY_DIR`
 
+The renamed built-ins use canonical lowercase names. Legacy `Explore` and `Plan` invocations still work, and `adversarial-review` is an alias for `review`. Discovery normalizes those names before applying the source precedence above, so an existing user `adversarial-review` definition overrides the built-in `review` rather than adding a second offered type. Its prompt, tools and other settings remain intact; overrides do not gain built-in semantics. Within one directory, the last filename in sorted order wins. `Agent(...)` grants use the same canonical names. Other custom names and package namespaces are unchanged.
+
 For Herdr panes, agent-file `keep: true` defaults to keeping the pane open after the agent finishes. An explicit `Agent.keep` overrides this default, including `false`; pinning persists across resumes. Owner-gone cleanup still applies. In-process agents ignore `keep`.
 
-The tool language matches Claude's. `Read`, `Bash`, `Glob` and similar names map to Pi's tools. `Agent(Explore, Plan)` limits which types an agent may launch, and `mcp__server` names a whole MCP server. A deny always wins over an allow.
+The tool language matches Claude's. `Read`, `Bash`, `Glob` and similar names map to Pi's tools. `Agent(explore, plan)` limits which types an agent may launch, and `mcp__server` names a whole MCP server. A deny always wins over an allow.
 
 Skills whose frontmatter sets `context: fork` run as their own agents. The model launches one with `subagent_type: "skill:<name>"`; you launch one with `/skill:<name> [arguments]`. Skills with `disable-model-invocation` can only be launched by you.
 
@@ -104,7 +107,7 @@ How runs behave:
 - Only command hooks are supported.
 - Background usage is shown in notices but isn't added to Pi's own session totals.
 - Parent tools that exist only at runtime can't be copied into a fork; the missing names are recorded.
-- The Explore model cap is opt-in.
+- The explore model cap is opt-in.
 - The delegation thresholds in the guidance are rules of thumb, not measured savings.
 - Workflow: no cloud remote workflows or server-delivered launches, and no reactive (v2) API. Resuming waits until every agent call and journal write from the previous run has finished, a stricter rule than Claude Code's. The VM bounds synchronous script code but doesn't fully harden async boundaries.
 

@@ -8,12 +8,12 @@ export const outcome = (status: RunOutcome["status"] = "completed", resultText =
 	toolStats: { toolUses: 0, byTool: {} }, durationMs: 1,
 });
 export const meta = (agentId = "one", runId = "r1"): AgentMeta => ({
-	agentId, agentType: "Explore", description: "inspect build", rootSessionId: "root", spawnDepth: 1, cwd: "/cwd", sessionFile: "/child.jsonl", taskListId: "root", backend: "in-process",
-	definition: { agentType: "Explore", description: "Explore", prompt: "", source: "built-in", disallowedTools: [], skills: [], diagnostics: [] },
+	agentId, agentType: "explore", description: "inspect build", rootSessionId: "root", spawnDepth: 1, cwd: "/cwd", sessionFile: "/child.jsonl", taskListId: "root", backend: "in-process",
+	definition: { agentType: "explore", description: "Explore", prompt: "", source: "built-in", disallowedTools: [], skills: [], diagnostics: [] },
 	model: { effective: "grok-4.6" }, effort: { effective: "high" }, stopGeneration: 0, runs: [{ runId, invocation: "spawn", startedAt: 1, status: "running" }],
 });
 export const agentSnapshot = (agentId = "one", runId = "r1"): AgentSnapshot => ({
-	agentId, runId, agentType: "Explore", description: "inspect build", backend: "in-process", disposition: "running", running: true,
+	agentId, runId, agentType: "explore", description: "inspect build", backend: "in-process", disposition: "running", running: true,
 	status: "running", startedAt: 1, model: "grok-4.6", effort: "high", depth: 1,
 });
 export class FakeEngine implements ActivityEngine {

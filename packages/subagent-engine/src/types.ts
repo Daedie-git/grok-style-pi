@@ -6,7 +6,7 @@ export type RunId = string;
 // ---- Definitions (plan §1) ----
 
 export type DefinitionSource = "built-in" | "package" | "user" | "project" | "flag" | "policy";
-export type BuiltInKind = "general-purpose" | "Explore" | "Plan" | "researcher" | "fork";
+export type BuiltInKind = "general-purpose" | "explore" | "plan" | "review" | "researcher" | "fork";
 export type MemoryScope = "user" | "project" | "local";
 
 export interface HookCommand {

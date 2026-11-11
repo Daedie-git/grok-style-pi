@@ -3,7 +3,7 @@ import { test, type TestContext } from "node:test";
 import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "../../herdr-subagents/src/herdr/backend.ts";
 import { HerdrBackendAdapter } from "../src/backends/herdr.ts";
 import { createHarness, toolResultText, until, type Harness, type Script } from "./fixtures/harness.ts";
-import { ROOT_CALLER } from "../src/engine.ts";
+import { ROOT_CALLER, type AgentDefaults } from "../src/engine.ts";
 import { SubagentAdapter } from "../../../src/subagents/adapter.ts";
 
 type Status = "running" | "blocked" | "completed" | "failed" | "stopped" | "needs-answer";
@@ -93,9 +93,9 @@ function firstProxy(harness: Harness) {
 	assert(proxy, "Agent must create an engine proxy");
 	return proxy;
 }
-async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean; agentFiles?: Record<string, string> } = {}) {
+async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean; agentFiles?: Record<string, string>; agentDefaults?: AgentDefaults } = {}) {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
-	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, agentFiles: options.agentFiles, env: options.env, child: () => () => ({ text: "Unexpected in-process child" }) });
+	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, agentFiles: options.agentFiles, env: options.env, agentDefaults: options.agentDefaults, child: () => () => ({ text: "Unexpected in-process child" }) });
 	const fake = new FakeHerdr();
 	fake.child = options.paneChild === true;
 	fake.rootHasNotice = () => rootNotices(harness).length > 0;
@@ -354,7 +354,25 @@ test("a Claude Code pane falls back to the definition's native model and effort"
 	assert.equal(fake.spawns[0].thinking, "high");
 });
 
-test("a machine pane uses that machine's default model unless the caller names one", { timeout: 20_000 }, async (t) => {
+test("configured review defaults reach both local and machine pane requests", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [
+			{ name: "Agent", args: { ...assignment, name: "local", subagent_type: "review" } },
+			{ name: "Agent", args: { ...assignment, name: "remote", machine: "laptop", subagent_type: "adversarial-review" } },
+		] } : { text: "Parent useful work" },
+	{ agentDefaults: { review: { model: "anthropic/claude-sonnet-4-5", effort: "low" } } });
+	await harness.parent.prompt("Review in local and remote panes", { source: "extension" });
+	assert.equal(fake.spawns.length, 2);
+	for (const request of fake.spawns) {
+		assert.equal(request.model, "anthropic/claude-sonnet-4-5");
+		assert.equal(request.thinking, "low");
+		assert.equal(request.subagentType, "review");
+		assert.deepEqual(request.resolved?.allowedTools, ["read", "grep", "find", "ls", "bash"]);
+	}
+	assert.equal(fake.spawns[1].machine, "laptop");
+});
+
+test("a machine pane uses the definition's model unless the caller overrides it", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => index === 0
 		? { tools: [
 			{ name: "Agent", args: { ...assignment, name: "default", machine: "laptop", subagent_type: "local-model" } },
@@ -363,11 +381,11 @@ test("a machine pane uses that machine's default model unless the caller names o
 	{ agentFiles: { "local-model.md": "---\nname: local-model\ndescription: local\nmodel: claude-sonnet-5-5\neffort: high\n---\nWork." } });
 	await harness.parent.prompt("Machine panes", { source: "extension" });
 	assert.equal(fake.spawns.length, 2);
-	assert.equal(fake.spawns[0].model, undefined);
+	assert.equal(fake.spawns[0].model, "claude-sonnet-5-5");
 	assert.equal(fake.spawns[0].thinking, "high");
 	assert.equal(fake.spawns[1].model, "openai-codex/gpt-6.1-sol");
 	const shown = [...harness.engine.control.conversations.values()].map((proxy) => proxy.meta.model?.effective);
-	assert.deepEqual(shown, [undefined, "openai-codex/gpt-6.1-sol"], "the panel shows only what the machine was told to run");
+	assert.deepEqual(shown, ["claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"], "the panel shows only what the machine was told to run");
 });
 
 test("a definition's turn limit reaches a Claude Code pane request, for the runner to refuse", { timeout: 20_000 }, async (t) => {

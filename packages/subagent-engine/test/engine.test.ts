@@ -40,16 +40,22 @@ for (const background of [false, true]) test(`needs_answer ends a ${background ?
 	assert.match(result, /Reply with SendMessage.*resume the same child/);
 });
 
-test("forks do not register needs_answer", { timeout: 20_000 }, async (t) => {
+test("forks inherit parent model and effort despite configured defaults and do not register needs_answer", { timeout: 20_000 }, async (t) => {
 	const harness = await createHarness({
 		env: { PI_SUBAGENT_FORK: "1" },
+		agentDefaults: { fork: { model: "not-a-real-provider/not-a-model", effort: "low" } },
 		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Fork check", prompt: "Report once", subagent_type: "fork", run_in_background: false } }] } : { text: "Done" },
 		child: () => () => ({ text: "Fork report" }),
 	});
 	t.after(() => harness.close());
 	await harness.parent.prompt("Go", { source: "extension" });
 	assert.equal(harness.children.size, 1);
-	for (const child of harness.children.values()) assert.ok(!child.getAllTools().some((tool) => tool.name === "needs_answer"));
+	for (const child of harness.children.values()) {
+		assert.ok(!child.getAllTools().some((tool) => tool.name === "needs_answer"));
+		assert.equal(child.model?.id, harness.parent.model?.id);
+		assert.equal(child.model?.provider, harness.parent.model?.provider);
+		assert.equal(child.thinkingLevel, harness.parent.thinkingLevel);
+	}
 });
 
 test("foreground Agent returns the child's report to the parent tool call", { timeout: 20_000 }, async (t) => {
@@ -223,7 +229,7 @@ test("agent listing reaches each request once, persists, and later definitions a
 	t.after(() => harness.close());
 	await harness.parent.prompt("First", { source: "extension" });
 	assert.match(seen[0], /Available agent types/);
-	assert.match(seen[0], /Explore/);
+	assert.match(seen[0], /explore/);
 	assert.equal((seen[0].match(/Available agent types/g) ?? []).length, 1);
 	const { mkdirSync, writeFileSync } = await import("node:fs");
 	const { join } = await import("node:path");

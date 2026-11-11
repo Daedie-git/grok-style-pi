@@ -1,4 +1,5 @@
 import type { AgentDefinition } from "../types.ts";
+import { canonicalAgentType } from "../definitions/names.ts";
 
 export interface ToolLite { name: string; mcpServer?: string; source?: string }
 export interface SurfaceInput {
@@ -76,7 +77,7 @@ export function compileToolSurface(input: SurfaceInput): ToolSurface {
 			return { names: [] };
 		}
 		if (!poolNames.has(canonical)) result.unavailable.push(value);
-		return { names: canonical ? [canonical] : [], types: agent ? unique(agent[1].split(",").map((type) => type.trim()).filter(Boolean)) : undefined };
+		return { names: canonical ? [canonical] : [], types: agent ? unique(agent[1].split(",").map((type) => canonicalAgentType(type.trim())).filter(Boolean)) : undefined };
 	}
 	const denied = new Set(definition.disallowedTools.flatMap((name) => expand(name).names));
 	const inherited = definition.tools === undefined || definition.tools.includes("*");

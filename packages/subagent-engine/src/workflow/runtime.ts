@@ -7,7 +7,8 @@ import type { JournalEvent } from "./journal.ts";
 import { parseWorkflowSource } from "./meta.ts";
 import { compileBody } from "./compile.ts";
 import { chooseReplay, createReplayState, type ReplayState } from "./replay.ts";
-import { defaultConcurrency, FifoPermits } from "./permits.ts";
+import { FifoPermits } from "./permits.ts";
+import { workflowLimits } from "./plan.ts";
 import { runInRealm } from "./vm.ts";
 
 export interface WorkflowRunResult {
@@ -59,7 +60,9 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 	const signal = input.signal ?? new AbortController().signal;
 	const env = input.env ?? process.env;
 	const obligations = input.obligations ?? new WorkflowObligations();
-	const permits = new FifoPermits(input.concurrency ?? defaultConcurrency(env));
+	const parsedSource = parseWorkflowSource(input.source);
+	const limits = workflowLimits(parsedSource.meta, env, input);
+	const permits = new FifoPermits(limits.concurrency);
 	const budget = new OutputBudget(input.budgetTotal ?? null, () => input.host.sessionOutputTokens());
 	const phaseIndices = new Map<string, number>();
 	const announced = new Set<string>(), children = new Map<string, number>();
@@ -71,7 +74,7 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 	function failure(index: number, error: string): void { failures.push({ index, error }); log(`Workflow slot ${index}: ${error}`); }
 	function admit(): void {
 		if (signal.aborted) throw new Error("Workflow aborted");
-		if (agentCount >= (input.maxCalls ?? 1000)) throw new Error("Workflow logical agent call limit reached");
+		if (agentCount >= limits.maxCalls) throw new Error("Workflow logical agent call limit reached");
 		budget.check();
 	}
 	function phase(title: unknown): string {
@@ -190,15 +193,24 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 		} finally { releaseObligation(); }
 	}
 	async function evaluate(source: string, args: unknown, depth: number, forcedPhase?: string): Promise<unknown> {
-		const parsed = parseWorkflowSource(source);
+		const parsed = depth === 0 ? parsedSource : parseWorkflowSource(source);
 		if (!parsed.meta || parsed.error) throw new Error(parsed.error ?? "Invalid workflow metadata");
 		const compiled = compileBody(parsed.body);
 		if (!compiled.ok) throw new Error(compiled.error);
 		if (depth === 0) await append({ type: "launched", scriptSha256: createHash("sha256").update(source).digest("hex") });
 		for (const entry of parsed.meta.phases) if (!phaseIndices.has(entry.title)) phaseIndices.set(entry.title, phaseIndices.size + 1);
+		// Nested workflows can narrow their own budget while sharing the root's global caps.
+		const nestedLimits = workflowLimits(parsed.meta, env, limits);
+		const nestedPermits = depth ? new FifoPermits(nestedLimits.concurrency) : undefined;
+		let nestedCalls = 0;
+		const invokeAgent = (prompt: unknown, options?: unknown) => {
+			if (!nestedPermits) return agent(prompt, options, forcedPhase);
+			if (nestedCalls++ >= nestedLimits.maxCalls) throw new Error("Workflow logical agent call limit reached");
+			return nestedPermits.run(() => agent(prompt, options, forcedPhase));
+		};
 		return runInRealm({ body: parsed.body, signal, timeoutMs: input.syncTimeoutMs, globals: {
 			args,
-			agent: (prompt: unknown, options?: unknown) => agent(prompt, options, forcedPhase),
+			agent: invokeAgent,
 			phase: (title: unknown) => { if (!depth) currentPhase = phase(title); },
 			log,
 			budget: { total: budget.total, spent: () => budget.spent(), remaining: () => budget.remaining() },

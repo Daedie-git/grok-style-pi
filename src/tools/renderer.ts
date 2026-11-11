@@ -26,7 +26,7 @@ import { openInCursor, type OpenTarget } from "../navigation/open-in-cursor.ts";
 import type { VisualPreparation } from "../rendering/visual-preparation.ts";
 import { languageForPath } from "../rendering/highlight.ts";
 import { createdRows, paintRows, type RenderRow } from "../rendering/diff-render.ts";
-import { countLines, withWriteSummary, writeSummary } from "./write-summary.ts";
+import { countLines, isGeneratedWorkflowWrite, withWriteSummary, writeSummary } from "./write-summary.ts";
 
 export const BUILTIN_TOOL_NAMES = [
 	"read",
@@ -135,6 +135,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 		renderCall(args, theme, context) {
 			const failed = context?.isError;
 			if (write) {
+				const generatedWorkflow = isGeneratedWorkflowWrite(args?.path, args?.content);
 				const path = compactArgs(args, Infinity);
 				const purpose = typeof args?.description === "string" ? sanitizeToolText(args.description).replace(/\s+/g, " ").trim().slice(0, 160) : "";
 				const lines = typeof args?.content === "string" ? countLines(args.content) : undefined;
@@ -143,7 +144,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 					const created = summary?.kind === "created";
 					const verb = failed ? "Failed to write" : created ? "Creating" : summary?.kind === "replaced" ? "Replaced" : summary ? "Wrote" : "Write";
 					const count = summary?.lines ?? lines;
-					const open = context?.state?.grokEdit?.open ?? true;
+					const open = generatedWorkflow ? context?.state?.grokTool?.open ?? context?.expanded ?? false : context?.state?.grokEdit?.open ?? true;
 					const stat = created && !open && count !== undefined
 						? paint(theme, "toolDiffAdded", ` +${count}`) + paint(theme, "muted", "/") + paint(theme, "toolDiffRemoved", "-0")
 						: "";
@@ -151,7 +152,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 					return paint(theme, failed ? "error" : "toolTitle", `◆ ${verb}`) + " " + paint(theme, failed ? "error" : "text", path) + detail;
 				}, (event) => {
 					const created = context?.state?.grokWrite?.kind === "created";
-					const display = context?.state && context.invalidate ? created ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false) : undefined;
+					const display = context?.state && context.invalidate ? created && !generatedWorkflow ? editDisplay(context, context.expanded ?? false) : toolDisplay(context, context.expanded ?? false) : undefined;
 					return handleDiamondClick(event, "header", {
 						display, closeNeedsAlt: created, invalidate: context?.invalidate,
 						openTarget: fileTarget(args, 1, context?.cwd, onModifierOpen),
@@ -190,7 +191,7 @@ function wrapSpecializedRenderer(original: OriginalTool, hooks?: DiamondHooks): 
 			if (summary && context?.state) context.state.grokWrite = summary;
 			const line = edit ? changedLine(result.details) : original.name === "read" && typeof context?.args?.offset === "number" ? context.args.offset : 1;
 			if (edit && context?.state) editDisplay(context, options.expanded).line = line;
-			const defaultOpen = edit || summary?.kind === "created";
+			const defaultOpen = edit || summary?.kind === "created" && !isGeneratedWorkflowWrite(context?.args?.path, context?.args?.content);
 			const display = defaultOpen ? editDisplay(context, options.expanded) : toolDisplay(context, options.expanded);
 			const open = display.open;
 			if (options.isPartial || !open) {

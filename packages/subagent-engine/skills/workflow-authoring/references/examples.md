@@ -7,18 +7,20 @@ Each script below is complete. Pass `args` through the tool's `args` parameter.
 ```js
 export const meta = {
   name: "module-survey",
-  description: "Survey each module for error handling, then summarize common gaps.",
+  description: "Survey up to 16 modules for error handling, then summarize common gaps.",
+  maxAgents: 17,
+  maxConcurrency: 4,
   phases: [{ title: "Survey" }, { title: "Synthesize" }],
 };
 
 const modules = args?.modules;
-if (!Array.isArray(modules) || modules.length === 0) throw new Error("args.modules must be a non-empty array of paths");
+if (!Array.isArray(modules) || modules.length === 0 || modules.length > 16) throw new Error("args.modules must contain 1–16 paths");
 
 phase("Survey");
 const findings = await parallel(modules.map((path, i) => () => agent(
   `Read the module at ${path} (absolute path). List how it handles errors: thrown errors, ignored rejections, ` +
   `missing checks. Report file:line references. Do not edit anything. (survey ${i})`,
-  { label: `survey ${path}`, agentType: "Explore" },
+  { label: `survey ${path}`, agentType: "explore" },
 )));
 
 const failed = modules.filter((_, i) => findings[i] === null);
@@ -39,9 +41,13 @@ Each target is investigated, then independently verified. A `null` result from t
 ```js
 export const meta = {
   name: "find-and-verify",
-  description: "Find a suspected bug in each target and independently verify each finding.",
+  description: "Investigate up to eight targets and independently verify each finding.",
+  maxAgents: 16,
+  maxConcurrency: 4,
   phases: [{ title: "Find" }, { title: "Verify" }],
 };
+
+if (!Array.isArray(args?.targets) || args.targets.length > 8) throw new Error("args.targets must contain at most eight targets");
 
 const verdictSchema = {
   type: "object",
@@ -74,9 +80,13 @@ return args.targets.map((target, i) => ({ path: target.path, verdict: results[i]
 ```js
 export const meta = {
   name: "apply-renames",
-  description: "Apply independent renames, each in its own worktree, and report the branches.",
+  description: "Apply up to eight independent renames in separate worktrees and report the branches.",
+  maxAgents: 8,
+  maxConcurrency: 4,
   phases: [{ title: "Edit" }],
 };
+
+if (!Array.isArray(args?.renames) || args.renames.length > 8) throw new Error("args.renames must contain at most eight renames");
 
 const outcomes = await parallel(args.renames.map((rename, i) => () => agent(
   `In this repository, rename ${rename.from} to ${rename.to} everywhere it is used, then run the tests that ` +
@@ -94,13 +104,15 @@ The completion notice names each kept worktree and its branch. Review the branch
 ```js
 export const meta = {
   name: "survey-then-plan",
-  description: "Run the module-survey workflow, then plan fixes for its top gaps.",
+  description: "Survey up to 16 modules, then plan fixes for their top gaps.",
+  maxAgents: 18,
+  maxConcurrency: 4,
 };
 
 const survey = await workflow("module-survey", { modules: args.modules });
 return await agent(
   `Plan fixes for the most severe gaps in this summary. Give an ordered list with files to change.\n\n${survey.summary}`,
-  { label: "plan", agentType: "Plan" },
+  { label: "plan", agentType: "plan" },
 );
 ```
 

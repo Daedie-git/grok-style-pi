@@ -8,6 +8,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { INSERT_BG } from "../src/rendering/diff-render.ts";
 import { withWriteSummary, writeSummary, countLines } from "../src/tools/write-summary.ts";
 import { wrapWithDiamondRenderer } from "../src/tools/renderer.ts";
+import { assertDiamondGestures } from "./fixtures/diamond-gestures.ts";
 
 const theme = { fg: (token: string, text: string) => `\x1b[${token === "toolDiffAdded" ? 32 : token === "toolDiffRemoved" ? 31 : 90}m${text}\x1b[0m` };
 
@@ -44,6 +45,67 @@ test("writes distinguish new files from replacements and render contents or colo
 			assert.match(stripTerminalSequences(output), /new/);
 		}
 	}
+});
+
+test("generated workflow writes start collapsed and retain source, snapshots and diamond gestures", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "grok-workflow-write-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+	const source = "/* Generated workflow */\n// Plan\nexport const meta = { name: 'review', description: 'Review changes', phases: [] };\nlog('source remains available');\n";
+	for (const [path, content] of [
+		["workflow.js", source],
+		["generated.mjs", source],
+		["inline.js", "export/* export trivia */const// declaration trivia\nmeta/* name trivia */=/* initializer trivia */{ name: 'inline', description: 'Inline comments' };\nlog('source remains available');"],
+	]) {
+		const opened: unknown[] = [];
+		const tool = wrapWithDiamondRenderer(withWriteSummary(createWriteToolDefinition, cwd), { onModifierOpen: target => opened.push(target) });
+		const context = { args: { path, content }, state: {}, expanded: false, cwd, invalidate() {} };
+		const header = tool.renderCall(context.args, theme, context) as any;
+		const result = await tool.execute("write", context.args);
+		const body = () => tool.renderResult(result, { expanded: context.expanded }, theme, context);
+		const isOpen = () => body().render(100).length > 0;
+		assert.equal(isOpen(), false, `${path}: generated source starts collapsed`);
+		assert.equal(stripTerminalSequences(header.render(100)[0]), `◆ Creating ${path} +${countLines(content)}/-0`);
+		assert.equal(await readFile(join(cwd, path), "utf8"), content);
+		assert.equal(writeSummary(result.details)?.preview, content);
+		header.handleMouse({ type: "click", button: "left" });
+		assert.match(stripTerminalSequences(body().render(100).join("\n")), /source remains available/);
+		const expandedBody = body() as any;
+		expandedBody.render(100);
+		assertDiamondGestures(path, { header: header.handleMouse, body: expandedBody.handleMouse, isOpen, closeNeedsAlt: true, opened: () => opened });
+		context.expanded = true;
+		assert.ok(isOpen(), "Ctrl+O expands generated source");
+		context.expanded = false;
+		assert.equal(isOpen(), false, "Ctrl+O collapses generated source");
+	}
+});
+
+test("ordinary new source writes remain open, including JavaScript and non-workflow metadata", () => {
+	for (const [path, content] of [
+		["source.js", "export const value = 1;"],
+		["many-comments.js", "/* trivia */\n".repeat(1_000) + "export const value = 1;"],
+		["malformed-comment.js", "/* unterminated comment\nexport const meta = { name: 'comment', description: 'Not code' };"],
+		["malformed-inline.js", "export const meta /* unterminated = { name: 'comment', description: 'Not code' };"],
+		["identifier.js", "export const metadata = { name: 'ordinary', description: 'Different identifier' };"],
+		["source.mjs", "// export const meta = {}\nexport const value = 1;"],
+		["source.js", "const value = 1;\nexport const meta = { name: 'ordinary', description: 'Not first' };"],
+		["source.ts", "export const meta = { name: 'typed', description: 'Not workflow JS' };"],
+	]) {
+		const tool = wrapWithDiamondRenderer(createWriteToolDefinition(process.cwd()));
+		const context = { args: { path, content }, state: {} };
+		const result = { content: [], details: { grokWrite: { kind: "created", lines: countLines(content), preview: content } } };
+		assert.ok(tool.renderResult(result, { expanded: false }, theme, context).render(100).length, path);
+	}
+});
+
+test("unrecorded workflow writes remain collapsed but expand their recorded source", () => {
+	const tool = wrapWithDiamondRenderer(createWriteToolDefinition(process.cwd()));
+	const context = { args: { path: "workflow.js", content: "export const meta = { name: 'history', description: 'Recorded source' };\nlog('history');" }, state: {}, expanded: false, invalidate() {} };
+	const result = { content: [{ type: "text", text: "Successfully wrote" }] };
+	const render = () => tool.renderResult(result, { expanded: context.expanded }, theme, context).render(100);
+	assert.deepEqual(render(), []);
+	(tool.renderCall(context.args, theme, context) as any).handleMouse({ type: "click", button: "left" });
+	assert.match(stripTerminalSequences(render().join("\n")), /Previous contents were not recorded/);
+	assert.match(stripTerminalSequences(render().join("\n")), /log\('history'\)/);
 });
 
 test("concurrent writes to one path snapshot the preceding queued write", async (t) => {

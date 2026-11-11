@@ -13,6 +13,36 @@ export type WriteSummary = {
 	note?: string;
 };
 
+// Presentation-only signature, not workflow validation. Keep engine parsing and
+// execution out of the generic write renderer; comments may precede the export
+// or separate its tokens, just as whitespace can.
+export function isGeneratedWorkflowWrite(path: unknown, content: unknown): boolean {
+	if (typeof path !== "string" || !/\.(?:js|mjs)$/i.test(path) || typeof content !== "string") return false;
+	let offset = 0;
+	for (const token of ["export", "const", "meta", "=", "{"]) {
+		// Consume each trivia span once, without trying alternate comment partitions.
+		while (offset < content.length) {
+			if (/\s/.test(content[offset])) { offset++; continue; }
+			if (content.startsWith("//", offset)) {
+				offset += 2;
+				while (offset < content.length && !/[\r\n\u2028\u2029]/.test(content[offset])) offset++;
+				continue;
+			}
+			if (content.startsWith("/*", offset)) {
+				const end = content.indexOf("*/", offset + 2);
+				if (end < 0) return false;
+				offset = end + 2;
+				continue;
+			}
+			break;
+		}
+		if (!content.startsWith(token, offset)) return false;
+		offset += token.length;
+		if (/^[a-z]/.test(token) && /[\w$]/.test(content[offset] ?? "")) return false;
+	}
+	return true;
+}
+
 export function countLines(text: string): number {
 	if (!text) return 0;
 	let lines = text.endsWith("\n") ? 0 : 1;

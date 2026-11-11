@@ -78,7 +78,7 @@ Skills whose frontmatter sets `context: fork` run as their own agents. The model
 
 ## Workflow
 
-`Workflow` runs a script that coordinates several agents. The script starts with a literal `export const meta = { name, description, phases }`, and its body uses:
+`Workflow` runs a script that coordinates several agents. The script starts with a literal `export const meta = { name, description, maxAgents, maxConcurrency, phases }`, and its body uses:
 
 - `agent(prompt, opts)` returns the agent's final text, or validated data when `opts.schema` is set. If the agent fails, it returns `null`.
 - `parallel([() => ...])` runs all its callbacks, keeps their order, and never fails fast.
@@ -89,12 +89,12 @@ Skills whose frontmatter sets `context: fork` run as their own agents. The model
 
 Where scripts come from and who approves them:
 
-- **Inline and file scripts** need your approval of the exact text, unless you set `PI_WORKFLOW_APPROVE=1`.
+- **Inline and file scripts** show a concise plan: description, phases, maximum agent-task count, and effective concurrency limit. Choose **Run workflow**, **View source**, or **Cancel**. Full source inspection is optional; edits in that viewer are ignored, and execution always uses the immutable approved snapshot, even if its file changes during approval. Long scripts do not force a source dump or a separate auto-approval setting. Headless sessions still require `PI_WORKFLOW_APPROVE=1`.
 - **Saved workflows** run without asking. They are `.js` files in `~/.pi/agent/workflows` and in the project's `.pi/workflows` and `.claude/workflows` folders, the project ones only when the project is trusted.
 
 How runs behave:
 
-- **Agents and concurrency.** Each `agent()` is a normal engine agent, but it can't use `Agent`, `Workflow` or `needs_answer` itself. At most `min(16, max(2, cores - 2))` agents run at once (`PI_WORKFLOW_CONCURRENCY`), and a run makes at most 1,000 agent calls.
+- **Agents and concurrency.** Each `agent()` is a normal engine agent, but it can't use `Agent`, `Workflow` or `needs_answer` itself. Declare literal `maxAgents` (0–1,000) and `maxConcurrency` (1–256) for new scripts. The runner enforces these limits; a script can narrow but never widen host or parent limits. The root budget includes nested and cached agent tasks; retries repeat a task. Legacy scripts without these fields retain the host limits: at most `min(16, max(2, cores - 2))` agents run at once (`PI_WORKFLOW_CONCURRENCY`), with at most 1,000 logical agent tasks.
 - **Determinism.** `Date.now()`, `new Date()` without arguments, and `Math.random()` are unavailable, so a run can be replayed.
 - **Resume.** `resumeFromRunId` re-runs the script from the start. Completed `agent()` calls whose prompt and options haven't changed return their saved results instantly; edited or new calls run again. Stop the old run with `TaskStop` first.
 - **Not a sandbox.** Scripts run in a restricted VM inside the Pi process.

@@ -17,9 +17,15 @@ The first statement must be a literal metadata object, and nothing may be comput
 export const meta = {
   name: "compare-parsers",
   description: "Compare two parser implementations and report differences.",
+  maxAgents: 3,
+  maxConcurrency: 2,
   phases: [{ title: "Investigate" }, { title: "Compare" }],
 };
 ```
+
+Set `maxAgents` to the intended upper bound on agent tasks, counting mapped items, dependent stages, review and correction passes, and nested workflows. Set `maxConcurrency` to the intended peak parallelism. These are literal integers, not expressions: `maxAgents` accepts 0–1,000 and `maxConcurrency` accepts 1–256. The runner enforces both and may apply a lower host limit. Retries repeat one task; cached tasks still count toward the task budget.
+
+Explain the goal, phases, agent-task count and peak concurrency briefly before invoking `Workflow`. Pass a new script through `Workflow.script`; the tool saves it automatically. Use `scriptPath` when editing or reusing an existing script. Approval shows the plan and limits, with full source inspection available separately.
 
 Everything after it is the body, run as the inside of an `async` function. You can use `await` and `return` at the top level. There is no `main()`, and you can't use `import`, `require`, `process`, `fs` or `fetch`. `args` holds the value passed as the tool's `args`.
 
@@ -59,11 +65,11 @@ The value you `return` becomes the workflow's result in its completion notice.
   - **What stays reusable:** editing only post-processing (formatting, merging) keeps all agent work, and changing `label` or `phase` doesn't invalidate a result.
   - **What forces a re-run:** changing a prompt, an option, or the order of calls re-runs from that call onward.
   - Stop the old run first; resuming a run that is still running is refused.
-- **Inline scripts need approval.** Inline and file scripts need the user's approval of their exact text. Saved workflows (`.js` files in `~/.pi/agent/workflows` or a trusted project's `.pi/workflows`) run directly.
+- **Dynamic scripts need approval.** Inline and file scripts show a concise description, phases, agent-task budget and concurrency limit, with Run, View source and Cancel choices. Source inspection is optional, and the approved source snapshot cannot change while the user decides. Legacy scripts without declared limits use the host defaults; declare meaningful limits for new scripts. Saved workflows (`.js` files in `~/.pi/agent/workflows` or a trusted project's `.pi/workflows`) run directly.
 
 ## Quality checklist
 
-1. **Shape.** Is the work genuinely parallel or staged? If it's one task, use a single `Agent` instead.
+1. **Shape and plan.** Is the work genuinely parallel or staged? If it's one task, use a single `Agent` instead. Do the description, phases and declared limits accurately cover the intended run, and has the user received that short plan?
 2. **Prompts.** Can each prompt be understood by someone who has never seen this conversation?
 3. **Combinators.** Are independent tracks inside `parallel` or `pipeline`, and dependent steps sequential?
 4. **Data.** Do structured results use `schema`?

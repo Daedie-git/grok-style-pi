@@ -36,6 +36,44 @@ test("public workflow entrypoint runs approved bytes, copies args/results and us
 	assert.deepEqual(h.requests[0].disallowedTools, ["Agent", "Workflow", "SendUserMessage"]);
 });
 
+test("metadata agent budgets are enforced for root and nested workflows without widening host limits", async () => {
+	for (const nested of [false, true]) {
+		const h = host();
+		const child = "export const meta={name:'bounded',description:'One agent only',maxAgents:1}; await agent('first'); return await agent('over budget');";
+		if (nested) h.named.set("bounded", child);
+		const result = await h.run("return await workflow('bounded');", { source: nested ? source("return await workflow('bounded');") : child });
+		assert.equal(result.status, "failed");
+		assert.match(result.error!, /logical agent call limit/);
+		assert.deepEqual(h.requests.map(request => request.prompt), ["first"]);
+	}
+	const h = host();
+	const expanded = "export const meta={name:'bounded',description:'Cannot widen host',maxAgents:10}; await agent('first'); return await agent('over budget');";
+	assert.equal((await h.run("", { source: expanded, maxCalls: 1 })).status, "failed");
+	assert.equal(h.requests.length, 1);
+	const none = await host().run("", { source: "export const meta={name:'no-agents',description:'No agents',maxAgents:0}; return 42;" });
+	assert.equal(none.status, "completed");
+	assert.equal(none.result, 42);
+});
+
+test("metadata concurrency is enforced for root and nested workflows", async () => {
+	for (const nested of [false, true]) {
+		let running = 0, peak = 0;
+		const h = host(async request => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise<void>(resolve => setImmediate(resolve));
+			running--;
+			return { status: "completed", agentId: request.prompt, text: request.prompt, outputTokens: 1 };
+		});
+		const child = "export const meta={name:'serial',description:'Serial agents',maxAgents:3,maxConcurrency:1}; return await parallel([()=>agent('a'),()=>agent('b'),()=>agent('c')]);";
+		if (nested) h.named.set("serial", child);
+		const result = await h.run("return await workflow('serial');", { concurrency: 4, ...(nested ? {} : { source: child }) });
+		assert.equal(result.status, "completed", result.error);
+		assert.deepEqual(result.result, ["a", "b", "c"]);
+		assert.equal(peak, 1);
+	}
+});
+
 test("VM defaults expose no host process, filesystem, network or dynamic code capabilities", async () => {
 	const result = await runInRealm({ globals: {}, body: `
 		const blocked=[];

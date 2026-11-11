@@ -291,6 +291,66 @@ test("resumeFromRunId refuses a still-running workflow before registering anothe
 	assert.equal(workflowNotice(harness, original.taskId), undefined);
 });
 
+test("workflow approval presents the plan and enforced agent limits instead of generated source", { timeout: 10_000 }, async t => {
+	noNetwork(t);
+	const harness = await createHarness({ env: {}, parent: () => ({ text: "done" }), child: () => () => ({ text: "unexpected" }) });
+	t.after(() => harness.close());
+	const base = harness.parent.extensionRunner.createContext();
+	let shown = "";
+	const ctx = { ...base, hasUI: true, ui: { ...base.ui,
+		confirm: async () => { assert.fail("Workflow approval must not dump source into a confirmation dialog"); },
+		select: async (title: string, choices: string[]) => {
+			shown = title;
+			assert.deepEqual(choices, ["Run workflow", "View source", "Cancel"]);
+			return "Cancel";
+		},
+	} };
+	const script = "export const meta={name:'cutover',description:'Convert access, validate, and independently review.',maxAgents:12,maxConcurrency:6,phases:[{title:'Foundation',detail:'Establish direct access'},{title:'Conversion'},{title:'Review'}]}; return 'PRIVATE_IMPLEMENTATION';";
+	const result = await harness.engine.workflows().launch({ script }, ctx);
+	assert.equal(result.isError, true);
+	assert.match(result.text, /declined/);
+	assert.match(shown, /Convert access, validate, and independently review/);
+	assert.match(shown, /1\. Foundation.*Establish direct access/);
+	assert.match(shown, /3\. Review/);
+	assert.match(shown, /up to 12 agent tasks/i);
+	assert.match(shown, /at most \d+ at once/i);
+	assert.doesNotMatch(shown, /export const|PRIVATE_IMPLEMENTATION/);
+	assert.equal(harness.children.size, 0);
+	assert.deepEqual(harness.engine.workflows().snapshots(), []);
+});
+
+test("long workflows can be approved from their plan with optional exact-source inspection", { timeout: 10_000 }, async t => {
+	noNetwork(t);
+	const harness = await createHarness({ env: {}, parent: () => ({ text: "done" }), child: () => () => ({ text: "unexpected" }) });
+	t.after(() => harness.close());
+	const base = harness.parent.extensionRunner.createContext();
+	const script = source(`/*${"a".repeat(21_000)}*/ return 'APPROVED_SNAPSHOT';`);
+	const path = join(harness.root, "workflow.js");
+	writeFileSync(path, script);
+	let selections = 0, inspected = 0;
+	const ctx = { ...base, hasUI: true, ui: { ...base.ui,
+		confirm: async () => { assert.fail("Approval must use the plan, not a source dump"); },
+		select: async (title: string) => {
+			assert.ok(title.length < 4000);
+			assert.doesNotMatch(title, /APPROVED_SNAPSHOT/);
+			return ++selections === 1 ? "View source" : "Run workflow";
+		},
+		editor: async (_title: string, value: string) => {
+			inspected++;
+			assert.equal(value, script, "source inspection is complete, not truncated");
+			writeFileSync(path, source("return 'REPLACEMENT_MUST_NOT_RUN';"));
+			return source("return 'EDITOR_EDITS_MUST_NOT_RUN';");
+		},
+	} };
+	const launched = await harness.engine.workflows().launch({ scriptPath: path }, ctx);
+	assert.notEqual(launched.isError, true, launched.text);
+	const { snapshot } = await completion(harness, launched.details as unknown as Receipt);
+	assert.equal(snapshot.result, "APPROVED_SNAPSHOT");
+	assert.equal(inspected, 1);
+	assert.equal(selections, 2);
+	assert.equal(readFileSync((launched.details as unknown as Receipt).scriptPath, "utf8"), script);
+});
+
 test("inline Workflow without approval or an interactive UI is refused without executing agents", { timeout: 10_000 }, async t => {
 	noNetwork(t);
 	const harness = await createHarness({
@@ -420,18 +480,20 @@ for (const approved of [false, true]) test(`nested file workflow ${approved ? "h
 	assert.equal(harness.children.size, 0);
 });
 
-test("nested dynamic file refusal and approval both review exact bytes; replacement cannot change the approved snapshot", { timeout: 10_000 }, async t => {
+test("nested dynamic file approval shows the plan; replacement cannot change the approved snapshot", { timeout: 10_000 }, async t => {
 	noNetwork(t);
 	const harness = await createHarness({ env: {}, parent: () => ({ text: "done" }), child: () => () => ({ text: "unexpected" }) });
 	t.after(() => harness.close());
 	const files = nestedFiles(harness), base = harness.parent.extensionRunner.createContext();
 	const confirmations: string[] = [];
 	let allow = false;
-	const ctx = { ...base, hasUI: true, ui: { ...base.ui, confirm: async (_title: string, message: string) => {
+	const ctx = { ...base, hasUI: true, ui: { ...base.ui, select: async (message: string) => {
 		confirmations.push(message);
-		assert.equal(message, `${files.childPath}\n\n${files.childSource}`);
+		assert.ok(message.includes(files.childPath));
+		assert.match(message, /Workflow integration fixture/);
+		assert.doesNotMatch(message, /approved-child-result|export const/);
 		if (allow) writeFileSync(files.childPath, source("return 'replacement-must-not-execute';", "dynamic-child"));
-		return allow;
+		return allow ? "Run workflow" : "Cancel";
 	} } };
 	const input = { name: files.name, args: { path: files.childPath } };
 	const refused = await harness.engine.workflows().launch(input, ctx);
@@ -462,18 +524,25 @@ test("named nested workflows remain directly invocable without dynamic-file appr
 	assert.equal(snapshot.result, "named-child-result");
 });
 
-test("long inline scripts are refused before confirmation instead of approving a hidden executable tail", { timeout: 10_000 }, async t => {
+for (const during of ["selection", "source inspection"]) test(`cancelling during ${during} never launches a workflow`, { timeout: 10_000 }, async t => {
 	noNetwork(t);
 	const harness = await createHarness({ env: {}, parent: () => ({ text: "done" }), child: () => () => ({ text: "unexpected" }) });
 	t.after(() => harness.close());
 	const base = harness.parent.extensionRunner.createContext();
-	let confirmations = 0;
-	const ctx = { ...base, hasUI: true, ui: { ...base.ui, confirm: async () => { confirmations++; return true; } } };
-	const script = source(`/*${"a".repeat(21_000)}*/ return 'HIDDEN_TAIL_MARKER';`);
-	const result = await harness.engine.workflows().launch({ script }, ctx);
+	const controller = new AbortController();
+	const ctx = { ...base, hasUI: true, ui: { ...base.ui,
+		select: async () => {
+			if (during === "source inspection") return "View source";
+			controller.abort();
+			return "Run workflow";
+		},
+		editor: async () => { controller.abort(); return ""; },
+	} };
+	const result = await harness.engine.workflows().launch({ script: source("return 1;") }, ctx, controller.signal);
 	assert.equal(result.isError, true);
-	assert.match(result.text, /too long to review completely/i);
-	assert.equal(confirmations, 0, "a partial preview must never authorize the tail");
+	assert.match(result.text, /cancelled/i);
+	assert.equal(harness.children.size, 0);
+	assert.deepEqual(harness.engine.workflows().snapshots(), []);
 	assert.equal(existsSync(join(harness.root, "agent", "subagents", harness.parent.sessionId, "workflows")), false);
 });
 

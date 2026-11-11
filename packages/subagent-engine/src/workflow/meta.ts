@@ -5,6 +5,10 @@ export interface WorkflowMeta {
 	description: string;
 	title?: string;
 	whenToUse?: string;
+	/** Logical agent-task budget, including nested workflows and cached calls. */
+	maxAgents?: number;
+	/** Maximum concurrently executing agent tasks. */
+	maxConcurrency?: number;
 	phases: { title: string; detail?: string; model?: string }[];
 }
 // Acorn's generic traversal shape, not executable metadata.
@@ -58,6 +62,12 @@ export function parseWorkflowSource(source: string): { meta?: WorkflowMeta; body
 		const meta: WorkflowMeta = { name: data.name, description: data.description, phases: [] };
 		if (typeof data.title === "string" && data.title.trim()) meta.title = data.title;
 		if (typeof data.whenToUse === "string") meta.whenToUse = data.whenToUse;
+		for (const [key, minimum, maximum] of [["maxAgents", 0, 1000], ["maxConcurrency", 1, 256]] as const) {
+			const value = data[key];
+			if (value === undefined) continue;
+			if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum) throw new Error(`${key} must be an integer from ${minimum} to ${maximum}`);
+			meta[key] = value;
+		}
 		if (Array.isArray(data.phases)) for (const phase of data.phases) {
 			if (!phase || typeof phase !== "object" || typeof phase.title !== "string") continue;
 			meta.phases.push({ title: phase.title, ...(typeof phase.detail === "string" ? { detail: phase.detail } : {}), ...(typeof phase.model === "string" ? { model: phase.model } : {}) });

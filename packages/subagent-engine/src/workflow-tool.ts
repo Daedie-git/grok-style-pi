@@ -10,7 +10,8 @@ import { compileBody } from "./workflow/compile.ts";
 import { discoverWorkflows } from "./workflow/discovery.ts";
 import type { WorkflowHost, WorkflowProgress } from "./workflow/host.ts";
 import { WorkflowJournal } from "./workflow/journal.ts";
-import { parseWorkflowSource } from "./workflow/meta.ts";
+import { parseWorkflowSource, type WorkflowMeta } from "./workflow/meta.ts";
+import { workflowApproval, workflowLimits, type WorkflowLimits } from "./workflow/plan.ts";
 import { WorkflowObligations } from "./workflow/obligations.ts";
 import { createReplayState } from "./workflow/replay.ts";
 import { runWorkflow, type WorkflowRunResult } from "./workflow/runtime.ts";
@@ -33,6 +34,7 @@ interface WorkflowTask {
 	taskId: string;
 	runId: string;
 	name: string;
+	limits: WorkflowLimits;
 	controller: AbortController;
 	status: WorkflowSnapshot["status"];
 	startedAt: number;
@@ -63,7 +65,7 @@ type Snapshot = { source: string; kind: "inline" | "named" | "path"; path?: stri
 const WORKFLOW_DESCRIPTION = [
 	"Run a JavaScript workflow script that orchestrates several subagents in the background. Before writing or editing a script, load the workflow-authoring skill (its rules and worked examples prevent common mistakes).",
 	"Use it only when the user explicitly asks for a workflow or multi-agent orchestration, names a saved workflow, or a skill or command instructs it. The chance to parallelize work is not by itself a reason; use Agent for ordinary delegation.",
-	"The script must start with `export const meta = { name, description, phases }` (a pure literal), followed by a body that uses agent(prompt, opts), parallel([...callbacks]), pipeline(items, ...stages), phase(title), workflow(name | {scriptPath}, args), log(value) and budget. agent() returns the agent's final text, or validated data when opts.schema is set; failures return null. Date.now(), argumentless new Date() and Math.random() are unavailable so runs replay deterministically.",
+	"Present the intended work, agent count and maximum concurrency briefly before calling Workflow. Supply the script directly through Workflow.script; the tool saves it, so a separate write call is unnecessary. Declare maxAgents and maxConcurrency in meta to show and enforce the planned limits.\n\nThe script must start with `export const meta = { name, description, maxAgents, maxConcurrency, phases }` (a pure literal), followed by a body that uses agent(prompt, opts), parallel([...callbacks]), pipeline(items, ...stages), phase(title), workflow(name | {scriptPath}, args), log(value) and budget. agent() returns the agent's final text, or validated data when opts.schema is set; failures return null. Date.now(), argumentless new Date() and Math.random() are unavailable so runs replay deterministically.",
 	"The result is a launch receipt; you will be notified when the workflow finishes. The script is saved, and the receipt gives its path: edit it and pass scriptPath to re-run, or pass resumeFromRunId (after stopping the earlier run with TaskStop) to reuse completed agent() results whose prompt and options did not change.",
 ].join("\n\n");
 
@@ -120,7 +122,8 @@ export class WorkflowTasks {
 		const compiled = compileBody(parsed.body);
 		if (!compiled.ok) return receipt({ status: "async_launched", taskId: "", taskType: "local_workflow", workflowName: name, error: compiled.error, notLaunched: true });
 
-		const approval = await this.approve(snapshot, name, ctx, signal);
+		const limits = workflowLimits(parsed.meta, this.env);
+		const approval = await this.approve(snapshot, parsed.meta, limits, ctx, signal);
 		if (approval) return error(approval);
 
 		let runId: string;
@@ -143,14 +146,14 @@ export class WorkflowTasks {
 			this.reserving.add(runId);
 		}
 		try {
-			return await this.start(runId, replay, digest, snapshot, parsed.meta, name, params, ctx);
+			return await this.start(runId, replay, digest, snapshot, parsed.meta, limits, name, params, ctx);
 		} finally {
 			this.reserving.delete(runId);
 		}
 	}
 
 	private async start(runId: string, replay: ReturnType<typeof createReplayState>, digest: string, snapshot: Snapshot,
-		meta: { description: string }, name: string, params: WorkflowInputParams, ctx: ExtensionContext): Promise<ToolText> {
+		meta: WorkflowMeta, limits: WorkflowLimits, name: string, params: WorkflowInputParams, ctx: ExtensionContext): Promise<ToolText> {
 		// Recheck collisions immediately before registration (dossier §9).
 		const existing = this.byRun.get(runId);
 		if (existing && !this.settled(existing)) return error(`Workflow run ${runId} is still active. Stop it with TaskStop and wait for it to finish first.`);
@@ -169,7 +172,7 @@ export class WorkflowTasks {
 		const controller = new AbortController();
 		const obligations = new WorkflowObligations();
 		const task: WorkflowTask = {
-			taskId, runId, name, controller, status: "running", startedAt: Date.now(), phases: new Map(), agents: new Map(),
+			taskId, runId, name, limits, controller, status: "running", startedAt: Date.now(), phases: new Map(), agents: new Map(),
 			chainSettled: false, activeAgents: new Set(), obligations,
 			execution: Promise.resolve(undefined as never), journalFile: journal.file,
 		};
@@ -177,7 +180,7 @@ export class WorkflowTasks {
 		this.tasks.set(taskId, task);
 		this.byRun.set(runId, task);
 		task.execution = runWorkflow({
-			source: snapshot.source, args: copyArgs(params.args), host, runId, taskId, journal, replay, signal: controller.signal, obligations, env: this.env,
+			source: snapshot.source, args: copyArgs(params.args), host, runId, taskId, journal, replay, signal: controller.signal, obligations, env: this.env, ...limits,
 		});
 		void task.execution.then((result) => this.finish(task, result, root), (runError) => this.finish(task, { status: "failed", error: String((runError as Error).message), agentCount: 0, logs: [], failures: [], durationMs: 0 }, root));
 		return receipt({
@@ -243,16 +246,22 @@ export class WorkflowTasks {
 		return { error: "Workflow needs a script, a name, or a scriptPath." };
 	}
 
-	/** Dynamic scripts (inline/path) need the user's approval of the exact bytes; named, trusted definitions run directly. */
-	private async approve(snapshot: Snapshot, name: string, ctx: ExtensionContext, signal?: AbortSignal): Promise<string | undefined> {
+	/** Approve one immutable source snapshot from its plan; inspecting the full source is optional. */
+	private async approve(snapshot: Snapshot, meta: WorkflowMeta, limits: WorkflowLimits, ctx: ExtensionContext, signal?: AbortSignal): Promise<string | undefined> {
+		if (signal?.aborted) return "Workflow approval was cancelled.";
 		if (snapshot.kind === "named") return undefined;
 		if (this.env.PI_WORKFLOW_APPROVE === "1") return undefined;
 		if (!ctx.hasUI) return "Dynamic workflow scripts need the user's approval, and this session has no interactive UI. Set PI_WORKFLOW_APPROVE=1 to allow them.";
-		// The confirmation surface has a bounded preview. Never authorize bytes
-		// omitted from it; large scripts need an explicitly approved configuration.
-		if (snapshot.source.length > 20_000) return "This workflow is too long to review completely in the confirmation dialog (maximum 20000 characters). Shorten it or explicitly configure PI_WORKFLOW_APPROVE=1 after reviewing the complete source.";
-		const approved = await ctx.ui.confirm(`Run workflow "${name}"?`, `${snapshot.path ? `${snapshot.path}\n\n` : ""}${snapshot.source}`, { signal } as never);
-		return approved ? undefined : "The user declined to run this workflow.";
+		const summary = workflowApproval(meta, limits, snapshot.path);
+		while (!signal?.aborted) {
+			const selected = await ctx.ui.select(summary, ["Run workflow", "View source", "Cancel"], { signal } as never);
+			if (signal?.aborted) return "Workflow approval was cancelled.";
+			if (selected === "Run workflow") return undefined;
+			if (selected !== "View source") return "The user declined to run this workflow.";
+			// The editor is only a source viewer. Its return value cannot replace the approved snapshot.
+			await ctx.ui.editor("Workflow source — edits are ignored; close to return to approval", snapshot.source);
+		}
+		return "Workflow approval was cancelled.";
 	}
 
 	private host(task: WorkflowTask, ctx: ExtensionContext, root: string): WorkflowHost {
@@ -275,10 +284,10 @@ export class WorkflowTasks {
 				const snapshot = readScriptPath(path, ctx.cwd);
 				const parsed = parseWorkflowSource(snapshot.source);
 				if (!parsed.meta || parsed.error) throw new Error(parsed.error ?? "Invalid nested workflow metadata.");
-				const refusal = await this.approve({ source: snapshot.source, path: snapshot.canonicalPath, kind: "path" }, parsed.meta.name, ctx, task.controller.signal);
+				const refusal = await this.approve({ source: snapshot.source, path: snapshot.canonicalPath, kind: "path" }, parsed.meta, workflowLimits(parsed.meta, this.env, task.limits), ctx, task.controller.signal);
 				if (refusal) throw new Error(refusal);
-				// Execute exactly the bytes shown above, even if the file was replaced
-				// while the user reviewed them. Named nested workflows stay direct.
+				// Execute exactly the approved snapshot, even if the file was replaced
+				// during approval or optional source inspection. Named nested workflows stay direct.
 				return snapshot;
 			},
 			progress: (event) => {

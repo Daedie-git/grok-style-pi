@@ -62,6 +62,7 @@ async function fixture(t: TestContext, parent: Script, child: Script, autonomy =
 
 test("real Grok integration dispatches Agent in a Pi tool loop and records completion", { timeout: 15000 }, async (t) => {
 	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { subagent_type: "general-purpose", description: "contract work", prompt: "finish this assignment", run_in_background: false } }] } : { text: "Parent handback" }, () => ({ text: "Child report" }));
+	assert.equal(h.engine.memoryEnabled(), false, "the combined integration applies the Grok master memory switch to subagents");
 	await h.session.prompt("Perform the contract assignment");
 	assert.match(JSON.stringify(h.session.messages), /Child report/);
 	assert.equal(h.children.length, 1);

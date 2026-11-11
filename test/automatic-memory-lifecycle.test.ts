@@ -18,8 +18,9 @@ async function setup(t: TestContext, overrides: Record<string, unknown> = {}) {
 	const waits = new Map<string, () => void>();
 	const notices: string[] = [];
 	const calls: any[] = [];
+	const statuses: Array<string | undefined> = [];
 	const ctx = { cwd: root, isIdle: () => true, getSystemPrompt: () => "inherited instructions", waitForIdle: async () => {},
-		ui: { notify: (text: string) => notices.push(text) }, sessionManager: { getBranch: () => entries, getSessionId: () => "current" } };
+		ui: { notify: (text: string) => notices.push(text), setStatus: (key: string, value: string | undefined) => { assert.equal(key, "grok-memory"); statuses.push(value); } }, sessionManager: { getBranch: () => entries, getSessionId: () => "current" } };
 	installAutomaticMemory({
 		on: (name: string, handler: Function) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
 		registerCommand: (name: string, command: any) => commands.set(name, command),
@@ -35,11 +36,57 @@ async function setup(t: TestContext, overrides: Record<string, unknown> = {}) {
 	const emit = async (name: string, event = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
 	await emit("session_start");
 	t.after(async () => { await emit("session_shutdown"); await rm(root, { recursive: true, force: true }); });
-	return { root, entries, calls, notices, ctx, emit, commands,
+	return { root, entries, calls, notices, statuses, ctx, emit, commands,
 		next: (type: string) => new Promise<void>(resolve => waits.set(type, resolve)),
 		prompt: (id: string) => entries.push({ id, type: "message", message: { role: "user", content: "Useful correction" } }),
 	};
 }
+
+test("memory requests use their configured model and reasoning, not the conversation model", async t => {
+	const h = await setup(t, { complete: undefined });
+	const requests: any[] = [];
+	const model = { id: "gpt-6.1-terra", provider: "openai-codex" };
+	Object.assign(h.ctx, {
+		model: { id: "other-conversation-model" },
+		modelRegistry: {
+			find: (provider: string, id: string) => { assert.equal(provider, model.provider); assert.equal(id, model.id); return model; },
+			streamSimple: (selected: unknown, _context: unknown, options: unknown) => {
+				assert.equal(selected, model); requests.push(options);
+				return { result: async () => reply() };
+			},
+		},
+	});
+	h.prompt("user");
+	await h.commands.get("memory").handler("extract", h.ctx);
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0].reasoning, "medium");
+	assert.deepEqual(h.statuses, ["on", "extracting", "on"]);
+	assert.equal(h.entries.find(entry => entry.customType === "grok-memory-usage").data.model, model.id);
+
+	await writeFile(join(h.root, "settings.json"), JSON.stringify({ automaticMemory: { provider: "custom", model: "configured", reasoning: "low" } }));
+	const custom = await setup(t, { complete: undefined, settingsPath: join(h.root, "settings.json") });
+	Object.assign(custom.ctx, { modelRegistry: {
+		find: (provider: string, id: string) => { assert.equal(provider, "custom"); assert.equal(id, "configured"); return model; },
+		streamSimple: (_model: unknown, _context: unknown, options: any) => {
+			assert.equal(options.reasoning, "low"); return { result: async () => reply() };
+		},
+	} });
+	custom.prompt("user");
+	await custom.commands.get("memory").handler("extract", custom.ctx);
+	assert.ok(custom.entries.some(entry => entry.customType === "grok-memory-cursor"));
+	Object.assign(custom.ctx, { modelRegistry: { find: () => undefined } });
+	custom.prompt("next");
+	await custom.commands.get("memory").handler("extract", custom.ctx);
+	assert.match(custom.notices.at(-1)!, /Memory model custom\/configured is unavailable/);
+	assert.equal(custom.statuses.at(-1), "error");
+});
+
+test("memory status reports missing authorization and clears on shutdown", async t => {
+	const h = await setup(t, { authorize: async () => false });
+	assert.equal(h.statuses.at(-1), "needs authorization");
+	await h.emit("session_shutdown");
+	assert.equal(h.statuses.at(-1), undefined);
+});
 
 test("five user prompts trigger automatic extraction and resume restores its cursor", async t => {
 	const h = await setup(t, { options: { idleMs: 10_000 } });
@@ -77,6 +124,7 @@ test("dreaming requires five other modified sessions and records successful cons
 	const memory = await loadProjectMemory(h.root, join(h.root, "store"));
 	assert.ok(Number(await readFile(join(memory.directory, ".last-consolidated"), "utf8")) > 0);
 	assert.match(h.calls[0].systemPrompt, /consolidation agent/);
+	assert.deepEqual(h.statuses, ["on", "consolidating", "on"]);
 });
 
 test("a cross-session lock prevents concurrent background writers and status explains it", async t => {

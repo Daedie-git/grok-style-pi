@@ -179,6 +179,14 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 	assert.ok(footerLine.includes("Context 36,000/200,000 used"));
 	assert.ok(footerLine.includes("│"));
 	assert.ok(footerLine.includes("Grok 4.6 high"));
+	assert.ok(footerLine.includes("<muted>Memory: off"));
+	for (const status of ["on", "recalling", "extracting", "consolidating", "needs authorization", "error"]) {
+		statuses.set("grok-memory", status);
+		assert.ok(footer.render(200).join("").includes(`Memory: ${status}`));
+	}
+	statuses.set("grok-memory", "error: /private/memory/path");
+	assert.ok(!footer.render(200).join("").includes("/private/memory/path"));
+	statuses.delete("grok-memory");
 	thinkingLevel = "low";
 	assert.ok(footer.render(160).join("").includes("Grok 4.6 low"));
 	assert.ok(footer.render(12).every((line: string) => visibleWidth(line) <= 12));
@@ -187,7 +195,7 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 	statuses.set("openai-fast", "Fast: priority requested");
 	assert.ok(!footer.render(160).join("").includes("Fast: on"));
 	ctx.model = { name: "GPT-6", id: "gpt-6", provider: "openai-codex" };
-	assert.ok(footer.render(160).join("").includes("Fast: on"));
+	assert.ok(footer.render(160).join("").includes("Fast: on<muted> │ <muted>Memory: off"));
 	ctx.model.provider = "openai";
 	assert.ok(footer.render(160).join("").includes("Fast: on"));
 	statuses.delete("openai-fast");

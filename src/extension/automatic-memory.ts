@@ -1,17 +1,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Usage } from "@earendil-works/pi-ai";
+import type { ThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import { open, lstat, unlink } from "node:fs/promises";
 import { constants } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { loadProjectMemory } from "./project-memory.ts";
 import { MemoryStore, type MutationQueue } from "./memory-store.ts";
-import { createRecallState, recallMemory, runMemoryPass, type MemoryCompletion, type MemoryRecallState } from "./memory-worker.ts";
+import { createRecallState, recallContent, recallMemory, runMemoryPass, type MemoryCompletion, type MemoryRecallState } from "./memory-worker.ts";
 import { loadFeatures, saveFeatures } from "./features.ts";
 import { readSettingsObject, writeSettingsObject, featureSettingsPath } from "../chrome/style-colors.ts";
 import { sanitizeToolText } from "../tools/diamond.ts";
+import type { MemoryFooterStatus } from "../chrome/footer.ts";
 
-export type MemoryOptions = { recall: boolean; extraction: boolean; consolidation: boolean; everyTurns: number; idleMs: number; minHours: number; minSessions: number };
-export const defaultMemoryOptions: MemoryOptions = { recall: true, extraction: true, consolidation: true, everyTurns: 5, idleMs: 120_000, minHours: 24, minSessions: 5 };
+export type MemoryOptions = { provider: string; model: string; reasoning: ThinkingLevel; recall: boolean; extraction: boolean; consolidation: boolean; everyTurns: number; idleMs: number; minHours: number; minSessions: number };
+export const defaultMemoryOptions: MemoryOptions = { provider: "openai-codex", model: "gpt-6.1-terra", reasoning: "medium", recall: true, extraction: true, consolidation: true, everyTurns: 5, idleMs: 120_000, minHours: 24, minSessions: 5 };
 export type RecentMemorySession = { id: string; modified: number; text: string };
 import { readMemoryProgress, writeMemoryProgress } from "./memory-progress.ts";
 import { consolidationChunks, memoryChunk, type MemoryCursor } from "./memory-context.ts";
@@ -24,6 +25,17 @@ function loadOptions(path: string): MemoryOptions {
 	for (const key of ["recall", "extraction", "consolidation"] as const) {
 		const value = (saved as Record<string, unknown>)[key];
 		if (typeof value === "boolean") result[key] = value;
+	}
+	const values = saved as Record<string, unknown>;
+	for (const key of ["provider", "model"] as const) {
+		if (values[key] !== undefined) {
+			if (typeof values[key] !== "string" || !values[key].trim()) throw new Error(`automaticMemory.${key} must be a non-empty string`);
+			result[key] = values[key].trim();
+		}
+	}
+	if (values.reasoning !== undefined) {
+		if (!["minimal", "low", "medium", "high", "xhigh", "max"].includes(values.reasoning as string)) throw new Error("Invalid automaticMemory.reasoning level");
+		result.reasoning = values.reasoning as ThinkingLevel;
 	}
 	return result;
 }
@@ -41,6 +53,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 	let active = false;
 	let generation = 0;
 	let job: AbortController | undefined;
+	let recallJob: AbortController | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let turns = 0;
 	let cursor: MemoryCursor = {};
@@ -50,6 +63,18 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 	let warned = false;
 	let lastError: string | undefined;
 	let lastWrites = 0;
+	let statusContext: ExtensionContext | undefined;
+	let publishedStatus: MemoryFooterStatus | undefined;
+	let needsAuthorization = false;
+
+	function publishStatus(status: MemoryFooterStatus) {
+		if (publishedStatus === status) return;
+		publishedStatus = status;
+		statusContext?.ui.setStatus?.("grok-memory", status);
+	}
+	function publishIdleStatus() {
+		publishStatus(!active ? "off" : needsAuthorization ? "needs authorization" : lastError ? "error" : "on");
+	}
 
 	function savedMemorySettings(): Record<string, unknown> {
 		const saved = readSettingsObject(settingsPath).automaticMemory;
@@ -69,20 +94,21 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 			if (!await authorized(ctx, directory)) throw new Error("Background memory access is not authorized; use /memory authorize for this directory");
 		});
 	}
-	function cancel() { generation++; job?.abort(); job = undefined; if (timer) clearTimeout(timer); timer = undefined; }
+	function cancel() { generation++; job?.abort(); job = undefined; if (timer) clearTimeout(timer); timer = undefined; publishIdleStatus(); }
 	function warn(ctx: ExtensionContext, error: unknown) {
 		lastError = sanitizeToolText(String(error)).slice(0, 400);
+		publishStatus("error");
 		if (!warned) { warned = true; ctx.ui.notify(`Automatic memory unavailable: ${lastError}`, "warning"); }
 	}
 	function completion(ctx: ExtensionContext): MemoryCompletion {
 		if (deps.complete) return deps.complete(ctx);
-		const model = ctx.model;
-		if (!model) throw new Error("No active model for memory requests");
-		return request => ctx.modelRegistry.complete(model, { systemPrompt: request.systemPrompt, messages: request.messages, tools: request.tools }, { signal: request.signal, maxTokens: request.maxTokens });
+		const model = ctx.modelRegistry.find(options.provider, options.model);
+		if (!model) throw new Error(`Memory model ${options.provider}/${options.model} is unavailable`);
+		return request => ctx.modelRegistry.streamSimple(model, { systemPrompt: request.systemPrompt, messages: request.messages, tools: request.tools }, { signal: request.signal, maxTokens: request.maxTokens, reasoning: options.reasoning }).result();
 	}
 	function usage(ctx: ExtensionContext, kind: string) {
 		return (value: Usage) => {
-			if (active && !job?.signal.aborted) pi.appendEntry("grok-memory-usage", { kind, model: ctx.model?.id, usage: value });
+			if (active && !job?.signal.aborted) pi.appendEntry("grok-memory-usage", { kind, provider: options.provider, model: options.model, reasoning: options.reasoning, usage: value });
 		};
 	}
 	function restore(ctx: ExtensionContext) {
@@ -90,7 +116,9 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		recall = createRecallState();
 		recallDirectory = undefined;
 		const entries = ctx.sessionManager.getBranch();
+		let publishedRecall = false;
 		for (const entry of entries) {
+			if (entry.type === "custom_message" && entry.customType === "grok-recalled-memory") publishedRecall = true;
 			if (entry.type !== "custom") continue;
 			if (entry.customType === "grok-memory-cursor") {
 				const data = entry.data as MemoryCursor;
@@ -107,6 +135,12 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 					recallDirectory = data.directory;
 				}
 			}
+		}
+		// Old versions injected topics into a transient system section, not durable
+		// messages. Let those snapshots be reselected instead of duplicating context.
+		if (recall.topics.length && !publishedRecall) {
+			const read = recall.read;
+			recall = createRecallState(); recall.read = read;
 		}
 		const index = cursor.entryId ? entries.findIndex(entry => entry.id === cursor.entryId) : -1;
 		turns = entries.slice(index + (cursor.offset === undefined ? 1 : 0)).filter(entry => entry.type === "message" && entry.message.role === "user").length;
@@ -128,7 +162,8 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		try {
 			const memory = await loadProjectMemory(ctx.cwd, deps.storageRoot, { signal });
 			if (!current()) return;
-			if (!await authorized(ctx, memory.directory)) { lastError = "Background memory access requires /memory authorize for this directory."; return; }
+			needsAuthorization = !await authorized(ctx, memory.directory);
+			if (needsAuthorization) { lastError = "Background memory access requires /memory authorize for this directory."; return; }
 			// Exclusive coordination across sessions. A crash leaves a conservative lock;
 			// /memory status explains it rather than stealing an unknown writer's lock.
 			lockPath = join(memory.directory, ".consolidate-lock");
@@ -139,6 +174,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 			const chunk = memoryChunk(ctx.sessionManager.getBranch(), cursor);
 			const conversation = chunk.text;
 			if (!dreamOnly && options.extraction && conversation && (force || turns >= options.everyTurns)) {
+				publishStatus("extracting");
 				const result = await runMemoryPass({ store, complete: completion(ctx), signal, policy: `${ctx.getSystemPrompt()}\n\n${memory.content}`, conversation, mode: "extract", onUsage: usage(ctx, "extract"), allowedTools: () => pi.getActiveTools() });
 				if (!current()) return;
 				lastWrites = result.writes;
@@ -175,6 +211,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 			const sessions = (await deps.recentSessions(ctx, 0, signal, processed)).filter(session => session.id !== ctx.sessionManager.getSessionId() && session.modified > (processed[session.id] ?? 0)).sort((a, b) => b.modified - a.modified);
 			if (!dreamOnly && sessions.length < options.minSessions) return;
 			let dreamWrites = 0;
+			publishStatus("consolidating");
 			for (const session of sessions.slice(0, 10)) {
 				for (const conversation of consolidationChunks([session])) {
 					const result = await runMemoryPass({ store, complete: completion(ctx), signal, policy: `${ctx.getSystemPrompt()}\n\n${memory.content}`, conversation, mode: "consolidate", onUsage: usage(ctx, "consolidate"), allowedTools: () => pi.getActiveTools() });
@@ -195,44 +232,88 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		} catch (error) { if (current()) warn(ctx, error); }
 		finally {
 			if (lock) { await lock.close().catch(() => {}); await unlink(lockPath!).catch(() => {}); }
-			if (job === controller) job = undefined;
+			if (job === controller) { job = undefined; publishIdleStatus(); }
 		}
 	}
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		cancel();
+		statusContext = ctx;
+		publishedStatus = undefined;
 		active = deps.enabled && !/^(?:1|true|yes|on)$/i.test(process.env.PI_DISABLE_AUTO_MEMORY ?? "");
 		warned = false;
-		if (active) restore(ctx);
+		lastError = undefined;
+		needsAuthorization = false;
+		publishIdleStatus();
+		if (!active) return;
+		restore(ctx);
+		const token = generation;
+		const controller = new AbortController();
+		job = controller;
+		try {
+			const memory = await loadProjectMemory(ctx.cwd, deps.storageRoot, { signal: controller.signal });
+			if (!active || generation !== token) return;
+			const granted = await authorized(ctx, memory.directory);
+			if (active && generation === token) { needsAuthorization = !granted; publishIdleStatus(); }
+		} catch (error) { if (active && generation === token && !controller.signal.aborted) warn(ctx, error); }
+		finally { if (job === controller) job = undefined; }
 	});
-	pi.on("session_shutdown", () => { active = false; cancel(); });
+	pi.on("session_shutdown", () => {
+		active = false; cancel();
+		statusContext?.ui.setStatus?.("grok-memory", undefined);
+		statusContext = undefined; publishedStatus = undefined;
+	});
 	pi.on("session_tree", (_event, ctx) => { cancel(); if (active) restore(ctx); });
 	pi.on("session_before_compact", () => { cancel(); });
 	pi.on("session_compact", () => { cancel(); resetRecall(); });
-	pi.on("before_agent_start", async (event, ctx) => {
+	async function startRecall(ctx: ExtensionContext, query: string, controller: AbortController, token: number) {
+		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
+		const current = () => active && generation === token && !signal.aborted;
+		try {
+			const memory = await loadProjectMemory(ctx.cwd, deps.storageRoot, { signal });
+			if (!current()) return;
+			const granted = await authorized(ctx, memory.directory);
+			if (!current()) return;
+			needsAuthorization = !granted;
+			if (needsAuthorization) { lastError = "Background memory access requires /memory authorize for this directory."; return; }
+			lastError = undefined;
+			publishStatus("recalling");
+			if (recallDirectory !== memory.directory) { recall = createRecallState(); recallDirectory = memory.directory; }
+			const state = recall;
+			const previousTopics = state.topics.length;
+			const before = JSON.stringify(state);
+			await recallMemory(guardedStore(ctx, memory.directory), query, completion(ctx), signal, usage(ctx, "recall"), state);
+			if (!current()) return;
+			// Foreground file reads and settled-run restoration can happen while selection runs.
+			state.read = [...new Set([...state.read, ...recall.read])];
+			recall = state;
+			const topics = state.topics.slice(previousTopics);
+			if (topics.length) {
+				// Pi appends this hidden reference after the current turn; never steer,
+				// interrupt a stream, or request another model turn just for recall.
+				pi.sendMessage({ customType: "grok-recalled-memory", content: recallContent({ ...state, topics }), display: false }, { triggerTurn: false });
+			}
+			if (JSON.stringify(state) !== before) saveRecall();
+		} catch (error) { if (current()) warn(ctx, error); }
+		finally {
+			if (recallJob === controller) recallJob = undefined;
+			if (job === controller) { job = undefined; publishIdleStatus(); }
+		}
+	}
+	pi.on("before_agent_start", (event, ctx) => {
 		cancel();
 		const sections = event.systemPromptOptions.sections ?? (event.systemPromptOptions.sections = {});
 		delete sections.grok_recalled_memory;
 		if (!active || typeof event.prompt !== "string" || !event.prompt.trim() || !options.recall || !pi.getActiveTools().includes("read")) return;
 		const controller = new AbortController();
-		job = controller;
-		const token = generation;
-		try {
-			const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
-			const memory = await loadProjectMemory(ctx.cwd, deps.storageRoot, { signal });
-			if (!await authorized(ctx, memory.directory)) { lastError = "Background memory access requires /memory authorize for this directory."; return; }
-			if (recallDirectory !== memory.directory) { recall = createRecallState(); recallDirectory = memory.directory; }
-			const before = JSON.stringify(recall);
-			const recalled = await recallMemory(guardedStore(ctx, memory.directory), event.prompt ?? "", completion(ctx), signal, usage(ctx, "recall"), recall);
-			if (active && generation === token && !signal.aborted) {
-				if (recalled) sections.grok_recalled_memory = recalled;
-				if (JSON.stringify(recall) !== before) saveRecall();
-			}
-		} catch (error) { if (active && generation === token && !controller.signal.aborted) warn(ctx, error); }
-		finally { if (job === controller) job = undefined; }
+		job = recallJob = controller;
+		// Submission must never await filesystem candidate scans or a selector model.
+		void startRecall(ctx, event.prompt, controller, generation);
 	});
 	pi.on("agent_settled", (event, ctx) => {
-		if (!active || event.aborted) return;
+		if (!active) return;
+		if (job && job === recallJob) cancel();
+		if (event.aborted) return;
 		restore(ctx);
 		if (turns >= options.everyTurns) void background(ctx);
 		else if (pendingProse && options.extraction) {
@@ -293,10 +374,12 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 						ctx.ui.notify("No background memory access granted.", "warning"); return;
 					}
 					saveMemorySettings({ authorizedDirectories: [...new Set([...directories, memory.directory])] });
+					needsAuthorization = false; lastError = undefined; publishIdleStatus();
 					ctx.ui.notify("Background memory access authorized for this directory only.", "info");
 				} else {
 					cancel(); resetRecall();
 					saveMemorySettings({ authorizedDirectories: directories.filter(directory => directory !== memory.directory) });
+					needsAuthorization = true; publishIdleStatus();
 					ctx.ui.notify("Background memory access revoked. Previously seen context and saved files remain; start a new session to discard prior context.", "info");
 				}
 				return;
@@ -321,7 +404,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 				const usage = (entry.data as { usage?: Usage })?.usage;
 				return total + (usage?.cost?.total ?? 0);
 			}, 0);
-			ctx.ui.notify(`Memory ${active ? "on" : "off"}; recall ${options.recall ? "on" : "off"}, extraction ${options.extraction ? "on" : "off"}, dream ${options.consolidation ? "on" : "off"}. ${memory?.directory ?? "No store accessed."} Background access: ${memory && await authorized(ctx, memory.directory) ? "authorized" : "not authorized; use /memory authorize"}.${lastError ? ` Last issue: ${lastError}` : ""} Background requests use the active model and may incur costs (recorded branch cost: $${costs.toFixed(4)}).`, "info");
+			ctx.ui.notify(`Memory ${active ? "on" : "off"}; recall ${options.recall ? "on" : "off"}, extraction ${options.extraction ? "on" : "off"}, dream ${options.consolidation ? "on" : "off"}. ${memory?.directory ?? "No store accessed."} Background access: ${memory && await authorized(ctx, memory.directory) ? "authorized" : "not authorized; use /memory authorize"}.${lastError ? ` Last issue: ${lastError}` : ""} Background requests use ${options.provider}/${options.model} (${options.reasoning} reasoning) and may incur costs (recorded branch cost: $${costs.toFixed(4)}).`, "info");
 		},
 	});
 }

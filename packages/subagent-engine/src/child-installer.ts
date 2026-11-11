@@ -50,8 +50,9 @@ export function childInstaller(policy: () => PolicyInput) {
 			}
 			const revoked = await engine.toolRevocation(caller.agentId!, event.toolName);
 			if (revoked) return { block: true, reason: revoked };
-			if (caller.memoryScoped?.includes(event.toolName) && caller.memoryGuard) {
-				const reason = caller.memoryGuard(event.toolName, event.input as Record<string, unknown>);
+			if (caller.memoryScoped?.includes(event.toolName)) {
+				if (!engine.memoryEnabled()) return { block: true, reason: "Persistent agent memory is disabled." };
+				const reason = caller.memoryGuard?.(event.toolName, event.input as Record<string, unknown>);
 				if (reason) return { block: true, reason };
 			}
 			return undefined;

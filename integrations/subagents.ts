@@ -59,8 +59,11 @@ export function createGrokSubagents(options: {
 		if (inHerdr) {
 			await createHerdrSubagents({ ...options.herdr, env: herdrIntegrationEnvironment(env), mode: "backend", onBackend(created) { handle = created; connect(); } })(pi);
 		}
+		const engineMemory = options.engine?.memoryEnabled;
 		const engine = createSubagentEngine({
 			...options.engine,
+			memoryEnabled: () => features.memory && !/^(?:1|true|yes|on)$/i.test(process.env.PI_DISABLE_AUTO_MEMORY ?? "")
+				&& (typeof engineMemory === "function" ? engineMemory() : engineMemory ?? true),
 			panes: inHerdr || options.engine?.panes,
 			paneGuidance: inHerdr ? handle?.machineGuidance : options.engine?.paneGuidance,
 			paneDefault: options.engine?.paneDefault ?? (inHerdr && features.panes),

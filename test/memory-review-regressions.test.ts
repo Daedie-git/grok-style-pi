@@ -12,19 +12,20 @@ import { recentMemorySessions } from "../src/extension/memory-history.ts";
 
 const signal = () => new AbortController().signal;
 function reply(text = "Nothing to save.", stopReason = "stop"): any { return { role: "assistant", content: [{ type: "text", text }], usage: { cost: { total: 0 } }, stopReason, timestamp: Date.now() }; }
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, cleanup = true) {
 	await mkdir(resolve("captures"), { recursive: true });
 	const directory = await mkdtemp(resolve("captures/memory-review-"));
-	t.after(() => rm(directory, { recursive: true, force: true }));
+	if (cleanup) t.after(() => rm(directory, { recursive: true, force: true }));
 	return directory;
 }
 async function harness(t: TestContext, extra: Record<string, unknown> = {}) {
-	const directory = await fixture(t);
+	const directory = await fixture(t, false);
 	const entries: any[] = [];
 	const handlers = new Map<string, Function>();
 	const commands = new Map<string, any>();
 	const notices: string[] = [];
 	const requests: any[] = [];
+	const listeners = new Map<string, () => void>();
 	const ctx = { cwd: directory, hasUI: true, isIdle: () => true, getSystemPrompt: () => "inherited instructions", waitForIdle: async () => {},
 		ui: { notify: (text: string) => notices.push(text), confirm: async () => true },
 		sessionManager: { getBranch: () => entries, getSessionId: () => "current" } };
@@ -32,14 +33,25 @@ async function harness(t: TestContext, extra: Record<string, unknown> = {}) {
 	const root = join(directory, "store");
 	installAutomaticMemory({
 		on: (name: string, handler: Function) => handlers.set(name, handler), registerCommand: (name: string, value: unknown) => commands.set(name, value),
-		getActiveTools: () => ["read", "write", "edit"], appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", id: `custom-${entries.length}`, customType, data: structuredClone(data) }),
+		getActiveTools: () => ["read", "write", "edit"],
+		sendMessage: (message: unknown) => entries.push({ type: "custom_message", id: `message-${entries.length}`, ...message as object }),
+		appendEntry: (customType: string, data: unknown) => {
+			entries.push({ type: "custom", id: `custom-${entries.length}`, customType, data: structuredClone(data) });
+			listeners.get(customType)?.(); listeners.delete(customType);
+		},
 	} as any, { enabled: true, storageRoot: root, settingsPath, queue: async (_path, run) => run(),
 		complete: () => async request => { requests.push(request); return reply(); }, ...extra });
 	const emit = async (name: string, event: any = {}) => handlers.get(name)?.(event, ctx);
 	const command = (args: string) => commands.get("memory").handler(args, ctx);
 	await emit("session_start");
-	t.after(() => emit("session_shutdown"));
-	return { directory, root, settingsPath, entries, requests, notices, ctx, emit, command };
+	t.after(async () => {
+		await emit("session_shutdown");
+		// Cancellation prevents new operations; an already-submitted mkdir may still finish.
+		await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 10 });
+	});
+	return { directory, root, settingsPath, entries, requests, notices, ctx, emit, command,
+		nextEntry: (type: string) => new Promise<void>(resolve => listeners.set(type, resolve)),
+	};
 }
 
 test("background filesystem access fails closed and revocation is rechecked before mutation", async t => {
@@ -169,18 +181,36 @@ test("token-exhausted output never advances extraction or consolidation progress
 test("recall deduplicates across calls, skips foreground reads, and enforces the cumulative context budget", async t => {
 	const directory = await fixture(t);
 	for (let index = 0; index < 20; index++) await writeFile(join(directory, `${index}.md`), `---\ndescription: ${index}\n---\n${"x".repeat(5000)}`);
-	const store = new MemoryStore(directory);
 	const state = createRecallState();
+	let readDuringBody = false;
+	let firstBody: string | undefined;
+	class ForegroundReadStore extends MemoryStore {
+		override async read(path: string, signal?: AbortSignal) {
+			const content = await super.read(path, signal);
+			if (readDuringBody) {
+				if (firstBody === undefined) firstBody = path;
+				else { readDuringBody = false; state.read.push(firstBody, path); }
+			}
+			return content;
+		}
+	}
+	const store = new ForegroundReadStore(directory);
 	state.read.push("19.md");
 	let calls = 0;
 	const complete = async (request: any) => {
 		calls++;
 		const question = JSON.parse(request.messages.at(-1).content);
 		assert.ok(question.candidates.every((candidate: any) => !state.read.includes(candidate.name) && !state.surfaced.includes(candidate.name)));
-		return reply(JSON.stringify({ selected_memories: question.candidates.slice(0, 5).map((candidate: any) => candidate.name) }));
+		const selected = question.candidates.slice(0, 5).map((candidate: any) => candidate.name);
+		if (calls === 1) {
+			state.read.push(selected[4]); // Read while the selector model is in flight.
+			readDuringBody = true; // Another foreground read during the selected body load.
+		}
+		return reply(JSON.stringify({ selected_memories: selected }));
 	};
 	await recallMemory(store, "preferences", complete, signal(), undefined, state);
-	assert.equal(state.surfaced.length, 5);
+	assert.equal(state.surfaced.length, 2);
+	assert.equal(state.read.length, 4);
 	for (let index = 0; index < 5; index++) await recallMemory(store, `question ${index}`, complete, signal(), undefined, state);
 	assert.ok(state.bytes <= MEMORY_RECALL_BYTES);
 	assert.equal(new Set(state.surfaced).size, state.surfaced.length);
@@ -189,26 +219,41 @@ test("recall deduplicates across calls, skips foreground reads, and enforces the
 	assert.equal(calls, before);
 });
 
-test("recall state survives resume, follows branch snapshots and resets on compaction", async t => {
+test("recall state survives resume, follows branches/compaction and migrates legacy system-only snapshots", async t => {
 	let calls = 0;
 	const h = await harness(t, { authorize: async () => true, complete: () => async () => { calls++; return reply('{"selected_memories":["topic.md"]}'); } });
 	const memory = await loadProjectMemory(h.directory, h.root);
 	await writeFile(join(memory.directory, "topic.md"), "---\ndescription: preference\n---\nuseful note");
 	const event = () => ({ prompt: "Which preferences apply?", systemPromptOptions: { sections: {} as Record<string, string> } });
+	const first = h.nextEntry("grok-memory-recall");
 	await h.emit("before_agent_start", event());
+	await first;
 	assert.equal(calls, 1);
 	await h.emit("session_start");
 	const resumed = event();
 	await h.emit("before_agent_start", resumed);
 	assert.equal(calls, 1);
-	assert.match(resumed.systemPromptOptions.sections.grok_recalled_memory, /useful note/);
+	assert.equal(resumed.systemPromptOptions.sections.grok_recalled_memory, undefined);
+	assert.equal(h.entries.filter(entry => entry.type === "custom_message" && entry.customType === "grok-recalled-memory").length, 1);
 	await h.emit("session_compact");
+	const compacted = h.nextEntry("grok-memory-recall");
 	await h.emit("before_agent_start", event());
+	await compacted;
 	assert.equal(calls, 2);
 	h.entries.splice(0);
 	await h.emit("session_tree");
+	const branched = h.nextEntry("grok-memory-recall");
 	await h.emit("before_agent_start", event());
+	await branched;
 	assert.equal(calls, 3);
+	for (let index = h.entries.length - 1; index >= 0; index--) {
+		if (h.entries[index].type === "custom_message") h.entries.splice(index, 1);
+	}
+	await h.emit("session_start");
+	const legacy = h.nextEntry("grok-memory-recall");
+	await h.emit("before_agent_start", event());
+	await legacy;
+	assert.equal(calls, 4, "legacy cached notes must remain eligible for background reselection");
 });
 
 test("foreground topic reads are remembered while recall is off and before background authorization", async t => {

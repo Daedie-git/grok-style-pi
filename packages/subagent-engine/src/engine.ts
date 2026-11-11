@@ -98,6 +98,8 @@ export interface EngineDeps {
 	env: Record<string, string | undefined>;
 	agentDir: string;
 	modelRuntime: () => Promise<ModelRuntime>;
+	/** Host master switch for definition-scoped memory; standalone engines default to enabled. */
+	memoryEnabled?: boolean | (() => boolean);
 	now?: () => number;
 	/** Installs the child-side tools and policy handlers into a child session. Supplied by the extension wiring. */
 	childInstaller: (engine: Engine, caller: Caller) => (pi: ExtensionAPI) => void;
@@ -165,7 +167,7 @@ export class Engine {
 	 * Rebind runtime-scoped dependencies after a reload handover: children created from now on must use the new runtime's
 	 * policy (autonomy) and installers, not closures captured by the runtime that created this engine.
 	 */
-	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault">>): void {
+	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault" | "memoryEnabled">>): void {
 		this.deps = { ...this.deps, ...deps };
 		this.tasks = undefined;
 	}
@@ -342,6 +344,12 @@ export class Engine {
 		});
 		this.definitionCache = { at: this.now(), set };
 		return set;
+	}
+
+	memoryEnabled(): boolean {
+		if (/^(?:1|true|yes|on)$/i.test(this.deps.env.PI_DISABLE_AUTO_MEMORY ?? "")) return false;
+		const enabled = this.deps.memoryEnabled;
+		return typeof enabled === "function" ? enabled() : enabled ?? true;
 	}
 
 	forkEnabled(): boolean {
@@ -1016,7 +1024,7 @@ export class Engine {
 		if (parent) { meta.forkSystemPrompt = parent.systemPrompt; meta.forkParentTools = parent.tools; }
 		const forkPrompt = meta.isFork ? meta.forkSystemPrompt : undefined;
 		const caller: Caller = { agentId: meta.agentId, depth: meta.spawnDepth, background, isFork: Boolean(meta.isFork) };
-		const configuredMemory = definition.memory ? memoryDir(definition.memory, { agentDir: this.deps.agentDir, cwd: meta.cwd, agentType: definition.agentType }) : undefined;
+		const configuredMemory = definition.memory && this.memoryEnabled() ? memoryDir(definition.memory, { agentDir: this.deps.agentDir, cwd: meta.cwd, agentType: definition.agentType }) : undefined;
 		const memoryWorkingCopy = definition.memory === "project" || definition.memory === "local" ? meta.cwd : undefined;
 		const memoryUnavailable = configuredMemory !== undefined && memoryWorkingCopy !== undefined && !memoryRootContained(configuredMemory, memoryWorkingCopy);
 		const memory = memoryUnavailable ? undefined : configuredMemory;
@@ -1377,7 +1385,7 @@ export class Engine {
 		const mcp = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName)?.[1];
 		const surface = compileToolSurface({
 			definition: current, available: [{ name: toolName, mcpServer: mcp }], depth: meta.spawnDepth, maxDepth: this.control.limits.maxDepth, background: false, isFork: false,
-			memoryTools: current.memory ? ["read", "write", "edit"] : undefined,
+			memoryTools: current.memory && this.memoryEnabled() ? ["read", "write", "edit"] : undefined,
 		});
 		return { surface, agentType: historical.agentType };
 	}

@@ -1,7 +1,7 @@
 import type { CustomEditor, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { applyComposerBorderColor, frameEditorLines } from "../chrome/composer.ts";
-import { modelDisplayName, renderFooter } from "../chrome/footer.ts";
+import { memoryFooterStatus, modelDisplayName, renderFooter } from "../chrome/footer.ts";
 import { startGrokFooterPolling } from "./grok-usage.ts";
 import { startAccountPolling } from "./account.ts";
 import { formatCodexQuota, parseCodexQuota, startCodexUsagePolling, type QuotaWindow } from "./subscription.ts";
@@ -16,7 +16,7 @@ import type { CustomEditorCtor, ExtensionApiLike, SessionContext, SessionUi } fr
 
 type SessionChromeDeps = {
 	CustomEditor: CustomEditorCtor;
-	features: Pick<Features, "footer" | "composer" | "terminalColors" | "toolStyling">;
+	features: Pick<Features, "footer" | "composer" | "terminalColors" | "toolStyling"> & Partial<Pick<Features, "memory">>;
 	warningEvents?: {
 		on(event: "warning", listener: (warning: Error) => void): unknown;
 		off(event: "warning", listener: (warning: Error) => void): unknown;
@@ -143,6 +143,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 							: undefined;
 						const branch = footerData?.getGitBranch?.();
 						const context = ctx.getContextUsage?.();
+						const statuses = footerData?.getExtensionStatuses?.();
 						return renderFooter({
 							cwd: ctx.cwd,
 							model: modelDisplayName(ctx.model),
@@ -151,7 +152,8 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 							thinkingLevel: pi.getThinkingLevel?.() ?? ctx.thinkingLevel,
 							branch: branch === undefined ? ctx.branch : branch,
 							provider: ctx.model?.provider,
-							fastMode: /^gpt-/i.test(ctx.model?.id ?? "") ? Boolean(footerData?.getExtensionStatuses?.().get("openai-fast")) : undefined,
+							fastMode: /^gpt-/i.test(ctx.model?.id ?? "") ? Boolean(statuses?.get("openai-fast")) : undefined,
+							memoryStatus: memoryFooterStatus(statuses?.get("grok-memory"), features.memory ?? false),
 							subscription,
 							account,
 							grokWeekly,

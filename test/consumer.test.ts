@@ -110,6 +110,7 @@ test("default export factory registers real create*Tool diamond overrides", asyn
 			hasUI: true,
 			mode: "tui",
 			model: { name: "Grok 4.6" },
+			sessionManager: { getBranch: () => [] },
 			getContextUsage: () => ({ percent: 3 }),
 			ui: {
 				theme: { fg: (_t: string, text: string) => text },

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { cwdDisplayPath, cwdBasename, formatPercent, formatTokens, modelDisplayName, renderFooter, type FooterInput } from "../src/chrome/footer.ts";
+import { cwdDisplayPath, cwdBasename, formatPercent, formatTokens, memoryFooterStatus, modelDisplayName, renderFooter, type FooterInput, type MemoryFooterStatus } from "../src/chrome/footer.ts";
 
 const line = (input: FooterInput, width = 200) => renderFooter(input, { width })[0];
 
@@ -39,6 +39,29 @@ test("footer reserves space for fast mode only on OpenAI providers", () => {
 	for (const width of [0, 1, 10, 20, 30, 60, 100]) {
 		assert.ok(visibleWidth(line(input, width)) <= width, `width ${width}`);
 	}
+});
+
+test("footer shows bounded memory status beside Fast on every provider", () => {
+	const input: FooterInput = { cwd: "/tmp/project", model: "GPT-6", provider: "openai-codex", tokens: 12, contextWindow: 100, fastMode: true, memoryStatus: "on" };
+	assert.match(line(input), /Fast: on │ Memory: on │ Context 12\/100 used/);
+	assert.match(line({ ...input, provider: "anthropic" }), /Memory: on │ Context/);
+	assert.doesNotMatch(line({ ...input, memoryStatus: undefined }), /Memory:/);
+	for (const [status, tone] of [["off", "muted"], ["on", "accent"], ["recalling", "accent"], ["extracting", "accent"], ["consolidating", "accent"], ["needs authorization", "warning"], ["error", "error"]] as const) {
+		const painted = renderFooter({ ...input, memoryStatus: status }, { width: 200, paint: (token, text) => `<${token}>${text}</${token}>` })[0];
+		assert.ok(painted.includes(`<${tone}>Memory: ${status}</${tone}>`));
+		for (let width = 0; width <= 160; width++) {
+			assert.ok(visibleWidth(line({ ...input, memoryStatus: status }, width)) <= width, `${status}, width ${width}`);
+		}
+		assert.equal(memoryFooterStatus(status, false), status);
+	}
+	assert.equal(memoryFooterStatus(undefined, true), "on");
+	assert.equal(memoryFooterStatus(undefined, false), "off");
+	assert.equal(memoryFooterStatus("error: /private/memory/path", true), "on");
+	const status: MemoryFooterStatus = "needs authorization";
+	const account = { ...input, memoryStatus: status, account: "person@example.com" };
+	assert.match(line(account), /Account person@example.com$/);
+	assert.doesNotMatch(line(account, 90), /Account/);
+	assert.match(line(account, 90), /Fast: on │ Memory: needs authorization │ Context 12\/100 used/);
 });
 
 test("footer marks unknown model, thinking level, and context", () => {

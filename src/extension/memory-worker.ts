@@ -57,28 +57,36 @@ export async function recallMemory(store: MemoryStore, query: string, complete: 
 	const selected = (parsed as { selected_memories?: unknown })?.selected_memories;
 	if (!Array.isArray(selected) || selected.some(name => typeof name !== "string")) throw new Error("Invalid memory selector response");
 	const allowed = new Set(candidates.map(candidate => candidate.name));
-	const names = [...new Set(selected as string[])].filter(name => allowed.has(name)).slice(0, 5);
-	const recalledNames: string[] = [];
+	const names = [...new Set(selected as string[])].filter(name => allowed.has(name) && !committed.read.includes(name)).slice(0, 5);
+	const pending: Array<{ name: string; topic: string; size: number }> = [];
+	let pendingBytes = 0;
 	for (const name of names) {
 		signal.throwIfAborted();
 		const content = await store.read(name, signal);
-		if (content === undefined) continue;
+		if (content === undefined || committed.read.includes(name)) continue;
 		const bytes = Buffer.from(content);
 		// TextDecoder avoids a split UTF-8 sequence at the byte ceiling.
 		const preview = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, 4096), { stream: true }).split("\n").slice(0, 200).join("\n");
 		const topic = `<memory_topic path="${escapeMemory(name).replace(/"/g, "&quot;")}">\n${escapeMemory(preview)}${preview.length < content.length ? "\n[Truncated; use read for more if relevant.]" : ""}\n</memory_topic>`;
 		const size = Buffer.byteLength(topic);
-		if (state.bytes + size > MEMORY_RECALL_BYTES) continue;
-		state.bytes += size;
-		state.topics.push(topic);
-		state.surfaced.push(name);
-		recalledNames.push(name);
+		if (state.bytes + pendingBytes + size > MEMORY_RECALL_BYTES) continue;
+		pending.push({ name, topic, size });
+		pendingBytes += size;
 	}
 	signal.throwIfAborted();
+	const recalledNames: string[] = [];
+	// Loading a later body may yield while the foreground reads an earlier one.
+	// Recheck all staged notes immediately before the synchronous commit.
+	for (const { name, topic, size } of pending) {
+		if (committed.read.includes(name)) continue;
+		state.bytes += size; state.topics.push(topic); state.surfaced.push(name);
+		recalledNames.push(name);
+	}
 	state.lastQuery = queryText;
 	state.lastCandidates = signature;
 	state.history = [...state.history, question, { ...response, content: [{ type: "text" as const, text: JSON.stringify({ selected_memories: recalledNames }) }] }].slice(-6);
 	while (state.history.length > 2 && JSON.stringify(state.history).length > 150_000) state.history.splice(0, 2);
+	state.read = [...new Set([...state.read, ...committed.read])];
 	Object.assign(committed, state);
 	return recallContent(state);
 }

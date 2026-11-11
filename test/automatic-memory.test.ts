@@ -9,11 +9,11 @@ import { installAutomaticMemory, memoryConversation } from "../src/extension/aut
 import { loadProjectMemory } from "../src/extension/project-memory.ts";
 import { recentMemorySessions } from "../src/extension/memory-history.ts";
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, cleanup = true) {
 	const captures = resolve("captures");
 	await mkdir(captures, { recursive: true });
 	const directory = await mkdtemp(join(captures, "auto-memory-"));
-	t.after(() => rm(directory, { recursive: true, force: true }));
+	if (cleanup) t.after(() => rm(directory, { recursive: true, force: true }));
 	return { directory, store: new MemoryStore(directory) };
 }
 async function optionalFileSymlink(t: TestContext, target: string, path: string): Promise<boolean> {
@@ -133,11 +133,12 @@ test("conversation capture excludes tools, thoughts and images and is bounded", 
 });
 
 async function harness(t: TestContext, enabled = true, overrides: Record<string, unknown> = {}) {
-	const { directory } = await fixture(t);
+	const { directory } = await fixture(t, false);
 	const handlers = new Map<string, Function[]>();
 	const commands = new Map<string, any>();
 	const entries: any[] = [];
 	const notices: string[] = [];
+	const messages: any[] = [];
 	let calls = 0;
 	const listeners = new Map<string, Array<() => void>>();
 	const pi = {
@@ -147,6 +148,10 @@ async function harness(t: TestContext, enabled = true, overrides: Record<string,
 			entries.push({ id: `custom-${entries.length}`, type: "custom", customType, data });
 			for (const listener of listeners.get(customType) ?? []) listener();
 			listeners.delete(customType);
+		},
+		sendMessage(message: any, options: unknown) {
+			messages.push({ message, options });
+			entries.push({ id: `message-${entries.length}`, type: "custom_message", ...message });
 		},
 		getActiveTools() { return ["read", "write", "edit"]; },
 	};
@@ -162,8 +167,11 @@ async function harness(t: TestContext, enabled = true, overrides: Record<string,
 	});
 	const emit = async (name: string, event: any = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, ctx); };
 	await emit("session_start");
-	t.after(() => emit("session_shutdown"));
-	return { directory, storageRoot, commands, entries, notices, ctx, emit, calls: () => calls,
+	t.after(async () => {
+		await emit("session_shutdown");
+		await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 10 });
+	});
+	return { directory, storageRoot, commands, entries, notices, messages, ctx, emit, calls: () => calls,
 		nextEntry: (type: string) => new Promise<void>(resolve => listeners.set(type, [...listeners.get(type) ?? [], resolve])),
 	};
 }
@@ -190,6 +198,33 @@ test("manual extraction persists a branch cursor and does not repeat reviewed me
 	assert.equal(h.calls(), 1);
 });
 
+test("message submission never waits for recall; ready notes queue without interrupting or starting a turn", async t => {
+	let release: (value: any) => void = () => {};
+	let started: () => void = () => {};
+	const begun = new Promise<void>(resolve => { started = resolve; });
+	const h = await harness(t, true, { complete: () => async () => { started(); return new Promise(resolve => { release = resolve; }); } });
+	const memory = await loadProjectMemory(h.directory, h.storageRoot);
+	await writeFile(join(memory.directory, "topic.md"), "---\ndescription: useful preference\n---\nKeep tests minimal.");
+	const event = { prompt: "recall preferences", systemPromptOptions: { sections: {} as Record<string, string> } };
+	const pending = h.emit("before_agent_start", event);
+	await begun;
+	const returned = await Promise.race([pending.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 50))]);
+	const remembered = h.nextEntry("grok-memory-recall");
+	release(response([{ type: "text", text: '{"selected_memories":["topic.md"]}' }]));
+	await remembered;
+	await pending;
+	assert.equal(returned, true, "a pending recall model must not hold message submission");
+	assert.equal(event.systemPromptOptions.sections.grok_recalled_memory, undefined, "completed recall must not mutate an already-submitted prompt");
+	assert.equal(h.messages.length, 1);
+	assert.equal(h.messages[0].message.display, false);
+	assert.match(h.messages[0].message.content, /Keep tests minimal/);
+	assert.deepEqual(h.messages[0].options, { triggerTurn: false });
+	const next = { prompt: "next question", systemPromptOptions: { sections: {} as Record<string, string> } };
+	await h.emit("before_agent_start", next);
+	assert.equal(next.systemPromptOptions.sections.grok_recalled_memory, undefined);
+	assert.equal(h.messages.length, 1, "persisted recall must not be injected a second time");
+});
+
 test("shutdown cancels an in-flight recall without publishing stale context", async t => {
 	let release: (value: any) => void = () => {};
 	let started: () => void = () => {};
@@ -201,9 +236,13 @@ test("shutdown cancels an in-flight recall without publishing stale context", as
 	const pending = h.emit("before_agent_start", event);
 	await begun;
 	await h.emit("session_shutdown");
+	const entriesBeforeRelease = h.entries.length;
 	release(response([{ type: "text", text: '{"selected_memories":["topic.md"]}' }]));
 	await pending;
+	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(event.systemPromptOptions.sections.grok_recalled_memory, undefined);
+	assert.equal(h.messages.length, 0);
+	assert.equal(h.entries.length, entriesBeforeRelease);
 });
 
 test("consolidation reads bounded session prose, not tool output or symlinked files", async t => {

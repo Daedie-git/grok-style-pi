@@ -15,7 +15,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 test("the Grok package ships the standalone runner and both compatibility entries", { timeout: 30_000 }, () => {
-	const packed = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+	// Windows ships npm as a command script, which cannot be launched directly by execFileSync.
+	const command = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : "npm";
+	const args = process.platform === "win32" ? ["/d", "/s", "/c", "npm pack --dry-run --json --ignore-scripts"] : ["pack", "--dry-run", "--json", "--ignore-scripts"];
+	const packed = JSON.parse(execFileSync(command, args, {
 		cwd: fileURLToPath(new URL("..", import.meta.url)), encoding: "utf8",
 	}));
 	const paths = packed[0].files.map((file: { path: string }) => file.path) as string[];

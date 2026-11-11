@@ -60,7 +60,9 @@ export function hcConnect(env: NodeJS.ProcessEnv = process.env): HcCall {
 		const childEnv = options.anonymous ? { ...env, HC_TERMINAL_ID: undefined, HC_SCOPE: undefined } : env;
 		const child = spawn(bin, ["connect"], { env: childEnv, signal: options.signal, killSignal: "SIGKILL", windowsHide: true });
 		// Spawn's own timeout outlives a failed start, holding the event loop.
-		const timer = setTimeout(() => child.kill("SIGKILL"), options.timeout ?? CALL_TIMEOUT_MS);
+		const timeout = options.timeout ?? CALL_TIMEOUT_MS;
+		let timedOut = false;
+		const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeout);
 		let stdout = "";
 		let stderr = "";
 		// On Windows, hc connect exits when its input closes, even before a slower reply (terminal.label) is written.
@@ -71,7 +73,7 @@ export function hcConnect(env: NodeJS.ProcessEnv = process.env): HcCall {
 		});
 		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 		child.on("error", (error) => { clearTimeout(timer); reject(error); });
-		child.on("close", (code) => {
+		child.on("close", (code, signal) => {
 			clearTimeout(timer);
 			let reply: { result?: unknown; error?: { message?: string; data?: { kind?: string } } } | undefined;
 			for (const line of stdout.split("\n")) {
@@ -82,7 +84,8 @@ export function hcConnect(env: NodeJS.ProcessEnv = process.env): HcCall {
 			}
 			if (reply?.error) reject(new HcError(reply.error.message ?? `hc ${method} failed`, reply.error.data?.kind));
 			else if (reply && "result" in reply) resolve(reply.result);
-			else reject(new HcError(stderr.trim() || `hc connect exited ${code} without answering ${method}`));
+			else if (timedOut) reject(new HcError(`hc ${method} timed out after ${timeout}ms`, "timeout"));
+			else reject(new HcError(stderr.trim() || `hc connect ${signal ? `terminated by ${signal}` : `exited ${code}`} without answering ${method}`));
 		});
 		child.stdin.on("error", () => undefined);
 		child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);

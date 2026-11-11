@@ -8,7 +8,7 @@ import { Type } from "typebox";
 import type { Engine, ToolText } from "./engine.ts";
 import { compileBody } from "./workflow/compile.ts";
 import { discoverWorkflows } from "./workflow/discovery.ts";
-import type { WorkflowHost } from "./workflow/host.ts";
+import type { WorkflowHost, WorkflowProgress } from "./workflow/host.ts";
 import { WorkflowJournal } from "./workflow/journal.ts";
 import { parseWorkflowSource } from "./workflow/meta.ts";
 import { WorkflowObligations } from "./workflow/obligations.ts";
@@ -19,12 +19,26 @@ import { runWorkflowAgent } from "./workflow-host.ts";
 export const MAX_SCRIPT_LENGTH = 524_288;
 const RESUME_QUIESCENCE_MS = 30_000;
 
+export interface WorkflowSnapshot {
+	taskId: string;
+	runId: string;
+	name: string;
+	status: "running" | "completed" | "failed" | "killed";
+	startedAt: number;
+	endedAt?: number;
+	progress: Exclude<WorkflowProgress, { type: "log" }>[];
+}
+
 interface WorkflowTask {
 	taskId: string;
 	runId: string;
 	name: string;
 	controller: AbortController;
-	status: "running" | "completed" | "failed" | "killed";
+	status: WorkflowSnapshot["status"];
+	startedAt: number;
+	endedAt?: number;
+	phases: Map<string, Extract<WorkflowProgress, { type: "phase" }>>;
+	agents: Map<number, Extract<WorkflowProgress, { type: "agent" }>>;
 	/** The runner chain has returned (the script settled or was aborted). */
 	chainSettled: boolean;
 	/** Live agent() attempts still running for this invocation. */
@@ -72,6 +86,15 @@ export class WorkflowTasks {
 		const sessionId = this.engine.sessionId;
 		if (!sessionId) throw new Error("The subagent engine is not bound to a session.");
 		return join(this.agentDir, "subagents", sessionId, "workflows");
+	}
+
+	/** Detached current task state, including logical calls with no live child session. */
+	snapshots(): WorkflowSnapshot[] {
+		return [...this.tasks.values()].map((task) => structuredClone({
+			taskId: task.taskId, runId: task.runId, name: task.name, status: task.status,
+			startedAt: task.startedAt, ...(task.endedAt === undefined ? {} : { endedAt: task.endedAt }),
+			progress: [...task.phases.values(), ...task.agents.values()],
+		}));
 	}
 
 	has(taskId: string): boolean {
@@ -146,15 +169,16 @@ export class WorkflowTasks {
 		const controller = new AbortController();
 		const obligations = new WorkflowObligations();
 		const task: WorkflowTask = {
-			taskId, runId, name, controller, status: "running", chainSettled: false, activeAgents: new Set(), obligations,
+			taskId, runId, name, controller, status: "running", startedAt: Date.now(), phases: new Map(), agents: new Map(),
+			chainSettled: false, activeAgents: new Set(), obligations,
 			execution: Promise.resolve(undefined as never), journalFile: journal.file,
 		};
 		const host = this.host(task, ctx, root);
+		this.tasks.set(taskId, task);
+		this.byRun.set(runId, task);
 		task.execution = runWorkflow({
 			source: snapshot.source, args: copyArgs(params.args), host, runId, taskId, journal, replay, signal: controller.signal, obligations, env: this.env,
 		});
-		this.tasks.set(taskId, task);
-		this.byRun.set(runId, task);
 		void task.execution.then((result) => this.finish(task, result, root), (runError) => this.finish(task, { status: "failed", error: String((runError as Error).message), agentCount: 0, logs: [], failures: [], durationMs: 0 }, root));
 		return receipt({
 			status: "async_launched", taskId, taskType: "local_workflow", workflowName: name, runId, summary: meta.description,
@@ -257,13 +281,24 @@ export class WorkflowTasks {
 				// while the user reviewed them. Named nested workflows stay direct.
 				return snapshot;
 			},
-			progress: (event) => this.engine.emitWorkflowProgress(task.taskId, task.runId, event),
+			progress: (event) => {
+				if (event.type === "phase") task.phases.set(event.title, { ...event });
+				if (event.type === "agent") {
+					const previous = task.agents.get(event.logicalIndex);
+					const next = { ...previous, ...event };
+					// A retry start has a new child identity, often not known until agentSnapshots() reports it.
+					if (event.state === "start" && event.agentId === undefined) delete next.agentId;
+					task.agents.set(event.logicalIndex, next);
+				}
+				this.engine.emitWorkflowProgress(task.taskId, task.runId, event);
+			},
 		};
 		void root;
 	}
 
 	private finish(task: WorkflowTask, result: WorkflowRunResult, root: string): void {
 		task.chainSettled = true;
+		task.endedAt = Date.now();
 		task.obligations.close();
 		task.status = task.controller.signal.aborted && result.status !== "completed" ? "killed" : result.status;
 		try {

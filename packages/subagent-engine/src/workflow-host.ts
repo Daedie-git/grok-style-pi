@@ -103,7 +103,7 @@ export async function runWorkflowAgent(engine: Engine, ctx: ExtensionContext, re
 		// Pi ends a batch on terminate only when every sibling agrees; exhaustion ends the agent at the turn boundary
 		// regardless of an ordinary sibling such as read (re-review RR05).
 		shouldEndTurn: () => capture.invalid >= MAX_INVALID_STRUCTURED,
-		workflow: { taskId: request.taskId, runId: request.runId, logicalIndex: request.logicalIndex, label: request.label, phase: request.phase },
+		workflow: { taskId: request.taskId, runId: request.runId, logicalIndex: request.logicalIndex, attempt: request.attempt, label: request.label, phase: request.phase },
 	} });
 	// Hold the workflow's permit/obligation until the child's own cleanup (stop hooks, worktree) finishes (plan §18.1 H1, M1).
 	const spawnedId = (result.details as { agentId?: unknown } | undefined)?.agentId;

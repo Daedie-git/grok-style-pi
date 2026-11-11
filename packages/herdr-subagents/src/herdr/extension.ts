@@ -20,7 +20,7 @@ import {
 	type ToolText,
 } from "./runner.ts";
 import { EXPLICIT_SUBAGENT_REQUEST } from "./policy.ts";
-import { machineDefaultCwd, readHerdrSettings } from "./config.ts";
+import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings } from "./config.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
 import { createHcCli, hcConnect, hcSessionTag, listHcMachines } from "./hc.ts";
 import { hostPaneId, terminalHost, type TerminalHost } from "./host.ts";
@@ -35,7 +35,7 @@ export interface HerdrSubagentDeps {
 	/** Herdr CLI routed to a saved SSH machine. */
 	machineClient: (machine: string, exec?: HerdrExec) => HerdrClient;
 	/** Opens the coordination store that lives on a saved SSH machine. */
-	machineChannel: (machine: string) => Promise<StoreChannelFactory>;
+	machineChannel: (machine: string, workerEntry?: string) => Promise<StoreChannelFactory>;
 	/** Distinguishes this machine's panes in a remote store, where pane IDs belong to another server. */
 	hostname: string;
 	/** Saved SSH machines named in the Agent description. Read once per load, so /reload refreshes it. */
@@ -91,10 +91,10 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		machineClient: overrides.machineClient ?? ((machine, exec) => hc
 			? createHcCli(env, { machine, call: hcCall })
 			: createHerdrCli(env, undefined, machine, undefined, exec)),
-		machineChannel: overrides.machineChannel ?? (async (machine) => sshChannel({
+		machineChannel: overrides.machineChannel ?? (async (machine, workerEntry) => sshChannel({
 			target: (await findMachine(machine)).target,
 			node: env.HERDR_SUBAGENTS_REMOTE_NODE || env.GROK_HERDR_REMOTE_NODE,
-			entry: remoteWorkerEntry(env),
+			entry: workerEntry ?? remoteWorkerEntry(env),
 		})),
 		hostname: overrides.hostname ?? hostname(),
 		// Older Herdr has no saved machines, and an unavailable listing only leaves them unnamed.
@@ -109,7 +109,8 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 	return async (pi: ExtensionAPI) => {
 		const profiles = await deps.listMachines().catch(() => []);
 		const settings = readHerdrSettings(deps.agentDir);
-		const savedMachines = machineGuidance(profiles);
+		const savedMachines = machineGuidance(profiles) + "\nTo launch remotely, call Agent with machine and an absolute machine_cwd on that machine; the backend handles SSH and startup. Do not use SSH or terminal.run to launch agents yourself. Remote project paths may differ from this session's directory; use a confirmed path, not a guess."
+			+ (hc ? " In the Herdr app, discover existing working directories with hc ls --json; remote terminal addresses start with the saved machine name followed by /." : "");
 		const queuedNotices = new Set<string>();
 		let runner: HerdrRunner | undefined;
 		let opening: Promise<HerdrRunner> | undefined;
@@ -139,7 +140,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 			if (!pending) {
 				const profile = pickHerdrMachine(profiles, machine);
 				const session = hc ? undefined : profile?.session;
-				const open = (herdrSession: string | undefined, hcClient?: HerdrClient) => deps.machineChannel(machine).then((channel) => {
+				const open = (herdrSession: string | undefined, hcClient?: HerdrClient) => deps.machineChannel(machine, machineWorkerEntry(machine, profiles, settings.machines)).then((channel) => {
 					// Herdr calls share the store's channel: `--machine` runs SSH twice per call, and PowerShell too on Windows.
 					// Only a known session may: a bare command would reach whichever session the worker inherited, where pane IDs repeat.
 					const exec: HerdrExec | undefined = session ? (args, timeout, signal) => runner.store.herdr(["--session", session, ...args], timeout, signal) : undefined;
@@ -247,6 +248,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		};
 
 		const backend = overrides.mode === "backend" ? createBackendController({
+			machineGuidance: savedMachines,
 			assertActive() { if (stopped) throw new Error("Herdr backend is shut down"); },
 			paneChild: () => child !== undefined,
 			async route(agentId) {

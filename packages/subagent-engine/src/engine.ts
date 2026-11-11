@@ -15,7 +15,7 @@ import { launchResultText, noticeText } from "./policy/text.ts";
 import { memoryDir, memoryIndex, memoryPathGuard, memoryRootContained } from "./memory.ts";
 import { truncateResult } from "./results.ts";
 import { buildForkEntries, writeForkSession } from "./context/fork.ts";
-import { WorkflowTasks } from "./workflow-tool.ts";
+import { WorkflowTasks, type WorkflowSnapshot } from "./workflow-tool.ts";
 import type { WorkflowProgress } from "./workflow/host.ts";
 import type { WorkflowRunResult } from "./workflow/runtime.ts";
 import { HerdrRuns, type HerdrRunsPort, type PaneRequest } from "./backends/herdr-runs.ts";
@@ -29,7 +29,7 @@ import { TaskStore, type TaskHooks } from "./tasks/store.ts";
 import { listMetas, writeMeta } from "./store/meta.ts";
 import { Outbox } from "./store/outbox.ts";
 import { agentFiles, newAgentId, newRunId, sessionDir } from "./store/paths.ts";
-import type { AgentDefinition, AgentId, AgentMeta, Envelope, KilledBy, NoticePayload, NoticeRecord, RunHandle, RunId, RunOutcome, SendReceipt } from "./types.ts";
+import type { AgentDefinition, AgentId, AgentMeta, Envelope, KilledBy, NoticePayload, NoticeRecord, RunHandle, RunId, RunOutcome, SendReceipt, UsageAccounting } from "./types.ts";
 
 export const NOTICE_TYPE = "subagent-notification";
 export const AUTO_BACKGROUND_MS = 120_000;
@@ -632,6 +632,11 @@ export class Engine {
 		return this.workflowTasks;
 	}
 
+	/** Authoritative workflow state for UI hydration, without creating a workflow manager. */
+	workflowSnapshots(): WorkflowSnapshot[] {
+		return this.workflowTasks?.snapshots() ?? [];
+	}
+
 	/** The session output-token ledger read by a workflow's budget.spent() (root turns plus every child run). */
 	sessionOutputTokens(): number {
 		return this.outputTokens;
@@ -694,6 +699,7 @@ export class Engine {
 			if (meta.name) snapshot.name = meta.name;
 			if (meta.ownerAgentId) snapshot.ownerAgentId = meta.ownerAgentId;
 			if (meta.workflow) snapshot.workflow = { ...meta.workflow };
+			if (run?.usage) snapshot.usage = structuredClone(run.usage);
 			return snapshot;
 		});
 	}
@@ -1052,6 +1058,13 @@ export class Engine {
 		this.control.markRunning(agentId, runId, handle);
 		this.runAborts.set(runId, new AbortController());
 		handle.subscribe((event) => {
+			if (event.type === "usage") {
+				const conversation = this.control.get(agentId);
+				const run = conversation?.meta.runs.at(-1);
+				if (conversation?.active?.runId === runId && run?.runId === runId && run.status === "running") {
+					run.usage = structuredClone(event.usage);
+				}
+			}
 			if (event.type === "envelope") this.inbox(agentId).setState(event.envelopeId, event.state);
 			this.emit({ type: "run-event", agentId, runId, event });
 		});
@@ -1534,6 +1547,8 @@ export interface AgentSnapshot {
 	depth: number;
 	ownerAgentId?: AgentId;
 	workflow?: NonNullable<AgentMeta["workflow"]>;
+	/** Latest metered accounting for runId, detached from engine state. */
+	usage?: UsageAccounting;
 }
 
 export type EngineEvent =

@@ -1,8 +1,10 @@
 import type { AgentSnapshot, EngineEvent } from "../../packages/subagent-engine/src/engine.ts";
+import type { WorkflowSnapshot } from "../../packages/subagent-engine/src/workflow-tool.ts";
+import type { WorkflowProgress } from "../../packages/subagent-engine/src/workflow/host.ts";
 import { plainText, type Activity } from "../activity/ui.ts";
 
 type AgentState = "queued" | "running" | "cached" | "done" | "failed";
-type Slot = { index: number; label?: string; phase?: string; state: AgentState; agentId?: string };
+type Slot = { index: number; label?: string; phase?: string; state: AgentState; agentId?: string; attempt?: number; startedAt?: number; endedAt?: number; tokens?: number };
 type Workflow = {
 	taskId: string; runId: string; activity: Activity; slots: Map<number, Slot>; phases: Map<string, number>;
 	logs: string; children: string; logTail: string; childTail: string; terminal: boolean;
@@ -50,7 +52,9 @@ export class WorkflowActivities {
 	}
 	private slot(workflow: Workflow, next: Slot): boolean {
 		const previous = workflow.slots.get(next.index);
-		if (previous && previous.label === next.label && previous.phase === next.phase && previous.state === next.state && previous.agentId === next.agentId) return false;
+		next = { ...previous, ...next };
+		if (previous && previous.label === next.label && previous.phase === next.phase && previous.state === next.state && previous.agentId === next.agentId && previous.attempt === next.attempt
+			&& previous.startedAt === next.startedAt && previous.endedAt === next.endedAt && previous.tokens === next.tokens) return false;
 		workflow.slots.set(next.index, next);
 		workflow.outlineDirty = true;
 		return true;
@@ -66,14 +70,51 @@ export class WorkflowActivities {
 		workflow[field] = projected;
 		return true;
 	}
-	child(meta: Pick<AgentSnapshot, "agentId" | "workflow">, runId: string): void {
+	child(meta: Pick<AgentSnapshot, "agentId" | "workflow" | "startedAt" | "usage"> & Partial<Pick<AgentSnapshot, "running" | "status" | "endedAt">>, runId: string): void {
 		const provenance = meta.workflow;
 		if (!provenance) return;
 		const workflow = this.ensure(provenance.taskId, provenance.runId);
 		if (!workflow || workflow.terminal) return;
 		this.children.set(meta.agentId, { taskId: provenance.taskId, workflowRunId: provenance.runId, logicalIndex: provenance.logicalIndex, runId });
 		const previous = workflow.slots.get(provenance.logicalIndex);
-		if (this.slot(workflow, { index: provenance.logicalIndex, label: provenance.label ?? previous?.label, phase: provenance.phase ?? previous?.phase, state: "running", agentId: meta.agentId })) this.refresh(workflow, false, true);
+		const sameAgent = previous?.agentId === meta.agentId;
+		const finished = meta.running === false;
+		if (this.slot(workflow, {
+			index: provenance.logicalIndex, label: provenance.label ?? previous?.label, phase: provenance.phase ?? previous?.phase,
+			state: finished ? meta.status === "completed" ? "done" : "failed" : "running", agentId: meta.agentId, attempt: provenance.attempt,
+			startedAt: meta.startedAt ?? (sameAgent ? previous?.startedAt : undefined) ?? (finished ? undefined : Date.now()), endedAt: finished ? meta.endedAt : undefined,
+			tokens: meta.usage?.billable.totalTokens ?? (sameAgent ? previous?.tokens : undefined) ?? 0,
+		})) this.refresh(workflow, false, true);
+	}
+	/** Restore logical call states after hydrating child-run metrics; a completed child can still fail its workflow call. */
+	restore(snapshot: WorkflowSnapshot): void {
+		const workflow = this.ensure(snapshot.taskId, snapshot.runId, snapshot.name);
+		if (!workflow || workflow.terminal) return;
+		workflow.activity.startedAt = snapshot.startedAt;
+		for (const progress of snapshot.progress) this.progress(workflow, progress, true);
+		this.refresh(workflow);
+	}
+	private progress(workflow: Workflow, progress: WorkflowProgress, restoring = false): boolean {
+		if (progress.type === "phase") {
+			if (workflow.phases.get(progress.title) === progress.index) return false;
+			workflow.phases.set(progress.title, progress.index);
+			workflow.outlineDirty = true;
+			return true;
+		}
+		if (progress.type === "log") return this.tail(workflow, "logs", progress.message + "\n");
+		const previous = workflow.slots.get(progress.logicalIndex);
+		const newAttempt = progress.attempt !== undefined && previous?.attempt !== undefined
+			? progress.attempt !== previous.attempt
+			: progress.state === "start" && ((progress.agentId !== undefined && previous?.agentId !== undefined && progress.agentId !== previous.agentId)
+				|| (!restoring && previous?.state !== "running"));
+		if (newAttempt && previous?.agentId) this.children.delete(previous.agentId);
+		return this.slot(workflow, {
+			index: progress.logicalIndex, label: progress.label ?? previous?.label, phase: progress.phase ?? previous?.phase,
+			state: progress.state === "start" ? "running" : progress.state, agentId: progress.agentId ?? (newAttempt ? undefined : previous?.agentId),
+			attempt: progress.attempt ?? (newAttempt ? undefined : previous?.attempt),
+			startedAt: newAttempt ? undefined : previous?.startedAt, tokens: newAttempt ? 0 : previous?.tokens,
+			endedAt: progress.state === "done" || progress.state === "failed" ? (newAttempt ? undefined : previous?.endedAt) ?? Date.now() : newAttempt ? undefined : previous?.endedAt,
+		});
 	}
 	observe(event: EngineEvent): boolean {
 		if (event.type === "workflow-progress" || event.type === "workflow-settled") {
@@ -86,27 +127,14 @@ export class WorkflowActivities {
 				workflow.activity.status = status;
 				workflow.activity.endedAt = Date.now(); workflow.activity.stop = undefined; workflow.activity.transcript = undefined;
 				this.refresh(workflow);
-			} else if (!workflow.terminal) {
-				const progress = event.event;
-				let changed = false;
-				if (progress.type === "phase") {
-					if (workflow.phases.get(progress.title) !== progress.index) {
-						workflow.phases.set(progress.title, progress.index);
-						workflow.outlineDirty = changed = true;
-					}
-				} else if (progress.type === "log") changed = this.tail(workflow, "logs", progress.message + "\n");
-				else {
-					const previous = workflow.slots.get(progress.logicalIndex);
-					changed = this.slot(workflow, {
-						index: progress.logicalIndex, label: progress.label ?? previous?.label, phase: progress.phase ?? previous?.phase,
-						state: progress.state === "start" ? "running" : progress.state, agentId: progress.agentId ?? previous?.agentId,
-					});
-				}
-				if (changed) this.refresh(workflow, false, true);
-			}
+			} else if (!workflow.terminal && this.progress(workflow, event.event)) this.refresh(workflow, false, true);
 			return true;
 		}
-		if (event.type === "spawned" && event.meta.workflow) { this.child(event.meta, event.runId); return true; }
+		if (event.type === "spawned" && event.meta.workflow) {
+			const run = event.meta.runs.find((run) => run.runId === event.runId);
+			this.child({ ...event.meta, startedAt: run?.startedAt, usage: run?.usage }, event.runId);
+			return true;
+		}
 		if (!("agentId" in event)) return false;
 		const child = this.children.get(event.agentId);
 		if (!child) return false;
@@ -117,9 +145,15 @@ export class WorkflowActivities {
 		else if (event.type === "run-event") {
 			if (event.event.type === "text") text = event.event.delta;
 			else if (event.event.type === "tool") text = `${event.event.toolName} · ${event.event.phase}`;
+			else if (event.event.type === "usage") {
+				const slot = workflow.slots.get(child.logicalIndex);
+				if (slot?.agentId === event.agentId && slot.endedAt === undefined && !workflow.terminal) changed = this.slot(workflow, { ...slot, tokens: event.event.usage.billable.totalTokens });
+			}
 		} else if (event.type === "settled") {
 			const slot = workflow.slots.get(child.logicalIndex);
-			if (slot?.agentId === event.agentId && !workflow.terminal) changed = this.slot(workflow, { ...slot, state: event.outcome.status === "completed" ? "done" : "failed" });
+			if (slot?.agentId === event.agentId && !workflow.terminal) changed = this.slot(workflow, {
+				...slot, state: event.outcome.status === "completed" ? "done" : "failed", endedAt: slot.endedAt ?? Date.now(), tokens: event.outcome.usage.billable.totalTokens,
+			});
 			text = event.outcome.error ?? event.outcome.resultText;
 		}
 		if (text) changed = this.tail(workflow, "children", `[${line(event.agentId)}] ${text}\n`) || changed;
@@ -136,6 +170,10 @@ export class WorkflowActivities {
 		const count = (state: AgentState) => slots.filter((slot) => slot.state === state).length;
 		const summary = `${count("done")}/${slots.length} done · ${count("cached")} cached · ${count("failed")} failed`;
 		workflow.activity.detail = summary;
+		workflow.activity.children = slots.map((slot) => ({
+			title: line(slot.label ?? `agent() #${slot.index}`), status: slot.state,
+			startedAt: slot.startedAt, endedAt: slot.endedAt, tokens: slot.tokens ?? 0,
+		}));
 		const groups = new Map<string, Slot[]>();
 		for (const slot of slots) { const phase = slot.phase ?? "Ungrouped"; const group = groups.get(phase) ?? []; group.push(slot); groups.set(phase, group); }
 		for (const phase of workflow.phases.keys()) if (!groups.has(phase)) groups.set(phase, []);

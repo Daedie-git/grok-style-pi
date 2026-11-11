@@ -1,10 +1,13 @@
 import type { AgentSnapshot, EngineEvent } from "../../packages/subagent-engine/src/engine.ts";
+import type { WorkflowSnapshot } from "../../packages/subagent-engine/src/workflow-tool.ts";
 import { plainText, type Activity } from "../activity/ui.ts";
 import { WorkflowActivities } from "./workflow-activity.ts";
 
 export interface ActivityEngine {
 	/** Detached public snapshots restore already-running entries after an engine handover. */
 	agentSnapshots(): AgentSnapshot[];
+	/** Authoritative logical workflow progress, including calls without a live child. */
+	workflowSnapshots?(): WorkflowSnapshot[];
 	subscribe(listener: (event: EngineEvent) => void): () => void;
 	userStop(agentId: string): Promise<void>;
 	userStopWorkflow?(taskId: string): boolean | void | Promise<boolean | void>;
@@ -30,12 +33,16 @@ export class SubagentAdapter {
 		this.engine = engine; this.publish = publish;
 		this.workflows = new WorkflowActivities(engine.userStopWorkflow?.bind(engine), publish);
 		this.unsubscribe = engine.subscribe((event) => this.observe(event));
-		for (const snapshot of engine.agentSnapshots()) {
-			if (snapshot.running && snapshot.runId) {
-				if (snapshot.workflow) this.workflows.child(snapshot, snapshot.runId);
-				else this.begin(snapshot.agentId, snapshot.runId, snapshot);
-			}
-		}
+		const snapshots = engine.agentSnapshots();
+		const workflows = engine.workflowSnapshots?.();
+		const workflowKey = (taskId: string, runId: string) => JSON.stringify([taskId, runId]);
+		const activeWorkflows = new Set(workflows ? workflows.filter((workflow) => workflow.status === "running").map((workflow) => workflowKey(workflow.taskId, workflow.runId))
+			: snapshots.filter((snapshot) => snapshot.running && snapshot.runId && snapshot.workflow).map((snapshot) => workflowKey(snapshot.workflow!.taskId, snapshot.workflow!.runId)));
+		// Restore attempt metrics first; logical workflow outcomes override child-run outcomes afterward.
+		for (const snapshot of snapshots.filter((snapshot) => snapshot.runId && snapshot.workflow && activeWorkflows.has(workflowKey(snapshot.workflow.taskId, snapshot.workflow.runId)))
+			.sort((a, b) => Number(a.running) - Number(b.running) || (a.startedAt ?? 0) - (b.startedAt ?? 0))) this.workflows.child(snapshot, snapshot.runId!);
+		for (const workflow of workflows ?? []) if (workflow.status === "running") this.workflows.restore(workflow);
+		for (const snapshot of snapshots) if (snapshot.running && snapshot.runId && !snapshot.workflow) this.begin(snapshot.agentId, snapshot.runId, snapshot);
 	}
 	workflowReceipt(details: unknown): void { this.workflows.receipt(details); }
 	identity(agentId: string): RunIdentity | undefined { return this.runs.get(agentId)?.identity; }

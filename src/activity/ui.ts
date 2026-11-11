@@ -1,5 +1,13 @@
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TuiMouseEvent } from "@earendil-works/pi-tui";
 
+export type ActivityChild = {
+	title: string;
+	status: string;
+	startedAt?: number;
+	endedAt?: number;
+	tokens: number;
+};
+
 export type Activity = {
 	id: string;
 	kind: "command" | "agent" | "workflow";
@@ -9,6 +17,8 @@ export type Activity = {
 	endedAt?: number;
 	output: string;
 	detail?: string;
+	/** Informational workflow agent rows; these have no independent controls or viewers. */
+	children?: readonly ActivityChild[];
 	/** Effective model and thinking level for a subagent run, when known. */
 	model?: string;
 	transcript?: () => string;
@@ -20,6 +30,10 @@ export const plainText = (text: string) => stripTerminalSequences(text).replace(
 const oneLine = (text: string) => plainText(text).replace(/\s+/g, " ").trim();
 type Theme = { fg: (token: any, text: string) => string; bg?: (token: any, text: string) => string };
 type Hit = { y: number; x: number; end: number; action: () => void };
+const elapsedTime = (startedAt: number, endedAt = Date.now()) => {
+	const seconds = Math.max(0, Math.floor((endedAt - startedAt) / 1000));
+	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${seconds % 60}s`;
+};
 
 export class ActivityPanel {
 	private hits: Hit[] = [];
@@ -55,8 +69,7 @@ export class ActivityPanel {
 				// Keep Close reachable when the terminal is too narrow for all controls.
 				while (buttons.length > 1 && buttons.map((button) => button.label).join(" ").length > width) buttons.shift();
 				const controls = buttons.map((button) => button.label).join(" ");
-				const elapsed = Math.max(0, Math.floor(((entry.endedAt ?? Date.now()) - entry.startedAt) / 1000));
-				const time = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m${elapsed % 60}s`;
+				const time = elapsedTime(entry.startedAt, entry.endedAt);
 				const label = `${oneLine(entry.title)} · ${entry.status} · ${time}${entry.detail ? ` · ${oneLine(entry.detail)}` : ""}`;
 				const leftWidth = Math.max(0, width - controls.length - 1);
 				const left = truncateToWidth(label, leftWidth, "…");
@@ -74,6 +87,11 @@ export class ActivityPanel {
 				this.hits.push({ y, x: 0, end: width, action: () => this.view(entry) });
 				if (entry.kind === "agent" && entry.model) {
 					lines.push(truncateToWidth(this.theme.fg("muted", `  ${oneLine(entry.model)}`), width));
+				}
+				if (entry.kind === "workflow") for (const child of entry.children ?? []) {
+					const time = child.startedAt === undefined ? "—" : elapsedTime(child.startedAt, child.endedAt);
+					const label = `  ${oneLine(child.status)} · ${time} · ${child.tokens.toLocaleString("en-US")} tokens · ${oneLine(child.title)}`;
+					lines.push(truncateToWidth(this.theme.fg("muted", label), width, "…"));
 				}
 			}
 			if (group.length > 3) {

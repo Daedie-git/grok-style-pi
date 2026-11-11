@@ -166,7 +166,7 @@ export interface AgentMeta {
 	/** A fork's inherited exact system prompt and tool names, kept so a continuation after eviction reproduces them. */
 	forkSystemPrompt?: string;
 	/** Set on agents started by a Workflow agent() call, so views can nest them under their workflow. */
-	workflow?: { taskId: string; runId: string; logicalIndex: number; label?: string; phase?: string };
+	workflow?: { taskId: string; runId: string; logicalIndex: number; attempt?: number; label?: string; phase?: string };
 	forkParentTools?: string[];
 	model?: { requested?: string; effective: string };
 	effort?: { requested?: string; effective: string };
@@ -268,6 +268,8 @@ export type BackendEvent =
 	/** The run dispatched its first provider request (its prompt reached the model). */
 	/** promptIncluded: whether the run's prompt survived context transforms into the first request (re-review RR03). */
 	| { type: "dispatched"; promptIncluded?: boolean }
+	/** Detached accounting after a metered assistant message in this run. */
+	| { type: "usage"; usage: UsageAccounting }
 	| { type: "progress"; at: number; kind: string }
 	| { type: "blocked" }
 	| { type: "unblocked" }

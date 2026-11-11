@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { installGrokStyle, type InstallDeps } from "../extensions/install.ts";
 import type { ToolTransform } from "../src/tools/register-extension.ts";
-import { createHerdrSubagents } from "../packages/herdr-subagents/src/herdr/extension.ts";
+import { createHerdrSubagents, type HerdrSubagentOptions } from "../packages/herdr-subagents/src/herdr/extension.ts";
 import type { HerdrBackendHandle } from "../packages/herdr-subagents/src/herdr/backend.ts";
 import { HerdrBackendAdapter } from "../packages/subagent-engine/src/backends/herdr.ts";
 import type { Engine } from "../packages/subagent-engine/src/engine.ts";
@@ -36,7 +36,10 @@ export function herdrIntegrationEnvironment(env: NodeJS.ProcessEnv): NodeJS.Proc
 }
 
 /** The same entrypoint with injectable engine services for embedding and offline SDK tests. */
-export function createGrokSubagents(options: { engine?: SubagentEngineOptions; style?: InstallDeps; env?: NodeJS.ProcessEnv } = {}): ExtensionFactory {
+export function createGrokSubagents(options: {
+	engine?: SubagentEngineOptions; style?: InstallDeps; env?: NodeJS.ProcessEnv;
+	herdr?: Omit<HerdrSubagentOptions, "env" | "mode" | "onBackend">;
+} = {}): ExtensionFactory {
 	return async (pi) => {
 		if (inChildContext()) return;
 		const { runtime, features, activity } = await installGrokStyle(pi, options.style);
@@ -54,11 +57,12 @@ export function createGrokSubagents(options: { engine?: SubagentEngineOptions; s
 			detach = current.attachHerdr(new HerdrBackendAdapter(handle));
 		};
 		if (inHerdr) {
-			await createHerdrSubagents({ env: herdrIntegrationEnvironment(env), mode: "backend", onBackend(created) { handle = created; connect(); } })(pi);
+			await createHerdrSubagents({ ...options.herdr, env: herdrIntegrationEnvironment(env), mode: "backend", onBackend(created) { handle = created; connect(); } })(pi);
 		}
 		const engine = createSubagentEngine({
 			...options.engine,
 			panes: inHerdr || options.engine?.panes,
+			paneGuidance: inHerdr ? handle?.machineGuidance : options.engine?.paneGuidance,
 			paneDefault: options.engine?.paneDefault ?? (inHerdr && features.panes),
 			autonomy: features.autonomy ? "positive" : "explicit",
 			onEngine(created) { activity?.attachEngine(created); current = created; connect(); options.engine?.onEngine?.(created); },

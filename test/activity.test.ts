@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { ActivityPanel, ActivityViewer, type Activity } from "../src/activity/ui.ts";
 import { installActivityPanel } from "../src/activity/panel.ts";
 import { subagentRuntimeLabel } from "../src/subagents/adapter.ts";
@@ -185,6 +185,32 @@ test("panel buttons retain correct hit targets at narrow and wide widths", () =>
 	assert.equal(viewed, 3);
 	entry.status = "completed";
 	assert.deepEqual(panel.render(80), []);
+});
+
+test("workflow agent rows are indented, sanitized, width-bounded and have no thread controls", () => {
+	const workflow: Activity = { id: "workflow:one", kind: "workflow", title: "◆ Workflow · Review", status: "running", startedAt: Date.now(), output: "", stop() {}, children: [
+		{ title: "Inspect 中文\nresource ownership\x1b]52;c;payload\x07", status: "running", tokens: 1234, startedAt: Date.now() },
+		{ title: "Verify changes ".repeat(30), status: "cached", tokens: 0 },
+	] };
+	const second: Activity = { ...workflow, id: "workflow:two", title: "◆ Workflow · Second", children: [] };
+	const agent: Activity = { ...workflow, id: "agent:one", kind: "agent", title: "Independent agent", children: undefined };
+	const actions: string[] = [];
+	const panel = new ActivityPanel(() => [workflow, second, agent], theme,
+		(entry) => actions.push(`view:${entry.id}`), (entry) => actions.push(`stop:${entry.id}`), () => actions.push("all"), (entry) => actions.push(`close:${entry.id}`));
+	for (const width of [1, 8, 20, 80, 180]) assert.ok(panel.render(width).every((row) => visibleWidth(row) <= width));
+	const rows = panel.render(180).map(stripTerminalSequences);
+	assert.match(rows[2], /^  running · 0s · 1,234 tokens · Inspect 中文 resource ownership$/);
+	assert.match(rows[3], /^  cached · — · 0 tokens · Verify changes .*…$/);
+	assert.doesNotMatch(rows.slice(2, 4).join("\n"), /\[View\]|\[Stop\]|\[Close\]|payload|\x1b/);
+	assert.equal(panel.handleMouse(click(4, 2)), undefined);
+	assert.equal(panel.handleMouse(click(4, 3)), undefined);
+	assert.deepEqual(actions, []);
+	const secondRow = rows.findIndex((row) => row.includes("Workflow · Second"));
+	panel.handleMouse(click(rows[secondRow].indexOf("[Stop]"), secondRow));
+	const agentRow = rows.findIndex((row) => row.includes("Independent agent"));
+	panel.handleMouse(click(2, agentRow));
+	panel.handleMouse(click(rows[agentRow].indexOf("[Close]"), agentRow));
+	assert.deepEqual(actions, ["stop:workflow:two", "view:agent:one", "close:agent:one"]);
 });
 
 test("stopping one command preserves its peer and parent signal, output stays inspectable", async (t) => {

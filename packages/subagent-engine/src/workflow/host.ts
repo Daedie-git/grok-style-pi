@@ -32,6 +32,6 @@ export interface WorkflowHost {
 	progress(event: WorkflowProgress): void;
 }
 export type WorkflowProgress =
-	| { type: "agent"; logicalIndex: number; label?: string; phase?: string; state: "queued" | "start" | "done" | "failed" | "cached"; agentId?: string }
+	| { type: "agent"; logicalIndex: number; attempt?: number; label?: string; phase?: string; state: "queued" | "start" | "done" | "failed" | "cached"; agentId?: string }
 	| { type: "phase"; index: number; title: string }
 	| { type: "log"; message: string };

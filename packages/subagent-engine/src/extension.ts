@@ -20,6 +20,8 @@ export interface SubagentEngineOptions extends Partial<EngineDeps> {
 	autonomy?: "positive" | "explicit";
 	/** A Herdr pane backend will be attached (engine.attachHerdr); exposes pane parameters on Agent. */
 	panes?: boolean;
+	/** Host-supplied discovery and launch guidance appended to the root Agent tool. */
+	paneGuidance?: string;
 	/** Called with the engine once created (integrations, tests). */
 	onEngine?: (engine: Engine) => void;
 }
@@ -98,7 +100,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 			return created;
 		};
 		let engine = create();
-		registerEngineTools(pi, () => engine, ROOT_CALLER, { policy, panes: options.panes, paneDefault: options.paneDefault });
+		registerEngineTools(pi, () => engine, ROOT_CALLER, { policy, panes: options.panes, paneDefault: options.paneDefault, paneGuidance: options.paneGuidance });
 		if (env.PI_SUBAGENT_ALIASES !== "0") registerCompatAliases(pi, () => engine, ROOT_CALLER);
 		if (env.PI_SUBAGENT_TASKS !== "0") registerTaskTools(pi, { store: () => engine.taskStore(), caller: {} });
 		if (env.PI_SUBAGENT_WORKFLOW !== "0") registerWorkflowTool(pi, () => engine.workflows());

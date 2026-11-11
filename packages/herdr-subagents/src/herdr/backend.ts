@@ -7,6 +7,8 @@ export type HerdrTerminalPhase = "completed" | "failed" | "stopped" | "needs-ans
 export type HerdrBackendRequest = Omit<SpawnRequest, "paneId" | "tabId" | "workspaceId" | "sessionFile" | "agentDir"> & { machine?: string; machineCwd?: string };
 export interface HerdrBackendNotice { noticeId: string; agentId: string; runId: string; phase: HerdrTerminalPhase; content: string; machine?: string }
 export interface HerdrBackendHandle {
+	/** Saved-machine selectors and host-specific launch guidance for the orchestrator's Agent tool. */
+	readonly machineGuidance?: string;
 	spawn(request: HerdrBackendRequest, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ agentId: string; runId: string; text: string }>;
 	read(agentId: string, options: { runId?: string; wait?: boolean; signal?: AbortSignal }): Promise<{ status: string; phase: RunPhase; resultText: string; text: string; runId?: string }>;
 	steer(agentId: string, message: string, options?: { runId?: string }): Promise<{ ok: boolean; message: string }>;
@@ -20,6 +22,7 @@ export interface HerdrBackendHandle {
 }
 
 interface BackendHost {
+	machineGuidance?: string;
 	route(agentId: string): Promise<{ id: string; runner: HerdrRunner }>;
 	spawn(request: HerdrBackendRequest, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ runner: HerdrRunner; agentId: string; runId: string }>;
 	caller?(ctx: ExtensionContext, runner: HerdrRunner, cwd: string): Promise<ResumeCaller>;
@@ -47,6 +50,7 @@ export function createBackendController(host: BackendHost) {
 		return { ...routed, id: record.id, record };
 	}
 	const handle: HerdrBackendHandle = {
+		machineGuidance: host.machineGuidance,
 		paneChild: () => host.paneChild(),
 		async spawn(request, ctx, signal) {
 			host.assertActive();

@@ -69,6 +69,42 @@ test("the store worker serves the same protocol over SSH stdio", async (t) => {
 	assert.match(args[split + 2], new RegExp(`'${root.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")}'$`), "a root with spaces is quoted for the remote shell");
 });
 
+test("the default SSH channel uses a machine's worker entry before global package defaults", async (t) => {
+	const ssh = fakeSsh(t);
+	const root = mkdtempSync(join(tmpdir(), "herdr-machine-entry-"));
+	const remoteRoot = join(root, "remote");
+	const entry = join(root, "machine worker.mjs");
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	writeFileSync(entry, `process.argv[2] = ${JSON.stringify(remoteRoot)}; await import(${JSON.stringify(ENTRY)});`);
+	const profiles = [{ id: "m1", label: "lappy", target: "aim-laptop", enabled: true }];
+	const bin = join(root, "herdr");
+	writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(profiles)}'\n`);
+	chmodSync(bin, 0o755);
+	writeFileSync(join(root, "herdr-subagents.json"), JSON.stringify({ machines: { m1: { cwd: PROJECT, workerEntry: entry } } }));
+	const tools: any[] = [];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = {
+		registerTool(tool: any) { tools.push(tool); },
+		on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
+		appendEntry() {},
+	} as unknown as ExtensionAPI;
+	await createHerdrSubagents({
+		root, agentDir: root, client: remoteClient().client,
+		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_BIN_PATH: bin, GROK_HERDR_REMOTE_PACKAGE: "/wrong-global-package" },
+		listMachines: async () => profiles, machineClient: () => remoteClient().client,
+	})(pi);
+	try {
+		// Reaching directory validation proves that the selected worker completed the protocol handshake.
+		await assert.rejects(tools[0].execute("call", {
+			prompt: "x", description: "x", subagent_type: "Explore", machine: "lappy", machine_cwd: join(root, "missing"),
+		}, undefined, undefined, { cwd: PROJECT, isProjectTrusted: () => false, sessionManager: { getSessionFile: () => undefined } }), /Directory .* does not exist on lappy/);
+		const args = ssh.args();
+		assert.equal(args[args.indexOf("--") + 1], "aim-laptop");
+		assert.ok(args.at(-1)!.includes(entry), "the exact per-machine entry reaches the existing SSH transport");
+		assert.ok(!args.at(-1)!.includes("wrong-global-package"));
+	} finally { await handlers.get("session_shutdown")!({ reason: "quit" }); }
+});
+
 test("a dropped SSH channel fails pending and later calls with its diagnostics", async (t) => {
 	fakeSsh(t, 'echo "Permission denied (publickey)" >&2\nexit 255\n');
 	const store = new HerdrStore(sshChannel({ target: "laptop", entry: ENTRY }));
@@ -303,7 +339,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 		sendUserMessage() {},
 		appendEntry(customType: string, data: unknown) { saved.push({ type: "custom", customType, data }); },
 	} as unknown as ExtensionAPI;
-	writeFileSync(join(localRoot, "herdr-subagents.json"), JSON.stringify({ machines: { m1: { cwd: PROJECT } } }));
+	writeFileSync(join(localRoot, "herdr-subagents.json"), JSON.stringify({ machines: { m1: { cwd: PROJECT, workerEntry: "C:/git/grok-style-pi/src/herdr/worker-entry.mjs" } } }));
 	await createHerdrSubagents({
 		root: localRoot, client: local, agentDir: localRoot, hostname: "desk", now: () => clock,
 		env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_TAB_ID: "w1:t1", HERDR_WORKSPACE_ID: "w1" },
@@ -312,7 +348,9 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 			{ id: "m1", label: "laptop", target: "aim@lappy.local", enabled: true, session: "jobs" },
 			{ id: "m2", label: "old", target: "old", enabled: false },
 		],
-		machineChannel: async () => {
+		machineChannel: async (machine, workerEntry) => {
+			assert.equal(machine, "laptop");
+			assert.equal(workerEntry, "C:/git/grok-style-pi/src/herdr/worker-entry.mjs");
 			opens++;
 			if (opens === 1) return sshChannel({ target: "laptop", entry: ENTRY, root: remoteRoot });
 			// Later channels can be dropped on demand, like a lost SSH connection.
@@ -326,7 +364,7 @@ test("Agent with machine runs in that machine's panes and store, and routes resu
 	const ctx = { cwd: localRoot, isProjectTrusted: () => true, isIdle: () => true, abort() {}, ui: { notify(text: string) { notices.push(text); } }, sessionManager: { getEntries: () => saved, getBranch: () => [], getSessionFile: () => undefined, getSessionId: () => "parent" } };
 	const [agentTool, resultTool] = tools;
 	assert.match(agentTool.parameters.properties.machine.description, /Only when the user asks/);
-	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\. Pass the name shown first as machine\.$/, "the model can map a casual name to the saved label");
+	assert.match(agentTool.description, /Saved machines: laptop \(aim@lappy\.local\)\. Pass the name shown first as machine\.\nTo launch remotely, call Agent with machine and an absolute machine_cwd on that machine; the backend handles SSH and startup\. Do not use SSH or terminal\.run to launch agents yourself\. Remote project paths may differ from this session's directory; use a confirmed path, not a guess\.$/, "the model can map a casual name to the saved label and receives remote launch instructions");
 	await handlers.get("session_start")!({}, ctx);
 	try {
 		const started = await agentTool.execute("call", { prompt: "Check the build", description: "Check build", subagent_type: "Explore", machine: "laptop" }, undefined, undefined, ctx);

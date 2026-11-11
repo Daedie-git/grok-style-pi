@@ -96,7 +96,7 @@ The bridge uses documented [Claude command hooks](https://code.claude.com/docs/e
 
 ## Remote machines
 
-`Agent.machine` selects a [saved Herdr SSH machine](https://herdr.dev/docs/connecting-machines/) label or profile ID, only when the user asks. Enabled machines and SSH targets appear in the tool description; repeated labels use profile IDs. Run `/reload` after adding a machine. Remote IDs end in `@<machine>`, such as `explore@laptop`, and subsequent result, steering, and cancellation calls route by that suffix.
+`Agent.machine` selects a [saved Herdr SSH machine](https://herdr.dev/docs/connecting-machines/) label or profile ID, only when the user asks. Enabled machines and SSH targets appear in the tool description, including the combined Grok integration; repeated labels use profile IDs. Launch with `Agent.machine`, not a hand-written SSH command. In the Herdr app, `hc ls --json` lists existing working directories; remote addresses begin with the machine name followed by `/`. Run `/reload` after adding a machine. Remote IDs end in `@<machine>`, such as `explore@laptop`, and subsequent result, steering, and cancellation calls route by that suffix.
 
 `machine_cwd` sets an absolute directory on that machine. It overrides the per-machine default in `~/.pi/agent/herdr-subagents.json` (or your `PI_CODING_AGENT_DIR`); without either, the parent's path is used. Configure Windows machines to avoid inheriting a Linux path:
 
@@ -129,7 +129,7 @@ The standalone plugin defaults to the same absolute worker path on the remote ma
 - `HERDR_SUBAGENTS_REMOTE_PACKAGE` to the standalone package root on the remote machines.
 - `HERDR_SUBAGENTS_REMOTE_NODE` to the remote Node executable if it is not on non-interactive SSH's `PATH`.
 
-Both apply to every machine. The old `GROK_HERDR_REMOTE_PACKAGE` and `GROK_HERDR_REMOTE_NODE` variables remain supported; the new names take precedence. The old package variable names a Grok package root, whose `src/herdr/worker-entry.mjs` forwards to the extracted runner. Update the package-root override if moving a remote machine from Grok to a standalone installation.
+Both apply to every machine. When checkouts differ between machines, set `machines.<selector>.workerEntry` in `herdr-subagents.json` to that machine's absolute worker file. It can be set on its own without changing the project's working-directory default, or alongside `cwd`. For example, `"lappy": { "cwd": "C:/git", "workerEntry": "C:/git/grok-style-pi/src/herdr/worker-entry.mjs" }` points to a combined Grok checkout; a standalone checkout uses its own `src/herdr/worker-entry.mjs`. Profile-ID settings take precedence over unique-label settings, and a per-machine worker entry overrides the global package path for that machine only. Run `/reload` after changing settings; no remote files are deployed or rewritten. The old `GROK_HERDR_REMOTE_PACKAGE` and `GROK_HERDR_REMOTE_NODE` variables remain supported; the new names take precedence. The old package variable names a Grok package root, whose `src/herdr/worker-entry.mjs` forwards to the extracted runner. Update the package-root override if moving a remote machine from Grok to a standalone installation.
 
 ## Coordination and upgrades
 

@@ -3,7 +3,8 @@ import { join } from "node:path";
 import type { HerdrMachine } from "./client.ts";
 
 export interface MachineSettings {
-	cwd: string;
+	cwd?: string;
+	workerEntry?: string;
 }
 
 export interface HerdrSettings {
@@ -29,11 +30,19 @@ export function readHerdrSettings(agentDir: string): HerdrSettings {
 		if (typeof closeWhenDone !== "boolean") throw new Error("closeWhenDone must be true or false");
 		const machines: Record<string, MachineSettings> = Object.create(null);
 		for (const [selector, settings] of Object.entries(config.machines ?? {})) {
-			if (!record(settings) || typeof settings.cwd !== "string" || !settings.cwd.trim()) {
+			if (!record(settings)) throw new Error(`machines.${selector} must be a settings object`);
+			if (settings.cwd !== undefined && (typeof settings.cwd !== "string" || !settings.cwd.trim())) {
 				throw new Error(`machines.${selector}.cwd must be a nonempty absolute directory`);
 			}
+			if (settings.workerEntry !== undefined && (typeof settings.workerEntry !== "string" || !settings.workerEntry.trim())) {
+				throw new Error(`machines.${selector}.workerEntry must be a nonempty string`);
+			}
+			if (settings.cwd === undefined && settings.workerEntry === undefined) throw new Error(`machines.${selector} must set cwd or workerEntry`);
 			// Absolute paths are checked on the target machine, not with the local OS's rules.
-			machines[selector] = { cwd: settings.cwd.trim() };
+			machines[selector] = {
+				...(typeof settings.cwd === "string" ? { cwd: settings.cwd.trim() } : {}),
+				...(typeof settings.workerEntry === "string" ? { workerEntry: settings.workerEntry.trim() } : {}),
+			};
 		}
 		return { machines, closeWhenDone };
 	} catch (error) {
@@ -47,11 +56,20 @@ export function readMachineSettings(agentDir: string): Record<string, MachineSet
 }
 
 export function machineDefaultCwd(selector: string, machines: HerdrMachine[], settings: Record<string, MachineSettings>): string | undefined {
+	return machineSettings(selector, machines, settings)?.cwd;
+}
+
+export function machineWorkerEntry(selector: string, machines: HerdrMachine[], settings: Record<string, MachineSettings>): string | undefined {
+	return machineSettings(selector, machines, settings)?.workerEntry;
+}
+
+/** Profile IDs win over unique labels; an ambiguous label never selects settings. */
+function machineSettings(selector: string, machines: HerdrMachine[], settings: Record<string, MachineSettings>): MachineSettings | undefined {
 	const byLabel = machines.filter((machine) => machine.label === selector);
 	const machine = machines.find((machine) => machine.id === selector) ?? (byLabel.length === 1 ? byLabel[0] : undefined);
-	if (!machine) return Object.hasOwn(settings, selector) ? settings[selector].cwd : undefined;
-	if (Object.hasOwn(settings, machine.id)) return settings[machine.id].cwd;
-	if (machines.filter((item) => item.label === machine.label).length === 1 && Object.hasOwn(settings, machine.label)) return settings[machine.label].cwd;
+	if (!machine) return byLabel.length > 1 ? undefined : Object.hasOwn(settings, selector) ? settings[selector] : undefined;
+	if (Object.hasOwn(settings, machine.id)) return settings[machine.id];
+	if (machines.filter((item) => item.label === machine.label).length === 1 && Object.hasOwn(settings, machine.label)) return settings[machine.label];
 	return undefined;
 }
 

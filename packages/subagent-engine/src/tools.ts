@@ -12,6 +12,8 @@ export interface ToolOptions {
 	panes?: boolean;
 	/** General-purpose launches default to a pane (EngineDeps.paneDefault). */
 	paneDefault?: boolean;
+	/** Host-supplied saved-machine selectors and remote-launch guidance, for the root Agent tool only. */
+	paneGuidance?: string;
 }
 
 /** `engine` is resolved per call: after a reload the root's tools route to the adopted engine (plan §17.11). */
@@ -30,7 +32,7 @@ export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => En
 	pi.registerTool(defineTool({
 		name: "Agent",
 		label: "Agent",
-		description: agentToolDescription(options.policy()),
+		description: agentToolDescription(options.policy()) + (options.panes && options.paneGuidance ? `\n\n${options.paneGuidance}` : ""),
 		parameters: Type.Object({
 			description: Type.String({ description: "A short (3-5 word) description of the task." }),
 			prompt: Type.String({ description: "The task for the agent to perform." }),

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { machineDefaultCwd, readHerdrSettings, readMachineSettings } from "../src/herdr/config.ts";
+import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings, readMachineSettings, type MachineSettings } from "../src/herdr/config.ts";
 import { parseAgentFile } from "../src/herdr/agent-file.ts";
 import { createHerdrSubagents, type HerdrBackendHandle } from "../src/herdr/extension.ts";
 import { HerdrRunner, type SpawnRequest } from "../src/herdr/runner.ts";
@@ -30,6 +30,48 @@ test("machine defaults accept Windows paths and resolve both labels and IDs", (t
 	for (const value of ["{", "null", '{"machines":[]}', '{"machines":{"lappy":{"cwd":""}}}']) {
 		writeFileSync(path, value);
 		assert.throws(() => readMachineSettings(dir), /Invalid .*herdr-subagents\.json/);
+	}
+});
+
+test("machine worker entries share directory selector precedence and refuse ambiguous labels", () => {
+	const settings: Record<string, MachineSettings> = {
+		lappy: { cwd: "C:/git", workerEntry: "C:/label/worker-entry.mjs" },
+	};
+	for (const selector of ["lappy", "m1"]) assert.equal(machineWorkerEntry(selector, profiles, settings), "C:/label/worker-entry.mjs");
+	settings.m1 = { cwd: "C:/work", workerEntry: "C:/id/worker-entry.mjs" };
+	for (const selector of ["lappy", "m1"]) assert.equal(machineWorkerEntry(selector, profiles, settings), "C:/id/worker-entry.mjs");
+	const duplicate = [...profiles, { ...profiles[0], id: "m2", enabled: false }];
+	assert.equal(machineWorkerEntry("lappy", duplicate, settings), undefined);
+	assert.equal(machineDefaultCwd("lappy", duplicate, settings), undefined);
+	assert.equal(machineWorkerEntry("m2", duplicate, settings), undefined);
+	assert.equal(machineWorkerEntry("m1", duplicate, settings), "C:/id/worker-entry.mjs");
+	assert.equal(machineWorkerEntry("toString", profiles, settings), undefined);
+	assert.equal(machineWorkerEntry("missing", profiles, settings), undefined);
+	assert.equal(machineWorkerEntry("lappy", [], settings), "C:/label/worker-entry.mjs", "settings still work when the listing is unavailable");
+	settings.m1 = { cwd: "C:/work" };
+	assert.equal(machineWorkerEntry("lappy", profiles, settings), undefined, "an ID settings object overrides the label object, as for cwd");
+});
+
+test("machine worker entries preserve explicit paths and reject invalid overrides", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "herdr-config-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const path = join(dir, "herdr-subagents.json");
+	writeFileSync(path, JSON.stringify({ machines: { lappy: { cwd: "C:/git", workerEntry: " C:/git/grok-style-pi/src/herdr/worker-entry.mjs " } } }));
+	assert.deepEqual(readMachineSettings(dir).lappy, { cwd: "C:/git", workerEntry: "C:/git/grok-style-pi/src/herdr/worker-entry.mjs" });
+	for (const workerEntry of ["", "  ", null, false, 7, [], {}]) {
+		writeFileSync(path, JSON.stringify({ machines: { lappy: { cwd: "C:/git", workerEntry } } }));
+		assert.throws(() => readMachineSettings(dir), /machines\.lappy\.workerEntry must be a nonempty string/);
+	}
+	writeFileSync(path, JSON.stringify({ machines: { lappy: { workerEntry: "/worker.mjs" } } }));
+	const workerOnly = readMachineSettings(dir);
+	assert.deepEqual(workerOnly.lappy, { workerEntry: "/worker.mjs" });
+	assert.equal(machineWorkerEntry("m1", profiles, workerOnly), "/worker.mjs");
+	assert.equal(machineDefaultCwd("m1", profiles, workerOnly), undefined, "worker configuration must not introduce a new project directory default");
+	writeFileSync(path, JSON.stringify({ machines: { lappy: {} } }));
+	assert.throws(() => readMachineSettings(dir), /machines\.lappy must set cwd or workerEntry/);
+	for (const cwd of ["", "  ", null, false, 7, [], {}]) {
+		writeFileSync(path, JSON.stringify({ machines: { lappy: { cwd, workerEntry: "/worker.mjs" } } }));
+		assert.throws(() => readMachineSettings(dir), /machines\.lappy\.cwd/);
 	}
 });
 

@@ -57,6 +57,7 @@ test("one workflow entry groups phases and counts done/cached/failed slots exact
 	const panel = new ActivityPanel(() => [...h.entries.values()], theme, () => {}, () => {}, () => {}, () => {});
 	assert.match(panel.render(140).join("\n"), /Active workflows · 1/);
 	assert.match(panel.render(140).join("\n"), /◆ Workflow · Review/);
+	assert.deepEqual(panel.render(140).slice(2), states.map((state, index) => `  ${state === "start" ? "running" : state} · — · 0 tokens · worker ${index + 1}`));
 	for (const width of [1, 10, 40, 100]) assert.ok(panel.render(width).every((row) => visibleWidth(row) <= width));
 });
 
@@ -78,6 +79,37 @@ test("workflow child agents are nested, with attributed transcripts and run-fenc
 	assert.doesNotMatch(h.entry().output, /STALE/);
 	h.engine.spawn("ordinary", "normal-run");
 	assert.equal(h.entries.has("agent:ordinary"), true, "unrelated agents remain top-level");
+});
+
+test("workflow agent rows update metered tokens, freeze elapsed time, and fence retries", (t) => {
+	let now = 61000;
+	t.mock.method(Date, "now", () => now);
+	const h = fixture(); t.after(() => h.adapter.dispose()); h.adapter.workflowReceipt(receipt);
+	h.engine.progress({ type: "agent", logicalIndex: 2, label: "Verify changes", state: "queued" });
+	const child = meta("child", "child-run"); child.runs[0].startedAt = 1000;
+	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Inspect resource ownership" };
+	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
+	const panel = new ActivityPanel(() => [...h.entries.values()], theme, () => {}, () => {}, () => {}, () => {});
+	const usage = outcome().usage;
+	usage.billable = { input: 100, output: 200, cacheRead: 1000, cacheWrite: 200, totalTokens: 1500, cost: 0 };
+	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage } });
+	assert.deepEqual(panel.render(160).slice(2), [
+		"  running · 1m0s · 1,500 tokens · Inspect resource ownership",
+		"  queued · — · 0 tokens · Verify changes",
+	]);
+	now = 121000;
+	assert.match(panel.render(160)[2], /running · 2m0s/);
+	const result = outcome(); result.usage.billable.totalTokens = 2400;
+	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
+	now = 181000;
+	assert.match(panel.render(160)[2], /done · 2m0s · 2,400 tokens/);
+	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "stale-run", event: { type: "usage", usage } });
+	assert.equal(h.entry().children![0].tokens, 2400);
+	const retry = meta("retry", "retry-run"); retry.workflow = child.workflow; retry.runs[0].startedAt = now;
+	h.engine.emit({ type: "spawned", agentId: retry.agentId, runId: "retry-run", meta: retry });
+	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage } });
+	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
+	assert.match(panel.render(160)[2], /running · 0s · 0 tokens · Inspect resource ownership/);
 });
 
 test("workflow Stop routes to userStopWorkflow and stale callbacks never stop other tasks", async (t) => {
@@ -135,13 +167,107 @@ test("active workflow child snapshots restore a nested workflow, not a top-level
 	const child = meta("restored", "child-run");
 	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 2, label: "Restored child", phase: "Inspect" };
 	const engine = new WorkflowEngine();
-	engine.snapshots = [{ ...agentSnapshot(child.agentId, "child-run"), workflow: child.workflow }];
+	const usage = outcome().usage; usage.billable.totalTokens = 12345;
+	engine.snapshots = [{ ...agentSnapshot(child.agentId, "child-run"), workflow: child.workflow, usage, startedAt: 42000 }];
 	const entries: Activity[] = [];
 	const adapter = new SubagentAdapter(engine, (entry) => { if (!entries.includes(entry)) entries.push(entry); });
 	t.after(() => adapter.dispose());
 	adapter.workflowReceipt(receipt);
 	assert.equal(entries.length, 1); assert.equal(entries[0].kind, "workflow");
 	assert.match(entries[0].output, /Restored child · running · restored/);
+	assert.deepEqual(entries[0].children, [{ title: "Restored child", status: "running", tokens: 12345, startedAt: 42000, endedAt: undefined }]);
+});
+
+test("reattachment restores finished siblings only for the same active workflow invocation", (t) => {
+	const engine = new WorkflowEngine();
+	const workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Finished child" };
+	const usage = outcome().usage; usage.billable.totalTokens = 2300;
+	engine.snapshots = [
+		{ ...agentSnapshot("finished", "finished-run"), workflow, running: false, status: "completed", startedAt: 1000, endedAt: 61000, usage },
+		{ ...agentSnapshot("failed", "failed-run"), workflow: { ...workflow, logicalIndex: 2, label: "Failed child" }, running: false, status: "failed", startedAt: 2000, endedAt: 62000, usage },
+		{ ...agentSnapshot("old", "old-run"), workflow: { ...workflow, runId: "old-workflow-run", logicalIndex: 3 }, running: false, status: "completed" },
+		{ ...agentSnapshot("other", "other-run"), workflow: { ...workflow, taskId: "finished-only" }, running: false, status: "completed" },
+		{ ...agentSnapshot("active", "active-run"), workflow: { ...workflow, logicalIndex: 4, label: "Active child" } },
+	];
+	const entries = new Map<string, Activity>();
+	const adapter = new SubagentAdapter(engine, entry => { entries.set(entry.id, entry); });
+	t.after(() => adapter.dispose());
+	assert.deepEqual([...entries.keys()], ["workflow:task-1"]);
+	assert.deepEqual(entries.get("workflow:task-1")!.children, [
+		{ title: "Finished child", status: "done", startedAt: 1000, endedAt: 61000, tokens: 2300 },
+		{ title: "Failed child", status: "failed", startedAt: 2000, endedAt: 62000, tokens: 2300 },
+		{ title: "Active child", status: "running", startedAt: 1, endedAt: undefined, tokens: 0 },
+	]);
+	assert.equal(entries.get("workflow:task-1")!.detail, "1/3 done · 0 cached · 1 failed");
+});
+
+test("reattachment preserves authoritative workflow failure, queued and cached slots even between child runs", (t) => {
+	for (const runningSibling of [false, true]) {
+		const engine = new WorkflowEngine();
+		const usage = outcome().usage; usage.billable.totalTokens = 700;
+		const failedWorkflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Validate structured output" };
+		engine.snapshots = [{ ...agentSnapshot("schema-child", "schema-run"), workflow: failedWorkflow, running: false, status: "completed", usage, startedAt: 1000, endedAt: 3000 }];
+		if (runningSibling) engine.snapshots.push({ ...agentSnapshot("sibling", "sibling-run"), workflow: { ...failedWorkflow, logicalIndex: 4, label: "Inspect" } });
+		const progress: WorkflowProgress[] = [
+			{ type: "agent", logicalIndex: 1, label: "Validate structured output", state: "failed", agentId: "schema-child" },
+			{ type: "agent", logicalIndex: 2, label: "Reuse analysis", state: "cached" },
+			{ type: "agent", logicalIndex: 3, label: "Verify", state: "queued" },
+		];
+		if (runningSibling) progress.push({ type: "agent", logicalIndex: 4, label: "Inspect", state: "start" });
+		const source = Object.assign(engine, { workflowSnapshots: () => [{ taskId: "task-1", runId: "run-1", name: "Review", status: "running" as const, startedAt: 500, progress: progress as Exclude<WorkflowProgress, { type: "log" }>[] }] });
+		const entries = new Map<string, Activity>();
+		const adapter = new SubagentAdapter(source, (entry) => { entries.set(entry.id, entry); });
+		t.after(() => adapter.dispose());
+		const entry = entries.get("workflow:task-1");
+		assert.ok(entry, "a running workflow survives reattachment even without a running child");
+		assert.equal(entry.title, "◆ Workflow · Review"); assert.equal(entry.startedAt, 500);
+		assert.equal(entry.detail, `0/${runningSibling ? 4 : 3} done · 1 cached · 1 failed`);
+		assert.deepEqual(entry.children!.slice(0, 3).map((child) => child.status), ["failed", "cached", "queued"]);
+		assert.deepEqual(entry.children![0], { title: "Validate structured output", status: "failed", startedAt: 1000, endedAt: 3000, tokens: 700 });
+	}
+});
+
+test("workflow snapshot attempt identity preserves teardown metrics and rejects unspawned retry accounting", (t) => {
+	for (const retryFailed of [false, true]) {
+		const engine = new WorkflowEngine();
+		const usage = outcome().usage; usage.billable.totalTokens = 2400;
+		engine.snapshots = [{ ...agentSnapshot("previous", "child-run"), running: false, status: "completed", startedAt: 1000, endedAt: 3000, usage,
+			workflow: { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Inspect", attempt: 1 } }];
+		const source = Object.assign(engine, { workflowSnapshots: () => [{ taskId: "task-1", runId: "run-1", name: "Review", status: "running" as const, startedAt: 500,
+			progress: [{ type: "agent" as const, logicalIndex: 1, label: "Inspect", state: retryFailed ? "failed" as const : "start" as const, attempt: retryFailed ? 2 : 1 }],
+		}] });
+		const entries = new Map<string, Activity>();
+		const adapter = new SubagentAdapter(source, (entry) => { entries.set(entry.id, entry); }); t.after(() => adapter.dispose());
+		const child = entries.get("workflow:task-1")!.children![0];
+		assert.equal(child.status, retryFailed ? "failed" : "running");
+		assert.equal(child.tokens, retryFailed ? 0 : 2400);
+		assert.equal(child.startedAt, retryFailed ? undefined : 1000);
+		if (!retryFailed) assert.equal(child.endedAt, 3000, "a completed child's timer stays frozen during workflow teardown");
+	}
+});
+
+test("retry start clears prior metrics before spawn while duplicate starts preserve the current attempt", (t) => {
+	let now = 61000;
+	t.mock.method(Date, "now", () => now);
+	const h = fixture(); t.after(() => h.adapter.dispose());
+	const child = meta("child", "child-run"); child.runs[0].startedAt = 1000;
+	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Retry child" };
+	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
+	const result = outcome(); result.usage.billable.totalTokens = 2400;
+	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage: result.usage } });
+	const running = h.entry().children;
+	h.engine.progress({ type: "agent", logicalIndex: 1, state: "start" });
+	h.engine.progress({ type: "agent", logicalIndex: 1, state: "start", agentId: child.agentId });
+	assert.equal(h.entry().children, running, "duplicate starts retain metrics and the cached projection");
+	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
+	now = 121000;
+	h.engine.progress({ type: "agent", logicalIndex: 1, state: "start" });
+	assert.deepEqual(h.entry().children, [{ title: "Retry child", status: "running", startedAt: undefined, endedAt: undefined, tokens: 0 }]);
+	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage: result.usage } });
+	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
+	h.engine.progress({ type: "agent", logicalIndex: 1, state: "failed", agentId: child.agentId });
+	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
+	assert.deepEqual(h.entry().children, [{ title: "Retry child", status: "failed", startedAt: undefined, endedAt: now, tokens: 0 }]);
 });
 
 test("Workflow and RunWorkflow diamonds show receipt metadata and shared file-target gestures", async () => {
@@ -196,7 +322,8 @@ test("real Grok Workflow tool events populate one panel entry and its viewer; St
 	const oldSteer = process.env.GROK_STEER_DIR; process.env.GROK_STEER_DIR = join(root, "steer");
 	const loader = new DefaultResourceLoader({ cwd: root, agentDir: join(root, "agent"), settingsManager: settings, noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
 		extensionFactories: [createGrokSubagents({ env: {}, style: { features }, engine: { env: { PI_WORKFLOW_APPROVE: "1" }, agentDir: join(root, "agent"), homeDir: root, modelRuntime: async () => runtime,
-			onEngine(created) { engine = created; }, onSessionCreated(child) { children++; child.agent.streamFunction = scripted(() => ({ wait: held, then: { text: "Done" } }), () => {}) as never; },
+			onEngine(created) { engine = created; }, onSessionCreated(child) { children++; child.agent.streamFunction = scripted(({ index }) => index === 0
+				? { tools: [{ name: "ls", args: { path: "." } }] } : { wait: held, then: { text: "Done" } }, () => {}) as never; },
 		} })] });
 	await loader.reload();
 	const { session } = await createAgentSession({ cwd: root, agentDir: join(root, "agent"), modelRuntime: runtime, model: getModel("anthropic", "claude-sonnet-4-5"), settingsManager: settings, sessionManager: SessionManager.inMemory(root), resourceLoader: loader });
@@ -209,9 +336,10 @@ test("real Grok Workflow tool events populate one panel entry and its viewer; St
 	t.after(async () => { closeViewer?.(); release(); await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); if (oldSteer === undefined) delete process.env.GROK_STEER_DIR; else process.env.GROK_STEER_DIR = oldSteer; rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); });
 	await session.bindExtensions({ mode: "tui", uiContext: ui as never, onError(error) { errors.push(error); } });
 	await session.prompt("Explicitly run this workflow");
-	await until(() => children === 2);
+	await until(() => children === 2 && /11 tokens · First/.test(panel.render(180).join("\n")) && /11 tokens · Second/.test(panel.render(180).join("\n")));
 	const rows = panel.render(180).join("\n");
 	assert.match(rows, /Active workflows · 1/); assert.match(rows, /◆ Workflow · Visual workflow/); assert.doesNotMatch(rows, /Active subagents/);
+	assert.match(rows, /  running · \d+s · 11 tokens · First/); assert.match(rows, /  running · \d+s · 11 tokens · Second/);
 	const viewing = session.prompt("/activity"); await until(() => viewer !== undefined);
 	const output = viewer!.render(160).join("\n");
 	assert.match(output, /Phase 1 · Inspect/); assert.match(output, /First · running/); assert.match(output, /Second · running/); assert.match(output, /Beginning review/);
@@ -238,6 +366,7 @@ test("RR11: unchanged child progress visits no historical slots and text tails r
 	activities.child({ agentId: "active-child", workflow: { taskId: "task-1", runId: "run-1", logicalIndex: 1000, label: "Active", phase: "Inspect" } }, "child-run");
 	assert.equal(latest.detail, "999/1000 done · 0 cached · 0 failed");
 	const before = latest.output;
+	const children = latest.children;
 	builds = slotVisits = publishes = 0;
 	for (let index = 0; index < 500; index++) activities.observe({ type: "run-event", agentId: "active-child", runId: "child-run", event: { type: "progress", at: index, kind: "stream" } });
 	assert.equal(builds, 0);
@@ -257,6 +386,7 @@ test("RR11: unchanged child progress visits no historical slots and text tails r
 	assert.equal(slotVisits, 0);
 	assert.equal(publishes, 500, "each text update publishes once; its redundant backend progress does not");
 	assert.equal(latest.detail, "999/1000 done · 0 cached · 0 failed");
+	assert.equal(latest.children, children, "streamed text reuses the agent row projection");
 	assert.match(latest.output, /FINAL LIVE TAIL/);
 	assert.ok(latest.output.length < 64000);
 	progress({ type: "log", message: "Latest workflow log" });

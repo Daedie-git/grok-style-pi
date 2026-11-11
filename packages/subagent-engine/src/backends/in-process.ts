@@ -325,7 +325,10 @@ export class InProcessBackend {
 			}
 			case "message_end": {
 				const message = event.message;
-				if (message?.role === "assistant") state.tracker.onAssistantMessage(message as never);
+				if (message?.role === "assistant") {
+					state.tracker.onAssistantMessage(message as never);
+					if ((message as { usage?: unknown }).usage) emit({ type: "usage", usage: state.tracker.snapshot() });
+				}
 				// Dispatch evidence: an assistant message that is not a pre-dispatch failure (an error with no usage at all).
 				if (message?.role === "assistant" && !state.dispatched) {
 					const ended = message as { stopReason?: string; usage?: { input?: number; output?: number } };

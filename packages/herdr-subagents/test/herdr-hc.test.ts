@@ -221,6 +221,24 @@ process.stdout.write(request.method === 'terminal.get'
 	await assert.rejects(hcConnect({ HC_BIN_PATH: join(dir, "missing") })("terminal.list", {}), { code: "ENOENT" });
 });
 
+test("hc connect distinguishes unanswered request timeouts from external signal termination", {
+	skip: process.platform === "win32" ? "Fixture requires executable shebang scripts" : false,
+}, async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "hc-connect-timeout-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const bin = join(dir, "hc.mjs");
+	writeFileSync(bin, `#!/usr/bin/env node
+import { createInterface } from 'node:readline';
+createInterface({ input: process.stdin }).once('line', line => {
+ if (JSON.parse(line).method === 'terminal.label') process.kill(process.pid, 'SIGTERM');
+});
+`);
+	chmodSync(bin, 0o755);
+	const call = hcConnect({ ...process.env, HC_BIN_PATH: bin });
+	await assert.rejects(call("terminal.list", {}, { timeout: 50 }), /hc terminal.list timed out after 50ms/);
+	await assert.rejects(call("terminal.label", {}, { timeout: 5000 }), /hc connect terminated by SIGTERM without answering terminal.label/);
+});
+
 test("hc connect keeps its input open until a slow reply arrives, as Windows hc exits when input closes", {
 	skip: process.platform === "win32" ? "Fixture requires executable shebang scripts" : false,
 }, async (t) => {

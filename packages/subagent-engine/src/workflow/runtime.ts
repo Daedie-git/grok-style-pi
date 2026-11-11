@@ -111,12 +111,13 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 		}
 		const releaseObligation = obligations.register();
 		let lastAgentId = `pending-${input.taskId}-${index}`;
+		let attempt = 0;
 		try {
 		if (options.isolation !== undefined && options.isolation !== "worktree") throw new Error("Only local worktree isolation is available; remote agents are unavailable");
 		input.host.progress({ type: "agent", ...common, state: "queued" });
 		const executed = await permits.run(async () => {
 			if (signal.aborted) throw new Error("Workflow aborted");
-			let stalls = 0, invalid = 0, nudged = false, attempt = 0;
+			let stalls = 0, invalid = 0, nudged = false;
 			budget.check();
 				for (;;) {
 					if (signal.aborted) throw new Error("Workflow aborted");
@@ -124,7 +125,7 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 					// The host allocates the real agent ID. A pending identity still
 					// records a crash before its runAgent promise hands that ID back.
 					void append({ type: "started", key: choice.key, agentId: lastAgentId, label, ...(grouping === undefined ? {} : { phase: grouping }) });
-					input.host.progress({ type: "agent", ...common, state: "start" });
+					input.host.progress({ type: "agent", ...common, state: "start", attempt });
 					const request: WorkflowAgentRequest = {
 						prompt: nudged ? `${prompt}\n\nReturn the result through the StructuredOutput tool.` : prompt,
 						label, ...(grouping === undefined ? {} : { phase: grouping }), runId: input.runId, taskId: input.taskId, logicalIndex: index, attempt, signal,
@@ -161,7 +162,7 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 						throw new Error("Agent stalled after five retries");
 					} else if (result.status !== "completed") {
 						failure(index, result.error ?? `Agent ${result.status}`);
-						input.host.progress({ type: "agent", ...common, state: "failed", agentId: result.agentId });
+						input.host.progress({ type: "agent", ...common, state: "failed", attempt, agentId: result.agentId });
 						return { value: null, agentId: result.agentId };
 					} else if (request.schema) {
 						if (result.structured?.ok === false) {
@@ -172,7 +173,7 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 						}
 						continue;
 					} else value = result.text;
-					input.host.progress({ type: "agent", ...common, state: "done", agentId: result.agentId });
+					input.host.progress({ type: "agent", ...common, state: "done", attempt, agentId: result.agentId });
 					return { value, agentId: result.agentId };
 				}
 		});
@@ -183,7 +184,7 @@ export async function runWorkflow(input: WorkflowRunInput): Promise<WorkflowRunR
 		return executed.value;
 		} catch (error) {
 			if (!signal.aborted) await append({ type: "failed", key: choice.key, agentId: lastAgentId });
-			input.host.progress({ type: "agent", ...common, state: "failed", agentId: lastAgentId });
+			input.host.progress({ type: "agent", ...common, state: "failed", ...(attempt === 0 ? {} : { attempt }), agentId: lastAgentId });
 			if (signal.aborted) return new Promise<never>(() => {});
 			throw error;
 		} finally { releaseObligation(); }

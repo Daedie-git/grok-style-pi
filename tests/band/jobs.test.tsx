@@ -122,6 +122,17 @@ test('a job whose worker stopped beating is reported lost with its partial outpu
   expect(s.submitted[0]).toMatch(/Exit -1: the job runner died[\s\S]*partial output/)
 })
 
+test('a job from a worker without heartbeats is waited for, not reported lost', async ($, on) => {
+  const s = setup(on)
+  s.files[`${DIR}/20261112085900-3-ask-abcdef12.json`] = '{"argv":["--slot","3","ask","x"],"started":1}'
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await s.clock.advance(300000)
+  expect(s.submitted).toEqual([])
+  s.files[`${DIR}/20261112085900-3-ask-abcdef12.done`] = '{"code":0,"finished":2}'
+  await s.clock.advance(3000)
+  expect(s.submitted[0]).toMatch(/Exit 0: report delivered/)
+})
+
 test('quick commands answer inline; hook entries are refused', async ($, on) => {
   const s = setup(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -139,8 +150,24 @@ test('Bash launches of job commands are refused; other launcher and unrelated co
     '"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 ask "Fix it" &',
     'cd ../wt && ~/p/scripts/sidecar --slot 4 --role implementer ask --accept x y',
     'sidecar answer yes',
+    'sidecar --slot 2 \\\n ask x',
+    "bash -c 'sidecar --slot 3 diff main'",
+    'if true; then sidecar ask x; fi',
+    'for s in 2 3; do sidecar --slot $s ask x; done',
+    'echo "$(sidecar ask x)"',
+    'x=`sidecar plan p.md`',
+    '>out 2>&1 sidecar ask x',
+    'timeout 600 env A=1 sidecar ask x',
+    'cat <<EOF\n$(sidecar ask x)\nEOF',
   ]) expect((await $.tool.call({ tool: 'Bash', command })).deny).toMatch(/mcp__claude-sidecar__sidecar/)
-  for (const command of ['"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 status', 'git commit -m "sidecar ask now a tool"', 'ls sidecar'])
+  for (const command of [
+    '"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 status',
+    'git commit -m "sidecar ask now a tool"',
+    'ls sidecar; echo sidecar ask # sidecar ask',
+    'ls 2>&1 | grep sidecar',
+    "python3 - <<'EOF'\nrun(\"bash -c 'sidecar ask x'\")\nsidecar ask x\nEOF\necho done",
+    'cat <<-EOF\n\tsidecar ask x\n\tEOF',
+  ])
     expect((await $.tool.call({ tool: 'Bash', command })).deny).toBe(undefined)
 })
 

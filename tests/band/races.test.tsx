@@ -55,3 +55,19 @@ test('a dropped prompt must remain pending for later delivery',async($,on)=>{
  await $.session.start({cwd:'/',surface:'terminal',isInteractive:true});await s.clock.advance(6000)
  expect(s.submitted.length).toBe(1)
 })
+
+test('a stale scan snapshot must not redeliver a completion claimed by a tool result',async($,on)=>{
+ const s=setup(on)
+ await $.session.start({cwd:'/',surface:'terminal',isInteractive:true});await $.turn.start({text:'go',turnId:'t1'})
+ await $.tool.call({tool:TOOL,args:['ask','A']});const a=s.ids()[0]
+ await $.tool.call({tool:TOOL,args:['--slot','2','ask','B']});const b=s.ids().find(id=>id!==a)!
+ s.finish(b);await s.clock.advance(3000)
+ s.finish(a)
+ const entered=latch(),release=latch();s.read(async e=>{if(e.path===`${DIR}/${a}.out`){entered.resolve();await release.promise}})
+ const advancing=s.clock.advance(3000);await entered.promise
+ const first=await $.tool.call({tool:'Read',file_path:'first'})
+ release.resolve();await advancing
+ const second=await $.tool.call({tool:'Read',file_path:'second'})
+ expect(first.context?.some(t=>t.includes(b))).toBe(true)
+ expect(second.context?.some(t=>t.includes(b))??false).toBe(false)
+})

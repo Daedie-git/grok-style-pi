@@ -41,7 +41,8 @@ export const INPUT_SCHEMA = {
   additionalProperties: false,
 }
 
-export type Job = { argv: string[]; cwd?: string; started: number }
+// beats: the worker touches .alive (0.20.1+); a job from an older worker has none, and only .done ends it.
+export type Job = { argv: string[]; cwd?: string; started: number; beats?: true }
 export type Done = { code: number; finished: number }
 export type Request = { args: string[]; cwd?: string; input?: string; slot: string; command: string; inline: boolean }
 
@@ -66,6 +67,25 @@ export function parseRequest(e: Record<string, unknown>): Request | { deny: stri
   if (!command) return { deny: 'args name no command' }
   if (INTERNAL.has(command)) return { deny: `${command} is a hook entry, not a command for the model` }
   return { args, cwd: typeof cwd === 'string' && cwd ? cwd : undefined, input, slot, command, inline: INLINE.has(command) }
+}
+
+// The line without here-document bodies, which are data. An unquoted delimiter still runs the body's substitutions, so
+// those stay, one per line.
+export function stripHeredocs(line: string): string {
+  const lines = line.split('\n')
+  const out: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]!)
+    for (const match of lines[i]!.matchAll(/(?<!<)<<(-?)\s*(['"]?)([\w.-]+)\2/g)) {
+      const [, dash, quoted, delimiter] = match
+      for (i++; i < lines.length; i++) {
+        const body = lines[i]!
+        if ((dash ? body.replace(/^\t+/, '') : body) === delimiter) break
+        if (!quoted) out.push(...substitutions(body).map(s => `$(${s})`))
+      }
+    }
+  }
+  return out.join('\n')
 }
 
 // The simple commands of a shell line as words: quotes removed, line continuations joined, split at ; & | ( ) and
@@ -101,7 +121,8 @@ export function shellCommands(line: string): string[][] {
         } else text += line[i]
       }
       word = (word ?? '') + text
-    } else if (/[;&|()\n]/.test(c)) endCommand()
+    } else if (c === '&' && word !== undefined && /[<>]$/.test(word)) word += c
+    else if (/[;&|()\n]/.test(c)) endCommand()
     else if (/\s/.test(c)) endWord()
     else if (c === '#' && word === undefined) {
       while (i + 1 < line.length && line[i + 1] !== '\n') i++
@@ -111,21 +132,49 @@ export function shellCommands(line: string): string[][] {
   return commands
 }
 
-// Words that run the command after them.
-const PREFIXES = new Set(['bash', 'sh', 'env', 'exec', 'command', 'nohup', 'setsid', 'nice', 'time', 'timeout', 'sudo'])
+// Words that run the command after them: wrappers and shell control words.
+const PREFIXES = new Set(['bash', 'sh', 'env', 'exec', 'command', 'nohup', 'setsid', 'nice', 'time', 'timeout', 'sudo',
+  'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{'])
+// A redirection word; a bare operator takes the next word as its target.
+const REDIRECT = /^\d*(?:&?>>?|<<?<?|[<>]&)/
+const BARE_REDIRECT = /^\d*(?:&?>>?|<<?<?|[<>]&)$/
+
+// The bodies of $(...) and `...` substitutions, which run even inside double quotes.
+function substitutions(line: string): string[] {
+  const bodies: string[] = []
+  for (let i = line.indexOf('$('); i >= 0; i = line.indexOf('$(', i + 2)) {
+    let depth = 0
+    for (let j = i + 1; j < line.length; j++) {
+      if (line[j] === '(') depth++
+      else if (line[j] === ')' && --depth === 0) {
+        bodies.push(line.slice(i + 2, j))
+        break
+      }
+    }
+  }
+  for (const match of line.matchAll(/`([^`]*)`/g)) bodies.push(match[1]!)
+  return bodies
+}
 
 // Why a Bash command is refused: the launcher's Bash path would leave a request unobserved.
-export function bashDenial(line: string): string | undefined {
+export function bashDenial(script: string): string | undefined {
+  const line = stripHeredocs(script)
+  for (const body of substitutions(line)) {
+    const inner = bashDenial(body)
+    if (inner) return inner
+  }
   for (const words of shellCommands(line)) {
     // A `bash -c SCRIPT` runs SCRIPT.
     const script = words.findIndex((w, j) => w === '-c' && /^(.*\/)?(ba)?sh$/.test(words[j - 1] ?? ''))
     const inner = script >= 0 ? bashDenial(words[script + 1] ?? '') : undefined
     if (inner) return inner
     let i = 0
-    // Assignments, wrappers and their options or durations.
+    // Assignments, redirections, wrappers and their options or durations.
     while (i < words.length) {
       const w = words[i]!
-      if (/^[A-Za-z_]\w*=/.test(w) || PREFIXES.has(w) || (i > 0 && (w.startsWith('-') || /^\d+[smhd]?$/.test(w)))) i++
+      if (BARE_REDIRECT.test(w)) i += 2
+      else if (REDIRECT.test(w) || /^[A-Za-z_]\w*=/.test(w) || PREFIXES.has(w)) i++
+      else if (i > 0 && (w.startsWith('-') || /^\d+[smhd]?$/.test(w))) i++
       else break
     }
     if (!/(^|\/)sidecar$/.test(words[i] ?? '')) continue

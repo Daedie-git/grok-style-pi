@@ -77,7 +77,12 @@ export const register: Register = on => {
     // A launch or scan request during a scan: poll again afterwards.
     let rescan = false
     const marker = (id: string) => `${jobDir}/${id}.delivered`
-    const mark = async (id: string) => $.fs.write(marker(id), `${await $.clock.now()}\n`)
+    // Delivered here: a scan whose directory listing predates the marker still skips them.
+    const delivered = new Set<string>()
+    const mark = async (id: string) => {
+      await $.fs.write(marker(id), `${await $.clock.now()}\n`)
+      delivered.add(id)
+    }
     // Takes every held result at once, so concurrent tool results never share one.
     const claim = () => {
       const taken = [...held]
@@ -101,6 +106,7 @@ export const register: Register = on => {
       }
       const refused = async () => {
         await $.process.run([bash, '-c', 'rm -f -- "$1"', 'rm', marker(id)]).catch(() => undefined)
+        delivered.delete(id)
         release(id, text)
       }
       void $.prompt.submit({ text }).then(r => (r.drop === undefined ? release(id) : refused()), refused)
@@ -119,11 +125,20 @@ export const register: Register = on => {
         let now: number | undefined
         for (const entry of entries) {
           const id = JOB_RECORD.exec(entry.name)?.[1]
-          if (!id || byName.has(`${id}.delivered`) || held.has(id) || claimed.has(id)) continue
+          if (!id || byName.has(`${id}.delivered`) || delivered.has(id) || held.has(id) || claimed.has(id)) continue
           if (!byName.has(`${id}.done`)) {
             running = true
-            // A worker that died without .done: record it lost; the next scan delivers it.
-            const beat = byName.get(`${id}.alive`) ?? entry
+            // A worker that died without .done: record it lost; the next scan delivers it. Workers from before
+            // heartbeats are waited for.
+            let beat = byName.get(`${id}.alive`)
+            if (!beat) {
+              let beats = false
+              try {
+                beats = Boolean((JSON.parse(await raw(`${jobDir}/${entry.name}`)) as Job).beats)
+              } catch {}
+              if (!beats) continue
+              beat = entry
+            }
             now ??= await $.clock.now()
             if (now - beat.mtimeMs <= LOST_MS) {
               stale.delete(id)
@@ -145,7 +160,7 @@ export const register: Register = on => {
             continue
           }
           const text = jobMessage(jobDir, id, job, done, await raw(`${jobDir}/${id}.out`), await raw(`${jobDir}/${id}.err`))
-          if (held.has(id) || claimed.has(id)) continue
+          if (delivered.has(id) || held.has(id) || claimed.has(id)) continue
           if (turnRunning) held.set(id, text)
           else await submit(id, text)
         }
@@ -183,7 +198,7 @@ export const register: Register = on => {
       const ms = await $.clock.now()
       const id = jobId(ms, request, crypto.randomUUID())
       if (request.input !== undefined) await $.fs.write(`${jobDir}/${id}.in`, request.input)
-      const job: Job = { argv: request.args, cwd: request.cwd, started: Math.floor(ms / 1000) }
+      const job: Job = { argv: request.args, cwd: request.cwd, started: Math.floor(ms / 1000), beats: true }
       await $.fs.write(`${jobDir}/${id}.json`, JSON.stringify(job))
       const run = await $.process
         .run([bash, `${$.plugin.root}/scripts/sidecar-job`, jobDir, id, ...request.args], { cwd: request.cwd })

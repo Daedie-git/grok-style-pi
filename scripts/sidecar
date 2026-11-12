@@ -22,7 +22,7 @@
 #   sidecar status               show agent state, request age and whether its last report was printed
 #   sidecar wait                 wait for the slot's launcher request; print its report path (run as a harness background task)
 #   sidecar report               print the latest saved report, including any pending question
-#   sidecar note TEXT            share context on ongoing work; no review
+#   sidecar note TEXT|-          share context on ongoing work; no review
 #   sidecar plan FILE [CONTEXT]  review a plan; prints the report
 #   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
 #   sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]
@@ -32,12 +32,12 @@
 #   sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-
 #                                follow-up request (- reads TEXT from stdin); prints the report. --accept runs CMD here
 #                                after the report and --scope flags changed files outside GLOB; both persist on the slot
-#   sidecar reject TEXT          tell the reviewer a finding is rejected and why; it withdraws with evidence or stands
+#   sidecar reject TEXT|-        tell the reviewer a finding is rejected and why; it withdraws with evidence or stands
 #   sidecar reject --overrule R<n> REASON
 #                                settle a standing rejection without the reviewer's agreement
 #   sidecar push-gate            PreToolUse hook entry: deny pushes while files changed since the latest diff review
-#   sidecar answer TEXT          answer the sidecar's pending question (exit 3 from a request); resumes that task
-#   sidecar steer TEXT           redirect busy work now; when idle, run a request and print its report
+#   sidecar answer TEXT|-        answer the sidecar's pending question (exit 3 from a request); resumes that task
+#   sidecar steer TEXT|-         redirect busy work now; when idle, run a request and print its report
 set -euo pipefail
 
 STATE_DIR="$HOME/.cache/claude-sidecar"
@@ -2729,6 +2729,16 @@ mkdir -p "$REQUEST_DIR" "$REPORT_DIR"
 # Parse dispatch and exit together before starting long-running work. Otherwise Bash reads past this command
 # after it returns; an in-place plugin update can move that offset into unrelated text in the new file.
 {
+# TEXT given as - is read from stdin (ask parses its own options first).
+case ${1:-} in
+  note|reject|answer|steer)
+    if [[ $# == 2 && $2 == - ]]; then
+      # A failed read may have captured part of the text; send none of it.
+      stdin_text=$(cat) || die "$1 -: reading stdin failed; nothing was sent"
+      [[ -n ${stdin_text//[[:space:]]/} ]] || die "$1 -: no text on stdin"
+      set -- "$1" "$stdin_text"
+    fi ;;
+esac
 case ${1:-} in
   sweep|done-close|push-gate|session-start|session-end|ask|keep|unkeep) ;;
   *) schedule_sweep "$PLUGIN_ROOT/scripts/sidecar" ;;

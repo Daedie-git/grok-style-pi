@@ -30,6 +30,8 @@ sidecar --slot 3 ask "Inspect the lifecycle code; report without editing."
 sidecar --slot 2 answer "Yes, preserve backward compatibility."
 ```
 
+For long text, give `-` in place of TEXT to `ask`, `answer`, `steer`, `note` or `reject` and pass the text as the tool's `input`.
+
 Pick the role by the work, on a fresh slot: the default reviewer for reviews, audits, bug or security scans and anything that writes findings files; `--role implementer` for code changes; `--role explorer` only to find code and explain how it connects; `--role researcher` only to answer a question from primary sources (docs, specs, release notes). Explorers and researchers report inline and write nothing, so they refuse audits and file output. Implementers, explorers and researchers default to medium reasoning, reviewers to high. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides reasoning at startup.
 
 Implementer asks carry a completion contract: a `Status: done|partial|blocked` line, verification through the real entry point, the smallest diff in the surrounding style, and `Verified`, `Not verified`, `Files changed`, `Additions` and `Suggested follow-ups` sections. `Additions` justifies each new function, option, fallback or dependency against the task; unjustified ones signal drift. Run the ask with `cwd` set to the implementer's checkout (`../fury-wt` here) and give it launcher checks:

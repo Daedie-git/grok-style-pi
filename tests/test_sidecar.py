@@ -1777,6 +1777,28 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('Yes, with constraint Y', request_files[0].read_text())
         self.assertFalse(self.run_cli('answer', 'again', check=False).returncode == 0)
 
+    def test_text_commands_read_dash_from_stdin(self):
+        self.run_cli('ask', 'Do the work', env=dict(self.env, FAKE_QUESTION='May I add X?'), check=False)
+        empty = self.run_cli('answer', '-', input=' \n', check=False)
+        self.assertEqual(empty.returncode, 1)
+        self.assertIn('no text on stdin', empty.stderr)
+        # A failed read (here: stdin is a directory) sends nothing.
+        fd = os.open(self.home, os.O_RDONLY)
+        try:
+            failed = subprocess.run([str(self.launcher), 'answer', '-'], stdin=fd, env=self.env, text=True, capture_output=True)
+        finally:
+            os.close(fd)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn('reading stdin failed', failed.stderr)
+        self.assertEqual(list((self.home / '.cache/claude-sidecar/requests').glob('*-answer-*.md')), [])
+        self.run_cli('answer', '-', input='Yes, from stdin\n')
+        answer = sorted((self.home / '.cache/claude-sidecar/requests').glob('*-answer-*.md'))[-1].read_text()
+        self.assertIn('Answer: Yes, from stdin', answer)
+        self.assertNotIn('Answer: -', answer)
+        self.run_cli('reject', '-', input='#1 (x): disproved by y\n')
+        reject = sorted((self.home / '.cache/claude-sidecar/requests').glob('*-reject-*.md'))[-1].read_text()
+        self.assertIn('#1 (x): disproved by y', reject)
+
     def test_a_delivered_answer_marks_its_question_and_a_refused_one_does_not(self):
         pending = self.home / '.cache/claude-sidecar/sc-pane-1.pending'
         self.run_cli('ask', 'Do the work', env=dict(self.env, FAKE_QUESTION='May I add X?'), check=False)

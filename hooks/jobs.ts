@@ -6,10 +6,13 @@ export const TOOL = 'mcp__claude-sidecar__sidecar'
 // Commands that finish within seconds run inline; the rest are jobs. Hook entries are not the model's to run.
 const INLINE = new Set(['status', 'report', 'keep', 'unkeep', 'stop', 'unreviewed'])
 const INTERNAL = new Set(['session-start', 'session-end', 'sweep', 'done-close', 'push-gate'])
-const JOB_COMMANDS = 'note|plan|diff|coop-review|ask|answer|steer|reject|wait|reload|start|restart|sync-machine'
-// A Bash run of the launcher for a job command: its result would reach nobody.
-const BASH_JOB = new RegExp(`(?:^|[\\s/;&|(])sidecar["']?(?:\\s+--[\\w-]+\\s+(?:'[^']*'|"[^"]*"|\\S+))*\\s+(?:${JOB_COMMANDS})\\b`)
+const JOB_COMMANDS = new Set(['note', 'plan', 'diff', 'coop-review', 'ask', 'answer', 'steer', 'reject', 'wait', 'reload', 'start', 'restart', 'sync-machine'])
 export const POLL_MS = 3000
+// A running job's worker touches DIR/ID.alive this often (scripts/sidecar-job). One silent for longer than LOST_MS, seen
+// so across scans at least that far apart (a suspended machine wakes up stale), died without writing .done.
+export const LOST_MS = 90000
+// The exit code the plugin records for a job whose worker died.
+export const LOST_CODE = -1
 const EXIT_MEANING: Record<number, string> = {
   0: 'report delivered',
   2: 'no report submitted; the output shows the pane',
@@ -17,6 +20,8 @@ const EXIT_MEANING: Record<number, string> = {
   4: 'an identical request is already in flight; wait for it',
   5: 'the sidecar is blocked on an approval in its pane; ask the user to handle it there',
   7: 'refused while a request runs',
+  [-1]: 'the job runner died before the launcher finished (killed, or the machine restarted); the sidecar may still be working, so check status and report on its slot',
+  129: 'the job runner was hung up',
   130: 'interrupted',
   143: 'terminated',
 }
@@ -63,20 +68,82 @@ export function parseRequest(e: Record<string, unknown>): Request | { deny: stri
   return { args, cwd: typeof cwd === 'string' && cwd ? cwd : undefined, input, slot, command, inline: INLINE.has(command) }
 }
 
+// The simple commands of a shell line as words: quotes removed, line continuations joined, split at ; & | ( ) and
+// newlines. Expansions stay literal, which is enough to recognize the launcher.
+export function shellCommands(line: string): string[][] {
+  const commands: string[][] = []
+  let words: string[] = []
+  let word: string | undefined
+  const endWord = () => {
+    if (word !== undefined) words.push(word)
+    word = undefined
+  }
+  const endCommand = () => {
+    endWord()
+    if (words.length) commands.push(words)
+    words = []
+  }
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!
+    if (c === '\\') {
+      if (line[i + 1] === '\n') i++
+      else word = (word ?? '') + (line[++i] ?? '')
+    } else if (c === "'") {
+      const end = line.indexOf("'", i + 1)
+      word = (word ?? '') + line.slice(i + 1, end < 0 ? undefined : end)
+      i = end < 0 ? line.length : end
+    } else if (c === '"') {
+      let text = ''
+      for (i++; i < line.length && line[i] !== '"'; i++) {
+        if (line[i] === '\\' && i + 1 < line.length) {
+          if (line[i + 1] !== '\n') text += /["\\$`]/.test(line[i + 1]!) ? line[i + 1] : `\\${line[i + 1]}`
+          i++
+        } else text += line[i]
+      }
+      word = (word ?? '') + text
+    } else if (/[;&|()\n]/.test(c)) endCommand()
+    else if (/\s/.test(c)) endWord()
+    else if (c === '#' && word === undefined) {
+      while (i + 1 < line.length && line[i + 1] !== '\n') i++
+    } else word = (word ?? '') + c
+  }
+  endCommand()
+  return commands
+}
+
+// Words that run the command after them.
+const PREFIXES = new Set(['bash', 'sh', 'env', 'exec', 'command', 'nohup', 'setsid', 'nice', 'time', 'timeout', 'sudo'])
+
 // Why a Bash command is refused: the launcher's Bash path would leave a request unobserved.
-export const bashDenial = (command: string) =>
-  BASH_JOB.test(command)
-    ? `Run sidecar requests with the ${TOOL} tool (args = the words after "sidecar"), one call per slot; its result reaches you as a message. Bash runs of ${JOB_COMMANDS.replace(/\|/g, ', ')} are refused.`
-    : undefined
+export function bashDenial(line: string): string | undefined {
+  for (const words of shellCommands(line)) {
+    // A `bash -c SCRIPT` runs SCRIPT.
+    const script = words.findIndex((w, j) => w === '-c' && /^(.*\/)?(ba)?sh$/.test(words[j - 1] ?? ''))
+    const inner = script >= 0 ? bashDenial(words[script + 1] ?? '') : undefined
+    if (inner) return inner
+    let i = 0
+    // Assignments, wrappers and their options or durations.
+    while (i < words.length) {
+      const w = words[i]!
+      if (/^[A-Za-z_]\w*=/.test(w) || PREFIXES.has(w) || (i > 0 && (w.startsWith('-') || /^\d+[smhd]?$/.test(w)))) i++
+      else break
+    }
+    if (!/(^|\/)sidecar$/.test(words[i] ?? '')) continue
+    if (JOB_COMMANDS.has(parseArgs(words.slice(i + 1)).command))
+      return `Run sidecar requests with the ${TOOL} tool (args = the words after "sidecar"), one call per slot; its result reaches you as a message. Bash runs of ${[...JOB_COMMANDS].join(', ')} are refused.`
+  }
+  return undefined
+}
 
 const quote = (word: string) => (/^[\w./:=@%+-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`)
 export const shown = (argv: readonly string[]) => ['sidecar', ...argv].map(quote).join(' ')
 
-// A job's record: DIR/<id>.json.
-export const JOB_RECORD = /^(\d{14}-\d+-[a-z-]+-[0-9a-f]{8})\.json$/
+// A job's record: DIR/<id>.json. Slot and command in the id are only labels, reduced to what the record pattern takes.
+export const JOB_RECORD = /^(\d{14}-[a-z0-9-]+-[0-9a-f]{8})\.json$/
+const label = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'x'
 
 export const jobId = (ms: number, request: Request, random: string) =>
-  `${new Date(ms).toISOString().replace(/\D/g, '').slice(0, 14)}-${request.slot}-${request.command}-${random.slice(0, 8)}`
+  `${new Date(ms).toISOString().replace(/\D/g, '').slice(0, 14)}-${label(request.slot)}-${label(request.command)}-${random.replace(/-/g, '').slice(0, 8)}`
 
 // The message that hands a finished job to the model.
 export function jobMessage(dir: string, id: string, job: Job, done: Done, out: string, err: string): string {

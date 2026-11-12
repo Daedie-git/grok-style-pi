@@ -2,11 +2,16 @@
 # Runs one launcher command as a job of the sidecar tool, detached so it outlives plugin reloads.
 #   sidecar-job DIR ID [ARGS...]
 # DIR/ID.json holds the job ({argv, cwd, started}); DIR/ID.in, when present, is its stdin. The launcher's output goes
-# to DIR/ID.out and DIR/ID.err, then DIR/ID.done records {code, finished}.
+# to DIR/ID.out and DIR/ID.err, then DIR/ID.done records {code, finished}. While it runs, DIR/ID.alive is touched every
+# 20 s; the plugin declares a job whose heartbeat stopped without .done lost.
 set -u
 dir=$1 id=$2
 shift 2
 if [[ -z ${SIDECAR_JOB_DETACHED:-} ]]; then
+  # Jobs delivered over a week ago are done with.
+  for marker in "$dir"/*.delivered; do
+    [[ -f $marker && -n $(find "$marker" -mtime +7 2>/dev/null) ]] && rm -f -- "${marker%.delivered}".*
+  done
   export SIDECAR_JOB_DETACHED=1
   if command -v setsid >/dev/null 2>&1; then
     setsid -f "$0" "$dir" "$id" "$@" </dev/null >/dev/null 2>&1
@@ -16,9 +21,21 @@ if [[ -z ${SIDECAR_JOB_DETACHED:-} ]]; then
   exit 0
 fi
 unset SIDECAR_JOB_DETACHED
+# shellcheck disable=SC2329  # run from the EXIT trap
+finish() {
+  local code=$?
+  printf '{"code":%d,"finished":%d}\n' "$code" "$(date +%s)" >"$dir/$id.done.tmp"
+  mv -f -- "$dir/$id.done.tmp" "$dir/$id.done"
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+touch "$dir/$id.alive"
+worker=$$
+(while kill -0 "$worker" 2>/dev/null; do touch "$dir/$id.alive"; sleep 20; done) </dev/null >/dev/null 2>&1 &
 input=/dev/null
 [[ -f $dir/$id.in ]] && input=$dir/$id.in
-code=0
-"${BASH_SOURCE[0]%/*}/sidecar" "$@" <"$input" >"$dir/$id.out" 2>"$dir/$id.err" || code=$?
-printf '{"code":%d,"finished":%d}\n' "$code" "$(date +%s)" >"$dir/$id.done.tmp"
-mv -f -- "$dir/$id.done.tmp" "$dir/$id.done"
+# In the background, so a signal to this worker runs its trap at once.
+"${BASH_SOURCE[0]%/*}/sidecar" "$@" <"$input" >"$dir/$id.out" 2>"$dir/$id.err" &
+wait $!

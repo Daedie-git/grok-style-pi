@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register, ToolCallResult } from 'claude-code'
 
 import type { SlotRow } from '../types'
-import { bashDenial, DESCRIPTION, JOB_RECORD, INPUT_SCHEMA, jobId, jobMessage, parseRequest, POLL_MS, shown, TOOL_NAME } from './jobs'
+import { bashDenial, DESCRIPTION, INPUT_SCHEMA, JOB_RECORD, jobId, jobMessage, LOST_CODE, LOST_MS, parseRequest, POLL_MS, shown, TOOL_NAME } from './jobs'
 import type { Done, Job, Request } from './jobs'
 import { identity } from './owner'
 
@@ -68,31 +68,73 @@ export const register: Register = on => {
     const raw = (path: string) => $.fs.read(path).then(t => (typeof t === 'string' ? t : ''), () => '')
     // Finished jobs waiting for the main thread's next tool result or the end of its turn.
     const held = new Map<string, string>()
+    // Jobs being handed on; scans skip them until their marker is written.
+    const claimed = new Set<string>()
+    // Running jobs whose heartbeat looked stale, with when that was first seen.
+    const stale = new Map<string, number>()
     let jobTimer: { cancel(): void } | undefined
     let scanning = false
-    const markDelivered = async (id: string) => {
-      await $.fs.write(`${jobDir}/${id}.delivered`, `${await $.clock.now()}\n`)
-      held.delete(id)
+    // A launch or scan request during a scan: poll again afterwards.
+    let rescan = false
+    const marker = (id: string) => `${jobDir}/${id}.delivered`
+    const mark = async (id: string) => $.fs.write(marker(id), `${await $.clock.now()}\n`)
+    // Takes every held result at once, so concurrent tool results never share one.
+    const claim = () => {
+      const taken = [...held]
+      held.clear()
+      for (const [id] of taken) claimed.add(id)
+      return taken
     }
-    // Marked before it is handed on, so a reload never delivers it twice. Not awaited: the submission resolves only
-    // once its turn starts, which a turn.complete hook would hold up.
+    const release = (id: string, text?: string) => {
+      claimed.delete(id)
+      if (text !== undefined) held.set(id, text)
+    }
+    // Marked before it is handed on, so a reload never delivers it twice. A refused submission is unmarked and held for
+    // the next tool result or turn end. Not awaited: a submission resolves only once its turn starts, which a
+    // turn.complete hook would hold up.
     const submit = async (id: string, text: string) => {
-      await markDelivered(id)
-      void $.prompt.submit({ text }).catch(() => undefined)
+      claimed.add(id)
+      try {
+        await mark(id)
+      } catch {
+        return release(id, text)
+      }
+      const refused = async () => {
+        await $.process.run([bash, '-c', 'rm -f -- "$1"', 'rm', marker(id)]).catch(() => undefined)
+        release(id, text)
+      }
+      void $.prompt.submit({ text }).then(r => (r.drop === undefined ? release(id) : refused()), refused)
     }
     const scanJobs = async () => {
-      if (scanning) return
+      if (scanning) {
+        rescan = true
+        return
+      }
       scanning = true
+      rescan = false
       let running = false
       try {
         const entries = await $.fs.list(jobDir).catch(() => [])
-        const names = new Set(entries.map(entry => entry.name))
+        const byName = new Map(entries.map(entry => [entry.name, entry]))
+        let now: number | undefined
         for (const entry of entries) {
           const id = JOB_RECORD.exec(entry.name)?.[1]
-          if (!id) continue
-          if (names.has(`${id}.delivered`) || held.has(id)) continue
-          if (!names.has(`${id}.done`)) {
+          if (!id || byName.has(`${id}.delivered`) || held.has(id) || claimed.has(id)) continue
+          if (!byName.has(`${id}.done`)) {
             running = true
+            // A worker that died without .done: record it lost; the next scan delivers it.
+            const beat = byName.get(`${id}.alive`) ?? entry
+            now ??= await $.clock.now()
+            if (now - beat.mtimeMs <= LOST_MS) {
+              stale.delete(id)
+              continue
+            }
+            const since = stale.get(id) ?? now
+            stale.set(id, since)
+            if (now - since < LOST_MS) continue
+            stale.delete(id)
+            const lost: Done = { code: LOST_CODE, finished: Math.floor(now / 1000) }
+            await $.fs.write(`${jobDir}/${id}.done`, JSON.stringify(lost))
             continue
           }
           let job: Job, done: Done
@@ -103,21 +145,30 @@ export const register: Register = on => {
             continue
           }
           const text = jobMessage(jobDir, id, job, done, await raw(`${jobDir}/${id}.out`), await raw(`${jobDir}/${id}.err`))
+          if (held.has(id) || claimed.has(id)) continue
           if (turnRunning) held.set(id, text)
           else await submit(id, text)
         }
       } finally {
         scanning = false
         jobTimer?.cancel()
-        jobTimer = running ? $.clock.after(POLL_MS, () => void scanJobs()) : undefined
+        jobTimer = running || rescan ? $.clock.after(POLL_MS, () => void scanJobs()) : undefined
       }
     }
     deliverHeld = async () => {
-      for (const [id, text] of [...held]) await submit(id, text)
+      for (const [id, text] of claim()) await submit(id, text)
     }
     takeHeld = async () => {
-      const texts = [...held.values()]
-      for (const id of [...held.keys()]) await markDelivered(id)
+      const texts: string[] = []
+      for (const [id, text] of claim()) {
+        try {
+          await mark(id)
+          release(id)
+          texts.push(text)
+        } catch {
+          release(id, text)
+        }
+      }
       return texts
     }
     serve = async request => {
@@ -138,11 +189,15 @@ export const register: Register = on => {
         .run([bash, `${$.plugin.root}/scripts/sidecar-job`, jobDir, id, ...request.args], { cwd: request.cwd })
         .catch((error: unknown) => ({ exitCode: -1, stderr: String(error) }))
       if (run.exitCode !== 0) {
-        await markDelivered(id)
+        await mark(id)
         return { deny: `could not start the job: ${run.stderr.trim() || `exit ${run.exitCode}`}` }
       }
-      jobTimer?.cancel()
-      jobTimer = $.clock.after(POLL_MS, () => void scanJobs())
+      // A scan in progress may have decided nothing runs; it polls again.
+      if (scanning) rescan = true
+      else {
+        jobTimer?.cancel()
+        jobTimer = $.clock.after(POLL_MS, () => void scanJobs())
+      }
       return {
         result: `Started job ${id}: ${shown(request.args)}. Its output and exit code arrive as a message when it ends; continue with other work or end your turn.`,
       }

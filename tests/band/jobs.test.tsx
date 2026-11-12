@@ -109,6 +109,19 @@ test('a finished job left by an earlier plugin copy is delivered at session star
   expect(s.submitted[0]).toMatch(/sidecar --slot 3 ask x[\s\S]*late report/)
 })
 
+test('a job whose worker stopped beating is reported lost with its partial output', async ($, on) => {
+  const s = setup(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: TOOL, args: ['ask', 'x'] })
+  const id = Object.keys(s.files).find(path => path.endsWith('.json'))!.slice(DIR.length + 1, -'.json'.length)
+  s.files[`${DIR}/${id}.out`] = 'partial output\n'
+  await s.clock.advance(90000)
+  expect(s.submitted).toEqual([])
+  await s.clock.advance(6000)
+  expect(s.submitted.length).toBe(1)
+  expect(s.submitted[0]).toMatch(/Exit -1: the job runner died[\s\S]*partial output/)
+})
+
 test('quick commands answer inline; hook entries are refused', async ($, on) => {
   const s = setup(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })

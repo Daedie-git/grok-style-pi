@@ -97,7 +97,7 @@ The plugin source sets the new model default. An already-running sidecar retains
 
 ## Use the launcher directly
 
-**The sidecar tool:** Claude drives the launcher through the plugin's `mcp__claude-sidecar__sidecar` tool (`args`: the launcher's words; `cwd`; `input` for `-`). `status`, `report`, `keep`, `unkeep`, `stop` and `unreviewed` answer inline. Every other command runs as a detached job (`scripts/sidecar-job`, files under `~/.cache/claude-sidecar/jobs/<owner>/`) that outlives plugin reloads. When the job ends, the plugin hands its output and exit code to Claude: as context on the next main-thread tool result mid-turn, otherwise as a new prompt; jobs that ended while Claude was away are delivered at the next session start. The plugin refuses Bash runs of request commands, whose results would reach nobody.
+**The sidecar tool:** Claude drives the launcher through the plugin's `mcp__claude-sidecar__sidecar` tool (`args`: the launcher's words; `cwd`; `input` for `-`). `status`, `report`, `keep`, `unkeep`, `stop` and `unreviewed` answer inline. Every other command runs as a detached job (`scripts/sidecar-job`, files under `~/.cache/claude-sidecar/jobs/<owner>/`) that outlives plugin reloads. When the job ends, the plugin hands its output and exit code to Claude: as context on the next main-thread tool result mid-turn, otherwise as a new prompt; jobs that ended while Claude was away are delivered at the next session start. A running job's worker touches `<id>.alive` every 20 s; one silent for 90 s without `.done` is reported lost (exit -1) with its partial output. The plugin refuses Bash runs of request commands, whose results would reach nobody.
 
 ```bash
 ./scripts/sidecar status

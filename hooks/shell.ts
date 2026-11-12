@@ -1,6 +1,7 @@
 // Just enough of Bash's lexer to find which commands a Bash tool call runs: quotes, escapes, comments, line
 // continuations, command substitutions (nested scripts) and here-documents (data, except an unquoted one's
-// substitutions). Expansions otherwise stay literal.
+// substitutions). Expansions otherwise stay literal. It steers a model away from mistakes, not an adversary: a
+// here-document inside $(...) whose body holds a ")" ends the substitution early, refusing inert text.
 
 export type Lexed = { commands: string[][]; scripts: string[] }
 
@@ -26,19 +27,24 @@ function readSubstitution(text: string, i: number): [string, number] {
     const c = text[j]
     if (c === '\\') j++
     else if (c === "'" || c === '"') j = skipQuoted(text, j)
-    else if (c === '(') depth++
+    // A comment runs to the end of its line, quotes and parentheses included.
+    else if (c === '#' && (j === i || /[\s;&|()]/.test(text[j - 1]!))) {
+      while (j + 1 < text.length && text[j + 1] !== '\n') j++
+    } else if (c === '(') depth++
     else if (c === ')' && --depth === 0) return [text.slice(i, j), j]
   }
   return [text.slice(i), text.length]
 }
 
-// The body of a backtick substitution starting just past its opening backtick, and the closing backtick's index.
+// The script a backtick substitution runs, starting just past its opening backtick, and the closing backtick's index.
+// Bash drops the backslash before $, ` and \\ inside backticks before running the body.
 function readBackticks(text: string, i: number): [string, number] {
+  const decode = (body: string) => body.replace(/\\([$`\\])/g, '$1')
   for (let j = i; j < text.length; j++) {
     if (text[j] === '\\') j++
-    else if (text[j] === '`') return [text.slice(i, j), j]
+    else if (text[j] === '`') return [decode(text.slice(i, j)), j]
   }
-  return [text.slice(i), text.length]
+  return [decode(text.slice(i)), text.length]
 }
 
 // The substitutions in text where only expansions are live: double-quoted text and unquoted here-document bodies.
@@ -136,8 +142,11 @@ export function lex(script: string): Lexed {
           quoted = true
         } else delimiter += q
       }
+      // A file descriptor written against the operator (0<<EOF) belongs to it.
+      const fd = word !== undefined && /^\d+$/.test(word) ? word : ''
+      if (fd) word = undefined
       endWord()
-      words.push(`<<${delimiter}`)
+      words.push(`${fd}<<${delimiter}`)
       if (delimiter) heredocs.push({ delimiter, quoted, dash })
       i = j - 1
     } else if (c === '&' && word !== undefined && /[<>]$/.test(word)) add(c)

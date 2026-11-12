@@ -162,6 +162,9 @@ test('Bash launches of job commands are refused; other launcher and unrelated co
     'cat <<EOF\n$(\nsidecar ask x\n)\nEOF',
     "printf '%s\\n' 'example <<EOF'\nsidecar ask x",
     'echo "$(echo "nested" && sidecar ask x)"',
+    'echo "$(echo foo # don\'t (\n)"; sidecar ask x',
+    'echo `echo "\\$(sidecar ask x)"`',
+    '0<<EOF sidecar ask x\ninput\nEOF',
   ]) expect((await $.tool.call({ tool: 'Bash', command })).deny).toMatch(/mcp__claude-sidecar__sidecar/)
   for (const command of [
     '"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 status',

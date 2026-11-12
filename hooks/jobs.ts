@@ -1,3 +1,5 @@
+import { lex } from './shell'
+
 // The sidecar tool: the model drives sidecars through it. Requests run as detached jobs (scripts/sidecar-job) that
 // outlive plugin reloads; each result comes back as a message, so no request goes unobserved. band.tsx serves it.
 
@@ -69,69 +71,6 @@ export function parseRequest(e: Record<string, unknown>): Request | { deny: stri
   return { args, cwd: typeof cwd === 'string' && cwd ? cwd : undefined, input, slot, command, inline: INLINE.has(command) }
 }
 
-// The line without here-document bodies, which are data. An unquoted delimiter still runs the body's substitutions, so
-// those stay, one per line.
-export function stripHeredocs(line: string): string {
-  const lines = line.split('\n')
-  const out: string[] = []
-  for (let i = 0; i < lines.length; i++) {
-    out.push(lines[i]!)
-    for (const match of lines[i]!.matchAll(/(?<!<)<<(-?)\s*(['"]?)([\w.-]+)\2/g)) {
-      const [, dash, quoted, delimiter] = match
-      for (i++; i < lines.length; i++) {
-        const body = lines[i]!
-        if ((dash ? body.replace(/^\t+/, '') : body) === delimiter) break
-        if (!quoted) out.push(...substitutions(body).map(s => `$(${s})`))
-      }
-    }
-  }
-  return out.join('\n')
-}
-
-// The simple commands of a shell line as words: quotes removed, line continuations joined, split at ; & | ( ) and
-// newlines. Expansions stay literal, which is enough to recognize the launcher.
-export function shellCommands(line: string): string[][] {
-  const commands: string[][] = []
-  let words: string[] = []
-  let word: string | undefined
-  const endWord = () => {
-    if (word !== undefined) words.push(word)
-    word = undefined
-  }
-  const endCommand = () => {
-    endWord()
-    if (words.length) commands.push(words)
-    words = []
-  }
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!
-    if (c === '\\') {
-      if (line[i + 1] === '\n') i++
-      else word = (word ?? '') + (line[++i] ?? '')
-    } else if (c === "'") {
-      const end = line.indexOf("'", i + 1)
-      word = (word ?? '') + line.slice(i + 1, end < 0 ? undefined : end)
-      i = end < 0 ? line.length : end
-    } else if (c === '"') {
-      let text = ''
-      for (i++; i < line.length && line[i] !== '"'; i++) {
-        if (line[i] === '\\' && i + 1 < line.length) {
-          if (line[i + 1] !== '\n') text += /["\\$`]/.test(line[i + 1]!) ? line[i + 1] : `\\${line[i + 1]}`
-          i++
-        } else text += line[i]
-      }
-      word = (word ?? '') + text
-    } else if (c === '&' && word !== undefined && /[<>]$/.test(word)) word += c
-    else if (/[;&|()\n]/.test(c)) endCommand()
-    else if (/\s/.test(c)) endWord()
-    else if (c === '#' && word === undefined) {
-      while (i + 1 < line.length && line[i + 1] !== '\n') i++
-    } else word = (word ?? '') + c
-  }
-  endCommand()
-  return commands
-}
-
 // Words that run the command after them: wrappers and shell control words.
 const PREFIXES = new Set(['bash', 'sh', 'env', 'exec', 'command', 'nohup', 'setsid', 'nice', 'time', 'timeout', 'sudo',
   'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{'])
@@ -139,31 +78,14 @@ const PREFIXES = new Set(['bash', 'sh', 'env', 'exec', 'command', 'nohup', 'sets
 const REDIRECT = /^\d*(?:&?>>?|<<?<?|[<>]&)/
 const BARE_REDIRECT = /^\d*(?:&?>>?|<<?<?|[<>]&)$/
 
-// The bodies of $(...) and `...` substitutions, which run even inside double quotes.
-function substitutions(line: string): string[] {
-  const bodies: string[] = []
-  for (let i = line.indexOf('$('); i >= 0; i = line.indexOf('$(', i + 2)) {
-    let depth = 0
-    for (let j = i + 1; j < line.length; j++) {
-      if (line[j] === '(') depth++
-      else if (line[j] === ')' && --depth === 0) {
-        bodies.push(line.slice(i + 2, j))
-        break
-      }
-    }
-  }
-  for (const match of line.matchAll(/`([^`]*)`/g)) bodies.push(match[1]!)
-  return bodies
-}
-
 // Why a Bash command is refused: the launcher's Bash path would leave a request unobserved.
 export function bashDenial(script: string): string | undefined {
-  const line = stripHeredocs(script)
-  for (const body of substitutions(line)) {
+  const { commands, scripts } = lex(script)
+  for (const body of scripts) {
     const inner = bashDenial(body)
     if (inner) return inner
   }
-  for (const words of shellCommands(line)) {
+  for (const words of commands) {
     // A `bash -c SCRIPT` runs SCRIPT.
     const script = words.findIndex((w, j) => w === '-c' && /^(.*\/)?(ba)?sh$/.test(words[j - 1] ?? ''))
     const inner = script >= 0 ? bashDenial(words[script + 1] ?? '') : undefined

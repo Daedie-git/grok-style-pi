@@ -159,6 +159,9 @@ test('Bash launches of job commands are refused; other launcher and unrelated co
     '>out 2>&1 sidecar ask x',
     'timeout 600 env A=1 sidecar ask x',
     'cat <<EOF\n$(sidecar ask x)\nEOF',
+    'cat <<EOF\n$(\nsidecar ask x\n)\nEOF',
+    "printf '%s\\n' 'example <<EOF'\nsidecar ask x",
+    'echo "$(echo "nested" && sidecar ask x)"',
   ]) expect((await $.tool.call({ tool: 'Bash', command })).deny).toMatch(/mcp__claude-sidecar__sidecar/)
   for (const command of [
     '"${CLAUDE_PLUGIN_ROOT}/scripts/sidecar" --slot 2 status',
@@ -167,6 +170,8 @@ test('Bash launches of job commands are refused; other launcher and unrelated co
     'ls 2>&1 | grep sidecar',
     "python3 - <<'EOF'\nrun(\"bash -c 'sidecar ask x'\")\nsidecar ask x\nEOF\necho done",
     'cat <<-EOF\n\tsidecar ask x\n\tEOF',
+    "printf '%s\\n' '$(sidecar ask x)'",
+    '# $(sidecar ask x)\nprintf ok',
   ])
     expect((await $.tool.call({ tool: 'Bash', command })).deny).toBe(undefined)
 })

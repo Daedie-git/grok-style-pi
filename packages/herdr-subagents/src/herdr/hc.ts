@@ -32,9 +32,8 @@ export const HC_AGENT_LABEL = "herdr-subagents.agent";
 export const HC_SESSION_LABEL = "herdr-subagents.session";
 
 const CALL_TIMEOUT_MS = 70_000;
-const LIST_TIMEOUT_MS = 5000;
-/** A machine's calls cross SSH. */
-const MACHINE_LIST_TIMEOUT_MS = 10_000;
+/** hc answers a listing only after every connected machine does, so even local calls can wait on SSH. */
+const LIST_TIMEOUT_MS = 10_000;
 
 /** One hc API call. `anonymous` drops the caller's terminal identity, which hc would otherwise wrap sent text with. */
 export type HcCall = (method: string, params: Record<string, unknown>, options?: { timeout?: number; signal?: AbortSignal; anonymous?: boolean }) => Promise<unknown>;
@@ -109,7 +108,7 @@ export function herdrAppFocus(env: NodeJS.ProcessEnv = process.env): HcFocus {
 }
 
 /** Saved hc machines in Herdr's shape. hc addresses a machine by its name, which becomes the label. */
-export async function listHcMachines(call: HcCall, timeout = MACHINE_LIST_TIMEOUT_MS): Promise<HerdrMachine[]> {
+export async function listHcMachines(call: HcCall, timeout = LIST_TIMEOUT_MS): Promise<HerdrMachine[]> {
 	const machines = record(await call("machine.list", {}, { timeout }))?.machines;
 	if (!Array.isArray(machines)) throw new Error("hc machine list did not return a machines array");
 	return machines.flatMap((item) => {
@@ -178,12 +177,11 @@ export function createHcCli(env: NodeJS.ProcessEnv = process.env, options: HcOpt
 	const focus = options.focus ?? herdrAppFocus(env);
 	const machine = options.machine;
 	const prefix = machine ? `${machine}/` : "";
-	const listTimeout = machine ? MACHINE_LIST_TIMEOUT_MS : LIST_TIMEOUT_MS;
 	const address = (paneId: string) => `${prefix}${paneId}`;
 	// Listings span every connected machine; this client sees only its own.
 	const ours = (terminal: HcTerminal) => machine ? terminal.address.startsWith(prefix) : !terminal.address.includes("/");
 	const paneOf = (terminal: HcTerminal) => terminal.address.slice(prefix.length);
-	const list = async (params: Record<string, unknown>, signal?: AbortSignal, timeout = listTimeout): Promise<HcTerminal[]> => {
+	const list = async (params: Record<string, unknown>, signal?: AbortSignal, timeout = LIST_TIMEOUT_MS): Promise<HcTerminal[]> => {
 		const listing = record(await call("terminal.list", params, { timeout, signal }));
 		const terminals = listing?.terminals;
 		if (!Array.isArray(terminals)) throw new HcError("hc terminal list did not return a terminals array");
@@ -252,12 +250,12 @@ export function createHcCli(env: NodeJS.ProcessEnv = process.env, options: HcOpt
 		},
 		async isAlive(name) { return !!(await named(name)); },
 		async getAgent(name, signal, bounded) {
-			const terminal = await named(name, signal, bounded ? listTimeout : CALL_TIMEOUT_MS);
+			const terminal = await named(name, signal, bounded ? LIST_TIMEOUT_MS : CALL_TIMEOUT_MS);
 			return terminal && hcRef(terminal, paneOf(terminal));
 		},
 		async getPane(paneId, signal) {
 			let terminal: HcTerminal | undefined;
-			try { terminal = record(await call("terminal.get", { terminal: address(paneId) }, { timeout: listTimeout, signal })) as HcTerminal | undefined; }
+			try { terminal = record(await call("terminal.get", { terminal: address(paneId) }, { timeout: LIST_TIMEOUT_MS, signal })) as HcTerminal | undefined; }
 			catch (error) {
 				if (error instanceof HcError && error.code === "not_found") return undefined;
 				throw error;

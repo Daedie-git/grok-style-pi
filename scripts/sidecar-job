@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Runs one launcher command as a job of the sidecar tool, detached so it outlives plugin reloads.
+#   sidecar-job DIR ID [ARGS...]
+# DIR/ID.json holds the job ({argv, cwd, started}); DIR/ID.in, when present, is its stdin. The launcher's output goes
+# to DIR/ID.out and DIR/ID.err, then DIR/ID.done records {code, finished}.
+set -u
+dir=$1 id=$2
+shift 2
+if [[ -z ${SIDECAR_JOB_DETACHED:-} ]]; then
+  export SIDECAR_JOB_DETACHED=1
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$0" "$dir" "$id" "$@" </dev/null >/dev/null 2>&1
+  else
+    nohup "$0" "$dir" "$id" "$@" </dev/null >/dev/null 2>&1 &
+  fi
+  exit 0
+fi
+unset SIDECAR_JOB_DETACHED
+input=/dev/null
+[[ -f $dir/$id.in ]] && input=$dir/$id.in
+code=0
+"${BASH_SOURCE[0]%/*}/sidecar" "$@" <"$input" >"$dir/$id.out" 2>"$dir/$id.err" || code=$?
+printf '{"code":%d,"finished":%d}\n' "$code" "$(date +%s)" >"$dir/$id.done.tmp"
+mv -f -- "$dir/$id.done.tmp" "$dir/$id.done"

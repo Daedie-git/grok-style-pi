@@ -1036,7 +1036,7 @@ cmd_session_start() {
   } 7>"$STATE_DIR/$SIDECAR_AGENT.identity.lock"
   schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
   jq -n --arg machines "$(machine_guidance)" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext:
-    ("Persistent pi and Claude Code sidecars are available on demand in Herdr; none is started at startup. Follow the claude-sidecar:sidecar-review skill. Requests start their sidecar automatically. Use --slot N before a command for independent parallel sidecars; reuse that slot for follow-ups and answers." + $machines)}}'
+    ("Persistent pi and Claude Code sidecars are available on demand in Herdr; none is started at startup. Follow the claude-sidecar:sidecar-review skill and drive them with the mcp__claude-sidecar__sidecar tool, one call per request; each result arrives as a message. Requests start their sidecar automatically. Use --slot N before a command for independent parallel sidecars; reuse that slot for follow-ups and answers." + $machines)}}'
 }
 
 # 0: identified interactive owner; 1: excluded Claude; 2: ancestry unavailable or unidentified.

@@ -1,7 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { Register, ToolCallResult } from 'claude-code'
 
 import type { SlotRow } from '../types'
+import { bashDenial, DESCRIPTION, JOB_RECORD, INPUT_SCHEMA, jobId, jobMessage, parseRequest, POLL_MS, shown, TOOL_NAME } from './jobs'
+import type { Done, Job, Request } from './jobs'
+import { identity } from './owner'
 
 const rows = atom({ plugin: 'claude-sidecar', key: 'rows' } as const, [] as SlotRow[])
 const now = atom({ plugin: 'claude-sidecar', key: 'now' } as const, 0)
@@ -36,20 +39,119 @@ export const register: Register = on => {
   let fastUntil = 0
   let refresh: (() => void) | undefined
   let ticker: { cancel(): void } | undefined
+  // The sidecar tool (hooks/jobs.ts), set up at session start in a Herdr pane or Herdr app terminal.
+  let serve: ((request: Request) => Promise<ToolCallResult>) | undefined
+  let deliverHeld: (() => Promise<void>) | undefined
+  let takeHeld: (() => Promise<string[]>) | undefined
+  let turnRunning = false
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
-    // Claude on Windows often has no HOME; the launcher's Git Bash HOME is the user profile.
-    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
-    // The launcher's owner name: SIDECAR_AGENT, else sc-<herdr pane id, lowercased, ':' as '-'>, else sc-hc-<hc terminal>.
-    // SIDECAR_MUX picks the host when both IDs are inherited.
-    const forced = await $.env.get('SIDECAR_MUX')
-    const pane = forced === 'hc' ? undefined : await $.env.get('HERDR_PANE_ID')
-    const terminal = forced === 'herdr' ? undefined : await $.env.get('HC_TERMINAL_ID')
-    const id = pane || (terminal ? `hc-${terminal}` : undefined)
-    const owner = (await $.env.get('SIDECAR_AGENT')) || (id ? `sc-${id.toLowerCase().replace(/:/g, '-')}` : undefined)
-    if (!home || !owner) return result
-    const dir = `${home}/.cache/claude-sidecar`
+    const who = identity({
+      HOME: await $.env.get('HOME'),
+      USERPROFILE: await $.env.get('USERPROFILE'),
+      SIDECAR_MUX: await $.env.get('SIDECAR_MUX'),
+      HERDR_PANE_ID: await $.env.get('HERDR_PANE_ID'),
+      HC_TERMINAL_ID: await $.env.get('HC_TERMINAL_ID'),
+      SIDECAR_AGENT: await $.env.get('SIDECAR_AGENT'),
+    })
+    if (!who) return result
+    const { dir, owner } = who
+
+    // Jobs: DIR/ID.json, then .out, .err and .done from scripts/sidecar-job, then .delivered once handed to the model.
+    const jobDir = `${dir}/jobs/${owner}`
+    // On Windows, plain `bash` may be WSL's: use the Git Bash Claude names, else Git's default install.
+    const gitBash = 'C:/Program Files/Git/bin/bash.exe'
+    const bash =
+      (await $.env.get('CLAUDE_CODE_GIT_BASH_PATH')) ||
+      ((await $.env.get('USERPROFILE')) && (await $.fs.exists(gitBash).catch(() => false)) ? gitBash : 'bash')
+    const raw = (path: string) => $.fs.read(path).then(t => (typeof t === 'string' ? t : ''), () => '')
+    // Finished jobs waiting for the main thread's next tool result or the end of its turn.
+    const held = new Map<string, string>()
+    let jobTimer: { cancel(): void } | undefined
+    let scanning = false
+    const markDelivered = async (id: string) => {
+      await $.fs.write(`${jobDir}/${id}.delivered`, `${await $.clock.now()}\n`)
+      held.delete(id)
+    }
+    // Marked before it is handed on, so a reload never delivers it twice. Not awaited: the submission resolves only
+    // once its turn starts, which a turn.complete hook would hold up.
+    const submit = async (id: string, text: string) => {
+      await markDelivered(id)
+      void $.prompt.submit({ text }).catch(() => undefined)
+    }
+    const scanJobs = async () => {
+      if (scanning) return
+      scanning = true
+      let running = false
+      try {
+        const entries = await $.fs.list(jobDir).catch(() => [])
+        const names = new Set(entries.map(entry => entry.name))
+        for (const entry of entries) {
+          const id = JOB_RECORD.exec(entry.name)?.[1]
+          if (!id) continue
+          if (names.has(`${id}.delivered`) || held.has(id)) continue
+          if (!names.has(`${id}.done`)) {
+            running = true
+            continue
+          }
+          let job: Job, done: Done
+          try {
+            job = JSON.parse(await raw(`${jobDir}/${entry.name}`))
+            done = JSON.parse(await raw(`${jobDir}/${id}.done`))
+          } catch {
+            continue
+          }
+          const text = jobMessage(jobDir, id, job, done, await raw(`${jobDir}/${id}.out`), await raw(`${jobDir}/${id}.err`))
+          if (turnRunning) held.set(id, text)
+          else await submit(id, text)
+        }
+      } finally {
+        scanning = false
+        jobTimer?.cancel()
+        jobTimer = running ? $.clock.after(POLL_MS, () => void scanJobs()) : undefined
+      }
+    }
+    deliverHeld = async () => {
+      for (const [id, text] of [...held]) await submit(id, text)
+    }
+    takeHeld = async () => {
+      const texts = [...held.values()]
+      for (const id of [...held.keys()]) await markDelivered(id)
+      return texts
+    }
+    serve = async request => {
+      if (request.inline) {
+        const run = await $.process.run([bash, `${$.plugin.root}/scripts/sidecar`, ...request.args], {
+          cwd: request.cwd,
+          stdin: request.input,
+          timeoutMs: 600000,
+        })
+        return { result: [run.stdout.trimEnd(), run.stderr.trimEnd(), `exit ${run.exitCode}`].filter(Boolean).join('\n') }
+      }
+      const ms = await $.clock.now()
+      const id = jobId(ms, request, crypto.randomUUID())
+      if (request.input !== undefined) await $.fs.write(`${jobDir}/${id}.in`, request.input)
+      const job: Job = { argv: request.args, cwd: request.cwd, started: Math.floor(ms / 1000) }
+      await $.fs.write(`${jobDir}/${id}.json`, JSON.stringify(job))
+      const run = await $.process
+        .run([bash, `${$.plugin.root}/scripts/sidecar-job`, jobDir, id, ...request.args], { cwd: request.cwd })
+        .catch((error: unknown) => ({ exitCode: -1, stderr: String(error) }))
+      if (run.exitCode !== 0) {
+        await markDelivered(id)
+        return { deny: `could not start the job: ${run.stderr.trim() || `exit ${run.exitCode}`}` }
+      }
+      jobTimer?.cancel()
+      jobTimer = $.clock.after(POLL_MS, () => void scanJobs())
+      return {
+        result: `Started job ${id}: ${shown(request.args)}. Its output and exit code arrive as a message when it ends; continue with other work or end your turn.`,
+      }
+    }
+    // The band works without the tool.
+    await $.tool.register({ name: TOOL_NAME, description: DESCRIPTION, inputSchema: INPUT_SCHEMA, isDeferred: false }).catch(() => undefined)
+    // Jobs that finished while the plugin was reloading or Claude was away.
+    await scanJobs()
+
     const pattern = new RegExp(`^${owner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:-(\\d+))?\\.request\\.json$`)
     const text = (name: string, fallback: string) =>
       $.fs.read(`${dir}/${name}`).then(t => (typeof t === 'string' ? t.trim() : fallback) || fallback, () => fallback)
@@ -119,13 +221,41 @@ export const register: Register = on => {
     return result
   })
 
-  // A launcher call starts or answers a request: look now and keep looking until it shows.
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    if (refresh && /\bsidecar\b/.test(e.command)) {
+  on('tool.call', { tool: 'mcp__claude-sidecar__sidecar' }, async ($, e) => {
+    if (!serve) return { deny: 'sidecars need a Herdr pane or Herdr app terminal' }
+    const request = parseRequest(e as unknown as Record<string, unknown>)
+    if ('deny' in request) return request
+    // A request starts or answers a sidecar: look now and keep looking until it shows.
+    if (refresh) {
       fastUntil = (await $.clock.now()) + LAUNCH_WINDOW_MS
       $.clock.after(1000, refresh)
     }
+    return serve(request)
+  }).catch(($, e, next) => ({ deny: `${$.plugin.name}: the sidecar tool failed` }))
+
+  on('tool.call', { tool: 'Bash' }, ($, e, next) => {
+    const deny = serve && bashDenial(e.command)
+    return deny ? { deny } : next(e)
+  }).catch(($, e, next) => next(e))
+
+  // A job that finishes during a main-thread turn rides on its next tool result, else it is submitted at turn end.
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined || !takeHeld || result.deny !== undefined) return result
+    const texts = await takeHeld()
+    return texts.length ? { ...result, context: [...(result.context ?? []), ...texts] } : result
+  }).catch(($, e, next) => next(e))
+  on('turn.start', ($, e, next) => {
+    if (e.agentId === undefined) turnRunning = true
     return next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined) {
+      turnRunning = false
+      await deliverHeld?.()
+    }
+    return result
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

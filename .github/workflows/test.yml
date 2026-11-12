@@ -19,7 +19,7 @@ jobs:
           curl --fail --location --silent --show-error https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz -o "$RUNNER_TEMP/shellcheck.tar.xz"
           tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
-      - run: bash -n scripts/sidecar && shellcheck scripts/sidecar
+      - run: bash -n scripts/sidecar && shellcheck scripts/sidecar scripts/sidecar-job
       - run: python3 tests/run.py
       - run: node --test tests/test_paths.mjs
       - run: python3 -m json.tool .claude-plugin/plugin.json >/dev/null && python3 -m json.tool .claude-plugin/marketplace.json >/dev/null && python3 -m json.tool hooks/hooks.json >/dev/null

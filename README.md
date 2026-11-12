@@ -21,7 +21,7 @@ cd /home/aim/git/claude-sidecar
 claude --plugin-dir "$PWD"
 ```
 
-The plugin exposes `/claude-sidecar:sidecar-review` and a `SessionStart` hook. Restart Claude after changing plugin files. Runtime requests, reports, logs, locks, and session markers stay in `~/.cache/claude-sidecar`, outside the plugin checkout.
+The plugin exposes `/claude-sidecar:sidecar-review`, the `sidecar` tool, the band above the prompt and a `SessionStart` hook. Restart Claude after changing plugin files. Runtime requests, reports, logs, locks, and session markers stay in `~/.cache/claude-sidecar`, outside the plugin checkout.
 
 ```bash
 python3 tests/run.py
@@ -40,7 +40,7 @@ The launcher verifies the native pi PID and `--session-id` through Herdr's `pane
 
 An aborted turn can discard a message that Windows pi accepted but had not yet delivered. Its waiter exits 6 (delivery unconfirmed; inspect the pane before resending), and that message no longer keeps the slot busy. Cancelling the launcher stops its local waiting client and releases the slot lock; it does not abort the sidecar's model turn. A fully published report takes precedence over a subsequent runtime shutdown or reload.
 
-After updating, run `sidecar --slot N reload` as a harness background task for each existing Windows pi sidecar. For the first upgrade from an older extension, run it once the sidecar is idle: that one bootstrap still uses Herdr and may time out if work is active. Subsequent reloads wait through the native channel for the current operation to become idle, then start the confirmation deadline; they do not interrupt work. New sidecars load the channel automatically. If reload cannot be confirmed, inspect the pane before retrying. Claude Code sidecars still use Herdr's terminal transport; this adaptation targets pi.
+After updating, run `sidecar --slot N reload` for each existing Windows pi sidecar. For the first upgrade from an older extension, run it once the sidecar is idle: that one bootstrap still uses Herdr and may time out if work is active. Subsequent reloads wait through the native channel for the current operation to become idle, then start the confirmation deadline; they do not interrupt work. New sidecars load the channel automatically. If reload cannot be confirmed, inspect the pane before retrying. Claude Code sidecars still use Herdr's terminal transport; this adaptation targets pi.
 
 ## Claude Code agents
 
@@ -97,7 +97,7 @@ The plugin source sets the new model default. An already-running sidecar retains
 
 ## Use the launcher directly
 
-**Notification safety:** run every `ask`, `diff`, `answer` and `steer` as a harness background task (`run_in_background: true` in Claude Code's Bash tool), including idle steering and follow-ups. Do the same for `plan`, `wait` and `reload`. Keep the launcher attached to that task so its completion notification reaches the orchestrator. Shell detachment (`&`, `disown`, `nohup`, `setsid`, or `( … & )`) does **not** produce a harness completion notification; a pane finishing does not wake Claude. Do not discard the task's output or assume a submitted request is finished.
+**The sidecar tool:** Claude drives the launcher through the plugin's `mcp__claude-sidecar__sidecar` tool (`args`: the launcher's words; `cwd`; `input` for `-`). `status`, `report`, `keep`, `unkeep`, `stop` and `unreviewed` answer inline. Every other command runs as a detached job (`scripts/sidecar-job`, files under `~/.cache/claude-sidecar/jobs/<owner>/`) that outlives plugin reloads. When the job ends, the plugin hands its output and exit code to Claude: as context on the next main-thread tool result mid-turn, otherwise as a new prompt; jobs that ended while Claude was away are delivered at the next session start. The plugin refuses Bash runs of request commands, whose results would reach nobody.
 
 ```bash
 ./scripts/sidecar status
@@ -113,7 +113,7 @@ The plugin source sets the new model default. An already-running sidecar retains
 ./scripts/sidecar --slot 3 ask "Review lifecycle handling independently."
 ./scripts/sidecar --slot 2 answer "Yes, keep backward compatibility."
 ./scripts/sidecar --slot 4 --machine laptop ask "Run the suite on the laptop."
-./scripts/sidecar --slot 2 wait     # blocking watcher; run as a harness background task
+./scripts/sidecar --slot 2 wait     # blocking watcher for a request started outside the tool
 ./scripts/sidecar --slot 2 report   # recover the latest full report
 ```
 
@@ -143,7 +143,7 @@ Every request prints `# Sidecar report (<local path>)` as its **first stdout lin
 
 `sidecar --slot N status` shows when the latest request started and finished, its exit code, and the last saved report path with `printed` or `unprinted`. `printed` means the launcher successfully wrote the full report to stdout, **not** that Claude or a person read it; redirected output can still be marked printed. An interrupted launcher may have no recorded finish time.
 
-If a request was already launched without an observable harness task, start `sidecar --slot N wait` with `run_in_background: true`. It blocks on that slot's launcher lock until the active request has finished, then prints its local report path without consuming the report. Exit 0 means report available; exit 3 means a question needs an answer; exit 1 means no request/report or an abnormal launcher exit (inspect the pane). It observes the latest request when it acquires the lock, not future requests or work started directly in the pane. Then run `sidecar --slot N report` to print the latest saved report in full, including any question. `report` exits 0 on successful printing; the original question remains pending until `answer`. These recovery commands use local state and do not start an agent.
+If a request was launched outside the tool, run `sidecar --slot N wait` through it. It blocks on that slot's launcher lock until the active request has finished, then prints its local report path without consuming the report. Exit 0 means report available; exit 3 means a question needs an answer; exit 1 means no request/report or an abnormal launcher exit (inspect the pane). It observes the latest request when it acquires the lock, not future requests or work started directly in the pane. Then run `sidecar --slot N report` to print the latest saved report in full, including any question. `report` exits 0 on successful printing; the original question remains pending until `answer`. These recovery commands use local state and do not start an agent.
 
 Commands run against the current working directory. `diff` takes a **single base ref**, not an `A..B` or `A...B` range. The diff review includes commits since the base, working-tree changes, and untracked files. Requests serialize per slot, while different slots can work concurrently. Slot 1 is the default; each slot retains its own context and pending questions across follow-ups and `/clear`. Sidecars fill Claude's current tab up to four total panes, counting every pane open in it, including Claude's and other Claude panes' sidecars. Each new sidecar halves the largest pane: first left/right, then top/bottom in each column. A full tab sends further sidecars to overflow tabs of up to four panes each; closing a pane frees its room. Reuse slots for later tasks. A blocked reviewer needs human attention in its pane.
 

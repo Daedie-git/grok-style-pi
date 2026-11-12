@@ -5,7 +5,7 @@ function setup(on, active=false) {
   let scans=0
   on('session.start', (_,e) => ({cwd:e.cwd}))
   on('env.get',(_,e)=>({value:e.name==='HOME'?'/fake-home':e.name==='HERDR_PANE_ID'?'PANE:1':undefined}))
-  on('fs.list',()=>{scans++;return {value:active?(active==='pending'?['sc-pane-1.request.json','sc-pane-1.pending']:['sc-pane-1.request.json']).map(name=>({name,kind:'file',size:0,mtimeMs:0,isLink:false})):[]}})
+  on('fs.list',(_,e)=>{if(!e.path.includes('/jobs/'))scans++;return {value:active?(active==='pending'?['sc-pane-1.request.json','sc-pane-1.pending']:['sc-pane-1.request.json']).map(name=>({name,kind:'file',size:0,mtimeMs:0,isLink:false})):[]}})
   on('fs.read',(_,e)=>({value:e.path.endsWith('.pending')?'{"id":"a-b-ask"}':e.path.endsWith('request.json')?(active==='pending'?'{"id":"a-b-ask","started":1,"finished":2}':'{"id":"a-b-ask","started":1}'):e.path.endsWith('.machine')?'local':'reviewer'}))
   on('ui.render',($,e)=>{const {Text}=$.ui.resolve(e);return <Text>below</Text>})
   on('tool.call',()=>({result:{}}))
@@ -20,7 +20,7 @@ test('idle scans every 30s, launcher calls discover work after 1s, seconds tick 
  expect(s.scans).toBe(1)
  await s.clock.advance(1000)
  expect(s.scans).toBe(2)
- await $.tool.call({tool:'Bash',command:'./scripts/sidecar ask task'})
+ await $.tool.call({tool:'mcp__claude-sidecar__sidecar',args:['ask','task']})
  s.active(true)
  await s.clock.advance(1000)
  expect(s.scans).toBe(3)

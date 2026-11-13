@@ -30,14 +30,14 @@ const EXIT_MEANING: Record<number, string> = {
 // Progress lines while a request runs say nothing once it has finished.
 const PROGRESS = /^sidecar: \S+ still working \(/
 
-export const DESCRIPTION = `Runs the claude-sidecar launcher (follow the claude-sidecar:sidecar-review skill). args are the launcher's words after "sidecar", e.g. ["--slot", "2", "--role", "implementer", "ask", "Fix the parser"] or ["--slot", "2", "answer", "Keep the old API"]. status, report, keep, unkeep, stop and unreviewed return their output. Every other command starts a job and returns at once; its output and exit code arrive later as a message (exit 3: the sidecar asks a question). Start parallel sidecars with one call per slot.`
+export const DESCRIPTION = `Runs the claude-sidecar launcher (follow the claude-sidecar:sidecar-review skill). args are the launcher's words after "sidecar", e.g. ["--slot", "2", "--role", "implementer", "ask", "Fix the parser"] or ["--slot", "2", "answer", "Keep the old API"]. status, report, keep, unkeep, stop and unreviewed return their output. For plan review, use ["plan", "path/to/plan.md", "Review context"]: FILE must be a real path, never "-", and context goes in args, not input. Every other command starts a job and returns at once; its output and exit code arrive later as a message (exit 3: the sidecar asks a question). Start parallel sidecars with one call per slot.`
 
 export const INPUT_SCHEMA = {
   type: 'object',
   properties: {
     args: { type: 'array', items: { type: 'string' }, minItems: 1, description: 'Launcher arguments: options, command, command arguments.' },
     cwd: { type: 'string', description: "Directory to run in (the checkout the request concerns); the session's by default." },
-    input: { type: 'string', description: 'Standard input, for commands given "-" in place of TEXT.' },
+    input: { type: 'string', description: 'Standard input for ask, note, answer, steer or reject with "-" in place of TEXT. Not supported by plan: use args ["plan", "FILE", "CONTEXT"].' },
   },
   required: ['args'],
   additionalProperties: false,
@@ -49,14 +49,14 @@ export type Done = { code: number; finished: number }
 export type Request = { args: string[]; cwd?: string; input?: string; slot: string; command: string; inline: boolean }
 
 // The command word and slot of launcher args; every global option takes a value.
-export function parseArgs(args: readonly string[]): { command: string; slot: string } {
+export function parseArgs(args: readonly string[]): { command: string; slot: string; commandIndex: number } {
   let slot = '1'
   let i = 0
   for (let word = args[i]; word?.startsWith('--'); word = args[i]) {
     if (word === '--slot') slot = args[i + 1] ?? slot
     i += 2
   }
-  return { command: args[i] ?? '', slot }
+  return { command: args[i] ?? '', slot, commandIndex: i }
 }
 
 // A tool call's input as a request, or why it is refused. Without cwd it runs in the session's directory.
@@ -65,9 +65,11 @@ export function parseRequest(e: Record<string, unknown>): Request | { deny: stri
   if (!Array.isArray(args) || args.length === 0 || !args.every(a => typeof a === 'string'))
     return { deny: 'args must be a non-empty list of strings' }
   if (input !== undefined && typeof input !== 'string') return { deny: 'input must be a string' }
-  const { command, slot } = parseArgs(args)
+  const { command, slot, commandIndex } = parseArgs(args)
   if (!command) return { deny: 'args name no command' }
   if (INTERNAL.has(command)) return { deny: `${command} is a hook entry, not a command for the model` }
+  if (command === 'plan' && (!args[commandIndex + 1] || args[commandIndex + 1] === '-' || input !== undefined))
+    return { deny: 'usage: sidecar plan FILE [CONTEXT]. FILE must be a real path, not "-"; put the review context in args, not input.' }
   return { args, cwd: typeof cwd === 'string' && cwd ? cwd : undefined, input, slot, command, inline: INLINE.has(command) }
 }
 

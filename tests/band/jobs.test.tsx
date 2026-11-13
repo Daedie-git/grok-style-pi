@@ -143,6 +143,38 @@ test('quick commands answer inline; hook entries are refused', async ($, on) => 
   expect(internal.deny).toMatch(/hook entry/)
 })
 
+test('invalid plan stdin calls are refused before announcing or creating a job', async ($, on) => {
+  const s = setup(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (const [args, input] of [
+    [['--slot', '2', '--role', 'reviewer', 'plan', '-'], 'Review the plan at p.md. Check its assumptions.'],
+    [['plan', '-'], undefined],
+    [['plan'], undefined],
+    [['plan', ''], undefined],
+    [['plan', 'p.md'], 'Check assumptions'],
+    [['plan', 'p.md'], ''],
+  ] as const) {
+    const reply = await $.tool.call({ tool: TOOL, args: [...args], ...(input === undefined ? {} : { input }) })
+    expect(reply.deny).toMatch(/plan FILE \[CONTEXT\]/)
+    expect(reply.deny).toMatch(/put the review context in args, not input/)
+    expect(reply.deny).not.toMatch(/ask/)
+    expect(reply.result).toBe(undefined)
+  }
+  expect(s.runs).toEqual([])
+  expect(Object.keys(s.files)).toEqual([])
+})
+
+test('plan file and context arguments and ask stdin still start jobs', async ($, on) => {
+  const s = setup(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const plan = await $.tool.call({ tool: TOOL, args: ['--slot', '2', '--role', 'reviewer', 'plan', 'p.md', 'Check assumptions'] })
+  expect(plan.result).toMatch(/^Started job/)
+  expect(s.runs.at(-1)!.slice(-3)).toEqual(['plan', 'p.md', 'Check assumptions'])
+  const ask = await $.tool.call({ tool: TOOL, args: ['ask', '-'], input: 'Review p.md and check assumptions' })
+  expect(ask.result).toMatch(/^Started job/)
+  expect(Object.values(s.files)).toContain('Review p.md and check assumptions')
+})
+
 test('Bash launches of job commands are refused; other launcher and unrelated commands run', async ($, on) => {
   setup(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })

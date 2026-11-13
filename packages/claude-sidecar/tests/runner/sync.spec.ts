@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { remoteNodeCommand, syncOptions } from "../../src/sync.ts";
+import { mapPath, remoteNodeCommand, syncOptions } from "../../src/sync.ts";
 
 const PROGRAM = readFileSync(new URL("../../scripts/sync-machine.cjs", import.meta.url), "utf8");
 
@@ -61,4 +61,9 @@ test("sync options map this checkout's path onto the machine and validate the ti
 	const options = syncOptions({ home: "C:/Users/me", paths: { "/home/me/git/": "C:/git", "/home/me": "C:/Users/me" } }, "/home/me/git/repo", {});
 	assert.deepEqual(options, { tooling: {}, runtimeHome: "C:/Users/me", workDir: "C:/git/repo", timeoutMs: 60_000 });
 	assert.throws(() => syncOptions({}, "/x", { SIDECAR_SYNC_TIMEOUT_S: "0" }), /positive integer/);
+});
+
+test("path mappings match native Windows directories", () => {
+	assert.equal(mapPath({ paths: { "C:\\work\\": "D:/repos" } }, "C:\\work\\project"), "D:/repos/project");
+	assert.equal(mapPath({ paths: { "/home/me/git": "C:/git" } }, "/home/me/gitx"), undefined);
 });

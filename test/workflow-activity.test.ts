@@ -434,3 +434,17 @@ test("RR11: stop and terminal controls publish immediately without rebuilding an
 	assert.equal(latest.status, "stopped");
 	assert.equal(builds, 0, "receipt titles do not invalidate the historical outline");
 });
+
+test("the workflow heading keeps output from attempts a retry replaced", () => {
+	let entry: Activity | undefined;
+	const projection = new WorkflowActivities(undefined, (next) => { entry = next; });
+	projection.receipt({ taskId: "task", runId: "workflow-run", workflowName: "Schema retry" });
+	const panel = new ActivityPanel(() => entry ? [entry] : [], theme, () => {}, () => {}, () => {}, () => {});
+	const first = outcome().usage; first.latestFootprint = 5000; first.billable.output = 1000;
+	projection.child({ agentId: "attempt-1", workflow: { taskId: "task", runId: "workflow-run", logicalIndex: 1, label: "Validate", attempt: 1 }, startedAt: 1000, endedAt: 2000, running: false, status: "completed", usage: first } as never, "run-1");
+	projection.observe({ type: "workflow-progress", taskId: "task", runId: "workflow-run", event: { type: "agent", logicalIndex: 1, label: "Validate", state: "start", attempt: 2 } } as never);
+	const retried = outcome().usage; retried.latestFootprint = 2000; retried.billable.output = 200;
+	projection.child({ agentId: "attempt-2", workflow: { taskId: "task", runId: "workflow-run", logicalIndex: 1, label: "Validate", attempt: 2 }, startedAt: 3000, usage: retried } as never, "run-2");
+	assert.match(panel.render(160)[0], /Active workflows · 1 · 1,200 output tokens/);
+	assert.equal(entry!.children![0].tokens, 2000);
+});

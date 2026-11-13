@@ -4,7 +4,7 @@ import type { WorkflowProgress } from "../../packages/subagent-engine/src/workfl
 import { plainText, type Activity } from "../activity/ui.ts";
 
 type AgentState = "queued" | "running" | "cached" | "done" | "failed";
-type Slot = { index: number; label?: string; phase?: string; state: AgentState; agentId?: string; attempt?: number; startedAt?: number; endedAt?: number; tokens?: number; output?: number };
+type Slot = { index: number; label?: string; phase?: string; state: AgentState; agentId?: string; attempt?: number; startedAt?: number; endedAt?: number; tokens?: number; output?: number; earlierOutput?: number };
 type Workflow = {
 	taskId: string; runId: string; activity: Activity; slots: Map<number, Slot>; phases: Map<string, number>;
 	logs: string; children: string; logTail: string; childTail: string; terminal: boolean;
@@ -54,7 +54,7 @@ export class WorkflowActivities {
 		const previous = workflow.slots.get(next.index);
 		next = { ...previous, ...next };
 		if (previous && previous.label === next.label && previous.phase === next.phase && previous.state === next.state && previous.agentId === next.agentId && previous.attempt === next.attempt
-			&& previous.startedAt === next.startedAt && previous.endedAt === next.endedAt && previous.tokens === next.tokens && previous.output === next.output) return false;
+			&& previous.startedAt === next.startedAt && previous.endedAt === next.endedAt && previous.tokens === next.tokens && previous.output === next.output && previous.earlierOutput === next.earlierOutput) return false;
 		workflow.slots.set(next.index, next);
 		workflow.outlineDirty = true;
 		return true;
@@ -84,7 +84,7 @@ export class WorkflowActivities {
 			state: finished ? meta.status === "completed" ? "done" : "failed" : "running", agentId: meta.agentId, attempt: provenance.attempt,
 			startedAt: meta.startedAt ?? (sameAgent ? previous?.startedAt : undefined) ?? (finished ? undefined : Date.now()), endedAt: finished ? meta.endedAt : undefined,
 			tokens: meta.usage?.latestFootprint ?? (sameAgent ? previous?.tokens : undefined) ?? 0,
-			output: meta.usage?.billable.output ?? (sameAgent ? previous?.output : undefined) ?? 0,
+			output: meta.usage?.billable.output ?? (sameAgent ? previous?.output : undefined) ?? 0, earlierOutput: previous?.earlierOutput,
 		})) this.refresh(workflow, false, true);
 	}
 	/** Restore logical call states after hydrating child-run metrics; a completed child can still fail its workflow call. */
@@ -114,6 +114,8 @@ export class WorkflowActivities {
 			state: progress.state === "start" ? "running" : progress.state, agentId: progress.agentId ?? (newAttempt ? undefined : previous?.agentId),
 			attempt: progress.attempt ?? (newAttempt ? undefined : previous?.attempt),
 			startedAt: newAttempt ? undefined : previous?.startedAt, tokens: newAttempt ? 0 : previous?.tokens, output: newAttempt ? 0 : previous?.output,
+			// Output a retried call generated before stays in the workflow's total.
+			earlierOutput: newAttempt ? (previous?.earlierOutput ?? 0) + (previous?.output ?? 0) : previous?.earlierOutput,
 			endedAt: progress.state === "done" || progress.state === "failed" ? (newAttempt ? undefined : previous?.endedAt) ?? Date.now() : newAttempt ? undefined : previous?.endedAt,
 		});
 	}
@@ -173,7 +175,7 @@ export class WorkflowActivities {
 		workflow.activity.detail = summary;
 		workflow.activity.children = slots.map((slot) => ({
 			title: line(slot.label ?? `agent() #${slot.index}`), status: slot.state,
-			startedAt: slot.startedAt, endedAt: slot.endedAt, tokens: slot.tokens ?? 0, output: slot.output ?? 0,
+			startedAt: slot.startedAt, endedAt: slot.endedAt, tokens: slot.tokens ?? 0, output: (slot.earlierOutput ?? 0) + (slot.output ?? 0),
 		}));
 		const groups = new Map<string, Slot[]>();
 		for (const slot of slots) { const phase = slot.phase ?? "Ungrouped"; const group = groups.get(phase) ?? []; group.push(slot); groups.set(phase, group); }

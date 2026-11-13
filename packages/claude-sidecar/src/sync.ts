@@ -18,10 +18,13 @@ export function machineConfig(machine: { id: string; label: string }, env: NodeJ
 
 /** CWD under the longest matching local prefix in `paths`, rewritten to its remote counterpart. */
 export function mapPath(config: MachineConfig, cwd: string): string | undefined {
-	const mapping = Object.entries(config.paths ?? {}).map(([prefix, value]) => [prefix.replace(/\/+$/, ""), value] as const)
-		.filter(([prefix]) => cwd === prefix || cwd.startsWith(prefix + "/"))
+	// Windows directories may use either separator; the remote suffix uses `/`, which both conventions accept.
+	const slashes = (path: string) => path.replaceAll("\\", "/");
+	const local = slashes(cwd);
+	const mapping = Object.entries(config.paths ?? {}).map(([prefix, value]) => [slashes(prefix).replace(/\/+$/, ""), value] as const)
+		.filter(([prefix]) => local === prefix || local.startsWith(prefix + "/"))
 		.sort((a, b) => a[0].length - b[0].length).at(-1);
-	return mapping ? mapping[1] + cwd.slice(mapping[0].length) : undefined;
+	return mapping ? mapping[1] + local.slice(mapping[0].length) : undefined;
 }
 
 /** Options for the remote program, as the Bash launcher computed them. */

@@ -5,7 +5,10 @@ export type ActivityChild = {
 	status: string;
 	startedAt?: number;
 	endedAt?: number;
+	/** Current context size. */
 	tokens: number;
+	/** Output generated so far. */
+	output?: number;
 };
 
 export type Activity = {
@@ -58,7 +61,8 @@ export class ActivityPanel {
 			const group = entries.filter((entry) => entry.kind === kind);
 			if (!group.length) continue;
 			this.hits.push({ y: lines.length, x: 0, end: width, action: this.all });
-			const title = `─ ${heading} · ${group.length} `;
+			const output = kind === "workflow" ? group.reduce((sum, entry) => sum + (entry.children ?? []).reduce((total, child) => total + (child.output ?? 0), 0), 0) : 0;
+			const title = `─ ${heading} · ${group.length}${output ? ` · ${output.toLocaleString("en-US")} output tokens` : ""} `;
 			lines.push(truncateToWidth(this.theme.fg("muted", title + "─".repeat(Math.max(0, width - visibleWidth(title)))), width));
 			for (const entry of group.slice(0, 3)) {
 				const buttons = [

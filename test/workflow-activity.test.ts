@@ -91,17 +91,19 @@ test("workflow agent rows update metered tokens, freeze elapsed time, and fence 
 	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
 	const panel = new ActivityPanel(() => [...h.entries.values()], theme, () => {}, () => {}, () => {}, () => {});
 	const usage = outcome().usage;
-	// The row shows the context in use plus output, not every turn's re-read context summed.
+	// The row shows the current context, not every turn's re-read context summed.
 	usage.billable.totalTokens = 1_657_658;
-	usage.liveMetric = 1500;
+	usage.latestFootprint = 1500;
+	usage.billable.output = 1234;
 	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage } });
+	assert.match(panel.render(160)[0], /─ Active workflows · 1 · 1,234 output tokens ─/);
 	assert.deepEqual(panel.render(160).slice(2), [
 		"  running · 1m0s · 1,500 tokens · Inspect resource ownership",
 		"  queued · — · 0 tokens · Verify changes",
 	]);
 	now = 121000;
 	assert.match(panel.render(160)[2], /running · 2m0s/);
-	const result = outcome(); result.usage.liveMetric = 2400;
+	const result = outcome(); result.usage.latestFootprint = 2400;
 	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
 	now = 181000;
 	assert.match(panel.render(160)[2], /done · 2m0s · 2,400 tokens/);
@@ -169,7 +171,7 @@ test("active workflow child snapshots restore a nested workflow, not a top-level
 	const child = meta("restored", "child-run");
 	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 2, label: "Restored child", phase: "Inspect" };
 	const engine = new WorkflowEngine();
-	const usage = outcome().usage; usage.liveMetric = 12345;
+	const usage = outcome().usage; usage.latestFootprint = 12345;
 	engine.snapshots = [{ ...agentSnapshot(child.agentId, "child-run"), workflow: child.workflow, usage, startedAt: 42000 }];
 	const entries: Activity[] = [];
 	const adapter = new SubagentAdapter(engine, (entry) => { if (!entries.includes(entry)) entries.push(entry); });
@@ -177,13 +179,13 @@ test("active workflow child snapshots restore a nested workflow, not a top-level
 	adapter.workflowReceipt(receipt);
 	assert.equal(entries.length, 1); assert.equal(entries[0].kind, "workflow");
 	assert.match(entries[0].output, /Restored child · running · restored/);
-	assert.deepEqual(entries[0].children, [{ title: "Restored child", status: "running", tokens: 12345, startedAt: 42000, endedAt: undefined }]);
+	assert.deepEqual(entries[0].children, [{ title: "Restored child", status: "running", tokens: 12345, output: 0, startedAt: 42000, endedAt: undefined }]);
 });
 
 test("reattachment restores finished siblings only for the same active workflow invocation", (t) => {
 	const engine = new WorkflowEngine();
 	const workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Finished child" };
-	const usage = outcome().usage; usage.liveMetric = 2300;
+	const usage = outcome().usage; usage.latestFootprint = 2300;
 	engine.snapshots = [
 		{ ...agentSnapshot("finished", "finished-run"), workflow, running: false, status: "completed", startedAt: 1000, endedAt: 61000, usage },
 		{ ...agentSnapshot("failed", "failed-run"), workflow: { ...workflow, logicalIndex: 2, label: "Failed child" }, running: false, status: "failed", startedAt: 2000, endedAt: 62000, usage },
@@ -196,9 +198,9 @@ test("reattachment restores finished siblings only for the same active workflow 
 	t.after(() => adapter.dispose());
 	assert.deepEqual([...entries.keys()], ["workflow:task-1"]);
 	assert.deepEqual(entries.get("workflow:task-1")!.children, [
-		{ title: "Finished child", status: "done", startedAt: 1000, endedAt: 61000, tokens: 2300 },
-		{ title: "Failed child", status: "failed", startedAt: 2000, endedAt: 62000, tokens: 2300 },
-		{ title: "Active child", status: "running", startedAt: 1, endedAt: undefined, tokens: 0 },
+		{ title: "Finished child", status: "done", startedAt: 1000, endedAt: 61000, tokens: 2300, output: 0 },
+		{ title: "Failed child", status: "failed", startedAt: 2000, endedAt: 62000, tokens: 2300, output: 0 },
+		{ title: "Active child", status: "running", startedAt: 1, endedAt: undefined, tokens: 0, output: 0 },
 	]);
 	assert.equal(entries.get("workflow:task-1")!.detail, "1/3 done · 0 cached · 1 failed");
 });
@@ -206,7 +208,7 @@ test("reattachment restores finished siblings only for the same active workflow 
 test("reattachment preserves authoritative workflow failure, queued and cached slots even between child runs", (t) => {
 	for (const runningSibling of [false, true]) {
 		const engine = new WorkflowEngine();
-		const usage = outcome().usage; usage.liveMetric = 700;
+		const usage = outcome().usage; usage.latestFootprint = 700;
 		const failedWorkflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Validate structured output" };
 		engine.snapshots = [{ ...agentSnapshot("schema-child", "schema-run"), workflow: failedWorkflow, running: false, status: "completed", usage, startedAt: 1000, endedAt: 3000 }];
 		if (runningSibling) engine.snapshots.push({ ...agentSnapshot("sibling", "sibling-run"), workflow: { ...failedWorkflow, logicalIndex: 4, label: "Inspect" } });
@@ -225,14 +227,14 @@ test("reattachment preserves authoritative workflow failure, queued and cached s
 		assert.equal(entry.title, "◆ Workflow · Review"); assert.equal(entry.startedAt, 500);
 		assert.equal(entry.detail, `0/${runningSibling ? 4 : 3} done · 1 cached · 1 failed`);
 		assert.deepEqual(entry.children!.slice(0, 3).map((child) => child.status), ["failed", "cached", "queued"]);
-		assert.deepEqual(entry.children![0], { title: "Validate structured output", status: "failed", startedAt: 1000, endedAt: 3000, tokens: 700 });
+		assert.deepEqual(entry.children![0], { title: "Validate structured output", status: "failed", startedAt: 1000, endedAt: 3000, tokens: 700, output: 0 });
 	}
 });
 
 test("workflow snapshot attempt identity preserves teardown metrics and rejects unspawned retry accounting", (t) => {
 	for (const retryFailed of [false, true]) {
 		const engine = new WorkflowEngine();
-		const usage = outcome().usage; usage.liveMetric = 2400;
+		const usage = outcome().usage; usage.latestFootprint = 2400;
 		engine.snapshots = [{ ...agentSnapshot("previous", "child-run"), running: false, status: "completed", startedAt: 1000, endedAt: 3000, usage,
 			workflow: { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Inspect", attempt: 1 } }];
 		const source = Object.assign(engine, { workflowSnapshots: () => [{ taskId: "task-1", runId: "run-1", name: "Review", status: "running" as const, startedAt: 500,
@@ -255,7 +257,7 @@ test("retry start clears prior metrics before spawn while duplicate starts prese
 	const child = meta("child", "child-run"); child.runs[0].startedAt = 1000;
 	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Retry child" };
 	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
-	const result = outcome(); result.usage.liveMetric = 2400;
+	const result = outcome(); result.usage.latestFootprint = 2400;
 	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage: result.usage } });
 	const running = h.entry().children;
 	h.engine.progress({ type: "agent", logicalIndex: 1, state: "start" });
@@ -264,12 +266,12 @@ test("retry start clears prior metrics before spawn while duplicate starts prese
 	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
 	now = 121000;
 	h.engine.progress({ type: "agent", logicalIndex: 1, state: "start" });
-	assert.deepEqual(h.entry().children, [{ title: "Retry child", status: "running", startedAt: undefined, endedAt: undefined, tokens: 0 }]);
+	assert.deepEqual(h.entry().children, [{ title: "Retry child", status: "running", startedAt: undefined, endedAt: undefined, tokens: 0, output: 0 }]);
 	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage: result.usage } });
 	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
 	h.engine.progress({ type: "agent", logicalIndex: 1, state: "failed", agentId: child.agentId });
 	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
-	assert.deepEqual(h.entry().children, [{ title: "Retry child", status: "failed", startedAt: undefined, endedAt: now, tokens: 0 }]);
+	assert.deepEqual(h.entry().children, [{ title: "Retry child", status: "failed", startedAt: undefined, endedAt: now, tokens: 0, output: 0 }]);
 });
 
 test("Workflow and RunWorkflow diamonds show receipt metadata and shared file-target gestures", async () => {

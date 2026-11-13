@@ -4,6 +4,6 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 case ${1:-} in
   # Hook entries return at once; a detached pass closes finished panes and those of departed owners.
-  session-end|sweep|done-close) (node "$root/src/cli.ts" maintain </dev/null >/dev/null 2>&1 &); exit 0 ;;
+  session-end|sweep|done-close) (node --disable-warning=ExperimentalWarning "$root/src/cli.ts" maintain </dev/null >/dev/null 2>&1 &); exit 0 ;;
 esac
-exec node "$root/src/cli.ts" "$@"
+exec node --disable-warning=ExperimentalWarning "$root/src/cli.ts" "$@"

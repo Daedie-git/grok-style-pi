@@ -59,10 +59,15 @@ const CHECKED = new Set(["ask", "answer", "steer"]);
 
 class UsageError extends Error {}
 
+/** Slot locks use node:sqlite, whose experimental notice would otherwise lead every report. */
+const NODE_FLAGS = ["--disable-warning=ExperimentalWarning"];
+
 interface RequestOptions {
 	keep?: boolean;
 	/** Identifies the request for duplicate detection; defaults to the text's digest. */
 	key?: string;
+	/** The question this request answers; it must still be unanswered once the slot lock is held. */
+	answers?: string;
 	/** Builds the prompt under the slot lock, once the slot's role and machine are known. */
 	build?: (slot: { role: Role; machine?: string }) => string;
 }
@@ -126,7 +131,8 @@ export class SidecarCli {
 		this.parent = new HerdrParent({ env: this.env, ...options.parent });
 		this.owner = ownerName(this.env, this.parent.hc ? "hc" : "herdr");
 		this.dir = stateDir(this.env);
-		this.ownerSession = claudeTranscript(this.env);
+		// SessionStart records the transcript for Claude versions that do not export their session ID.
+		this.ownerSession = claudeTranscript(this.env) ?? recordedTranscript(this.dir, this.owner);
 	}
 
 	private profile: Profile | undefined;
@@ -224,8 +230,9 @@ export class SidecarCli {
 	}
 
 	private async answer(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
-		if (!slot.pendingId()) throw new UsageError(`no pending question in slot ${globals.slot}; use: sidecar --slot ${globals.slot} ask TEXT for a new request`);
-		return this.request(slot, globals, "answer", answerPrompt(await this.text(rest)));
+		const answers = slot.pendingId();
+		if (!answers) throw new UsageError(`no pending question in slot ${globals.slot}; use: sidecar --slot ${globals.slot} ask TEXT for a new request`);
+		return this.request(slot, globals, "answer", answerPrompt(await this.text(rest)), { answers });
 	}
 
 	private async steer(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
@@ -255,6 +262,7 @@ export class SidecarCli {
 		}
 		const release = await slot.lock();
 		try {
+			if (options.answers && slot.pendingId() !== options.answers) throw new UsageError(`slot ${globals.slot}'s question was already answered; check its report before sending another request`);
 			let record = slot.read();
 			if (record) this.assertBinding(record, globals);
 			this.assertProfile(record, globals);
@@ -293,7 +301,8 @@ export class SidecarCli {
 				const snapshot = await this.settle(local, runner, ref, id);
 				return await this.deliver(slot, record, runner, ref, snapshot, id, kind, globals.slot);
 			} finally {
-				slot.write({ ...record, inflight: undefined });
+				// stop --fresh may have forgotten the slot meanwhile; its conversation must stay discarded.
+				if (slot.read()?.agentId === record.agentId) slot.write({ ...record, inflight: undefined });
 				slot.finishRequest(Math.floor(Date.now() / 1000));
 			}
 		} finally {
@@ -407,7 +416,7 @@ export class SidecarCli {
 		this.io.stdout(kind === "note" && !question ? "noted\n" : `${body.trimEnd()}\n`);
 		// The job's output file is the notice's destination; it is written before the outbox entry is acknowledged.
 		await runner.store.acknowledgeNotice(ref.runId).catch(() => undefined);
-		slot.pending(question ? id : undefined);
+		if (slot.read()?.agentId === record.agentId) slot.pending(question ? id : undefined);
 		if (question) {
 			this.io.stdout(`NEEDS_ANSWER: ${question}\n`);
 			return EXIT.question;
@@ -460,7 +469,7 @@ export class SidecarCli {
 	/** Runs this front-end for one reviewer, so each request keeps its own slot lock, progress and exit code. */
 	private launchSelf(args: string[], stdin: string, onStderr: (line: string) => void): Promise<{ code: number; stdout: string }> {
 		return new Promise((done, fail) => {
-			const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...args], { cwd: this.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+			const child = spawn(process.execPath, [...NODE_FLAGS, fileURLToPath(import.meta.url), ...args], { cwd: this.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"] });
 			let stdout = "", pending = "";
 			child.stdout.on("data", (chunk: Buffer) => { stdout += chunk; });
 			child.stderr.on("data", (chunk: Buffer) => {
@@ -641,6 +650,14 @@ export class SidecarCli {
 			this.io.stdout(`${snapshot.phase === "stopped" ? "stopped" : "stop requested"}: ${agent.herdrName}\n`);
 		} else this.io.stdout(agent.paneState ? `${agent.herdrName} is idle and its pane is closed\n` : `${agent.herdrName} is idle; its pane closes once it settles\n`);
 		if (fresh) {
+			// A request still finishing (launcher checks) would write its slot back; wait for it unless forced.
+			if (!force) {
+				const now = new AbortController();
+				now.abort();
+				const release = await slot.lock(now.signal).catch(() => undefined);
+				if (!release) { this.io.stderr("sidecar: a request is finishing on this slot; retry, or pass --force\n"); return EXIT.busy; }
+				release();
+			}
 			// A rebound profiled worker must not run the previous checkout's acceptance commands.
 			if (record.profile) new Checks(this.dir, slot.name).clear();
 			slot.forget();
@@ -657,33 +674,31 @@ export class SidecarCli {
 		const base = join(this.dir, "runner", `${this.owner}.maintain`);
 		const extend = () => writeFileSync(`${base}.until`, String(this.parent.deps.now() + (this.options.maintainMs ?? 180_000)));
 		extend();
-		try { writeFileSync(`${base}.lock`, `${process.pid}\n`, { flag: "wx" }); }
-		catch {
-			const holder = Number(readFileSync(`${base}.lock`, "utf8"));
-			if (Number.isInteger(holder) && holder > 0 && alive(holder)) return EXIT.report;
-			writeFileSync(`${base}.lock`, `${process.pid}\n`);
-		}
+		const now = new AbortController();
+		now.abort();
+		let release: () => void;
+		try { release = await acquireLock(`${base}.lock`, now.signal); } catch { return EXIT.report; }
 		try {
 			const local = await this.parent.local();
+			// Remote slots' panes close only while their machines' channels are serviced.
+			for (const number of SlotState.slots(this.dir, this.owner)) {
+				const machine = new SlotState(this.dir, slotName(this.owner, number)).read()?.machine;
+				if (machine) this.parent.remember(machine);
+			}
 			while (this.parent.deps.now() < Number(readFileSync(`${base}.until`, "utf8"))) {
 				await this.parent.tick(local, { service: async () => undefined, reportError: () => undefined });
 				await this.parent.deps.sleep(this.options.pollMs ?? 1000);
 			}
 		} finally {
-			if (readFileSync(`${base}.lock`, "utf8").trim() === String(process.pid)) rmSync(`${base}.lock`, { force: true });
+			release();
 		}
 		return EXIT.report;
 	}
 }
 
-function alive(pid: number): boolean {
-	try { process.kill(pid, 0); return true; }
-	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-}
-
 /** One detached maintenance pass per owner; a newer one replaces nothing while the first still runs. */
 export function maintainDetached(env: NodeJS.ProcessEnv = process.env): void {
-	const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "maintain"], { detached: true, stdio: "ignore", env });
+	const child = spawn(process.execPath, [...NODE_FLAGS, fileURLToPath(import.meta.url), "maintain"], { detached: true, stdio: "ignore", env });
 	child.unref();
 }
 

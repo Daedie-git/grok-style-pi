@@ -1,5 +1,5 @@
 // Slot state. The band reads the role, agent, machine, request and pending files.
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -129,30 +129,25 @@ export class SlotState {
 	}
 }
 
-/** An exclusive lock file holding the owner's PID. A holder whose process is gone leaves a stale lock, which is taken over. */
+/**
+ * An exclusive lock held as a SQLite write lock on PATH: the OS releases it when the holder exits, so a crashed holder
+ * never leaves a lock to reclaim. An aborted SIGNAL makes a held lock fail at once.
+ */
 export async function acquireLock(path: string, signal?: AbortSignal, pollMs = 500): Promise<() => void> {
+	const { DatabaseSync } = await import("node:sqlite");
+	let db = new DatabaseSync(path);
 	for (;;) {
 		try {
-			const fd = openSync(path, "wx");
-			writeSync(fd, `${process.pid}\n`);
-			closeSync(fd);
-			return () => { if (readText(path) === String(process.pid)) rmSync(path, { force: true }); };
+			db.exec("BEGIN EXCLUSIVE");
+			return () => { try { db.close(); } catch {} };
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			// A PID file from an earlier launcher version; nothing holds it.
+			if ((error as { errcode?: number }).errcode === 26) { db.close(); rmSync(path, { force: true }); db = new DatabaseSync(path); continue; }
+			if ((error as { errcode?: number }).errcode !== 5) { db.close(); throw error; }
 		}
-		const holder = Number(readText(path));
-		if (!Number.isInteger(holder) || holder <= 0 || !alive(holder)) {
-			rmSync(path, { force: true });
-			continue;
-		}
-		if (signal?.aborted) throw new Error("aborted");
+		if (signal?.aborted) { db.close(); throw new Error("aborted"); }
 		await new Promise((resolve) => setTimeout(resolve, pollMs));
 	}
-}
-
-function alive(pid: number): boolean {
-	try { process.kill(pid, 0); return true; }
-	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
 /** The band labels a request by the third dash-separated word of its id. */

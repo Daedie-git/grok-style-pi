@@ -46,7 +46,7 @@ test("footer shows bounded memory status beside Fast on every provider", () => {
 	assert.match(line(input), /Fast: on │ Memory: on │ Context 12\/100 used/);
 	assert.match(line({ ...input, provider: "anthropic" }), /Memory: on │ Context/);
 	assert.doesNotMatch(line({ ...input, memoryStatus: undefined }), /Memory:/);
-	for (const [status, tone] of [["off", "muted"], ["on", "accent"], ["recalling", "accent"], ["extracting", "accent"], ["consolidating", "accent"], ["needs authorization", "warning"], ["error", "error"]] as const) {
+	for (const [status, tone] of [["off", "muted"], ["on", "accent"], ["recalling", "accent"], ["extracting", "accent"], ["consolidating", "accent"], ["needs authorization", "warning"], ["deferred", "warning"], ["error", "error"]] as const) {
 		const painted = renderFooter({ ...input, memoryStatus: status }, { width: 200, paint: (token, text) => `<${token}>${text}</${token}>` })[0];
 		assert.ok(painted.includes(`<${tone}>Memory: ${status}</${tone}>`));
 		for (let width = 0; width <= 160; width++) {

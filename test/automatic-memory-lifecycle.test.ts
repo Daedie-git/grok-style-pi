@@ -115,6 +115,25 @@ test("idle flushing reviews fewer than five prompts", async t => {
 	assert.equal(h.calls.length, 1);
 });
 
+test("budget-deferred extraction resumes automatically on idle without reporting unavailability", async t => {
+	let calls = 0;
+	const h = await setup(t, { options: { idleMs: 5 }, complete: () => async (request: any) => {
+		calls++;
+		if (calls <= 5) return reply([{ type: "toolCall", id: `read-${calls}`, name: "memory_read", arguments: { path: "note.md" } }]);
+		if (calls === 6) return reply([{ type: "text", text: '{"complete":false}' }]);
+		assert.ok(request.messages.some((message: any) => message.role === "toolResult"));
+		return reply([{ type: "text", text: "nothing eligible to save" }]);
+	} });
+	h.prompt("user");
+	const done = h.next("grok-memory-cursor");
+	await h.emit("agent_settled", { aborted: false });
+	const hold = setInterval(() => {}, 1000);
+	try { await done; } finally { clearInterval(hold); }
+	assert.equal(calls, 7);
+	assert.ok(h.statuses.includes("deferred"));
+	assert.doesNotMatch(h.notices.join("\n"), /unavailable|five-turn budget/);
+});
+
 test("dreaming requires five other modified sessions and records successful consolidation", async t => {
 	const h = await setup(t, { recentSessions: async () => Array.from({ length: 5 }, (_, index) => ({ id: `other-${index}`, modified: Date.now(), text: "user: durable feedback" })) });
 	const done = h.next("grok-memory-consolidated");
@@ -149,19 +168,19 @@ test("disabling extraction persists its mode and prevents manual extraction", as
 	assert.equal(settings.automaticMemory.extraction, false);
 });
 
-test("memory agents cannot acquire an inactive write tool and stop at five model turns", async t => {
+test("memory agents cannot acquire an inactive write tool, including during tool-free confirmation", async t => {
 	const h = await setup(t);
 	const memory = await loadProjectMemory(h.root, join(h.root, "store"));
 	let calls = 0;
 	const result = await runMemoryPass({ store: new MemoryStore(memory.directory), signal: new AbortController().signal,
 		policy: "policy", conversation: "feedback", mode: "extract", allowedTools: () => ["read"],
 		complete: async request => {
-			assert.deepEqual(request.tools?.map(tool => tool.name), ["memory_read"]);
+			assert.deepEqual(request.tools?.map(tool => tool.name), calls === 5 ? [] : ["memory_read"]);
 			calls++;
 			return reply([{ type: "toolCall", id: `call-${calls}`, name: "memory_write", arguments: { path: "new.md", content: "not allowed" } }]);
 		},
 	});
 	assert.deepEqual(result, { writes: 0, exhausted: true });
-	assert.equal(calls, 5);
+	assert.equal(calls, 6);
 	await assert.rejects(readFile(join(memory.directory, "new.md")), { code: "ENOENT" });
 });

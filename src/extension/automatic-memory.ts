@@ -5,7 +5,7 @@ import { constants } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { loadProjectMemory } from "./project-memory.ts";
 import { MemoryStore, type MutationQueue } from "./memory-store.ts";
-import { createRecallState, recallContent, recallMemory, runMemoryPass, type MemoryCompletion, type MemoryRecallState } from "./memory-worker.ts";
+import { createMemoryPassState, createRecallState, recallContent, recallMemory, runMemoryPass, type MemoryCompletion, type MemoryPassState, type MemoryPassStep, type MemoryRecallState } from "./memory-worker.ts";
 import { loadFeatures, saveFeatures } from "./features.ts";
 import { readSettingsObject, writeSettingsObject, featureSettingsPath } from "../chrome/style-colors.ts";
 import { sanitizeToolText } from "../tools/diamond.ts";
@@ -63,6 +63,9 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 	let warned = false;
 	let lastError: string | undefined;
 	let lastWrites = 0;
+	let lastDeferred: string | undefined;
+	let lastPass: (MemoryPassStep & { mode: "extract" | "consolidate" }) | undefined;
+	let extraction: { directory: string; sessionId: string; start: MemoryCursor; cursor: MemoryCursor; conversation: string; state: MemoryPassState } | undefined;
 	let statusContext: ExtensionContext | undefined;
 	let publishedStatus: MemoryFooterStatus | undefined;
 	let needsAuthorization = false;
@@ -73,7 +76,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		statusContext?.ui.setStatus?.("grok-memory", status);
 	}
 	function publishIdleStatus() {
-		publishStatus(!active ? "off" : needsAuthorization ? "needs authorization" : lastError ? "error" : "on");
+		publishStatus(!active ? "off" : needsAuthorization ? "needs authorization" : lastError ? "error" : lastDeferred ? "deferred" : "on");
 	}
 
 	function savedMemorySettings(): Record<string, unknown> {
@@ -99,6 +102,20 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		lastError = sanitizeToolText(String(error)).slice(0, 400);
 		publishStatus("error");
 		if (!warned) { warned = true; ctx.ui.notify(`Automatic memory unavailable: ${lastError}`, "warning"); }
+	}
+	function passDiagnostics(mode: "extract" | "consolidate", current: () => boolean) {
+		const tools: MemoryPassStep["tools"] = [];
+		return (step: MemoryPassStep) => {
+			if (!current()) return;
+			tools.push(...step.tools);
+			lastPass = { mode, ...step, tools: tools.slice(-80) };
+			pi.appendEntry("grok-memory-pass", { mode, ...step });
+		};
+	}
+	function deferExtraction(ctx: ExtensionContext) {
+		lastDeferred = "Memory extraction deferred; unfinished work will resume on a later idle pass. See /memory status for tool diagnostics.";
+		timer = setTimeout(() => { timer = undefined; void background(ctx, true); }, options.idleMs);
+		timer.unref();
 	}
 	function completion(ctx: ExtensionContext): MemoryCompletion {
 		if (deps.complete) return deps.complete(ctx);
@@ -156,6 +173,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
 		const current = () => active && generation === token && !signal.aborted;
 		lastError = undefined;
+		lastDeferred = undefined;
 		lastWrites = 0;
 		let lock: Awaited<ReturnType<typeof open>> | undefined;
 		let lockPath: string | undefined;
@@ -171,15 +189,26 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 			catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") { lastError = `Memory worker lock exists: ${lockPath}. If no Pi memory worker is running, remove this stale lock.`; return; } throw error; }
 			await lock.writeFile(JSON.stringify({ pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), started: Date.now() }));
 			const store = guardedStore(ctx, memory.directory);
-			const chunk = memoryChunk(ctx.sessionManager.getBranch(), cursor);
-			const conversation = chunk.text;
-			if (!dreamOnly && options.extraction && conversation && (force || turns >= options.everyTurns)) {
+			const entries = ctx.sessionManager.getBranch();
+			const chunk = memoryChunk(entries, cursor);
+			if (extraction) {
+				const sameCursor = extraction.start.entryId === cursor.entryId && extraction.start.offset === cursor.offset;
+				const endId = extraction.cursor.entryId;
+				const end = entries.findIndex(entry => entry.id === endId);
+				const pinned = sameCursor && end >= 0 ? memoryChunk(entries.slice(0, end + 1), cursor, Math.max(100, extraction.conversation.length)) : undefined;
+				if (extraction.directory !== memory.directory || extraction.sessionId !== ctx.sessionManager.getSessionId()
+					|| pinned?.text !== extraction.conversation || pinned.cursor.entryId !== extraction.cursor.entryId || pinned.cursor.offset !== extraction.cursor.offset) extraction = undefined;
+			}
+			if (!dreamOnly && options.extraction && chunk.text && (force || turns >= options.everyTurns)) {
+				const pending = extraction ??= { directory: memory.directory, sessionId: ctx.sessionManager.getSessionId(), start: { ...cursor }, cursor: chunk.cursor, conversation: chunk.text, state: createMemoryPassState() };
 				publishStatus("extracting");
-				const result = await runMemoryPass({ store, complete: completion(ctx), signal, policy: `${ctx.getSystemPrompt()}\n\n${memory.content}`, conversation, mode: "extract", onUsage: usage(ctx, "extract"), allowedTools: () => pi.getActiveTools() });
+				const result = await runMemoryPass({ store, complete: completion(ctx), signal, policy: `${ctx.getSystemPrompt()}\n\n${memory.content}`, conversation: pending.conversation, state: pending.state,
+					mode: "extract", onUsage: usage(ctx, "extract"), onStep: passDiagnostics("extract", current), allowedTools: () => pi.getActiveTools() });
 				if (!current()) return;
 				lastWrites = result.writes;
-				if (result.exhausted) throw new Error("Memory extraction reached its five-turn budget; cursor retained for retry");
-				cursor = chunk.cursor;
+				if (result.exhausted) { deferExtraction(ctx); return; }
+				cursor = pending.cursor;
+				extraction = undefined;
 				pi.appendEntry("grok-memory-cursor", cursor);
 				restore(ctx);
 				if (pendingProse && options.extraction) {
@@ -214,9 +243,9 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 			publishStatus("consolidating");
 			for (const session of sessions.slice(0, 10)) {
 				for (const conversation of consolidationChunks([session])) {
-					const result = await runMemoryPass({ store, complete: completion(ctx), signal, policy: `${ctx.getSystemPrompt()}\n\n${memory.content}`, conversation, mode: "consolidate", onUsage: usage(ctx, "consolidate"), allowedTools: () => pi.getActiveTools() });
+					const result = await runMemoryPass({ store, complete: completion(ctx), signal, policy: `${ctx.getSystemPrompt()}\n\n${memory.content}`, conversation, mode: "consolidate", onUsage: usage(ctx, "consolidate"), onStep: passDiagnostics("consolidate", current), allowedTools: () => pi.getActiveTools() });
 					if (!current() || !await authorized(ctx, memory.directory)) return;
-					if (result.exhausted) throw new Error("Memory consolidation reached its five-turn budget");
+					if (result.exhausted) { lastDeferred = "Memory consolidation deferred; snapshot progress was not advanced. See /memory status for tool diagnostics."; return; }
 					dreamWrites += result.writes;
 				}
 				processed[session.id] = Math.min(session.modified, scanStarted);
@@ -238,6 +267,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 
 	pi.on("session_start", async (_event, ctx) => {
 		cancel();
+		extraction = undefined; lastDeferred = undefined; lastPass = undefined;
 		statusContext = ctx;
 		publishedStatus = undefined;
 		active = deps.enabled && !/^(?:1|true|yes|on)$/i.test(process.env.PI_DISABLE_AUTO_MEMORY ?? "");
@@ -259,13 +289,13 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 		finally { if (job === controller) job = undefined; }
 	});
 	pi.on("session_shutdown", () => {
-		active = false; cancel();
+		active = false; cancel(); extraction = undefined;
 		statusContext?.ui.setStatus?.("grok-memory", undefined);
 		statusContext = undefined; publishedStatus = undefined;
 	});
-	pi.on("session_tree", (_event, ctx) => { cancel(); if (active) restore(ctx); });
+	pi.on("session_tree", (_event, ctx) => { cancel(); extraction = undefined; lastDeferred = undefined; if (active) restore(ctx); });
 	pi.on("session_before_compact", () => { cancel(); });
-	pi.on("session_compact", () => { cancel(); resetRecall(); });
+	pi.on("session_compact", () => { cancel(); extraction = undefined; lastDeferred = undefined; resetRecall(); });
 	async function startRecall(ctx: ExtensionContext, query: string, controller: AbortController, token: number) {
 		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
 		const current = () => active && generation === token && !signal.aborted;
@@ -377,7 +407,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 					needsAuthorization = false; lastError = undefined; publishIdleStatus();
 					ctx.ui.notify("Background memory access authorized for this directory only.", "info");
 				} else {
-					cancel(); resetRecall();
+					cancel(); extraction = undefined; lastDeferred = undefined; resetRecall();
 					saveMemorySettings({ authorizedDirectories: directories.filter(directory => directory !== memory.directory) });
 					needsAuthorization = true; publishIdleStatus();
 					ctx.ui.notify("Background memory access revoked. Previously seen context and saved files remain; start a new session to discard prior context.", "info");
@@ -387,6 +417,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 			const key = action === "dream" ? "consolidation" : action;
 			if (["recall", "extraction", "consolidation"].includes(key) && ["on", "off"].includes(value)) {
 				cancel(); options = { ...options, [key]: value === "on" };
+				if (key === "extraction" && value === "off") { extraction = undefined; lastDeferred = undefined; }
 				saveMemorySettings(options);
 				ctx.ui.notify(`Memory ${action} ${value}.`, "info"); return;
 			}
@@ -395,7 +426,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 				if (action === "extract" ? !options.extraction : !options.consolidation) { ctx.ui.notify(`This memory mode is disabled; enable /memory ${action === "extract" ? "extraction" : "dream"} on first.`, "warning"); return; }
 				await ctx.waitForIdle(); cancel(); restore(ctx);
 				await background(ctx, true, action === "consolidate");
-				ctx.ui.notify(lastError ?? `Memory pass finished (${lastWrites} mutations).`, lastError ? "warning" : "info"); return;
+				ctx.ui.notify(lastError ?? lastDeferred ?? `Memory pass finished (${lastWrites} mutations).`, lastError ? "warning" : "info"); return;
 			}
 			if (action !== "status") { ctx.ui.notify("Usage: /memory [status|on|off|authorize|revoke|recall on/off|extraction on/off|dream on/off|extract|consolidate]", "warning"); return; }
 			const memory = active ? await loadProjectMemory(ctx.cwd, deps.storageRoot) : undefined;
@@ -404,7 +435,7 @@ export function installAutomaticMemory(pi: ExtensionAPI, deps: {
 				const usage = (entry.data as { usage?: Usage })?.usage;
 				return total + (usage?.cost?.total ?? 0);
 			}, 0);
-			ctx.ui.notify(`Memory ${active ? "on" : "off"}; recall ${options.recall ? "on" : "off"}, extraction ${options.extraction ? "on" : "off"}, dream ${options.consolidation ? "on" : "off"}. ${memory?.directory ?? "No store accessed."} Background access: ${memory && await authorized(ctx, memory.directory) ? "authorized" : "not authorized; use /memory authorize"}.${lastError ? ` Last issue: ${lastError}` : ""} Background requests use ${options.provider}/${options.model} (${options.reasoning} reasoning) and may incur costs (recorded branch cost: $${costs.toFixed(4)}).`, "info");
+			ctx.ui.notify(`Memory ${active ? "on" : "off"}; recall ${options.recall ? "on" : "off"}, extraction ${options.extraction ? "on" : "off"}, dream ${options.consolidation ? "on" : "off"}. ${memory?.directory ?? "No store accessed."} Background access: ${memory && await authorized(ctx, memory.directory) ? "authorized" : "not authorized; use /memory authorize"}.${lastError ? ` Last issue: ${lastError}` : lastDeferred ? ` ${lastDeferred}` : ""}${lastPass ? ` Last pass: ${lastPass.mode} ${lastPass.outcome}, round ${lastPass.turn}, ${lastPass.writes} mutations; tools: ${lastPass.tools.map(tool => `${tool.name}${tool.error ? ` (${tool.error})` : ""}`).join(", ") || "none"}.` : ""} Background requests use ${options.provider}/${options.model} (${options.reasoning} reasoning) and may incur costs (recorded branch cost: $${costs.toFixed(4)}).`, "info");
 		},
 	});
 }

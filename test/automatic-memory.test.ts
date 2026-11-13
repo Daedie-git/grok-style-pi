@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
 import { MemoryStore, indexWarning } from "../src/extension/memory-store.ts";
-import { recallMemory, runMemoryPass, type MemoryCompletion } from "../src/extension/memory-worker.ts";
+import { createMemoryPassState, recallMemory, runMemoryPass, type MemoryCompletion } from "../src/extension/memory-worker.ts";
 import { installAutomaticMemory, memoryConversation } from "../src/extension/automatic-memory.ts";
 import { loadProjectMemory } from "../src/extension/project-memory.ts";
 import { recentMemorySessions } from "../src/extension/memory-history.ts";
@@ -105,6 +105,88 @@ test("private memory agent reads before mutation and uses exact edits without ex
 	assert.equal(await readFile(join(directory, "MEMORY.md"), "utf8"), "new$&");
 });
 
+test("a successful fifth-round write gets a tool-free completion confirmation", async t => {
+	const { directory, store } = await fixture(t);
+	let calls = 0;
+	const steps: any[] = [];
+	const result = await runMemoryPass({ store, signal: signal(), policy: "policy", conversation: "durable preference", mode: "extract",
+		onStep: (step: any) => steps.push(step),
+		complete: async (request: any) => {
+			calls++;
+			if (calls === 6) {
+				assert.deepEqual(request.tools, []);
+				assert.match(request.systemPrompt, /Return only JSON.*complete/);
+				return response([{ type: "text", text: '{"complete":true}' }]);
+			}
+			if (calls === 5) {
+				assert.match(request.systemPrompt, /last tool-capable/i);
+				return response([tool("memory_write", { path: "note.md", content: "saved preference" })]);
+			}
+			return response([tool("memory_read", { path: "note.md" })]);
+		},
+	} as any);
+	assert.equal(calls, 6);
+	assert.deepEqual(result, { writes: 1, exhausted: false });
+	assert.equal(await readFile(join(directory, "note.md"), "utf8"), "saved preference");
+	assert.equal(steps.at(-1).outcome, "complete");
+	assert.equal(steps.at(-1).writes, 1);
+});
+
+test("tool-error exhaustion records bounded diagnostics without paths, arguments or note contents", async t => {
+	const { store } = await fixture(t);
+	const steps: any[] = [];
+	let calls = 0;
+	const result = await runMemoryPass({ store, signal: signal(), policy: "policy", conversation: "durable preference", mode: "extract",
+		onStep: (step: any) => steps.push(step),
+		complete: async (request: any) => {
+			calls++;
+			if (calls === 6) return response([{ type: "text", text: '{"complete":false}' }]);
+			if (calls > 1) assert.match(request.messages.at(-1).content[0].text, /Read this file first/);
+			return response([tool("memory_write", { path: "private-name.md", content: "private contents" })]);
+		},
+	} as any);
+	assert.deepEqual(result, { writes: 0, exhausted: true });
+	assert.equal(steps.length, 6);
+	assert.deepEqual(steps[0].tools, [{ name: "memory_write", error: "read-required" }]);
+	assert.equal(steps.at(-1).outcome, "deferred");
+	assert.doesNotMatch(JSON.stringify(steps), /private-name|private contents|durable preference/);
+});
+
+test("confirmation cannot execute tools or advance an unfinished pass on malformed output", async t => {
+	const { store } = await fixture(t);
+	for (const confirmation of [response([{ type: "text", text: "I still need another write." }]), response([tool("memory_delete", { path: "note.md" })])]) {
+		await store.mutate("note.md", "preserved", await store.read("note.md"));
+		let calls = 0;
+		const result = await runMemoryPass({ store, signal: signal(), policy: "policy", conversation: "feedback", mode: "extract",
+			complete: async () => ++calls === 6 ? confirmation : response([tool("memory_read", { path: "note.md" })]),
+		});
+		assert.deepEqual(result, { writes: 0, exhausted: true });
+		assert.equal(await store.read("note.md"), "preserved");
+	}
+});
+
+test("resumed extraction refuses stale writes and can recover by rereading", async t => {
+	const { store } = await fixture(t);
+	await store.mutate("note.md", "original", undefined);
+	const state = createMemoryPassState();
+	let calls = 0;
+	await runMemoryPass({ store, state, signal: signal(), policy: "policy", conversation: "feedback", mode: "extract",
+		complete: async () => ++calls === 6 ? response([{ type: "text", text: '{"complete":false}' }]) : response([tool("memory_read", { path: "note.md" })]),
+	});
+	await store.mutate("note.md", "foreground correction", "original");
+	const steps: any[] = [];
+	const script = scripted(
+		response([tool("memory_write", { path: "note.md", content: "stale replacement" })]),
+		response([tool("memory_read", { path: "note.md" })]),
+		response([tool("memory_edit", { path: "note.md", oldText: "foreground correction", newText: "correctly merged" })]),
+		response([{ type: "text", text: "done" }]),
+	);
+	const result = await runMemoryPass({ store, state, signal: signal(), policy: "policy", conversation: "feedback", mode: "extract", complete: script, onStep: step => steps.push(step) });
+	assert.deepEqual(result, { writes: 1, exhausted: false });
+	assert.equal(steps[0].tools[0].error, "stale-read");
+	assert.equal(await store.read("note.md"), "correctly merged");
+});
+
 test("cancellation after provider response prevents all memory mutations", async t => {
 	const { store } = await fixture(t);
 	const controller = new AbortController();
@@ -196,6 +278,53 @@ test("manual extraction persists a branch cursor and does not repeat reviewed me
 	assert.ok(h.entries.some(entry => entry.customType === "grok-memory-cursor" && entry.data.entryId === "user-1"));
 	await h.commands.get("memory").handler("extract", h.ctx);
 	assert.equal(h.calls(), 1);
+});
+
+test("deferred extraction resumes its tool history and pinned chunk instead of replaying writes", async t => {
+	let calls = 0;
+	const requests: any[] = [];
+	const h = await harness(t, true, { complete: () => async (request: any) => {
+		requests.push(structuredClone(request)); calls++;
+		if (calls <= 4) return response([tool("memory_read", { path: "note.md" })]);
+		if (calls === 5) return response([tool("memory_write", { path: "note.md", content: "saved once" })]);
+		if (calls === 6) return response([{ type: "text", text: '{"complete":false}' }]);
+		return response([{ type: "text", text: "Finished reviewing this chunk." }]);
+	} });
+	h.entries.push({ id: "user-1", type: "message", message: { role: "user", content: "Prefer concise feedback" } });
+	await h.commands.get("memory").handler("extract", h.ctx);
+	assert.equal(calls, 6);
+	assert.equal(h.entries.some(entry => entry.customType === "grok-memory-cursor"), false);
+	assert.match(h.notices.at(-1)!, /extraction deferred/i);
+	assert.doesNotMatch(h.notices.join("\n"), /unavailable|five-turn budget/);
+	h.entries.push({ id: "user-2", type: "message", message: { role: "user", content: "A new unrelated prompt" } });
+	await h.commands.get("memory").handler("extract", h.ctx);
+	assert.equal(calls, 7);
+	assert.ok(requests[6].messages.some((message: any) => message.role === "toolResult" && message.toolName === "memory_write"));
+	assert.doesNotMatch(JSON.stringify(requests[6].messages), /unrelated prompt/);
+	assert.equal(h.entries.filter(entry => entry.customType === "grok-memory-cursor").at(-1).data.entryId, "user-1");
+	assert.ok(h.entries.some(entry => entry.customType === "grok-memory-pass" && entry.data.outcome === "deferred"));
+	await h.commands.get("memory").handler("status", h.ctx);
+	assert.match(h.notices.at(-1)!, /Last pass:/);
+});
+
+test("branch changes discard unfinished extraction history instead of leaking another branch's prose", async t => {
+	let calls = 0;
+	const requests: any[] = [];
+	const h = await harness(t, true, { complete: () => async (request: any) => {
+		requests.push(structuredClone(request)); calls++;
+		if (calls <= 5) return response([tool("memory_read", { path: "note.md" })]);
+		return response([{ type: "text", text: calls === 6 ? '{"complete":false}' : "done" }]);
+	} });
+	h.entries.push({ id: "branch-one", type: "message", message: { role: "user", content: "Abandoned branch preference" } });
+	await h.commands.get("memory").handler("extract", h.ctx);
+	h.entries.splice(0);
+	h.entries.push({ id: "branch-two", type: "message", message: { role: "user", content: "Current branch preference" } });
+	await h.emit("session_tree");
+	await h.commands.get("memory").handler("extract", h.ctx);
+	assert.equal(calls, 7);
+	assert.equal(requests[6].messages.length, 1);
+	assert.doesNotMatch(JSON.stringify(requests[6].messages), /Abandoned branch/);
+	assert.equal(h.entries.filter(entry => entry.customType === "grok-memory-cursor").at(-1).data.entryId, "branch-two");
 });
 
 test("message submission never waits for recall; ready notes queue without interrupting or starting a turn", async t => {

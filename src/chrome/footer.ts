@@ -16,12 +16,12 @@ function displaySeparator(...paths: string[]): string {
 	return path.includes("\\") && !path.includes("/") ? "\\" : "/";
 }
 
-export type MemoryFooterStatus = "off" | "on" | "recalling" | "extracting" | "consolidating" | "needs authorization" | "error";
+export type MemoryFooterStatus = "off" | "on" | "recalling" | "extracting" | "consolidating" | "needs authorization" | "deferred" | "error";
 
 /** Only fixed public status labels reach the footer, never error details or storage paths. */
 export function memoryFooterStatus(status: string | undefined, enabled: boolean): MemoryFooterStatus {
 	switch (status) {
-		case "off": case "on": case "recalling": case "extracting": case "consolidating": case "needs authorization": case "error":
+		case "off": case "on": case "recalling": case "extracting": case "consolidating": case "needs authorization": case "deferred": case "error":
 			return status;
 		default: return enabled ? "on" : "off";
 	}
@@ -153,7 +153,7 @@ export function renderFooter(input: FooterInput, options: { width: number; paint
 	];
 	const usage = usageItems(input);
 	if (input.memoryStatus !== undefined) {
-		const tone = input.memoryStatus === "error" ? "error" : input.memoryStatus === "needs authorization" ? "warning"
+		const tone = input.memoryStatus === "error" ? "error" : input.memoryStatus === "needs authorization" || input.memoryStatus === "deferred" ? "warning"
 			: input.memoryStatus === "off" ? "muted" : "accent";
 		usage.unshift({ text: `Memory: ${input.memoryStatus}`, tone });
 	}

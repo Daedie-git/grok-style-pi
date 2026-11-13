@@ -1,5 +1,4 @@
-// Role instructions for runner-managed sidecars. The role files' review guidance is reused; their report protocol is
-// the Bash launcher's (submit_review, report files), so it is replaced by the runner's: the final reply is the report.
+// Role instructions for sidecars: the shared protocol, how this backend asks a question, then the role file.
 import { readFileSync } from "node:fs";
 import type { Backend, Role } from "./state.ts";
 
@@ -21,17 +20,9 @@ const ASK = {
 	claude: "If only Claude or the user can resolve a blocker, end your reply with a final line `NEEDS_ANSWER: <one concrete question>` after the work state.",
 };
 
-/** Drops the launcher's protocol: whole sections about delivery, and lines naming its delivery tools. */
-function roleGuidance(text: string): string {
-	const sections = text.split(/(?=^## )/m).filter((section) => !/^## Messages you receive/.test(section));
-	return sections.join("").split("\n")
-		.filter((line) => !/submit_review|needs_answer/.test(line))
-		.join("\n").trim();
-}
-
 export function roleInstructions(role: Role, backend: Backend): string {
 	const file = readFileSync(new URL(`${role}.md`, SIDECAR_HOME), "utf8");
-	return [PROTOCOL, ASK[backend], roleGuidance(file)].join("\n\n");
+	return [PROTOCOL, ASK[backend], file.trim()].join("\n\n");
 }
 
 /** A Fleet profile's prompt replaces the role guidance and is always last. */

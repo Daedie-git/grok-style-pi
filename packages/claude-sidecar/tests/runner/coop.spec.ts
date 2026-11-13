@@ -84,3 +84,19 @@ test("coop-review reports the first failing reviewer's exit during review", asyn
 	assert.match(f.out(), /incomplete \(during review\)[\s\S]*pi \(slot 98\): failed with exit 2/);
 	assert.equal(f.calls.length, 2);
 });
+
+test("coop-review validates its slots and refuses a slot that is busy", async (t) => {
+	const { fixture } = await import("./fixture.ts");
+	const { mkdirSync, writeFileSync } = await import("node:fs");
+	const { join } = await import("node:path");
+	const f = fixture(t, () => ({ type: "completed", result: "x" }));
+	assert.match((await f.run("coop-review", "--pi-slot", "5", "--claude-slot", "5")).stderr, /must differ/);
+	assert.match((await f.run("--slot", "2", "coop-review")).stderr, /chooses its own slots/);
+	assert.match((await f.run("coop-review", "--pi-slot", "0")).stderr, /integer from 1 to 9999/);
+	// A request holds slot 99: this process is alive, so its lock is live.
+	mkdirSync(join(f.root, "state", "runner"), { recursive: true });
+	writeFileSync(join(f.root, "state", "runner", "sc-w1-p1-99.lock"), `${process.pid}\n`);
+	const busy = await f.run("coop-review");
+	assert.equal(busy.code, 1);
+	assert.match(busy.stderr, /slot 99 is busy with another request/);
+});

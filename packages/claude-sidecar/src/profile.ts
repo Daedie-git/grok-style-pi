@@ -46,8 +46,8 @@ export function loadProfile(file: string): Profile {
 		|| !strings(skills) || !skills.every((skill) => skill.length > 0 && !/[\r\n]/.test(skill) && /^(\/|~\/|[A-Za-z]:[/\\])/.test(skill))) throw invalid();
 	for (const pattern of deny) for (const name of MANDATORY) if (patternMatch(pattern, name)) throw new Error(`profile cannot deny mandatory tool ${name}`);
 	// The runner has no switch for Pi's MCP extensions, and it filters tools by exact name.
-	if (mcp) throw new Error("profile mcp: true cannot be honored with SIDECAR_RUNNER=1: the runner cannot load Pi's MCP extensions; use the Bash launcher");
-	for (const name of allow ?? []) if (name.includes("*")) throw new Error(`profile allow pattern ${name} cannot be honored with SIDECAR_RUNNER=1: the runner matches tool names exactly; list the tools`);
+	if (mcp) throw new Error("profile mcp: true cannot be honored: the runner cannot load Pi's MCP extensions");
+	for (const name of allow ?? []) if (name.includes("*")) throw new Error(`profile allow pattern ${name} cannot be honored: the runner matches tool names exactly; list the tools`);
 	const json = canonical(value);
 	return { role, prompt, allow, deny, skills, mcp, json, hash: createHash("sha256").update(`${json}\n`).digest("hex") };
 }

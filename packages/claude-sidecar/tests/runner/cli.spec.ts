@@ -30,7 +30,8 @@ test("follow-ups resume the same conversation; a question exits 3 and answer con
 	const asked = await f.run("ask", "second");
 	assert.equal(asked.code, EXIT.question);
 	assert.match(asked.stdout, /^NEEDS_ANSWER: Keep the old API\?$/m);
-	assert.equal(f.starts.length, 1, "the slot keeps one conversation");
+	// A completed pane may close between requests; a resumed pane reopens the same session.
+	assert.equal(new Set(f.starts.map((args) => args[args.indexOf("--session") + 1])).size, 1, "the slot keeps one conversation");
 	const answered = await f.run("answer", "yes");
 	assert.equal(answered.code, EXIT.report, answered.stderr);
 	assert.match(answered.stdout, /report 3/);
@@ -48,7 +49,7 @@ test("a slot keeps its role, and unsupported launcher features refuse", async (t
 	const mismatch = await f.run("--role", "reviewer", "ask", "x");
 	assert.equal(mismatch.code, EXIT.failed);
 	assert.match(mismatch.stderr, /already a implementer/);
-	assert.match((await f.run("coop-review", "x")).stderr, /not supported with SIDECAR_RUNNER=1/);
+	assert.match((await f.run("reload")).stderr, /reload is not a sidecar command/);
 });
 
 test("a failed run reports no report and exits 2", async (t) => {
@@ -72,16 +73,15 @@ test("a Claude Code sidecar's final NEEDS_ANSWER line is its question", () => {
 	assert.deepEqual(claudeQuestion("NEEDS_ANSWER: x\nmore"), { report: "NEEDS_ANSWER: x\nmore" });
 });
 
-test("the Bash launcher hands runner commands to the front-end only with SIDECAR_RUNNER=1", async () => {
+test("scripts/sidecar runs the front-end, and its hook entries return at once", async () => {
 	const { spawnSync } = await import("node:child_process");
 	const launcher = new URL("../../scripts/sidecar", import.meta.url).pathname;
-	const home = mkdtempSync(join(tmpdir(), "sidecar-switch-"));
+	const home = mkdtempSync(join(tmpdir(), "sidecar-shim-"));
 	try {
 		const env = { PATH: process.env.PATH, HOME: home, SIDECAR_STATE_DIR: join(home, "state") };
-		const delegated = spawnSync(launcher, ["--slot", "3", "status"], { env: { ...env, SIDECAR_RUNNER: "1" }, encoding: "utf8" });
-		assert.equal(delegated.status, EXIT.failed);
-		assert.match(delegated.stderr, /run inside a herdr pane or a Herdr app terminal/);
-		const bash = spawnSync(launcher, ["--slot", "3", "status"], { env, encoding: "utf8" });
-		assert.doesNotMatch(bash.stderr, /herdr pane or a Herdr app terminal/);
+		const status = spawnSync(launcher, ["--slot", "3", "status"], { env, encoding: "utf8" });
+		assert.equal(status.status, EXIT.failed);
+		assert.match(status.stderr, /run inside a herdr pane or a Herdr app terminal/);
+		for (const hook of ["session-end", "sweep", "done-close"]) assert.equal(spawnSync(launcher, [hook], { env }).status, 0);
 	} finally { rmSync(home, { recursive: true, force: true }); }
 });

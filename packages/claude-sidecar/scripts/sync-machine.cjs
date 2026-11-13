@@ -3,7 +3,8 @@
 const fs = require('fs'), path = require('path'), os = require('os');
 const { execFileSync } = require('child_process');
 const options = JSON.parse(typeof args === 'undefined' ? process.argv[2] || '{}' : args[0]);
-const names = ['grok-style-pi', 'claude-sidecar'];
+// The plugin and the runner its sidecars need both live in grok-style-pi.
+const names = ['grok-style-pi'];
 const home = os.homedir();
 const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never',
   GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes -o ConnectTimeout=10' };
@@ -50,7 +51,7 @@ function checkout(candidate) {
 function identifies(root, name) {
   if (path.basename(root).toLowerCase() === name) return true;
   try { if (JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).name === name) return true; } catch (_) {}
-  return name === 'claude-sidecar' && fs.existsSync(path.join(root, 'scripts', 'sidecar')) && fs.existsSync(path.join(root, 'sidecar', 'sidecar.ts'));
+  return false;
 }
 function settingsCandidates() {
   const agent = expand(process.env.PI_CODING_AGENT_DIR || '~/.pi/agent');
@@ -114,7 +115,6 @@ function preflight(name, root) {
 try {
   if (options.tooling != null && (typeof options.tooling !== 'object' || Array.isArray(options.tooling))) throw Error('tooling must be an object of checkout paths');
   const repos = names.map(name => preflight(name, discover(name, options.tooling?.[name])));
-  if (repos[0].root === repos[1].root) throw Error('The two tooling paths resolve to the same checkout');
   // Fetch and validate both destinations before advancing either checkout. Never reset, rebase, stash or switch branches.
   for (const repo of repos) {
     git(repo.root, 'fetch', '--no-tags', 'origin', `+refs/heads/${repo.branch}:refs/remotes/origin/${repo.branch}`);

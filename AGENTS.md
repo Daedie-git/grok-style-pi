@@ -18,4 +18,4 @@ Route every header and body `handleMouse` through `handleDiamondClick` in `src/t
 
 ## Verify
 
-`npm test` is the gate (Node 22+ type stripping): strict typechecks and tests for Grok, the runner core and the standalone Herdr package. When you touch `packages/claude-sidecar`, also run `python3 tests/run.py` there. When you touch subagent integration, also run `node --test test/activity.test.ts test/subagent-contract.test.ts test/workflow-activity.test.ts test/herdr-integration.test.ts`. When you touch `bat` highlighting, also run `npm run test:bat`.
+`npm test` is the gate (Node 22+ type stripping): strict typechecks and tests for Grok, the runner core and the standalone Herdr package. When you touch `packages/claude-sidecar/hooks`, also run `claude plugin test packages/claude-sidecar`. When you touch subagent integration, also run `node --test test/activity.test.ts test/subagent-contract.test.ts test/workflow-activity.test.ts test/herdr-integration.test.ts`. When you touch `bat` highlighting, also run `npm run test:bat`.

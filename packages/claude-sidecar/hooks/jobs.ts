@@ -7,8 +7,8 @@ export const TOOL_NAME = 'sidecar'
 export const TOOL = 'mcp__claude-sidecar__sidecar'
 // Commands that finish within seconds run inline; the rest are jobs. Hook entries are not the model's to run.
 const INLINE = new Set(['status', 'report', 'keep', 'unkeep', 'stop', 'unreviewed'])
-const INTERNAL = new Set(['session-start', 'session-end', 'sweep', 'done-close', 'push-gate'])
-const JOB_COMMANDS = new Set(['note', 'plan', 'diff', 'coop-review', 'ask', 'answer', 'steer', 'reject', 'wait', 'reload', 'start', 'restart', 'sync-machine'])
+const INTERNAL = new Set(['session-start', 'session-end', 'sweep', 'done-close', 'push-gate', 'maintain'])
+const JOB_COMMANDS = new Set(['note', 'plan', 'diff', 'coop-review', 'ask', 'answer', 'steer', 'reject', 'wait', 'sync-machine'])
 export const POLL_MS = 3000
 // A running job's worker touches DIR/ID.alive this often (scripts/sidecar-job). One silent for longer than LOST_MS, seen
 // so across scans at least that far apart (a suspended machine wakes up stale), died without writing .done.

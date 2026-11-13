@@ -43,7 +43,7 @@ sidecar --slot 4 --role implementer ask \
 
 After the report, the launcher runs each `--accept` command itself (`SIDECAR_ACCEPT_TIMEOUT_S`, default 1800) and flags files changed outside the `--scope` globs (`*` crosses directories). Results lead the report under `## Launcher checks`. Make an accept command exercise the real user path, not the unit tests the implementer already ran. Checks persist on the slot through answers, steers and follow-up asks until another ask sets new ones or passes `--no-checks`. They run only for local slots.
 
-`--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for the other roles, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). It returns reports by writing a file, and the slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there; `SIDECAR_CLAUDE_PERMISSION_MODE=bypassPermissions` lets it work unattended). It cannot be reloaded, and a busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
+`--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for the other roles, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). The slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there, with an up-to-date grok-style-pi). A busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
 
 Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. In the herdr TUI, sidecars fill Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus. In the Herdr app, sidecars are listed under Claude's terminal.
 
@@ -56,7 +56,7 @@ sidecar --slot 2 --machine laptop ask "Run the integration tests there and repor
 sidecar --slot 2 diff <base> "Intent of the change"
 ```
 
-The sidecar works in the machine's own checkout of the repository, at the same path unless `--remote-cwd DIR` says where. It does not see your uncommitted changes: `diff` and `plan` send them as copied files, and the checkout may lack your commits (the request tells the sidecar to `git fetch`). **Anything a remote sidecar edits or commits lands in the machine's checkout, not yours**; ask it to push or report the patch, and say so in the request. Reports come back as usual. If the command says the machine is unreachable or lacks the plugin, tell the user; do not retry with another machine.
+The sidecar works in the machine's own checkout of the repository, at the same path unless `--remote-cwd DIR` says where. It does not see your uncommitted changes, and the checkout may lack your commits; `diff` and `plan` run on local slots only, so send a remote sidecar what to review in an `ask`. **Anything a remote sidecar edits or commits lands in the machine's checkout, not yours**; ask it to push or report the patch, and say so in the request. Reports come back as usual. If the command says the machine is unreachable or runs an older grok-style-pi, tell the user; do not retry with another machine.
 
 ## Brief it
 
@@ -70,29 +70,25 @@ Notes return in seconds and cost little; the reviews they inform are sharper for
 
 ## Sync remote tooling
 
-When asked to update a saved machine's sidecar tooling, run `sidecar sync-machine NAME`. This does not select or move a slot. It finds the remote `grok-style-pi` and `claude-sidecar` checkouts through Pi settings/known locations, or the machine configuration's `tooling` paths, and fast-forwards their current branches from `origin`. Both must be clean and have no local-only/diverged commits; a refusal preserves that work. Exit 0 means both synchronized; exit 1 means refusal/failure. Read the old/new commits in the output, then run the affected slot's `reload` between requests. It cannot transfer unpublished commits, install dependencies, or replace a running Pi executable. See README's sync section for path overrides and partial-failure behavior.
-
-## Reload safely
-
-After updating sidecar or Pi extension files, run `sidecar [--slot N] reload`. It waits for the active request's report and Pi's idle state, then reloads without changing the session or pending question. The original request still prints its own report. Exit 0 confirms a fresh runtime; exit 1 means refusal or missing confirmation (inspect the pane before retrying). Confirmation has a 30-second default timeout, configurable with `SIDECAR_RELOAD_TIMEOUT_S`; waiting for active work has no deadline. It does not cancel hung work or replace Pi's executable/startup flags.
+When asked to update a saved machine's sidecar tooling, run `sidecar sync-machine NAME`. This does not select or move a slot. It finds the machine's `grok-style-pi` checkout (which holds the plugin and the runner) through Pi settings/known locations, or the machine configuration's `tooling.grok-style-pi` path, and fast-forwards its current branch from `origin`. It must be clean and have no local-only/diverged commits; a refusal preserves that work. Exit 0 means synchronized; exit 1 means refusal/failure. It cannot transfer unpublished commits or install dependencies (run `npm install` there after a dependency change). A sidecar's pane closes after each report, so its next request starts a fresh Pi with the new resources.
 
 ## Pane lifecycle
 
-A pane closes once its request delivers a report, and when this Claude pane ends; the next request to the slot resumes the same conversation in a new pane, so keep using the slot for follow-ups. Panes with a pending question, a request that ended without a report, or user focus stay open. Pass `ask --keep` only when the user watches the pane; `sidecar [--slot N] keep|unkeep` changes the pin later. Clearing Claude keeps panes open.
+A pane closes once its request delivers a report, and when this Claude pane ends; the next request to the slot resumes the same conversation in a new pane, so keep using the slot for follow-ups. Panes with a pending question, a request that ended without a report, or user focus stay open. Pass `ask --keep` only when the user watches the pane; `sidecar [--slot N] keep|unkeep` changes the pin later. Clearing Claude keeps the slots: the new conversation takes them over.
 
-For immediate closure, use `sidecar [--slot N] stop`; `stop --all` stops every slot of this Claude pane. While a request runs it refuses with exit 7; `--force` stops it anyway, ending that request without a report. `--fresh` removes the pin and saved session so the next start begins a new conversation. A pane taken over by another agent is left running.
+To end a running request, use `sidecar [--slot N] stop --force`; without `--force` it refuses with exit 7 while a request runs. `--fresh` forgets the slot so its next request begins a new conversation.
 
 ## Steer a sidecar
 
-If the running slot is idle and has no request in flight, `steer TEXT` creates an `ask` request and waits for its report. Handle its result like any request: exit 0 report, 2 no report, 3 question, 4 duplicate, 5 approval blocked, or 1 failure. A missing sidecar needs `ask` or `start` first.
+If the slot is idle, `steer TEXT` runs as an `ask` and waits for its report. Handle its result like any request: exit 0 report, 2 no report, 3 question, 4 duplicate, 5 approval blocked, or 1 failure.
 
-`ask`, `diff` and `plan` hold their slot until the report arrives, and a `note` queues behind them. To redirect a sidecar that is mid-task, use `steer`: it reaches the running pi within a second (after verifying it is the sidecar's own pi), shows in its transcript as a steering message, and never waits for the in-flight request. The sidecar adjusts its current task; its report for that request still comes back as usual. Use it for a changed decision or a wrong turn, not for routine context (that is a `note`).
+`ask`, `diff` and `plan` hold their slot until the report arrives, and a `note` queues behind them. To redirect a pi sidecar that is mid-task, use `steer`: it queues the message for the sidecar's next tool round and never waits for the in-flight request. The sidecar adjusts its current task; its report for that request still comes back as usual. Use it for a changed decision or a wrong turn, not for routine context (that is a `note`).
 
 ```bash
 sidecar --slot 3 steer "Stop refactoring; the user wants only the failing test fixed."
 ```
 
-For a busy slot, it exits 0 when delivered or queued and 1 when refused or failed. Exit 4 means the sidecar did not pick it up in time and it was withdrawn, so it is safe to resend. A sidecar whose pi predates the feature (needs grok-style-pi updated and `/reload`) or runs under another process fails with exit 1 before anything is sent. Exit 6 means pi never confirmed the message entering the conversation (for example during compaction), so it may still arrive; check before resending. A steer is applied after the sidecar's current tool call finishes, not mid-command. Exit 0 with `queued (not yet confirmed in conversation)` means pi accepted it behind the running turn but it was not yet seen in the conversation; a later input handler could still consume it. Messages to an idle sidecar sent in quick succession are held back while an earlier one is unconfirmed, but only for 15 s: after that an unconfirmed idle prompt may race, be dropped, or run out of order relative to later messages, so send one steer at a time and check the pane after exit 6.
+For a busy slot, it exits 0 once queued and 1 when refused (a busy Claude Code sidecar, or a run that just ended). A steer is applied after the sidecar's current tool call finishes, not mid-command.
 
 ## Plan review
 
@@ -126,7 +122,7 @@ Run `coop-review` only when the user asks for a co-op review. It costs about thr
 sidecar coop-review [--pi-slot N] [--claude-slot M] <base> "Intent of the change"
 ```
 
-A pi reviewer (slot 98) and a Claude Code reviewer (slot 99) review the diff in parallel, then check each other's numbered findings. The slots are dedicated and the command reserves them for the whole run and fails at once if one is busy or in another coop-review. The report accounts for every finding: confirmed by both, disputed (each side's argument, including unchecked ones), or rejected by both, each with its origin. It decides nothing: settle disputes and fixes yourself, verifying each as usual. After fixing, call `coop-review` again with the same slots so both reviewers keep their memory. Exit 3 names the slot that asked; reply with `sidecar --slot N answer`, then rerun. Cancelling it (exit 130/143) stops nothing: the reviewers finish their requests and the slots stay busy until then. It accepts `--machine` for both reviewers, but not `--slot`, `--agent` or `--role`.
+A pi reviewer (slot 98) and a Claude Code reviewer (slot 99) review the diff in parallel, then check each other's numbered findings. The slots are dedicated and the command reserves them for the whole run and fails at once if one is busy or in another coop-review. The report accounts for every finding: confirmed by both, disputed (each side's argument, including unchecked ones), or rejected by both, each with its origin. It decides nothing: settle disputes and fixes yourself, verifying each as usual. After fixing, call `coop-review` again with the same slots so both reviewers keep their memory. Exit 3 names the slot that asked; reply with `sidecar --slot N answer`, then rerun. Cancelling it (exit 130/143) stops nothing: the reviewers finish their requests and the slots stay busy until then. It runs locally and does not accept `--slot`, `--agent` or `--role`.
 
 ## Reviewing a merge request
 
@@ -134,7 +130,7 @@ When the review targets a GitLab/GitHub merge request, post each confirmed findi
 
 ## Handle the report
 
-The command's first stdout line is `# Sidecar report (<local path>)`, printed before the wait; the full Markdown report is saved there and prints on completion. Remote reports are copied locally before printing. If output was truncated, run `sidecar --slot N report` to recover the latest saved report in full, including any question, even without SSH. This exits 0 after printing; it does not answer or clear a pending question. Every finding is a claim to verify, not an instruction:
+The command's first stdout line is `# Sidecar report (<local path>)`, printed before the wait; the full Markdown report is saved there and prints on completion. If output was truncated, run `sidecar --slot N report` to recover the latest saved report in full. This exits 0 after printing; it does not answer or clear a pending question. Every finding is a claim to verify, not an instruction:
 
 1. Check each finding against the code. Mark it **confirmed** or **rejected** with the reason.
 2. Fix the confirmed ones.
@@ -146,18 +142,18 @@ Done when every finding is fixed, withdrawn by the reviewer, or overruled, and t
 
 ## Long-running requests
 
-`plan`, `diff`, `ask`, `answer` and idle `steer` wait without a deadline until the sidecar submits its report, so an implementation task that takes hours is one job. For a request started outside the tool, run `sidecar --slot N wait` to get a message when it ends. It blocks until the slot's launcher releases its request lock, then prints the saved report path: exit 0 report available, 3 question pending, 1 no saved report or abnormal launcher exit. It observes the latest request when it gets the lock, not future requests or work started directly in the pane. Follow it with `sidecar --slot N report` to read the full result.
+`plan`, `diff`, `ask`, `answer` and idle `steer` wait without a deadline until the sidecar finishes, so an implementation task that takes hours is one job. If a request's job was lost, run `sidecar --slot N wait`: it waits for the slot's current run and prints its report like a request.
 
-`sidecar --slot N status` shows the latest request's start/finish ages and exit code, plus the last report path and `printed`/`unprinted`. `printed` only confirms stdout accepted the full report, not that you or the user read it; truncation or redirection can hide printed reports. If the sidecar's turn ends without a report (an aborted turn or failed context compaction), the original command exits 2 with the pane's recent output within seconds; send the task again with `ask`.
+`sidecar status` shows each slot's role, agent, machine, run state and pane. If a run fails without a report (an aborted turn or failed context compaction), the command exits 2 with the reason; send the task again with `ask`.
 
 ## Questions from the sidecar
 
-When the sidecar is blocked on a decision only you or the user can make, the command prints `NEEDS_ANSWER: <question>` after its first-line report path, then its report, and exits with code 3 (the job's message shows this exit code). Decide, or ask the user, then reply with `sidecar --slot N answer "<decision and constraints>"` using the requesting sidecar's slot; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
+When the sidecar is blocked on a decision only you or the user can make, the command prints its report, then a `NEEDS_ANSWER: <question>` line, and exits with code 3 (the job's message shows this exit code). Decide, or ask the user, then reply with `sidecar --slot N answer "<decision and constraints>"` using the requesting sidecar's slot; the sidecar resumes the same task. Do not start a new `ask` for it. Exit code 4 means an identical request is already in flight; wait for it instead of resending. Exit code 5 means the sidecar is blocked on an approval in its own pane; ask the user to handle it there.
 
 ## When it misbehaves
 
 - Outside Herdr (`HERDR_ENV` is not `1` and `HC_TERMINAL_ID` is unset): explain that the sidecar requires an interactive Claude session inside Herdr, and continue without a sidecar review.
 - `blocked`: the sidecar is waiting on a question in its pane. Ask the user to answer it there; do not send keys to it yourself.
-- `no report submitted`: the command prints the pane's recent output. Retry once with `sidecar ask`; after that, report the failure to the user and continue with your own review.
-- A sidecar whose turns keep ending without a report while its context is nearly full (compaction in the pane output, or a context figure near its limit) cannot finish in that conversation, and plain `stop` resumes it. Run `sidecar --slot N stop --fresh`, then resend the task with a complete briefing: the new conversation remembers nothing.
-- `sidecar status` shows its state; `sidecar start` restarts it, resuming the same agent session.
+- `no report`: the command prints why the run ended. Retry once with `sidecar ask`; after that, report the failure to the user and continue with your own review.
+- A sidecar whose turns keep ending without a report while its context is nearly full (compaction in the pane output, or a context figure near its limit) cannot finish in that conversation. Run `sidecar --slot N stop --fresh`, then resend the task with a complete briefing: the new conversation remembers nothing.
+- `sidecar status` shows its state.

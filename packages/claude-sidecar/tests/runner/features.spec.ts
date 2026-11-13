@@ -127,19 +127,24 @@ test("session-start moves the pane's sidecars to the cleared conversation", asyn
 	assert.equal((await f.run("ask", "first")).code, EXIT.report);
 	const first = await owner();
 	assert.match(first!, /0b0c0d0e-0000-4000-8000-00000000000a\.jsonl$/);
-	const hook = (input: object, env?: Record<string, string | undefined>) => f.runWith({ stdin: JSON.stringify(input), env }, "session-start");
+	// The hook needs the host CLI and an agent CLI on PATH.
+	const bin = join(f.root, "bin");
+	mkdirSync(bin);
+	for (const name of ["herdr", "pi"]) writeFileSync(join(bin, name), "#!/bin/sh\n", { mode: 0o755 });
+	const hook = (input: object, env?: Record<string, string | undefined>) => f.runWith({ stdin: JSON.stringify(input), env: { PATH: bin, ...env } }, "session-start");
 	// Resuming the same conversation changes nothing.
-	assert.equal((await hook({ session_id: "s1", transcript_path: first, source: "resume" })).stdout, "");
+	assert.match((await hook({ session_id: "s1", transcript_path: first, source: "resume" })).stdout, /"hookEventName":"SessionStart".*Persistent pi and Claude Code sidecars/);
 	assert.equal(await owner(), first);
 	const cleared = await hook({ session_id: "s2", transcript_path: "/claude/projects/p/s2.jsonl", source: "clear" });
-	assert.deepEqual([cleared.code, cleared.stdout, cleared.stderr], [0, "", ""]);
+	assert.deepEqual([cleared.code, cleared.stderr], [0, ""]);
 	assert.equal(await owner(), "/claude/projects/p/s2.jsonl");
 	// Without transcript_path the session ID names the transcript; a session that changed for the pane counts too.
 	await hook({ session_id: "s3", source: "startup" });
 	assert.match((await owner())!, /projects\/s3\.jsonl$/);
 	// Outside a pane the hook does nothing.
 	const outside = await hook({ session_id: "s4", transcript_path: "/x/s4.jsonl", source: "clear" }, { HERDR_ENV: undefined, HERDR_PANE_ID: undefined });
-	assert.equal(outside.code, EXIT.report);
+	assert.deepEqual([outside.code, outside.stdout], [EXIT.report, ""]);
+	assert.match((await hook({ session_id: "s5" }, { PATH: join(f.root, "none") })).stderr, /missing dependency herdr/);
 	assert.match((await owner())!, /projects\/s3\.jsonl$/);
 });
 
@@ -211,20 +216,6 @@ test("a profile cannot attach to an unprofiled conversation, and anything the ru
 	assert.match((await f.run("--profile-file", write({ prompt: "q" }), "ask", "x")).stderr, /slot profile differs/);
 });
 
-test("the Bash launcher delegates the new commands under SIDECAR_RUNNER=1 and still parses", async () => {
-	const launcher = new URL("../../scripts/sidecar", import.meta.url).pathname;
-	assert.equal(spawnSync("bash", ["-n", launcher]).status, 0);
-	const home = mkdtempSync(join(tmpdir(), "sidecar-switch-"));
-	try {
-		const env = { PATH: process.env.PATH, HOME: home, SIDECAR_STATE_DIR: join(home, "state"), SIDECAR_AGENT: "sc-test" };
-		const delegated = spawnSync(launcher, ["unreviewed"], { env: { ...env, SIDECAR_RUNNER: "1" }, encoding: "utf8", cwd: home });
-		assert.equal(delegated.status, EXIT.failed);
-		assert.equal(delegated.stderr, "sidecar: not a git repository\n");
-		const gate = spawnSync(launcher, ["push-gate"], { env: { ...env, SIDECAR_RUNNER: "1" }, input: "{}", encoding: "utf8", cwd: home });
-		assert.deepEqual([gate.status, gate.stdout], [0, ""]);
-	} finally { rmSync(home, { recursive: true, force: true }); }
-});
-
 test("an unprofiled conversation cannot adopt a profile", async (t) => {
 	const f = fixture(t, () => ({ type: "completed", result: "ok" }));
 	assert.equal((await f.run("ask", "x")).code, EXIT.report);
@@ -232,4 +223,27 @@ test("an unprofiled conversation cannot adopt a profile", async (t) => {
 	writeFileSync(path, JSON.stringify({ version: 1, role: "reviewer", prompt: "p", allow: [], deny: [], skills: [], mcp: false }));
 	assert.match((await f.run("--profile-file", path, "ask", "y")).stderr, /cannot attach a profile to an unprofiled conversation; use stop --fresh first/);
 	assert.equal(f.prompts.length, 1);
+});
+
+test("only an interactive Claude ancestor owns sidecars", async () => {
+	const { claudeAncestry } = await import("../../src/hook.ts");
+	const proc = mkdtempSync(join(tmpdir(), "sidecar-proc-"));
+	try {
+		const process = (pid: number, parent: number, ...argv: string[]) => {
+			mkdirSync(join(proc, String(pid)));
+			writeFileSync(join(proc, String(pid), "cmdline"), argv.join("\0") + "\0");
+			writeFileSync(join(proc, String(pid), "stat"), `${pid} (x y) S ${parent} 0`);
+		};
+		process(10, 1, "/usr/bin/claude", "--dangerously-skip-permissions");
+		process(11, 10, "bash", "-c", "hook");
+		process(20, 1, "node", "/opt/claude-code/cli.js", "-p", "hi");
+		process(21, 20, "bash");
+		process(30, 1, "claude", "--name", "claude-sidecar");
+		process(40, 1, "bash");
+		assert.equal(claudeAncestry(11, proc), 0);
+		assert.equal(claudeAncestry(21, proc), 1);
+		assert.equal(claudeAncestry(30, proc), 1);
+		assert.equal(claudeAncestry(40, proc), 2);
+		assert.equal(claudeAncestry(99, proc), 2);
+	} finally { rmSync(proc, { recursive: true, force: true }); }
 });

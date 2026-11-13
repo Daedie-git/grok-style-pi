@@ -1,7 +1,7 @@
 // The sidecar launcher's runner front-end: Claude Code owns persistent Pi or Claude Code sidecars that herdr-runner
-// launches, supervises and resumes. scripts/sidecar delegates here when SIDECAR_RUNNER=1.
+// launches, supervises and resumes. scripts/sidecar runs it.
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -10,22 +10,25 @@ import { HerdrParent, type ParentOptions } from "../herdr-runner/src/parent.ts";
 import { qualifiedAgentId, type HerdrRunner, type SpawnRequest } from "../herdr-runner/src/runner.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "../herdr-runner/src/state.ts";
 import { Checks } from "./checks.ts";
-import { toplevel } from "./git.ts";
+import { syncMachine } from "./sync.ts";
+import { claudeAncestry, onPath, sessionContext } from "./hook.ts";
+import { coopReview } from "./coop.ts";
+import { bashQuote, toplevel } from "./git.ts";
 import { answerPrompt, claudeQuestion, notePrompt, profileInstructions, roleInstructions } from "./prompts.ts";
 import { loadProfile, profileSkills, profileTools, type Profile } from "./profile.ts";
 import { pushGate } from "./push-gate.ts";
 import { Rejections, rejectionPrompt } from "./rejections.ts";
 import { latestReviewedFile, planPrompt, prepareDiff, unreviewedSince } from "./review.ts";
 import { parseSessionStart, recordTranscript, recordedTranscript } from "./session.ts";
-import { ROLES, SlotState, ownerName, requestId, slotName, stateDir, type Backend, type Role, type SlotRecord } from "./state.ts";
+import { ROLES, SlotState, acquireLock, ownerName, requestId, slotName, stateDir, type Backend, type Role, type SlotRecord } from "./state.ts";
 
-/** Exit codes shared with the Bash launcher and the plugin's job messages. */
+/** Exit codes the plugin's job messages and the skill rely on. */
 export const EXIT = { report: 0, failed: 1, noReport: 2, question: 3, duplicate: 4, blocked: 5, busy: 7 } as const;
 
-/** Commands this front-end runs; the others stay with the Bash launcher. */
+/** The launcher commands. */
 export const RUNNER_COMMANDS = new Set([
 	"ask", "answer", "note", "steer", "status", "report", "stop", "wait", "maintain",
-	"plan", "diff", "unreviewed", "push-gate", "reject", "keep", "unkeep", "session-start",
+	"plan", "diff", "unreviewed", "push-gate", "reject", "keep", "unkeep", "session-start", "coop-review", "sync-machine",
 ]);
 
 export interface Io {
@@ -77,7 +80,7 @@ function parse(argv: string[]): { globals: Globals; command: string; rest: strin
 			case "--machine": globals.machine = value; break;
 			case "--remote-cwd": globals.remoteCwd = value; break;
 			case "--profile-file": globals.profileFile = value; break;
-			default: throw new UsageError(`${argv[i]} is not supported with SIDECAR_RUNNER=1`);
+			default: throw new UsageError(`${argv[i]} is not supported`);
 		}
 	}
 	return { globals, command: argv[i] ?? "", rest: argv.slice(i + 1) };
@@ -131,10 +134,10 @@ export class SidecarCli {
 	async run(argv: string[]): Promise<number> {
 		try {
 			const { globals, command, rest } = parse(argv);
-			if (!RUNNER_COMMANDS.has(command)) throw new UsageError(`${command || "no command"} is not supported with SIDECAR_RUNNER=1; unset it to use the Bash launcher`);
+			if (!RUNNER_COMMANDS.has(command)) throw new UsageError(`${command || "no command"} is not a sidecar command`);
 			if (command === "unreviewed") return this.unreviewed();
 			if (command === "push-gate") return await this.pushGate();
-			if (command === "session-start") return await this.sessionStart();
+			if (command === "session-start") { await this.parent.load(); return await this.sessionStart(); }
 			if (command === "reject" && rest[0] === "--overrule") return await this.overrule(globals, rest);
 			if (!this.parent.paneId && command !== "maintain") throw new UsageError("run inside a herdr pane or a Herdr app terminal");
 			await this.parent.load();
@@ -150,6 +153,13 @@ export class SidecarCli {
 				case "reject": return await this.reject(slot, globals, rest);
 				case "keep": return await this.keep(slot, globals, rest, true);
 				case "unkeep": return await this.keep(slot, globals, rest, false);
+				case "coop-review": return await this.coop(globals, rest);
+				case "sync-machine": {
+					if (rest.length !== 1) throw new UsageError("usage: sidecar sync-machine NAME");
+					const machine = await this.parent.findMachine(rest[0]);
+					if (!machine.target) throw new UsageError(`machine '${machine.label}' has no SSH target`);
+					return syncMachine(machine, this.cwd, this.env, (text) => this.io.stdout(text));
+				}
 				case "status": return await this.status();
 				case "report": return this.report(slot);
 				case "stop": return await this.stop(slot, globals, rest);
@@ -297,7 +307,7 @@ export class SidecarCli {
 		const profile = this.profile;
 		if (!profile) return;
 		if ((record ? record.agent : globals.agent ?? "pi") !== "pi") throw new UsageError("role profiles support --agent pi only");
-		if (record ? record.machine : globals.machine) throw new UsageError("role profiles run on this machine only with SIDECAR_RUNNER=1");
+		if (record ? record.machine : globals.machine) throw new UsageError("role profiles run on this machine only");
 		if (record && !record.profile) throw new UsageError("cannot attach a profile to an unprofiled conversation; use stop --fresh first");
 		if (record && record.profile !== profile.hash) throw new UsageError("slot profile differs; use stop --fresh before attaching a different profile");
 	}
@@ -405,10 +415,69 @@ export class SidecarCli {
 		return EXIT.report;
 	}
 
+	/**
+	 * Cooperative diff review by a Pi and a Claude Code reviewer on dedicated slots. Each slot is reserved for the whole
+	 * run; a slot busy with another request is refused rather than queued behind.
+	 */
+	private async coop(globals: Globals, rest: string[]): Promise<number> {
+		const slots = { pi: "98", claude: "99" };
+		const words = [...rest];
+		while (words[0] === "--pi-slot" || words[0] === "--claude-slot") {
+			const [flag, value] = words.splice(0, 2);
+			if (!/^[1-9][0-9]{0,3}$/.test(value ?? "")) throw new UsageError(`${flag} requires an integer from 1 to 9999`);
+			slots[flag === "--pi-slot" ? "pi" : "claude"] = value;
+		}
+		if (words[0]?.startsWith("--")) throw new UsageError(`unknown coop-review option ${words[0]}`);
+		if (words.length > 2) throw new UsageError("usage: sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]");
+		if (globals.slot !== "1" || globals.role || globals.agent || globals.profileFile) throw new UsageError("coop-review chooses its own slots, agents and roles; use --pi-slot and --claude-slot");
+		if (slots.pi === slots.claude) throw new UsageError("--pi-slot and --claude-slot must differ");
+		if (globals.machine || globals.remoteCwd) throw new UsageError("coop-review runs on this machine; diff reviews need the local checkout");
+		const releases: Array<() => void> = [];
+		const now = new AbortController();
+		now.abort();
+		try {
+			for (const [flag, slot] of [["--pi-slot", slots.pi], ["--claude-slot", slots.claude]] as const) {
+				const name = slotName(this.owner, slot);
+				try { releases.push(await acquireLock(join(this.dir, "runner", `${name}.coop.lock`), now.signal)); }
+				catch { throw new UsageError(`slot ${slot} is in use by another coop-review; choose another slot with ${flag}`); }
+				try { (await acquireLock(join(this.dir, "runner", `${name}.lock`), now.signal))(); }
+				catch { throw new UsageError(`slot ${slot} is busy with another request; wait for it or choose another slot with ${flag}`); }
+			}
+			const extra: string[] = [];
+			const report = join(this.dir, "reports", `${requestId("coop", this.owner)}.md`);
+			return await coopReview({
+				launch: (args, stdin, onStderr) => this.launchSelf(args, stdin, onStderr),
+				base: words[0] || "HEAD", context: words[1] ?? "", piSlot: slots.pi, claudeSlot: slots.claude, extra, reportPath: report,
+				save: (text) => writeFileSync(report, text.endsWith("\n") ? text : text + "\n"),
+				readReport: (path) => readFileSync(path, "utf8"),
+				stdout: (text) => this.io.stdout(text), stderr: (text) => this.io.stderr(text),
+			});
+		} finally {
+			for (const release of releases) release();
+		}
+	}
+
+	/** Runs this front-end for one reviewer, so each request keeps its own slot lock, progress and exit code. */
+	private launchSelf(args: string[], stdin: string, onStderr: (line: string) => void): Promise<{ code: number; stdout: string }> {
+		return new Promise((done, fail) => {
+			const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...args], { cwd: this.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+			let stdout = "", pending = "";
+			child.stdout.on("data", (chunk: Buffer) => { stdout += chunk; });
+			child.stderr.on("data", (chunk: Buffer) => {
+				const lines = (pending + chunk).split("\n");
+				pending = lines.pop()!;
+				for (const line of lines) onStderr(line);
+			});
+			child.on("error", fail);
+			child.on("close", (code) => { if (pending) onStderr(pending); done({ code: code ?? 1, stdout }); });
+			child.stdin.end(stdin);
+		});
+	}
+
 	/** Plans and diffs are copied to files the sidecar reads here; another machine could not read them. */
 	private assertLocal(slot: SlotState, globals: Globals, command: string): void {
 		const record = slot.read();
-		if (record ? record.machine : globals.machine) throw new UsageError(`${command} on another machine is not supported with SIDECAR_RUNNER=1: its file cannot be copied there`);
+		if (record ? record.machine : globals.machine) throw new UsageError(`${command} on another machine is not supported: its file cannot be copied there`);
 	}
 
 	private async plan(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
@@ -474,14 +543,24 @@ export class SidecarCli {
 		return EXIT.report;
 	}
 
-	/** SessionStart hook: prints nothing; the Bash launcher prints the hook's context. */
+	/**
+	 * SessionStart hook: hands the pane's sidecars to a continued conversation, exports the owner name the band reads,
+	 * and tells Claude how to use sidecars. Headless and sidecar-owned Claudes get nothing.
+	 */
 	private async sessionStart(): Promise<number> {
+		const stdin = await this.io.stdin();
 		if (!this.parent.paneId) return EXIT.report;
-		const input = parseSessionStart(await this.io.stdin());
-		const transcript = input.transcript ?? (input.sessionId ? claudeTranscript(this.env, input.sessionId) : undefined);
-		if (!transcript) return EXIT.report;
-		await this.parent.load();
-		await this.adoptTranscript(await this.parent.local(), transcript);
+		const cli = this.parent.hc ? "hc" : "herdr";
+		for (const command of [cli]) if (!onPath(command, this.env)) { this.io.stderr(`sidecar: missing dependency ${command}; skipping startup\n`); return EXIT.report; }
+		if (!onPath("pi", this.env) && !onPath("claude", this.env)) { this.io.stderr("sidecar: missing agent CLI (pi or claude); skipping startup\n"); return EXIT.report; }
+		const pid = Number(this.env.SIDECAR_TEST_ANCESTRY_PID ?? process.ppid);
+		if (claudeAncestry(pid) === 1) return EXIT.report;
+		const input = parseSessionStart(stdin);
+		if (!input.sessionId) return EXIT.report;
+		if (this.env.CLAUDE_ENV_FILE) appendFileSync(this.env.CLAUDE_ENV_FILE, `export SIDECAR_AGENT=${bashQuote(this.owner)}\n`);
+		const transcript = input.transcript ?? claudeTranscript(this.env, input.sessionId);
+		if (transcript) await this.adoptTranscript(await this.parent.local(), transcript).catch((error) => this.io.stderr(`sidecar: ${error instanceof Error ? error.message : String(error)}\n`));
+		this.io.stdout(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: sessionContext(this.parent.profiles, cli) } }) + "\n");
 		return EXIT.report;
 	}
 
@@ -550,7 +629,7 @@ export class SidecarCli {
 	private async stop(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
 		const force = rest.includes("--force");
 		const fresh = rest.includes("--fresh");
-		for (const flag of rest) if (!["--force", "--fresh"].includes(flag)) throw new UsageError(`stop ${flag} is not supported with SIDECAR_RUNNER=1`);
+		for (const flag of rest) if (!["--force", "--fresh"].includes(flag)) throw new UsageError(`stop ${flag} is not supported`);
 		const record = slot.read();
 		if (!record) { this.io.stdout(`slot ${globals.slot} has no sidecar\n`); return EXIT.report; }
 		const { id, runner } = await this.parent.routeLive(record.agentId);

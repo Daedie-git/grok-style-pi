@@ -1,4 +1,4 @@
-// Slot state of the runner front-end. File names match the Bash launcher's, so the band and job delivery read both.
+// Slot state. The band reads the role, agent, machine, request and pending files.
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
-import { claudeArgs, claudeTools, handleClaudeHook } from "../src/claude.ts";
+import { claudeArgs, claudeTools, handleClaudeHook, localClaudeHook } from "../src/claude.ts";
 import type { HerdrClient } from "../src/client.ts";
 import { HerdrRunner, type SpawnRequest } from "../src/runner.ts";
 
@@ -187,7 +187,7 @@ test("Unsupported Claude controls fail before opening a pane", async (t) => {
 test("Claude tool selection maps built-ins without granting permission bypass", () => {
 	assert.deepEqual(claudeTools(["read", "find", "ls"]), ["Read", "Glob"]);
 	assert.throws(() => claudeTools(["customTool"]), /cannot enforce/);
-	const args = claudeArgs({ id: "agent", allowedTools: ["read"], description: "", prompt: "", herdrName: "agent", paneId: "p", depth: 1, type: "review", createdAt: "" }, "session", "/state path/'quoted");
+	const args = claudeArgs({ id: "agent", allowedTools: ["read"], description: "", prompt: "", herdrName: "agent", paneId: "p", depth: 1, type: "review", createdAt: "" }, "session", localClaudeHook("/state path/'quoted"));
 	assert.equal(args[args.indexOf("--tools") + 1], "Read");
 	assert.ok(args.includes("--strict-mcp-config"));
 	assert.ok(!args.includes("--allowedTools"));
@@ -214,7 +214,7 @@ test("a resolved definition replaces the agent file, keeping only grants Claude 
 test("Claude launch arguments carry multiline instructions only through task submission", async (t) => {
 	const f = fixture(t);
 	const task = { id: "reviewer", herdrName: "reviewer", paneId: "w1:p2", depth: 1, type: "reviewer", description: "Review", prompt: "Task", createdAt: "", instructions: "First paragraph\n\nSecond paragraph" };
-	const args = claudeArgs(task, "session", f.root);
+	const args = claudeArgs(task, "session", localClaudeHook(f.root));
 	assert.ok(args.every((arg) => !/[\r\n]/.test(arg)), "Herdr rejects any newline in native launch arguments");
 });
 
@@ -375,4 +375,27 @@ test("Generated exec-form Claude hooks communicate through SQLite with native pa
 	const stale = invoke("UserPromptSubmit", { prompt: f.prompts[0] });
 	assert.equal(stale.status, 0, stale.stderr);
 	assert.equal(JSON.parse(stale.stdout).decision, "block", "exec form preserves fail-closed input decisions");
+});
+
+test("a machine's Claude child runs its hooks with that machine's Node, hook entry and store", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "herdr-claude-machine-"));
+	const starts: string[][] = [];
+	const live = new Map<string, string>();
+	const client = {
+		createTab: async () => ({ paneId: "m:p2", tabId: "m:t2" }),
+		startClaude: async ({ name, paneId, args }: { name: string; paneId: string; args: string[] }) => { live.set(name, paneId); starts.push(args); },
+		promptAgent: async () => {},
+		closePane: async () => {},
+		isAlive: async (name: string) => live.has(name),
+		getAgent: async (name: string) => live.has(name) ? { name, paneId: live.get(name) } : undefined,
+		listAgents: async () => [...live].map(([name, paneId]) => ({ name, paneId })),
+		listPanes: async () => [],
+		showLabel: async () => {},
+	} as unknown as HerdrClient;
+	// The store answers as the machine's worker would; here it is a local worker over `root`.
+	const runner = new HerdrRunner({ root, client, machine: "laptop" });
+	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
+	await runner.spawn({ runtime: "claude-code", prompt: "x", description: "x", subagentType: "reviewer", cwd: root, paneId: "host/w1:p1", runInBackground: true });
+	const hooks = JSON.parse(starts[0][starts[0].indexOf("--settings") + 1]).hooks.Stop[0].hooks[0];
+	assert.deepEqual({ command: hooks.command, args: hooks.args.slice(0, 2) }, { command: process.execPath, args: [fileURLToPath(new URL("../src/claude-hook-entry.mjs", import.meta.url)), root] });
 });

@@ -8,7 +8,7 @@ import { isHcSessionTag } from "./hc.ts";
 import { HerdrStore, numberedAgentName, type StoreChannelFactory, type AgentRecord, type LaunchRecord, type CompletionNotice, type HerdrTask, type MaintenanceObservation } from "./store.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "./state.ts";
 import { taskMessage } from "./child.ts";
-import { claudeArgs, claudeEnforceable, claudePrompt, claudeTools } from "./claude.ts";
+import { claudeArgs, claudeEnforceable, claudePrompt, claudeTools, localClaudeHook, type ClaudeHookCommand } from "./claude.ts";
 
 export const HERDR_MAX_DEPTH = 3;
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -533,10 +533,18 @@ export class HerdrRunner {
 		return promise;
 	}
 
+	/** A machine's worker names its own Node, hook entry and store; an older worker cannot host Claude children. */
+	private async claudeHook(): Promise<ClaudeHookCommand> {
+		if (!this.machine) return localClaudeHook(this.deps.root);
+		return this.store.claudeHookCommand().catch((error: Error) => {
+			if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${this.machine} runs a Herdr runner too old for Claude Code children. Update it there, then retry.`);
+			throw error;
+		});
+	}
+
 	private async launch(request: SpawnRequest, signal: AbortSignal): Promise<RunRef> {
 		check(signal);
 		const claude = request.runtime === "claude-code";
-		if (claude && this.machine) throw new Error("Claude Code subagents currently support local Herdr panes only.");
 		if (claude && request.inheritContext) throw new Error("Claude Code cannot inherit a Pi session. Provide context in prompt.");
 		if (claude && (!this.deps.client.startClaude || !this.deps.client.promptAgent)) throw new Error("The Herdr client does not support Claude Code launches.");
 		if (!request.paneId) throw new Error("Not inside a Herdr pane, so no subagent pane can be opened.");
@@ -606,7 +614,7 @@ export class HerdrRunner {
 		let published = false;
 		let creationIssued = false;
 		const launch = this.deps.client.launch;
-		const args = claude ? claudeArgs(task, sessionId, this.deps.root) : piArgs(task, sessionFile!);
+		const args = claude ? claudeArgs(task, sessionId, await this.claudeHook()) : piArgs(task, sessionFile!);
 		try {
 			check(signal);
 			await this.withPlacement(async () => {
@@ -694,7 +702,7 @@ export class HerdrRunner {
 		let creationIssued = false;
 		let startupIssued = false;
 		const claude = record.runtime === "claude-code";
-		const args = claude ? claudeArgs(record, record.sessionId!, this.deps.root) : piArgs(record, record.sessionFile);
+		const args = claude ? claudeArgs(record, record.sessionId!, await this.claudeHook()) : piArgs(record, record.sessionFile);
 		if (claude) args[0] = "--resume";
 		try {
 			// The original launch retains this fleet's grid history across all of its runs.

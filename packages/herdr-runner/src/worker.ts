@@ -8,7 +8,7 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
 import { HERDR_REMOTE_PROTOCOL, agentNamePrefix, agentNumbers, herdrSubagentRoot, type MaintenanceObservation } from "./store.ts";
-import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
+import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, localClaudeHook, type ClaudeHookCommand, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, AgentOwnership, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
 import { loadPiSessionApi, piSessionReady } from "./session-ready.ts";
 
@@ -387,6 +387,8 @@ const operations = {
 			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(agentId);
 		});
 	},
+	/** This machine's hook command for Claude children, whose hooks must reach this store. */
+	claudeHookCommand(): ClaudeHookCommand { return localClaudeHook(root); },
 	/** Pins or unpins a pane against completion closing; owner-gone cleanup still applies. */
 	setKeep(agentId: string, keep: boolean): boolean {
 		return transaction(() => {

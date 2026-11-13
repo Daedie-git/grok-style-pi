@@ -22,6 +22,8 @@ Behavior, configuration and upgrade rules are documented in the herdr-subagents 
 | `session-ready.ts` | Read-only Pi session validation |
 | `load-ts.mjs` | Loads TypeScript through jiti when installed, else Node's type stripping |
 
+Claude Code children may run on saved machines: that machine's worker names the Node, hook entry and store their hooks use. herdr-subagents' Pi tools still launch Claude Code locally only.
+
 The package has no required npm dependencies. Pi's session API is loaded from the Pi package when present, else from the `pi` on `PATH`; without either, saved Pi sessions never count as loadable, so their panes stay open and cold resume refuses.
 
 ## Development

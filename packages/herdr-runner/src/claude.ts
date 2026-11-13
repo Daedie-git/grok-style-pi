@@ -53,13 +53,20 @@ export function claudeTools(tools: string[]): string[] {
 	}))];
 }
 
+/** Where a Claude child's hooks run: on the machine whose store holds the agent. */
+export interface ClaudeHookCommand { node: string; entry: string; root: string }
+
+export function localClaudeHook(root: string): ClaudeHookCommand {
+	return { node: process.execPath, entry: fileURLToPath(new URL("./claude-hook-entry.mjs", import.meta.url)), root };
+}
+
 /** Native interactive Claude; no permission bypass, print-mode subprocess, or transcript scraping. */
-export function claudeArgs(task: HerdrTask, sessionId: string, root: string): string[] {
+export function claudeArgs(task: HerdrTask, sessionId: string, hook: ClaudeHookCommand): string[] {
 	// Exec-form hooks bypass Bash/PowerShell and preserve native paths, spaces, and shell metacharacters.
-	const hookArgs = [fileURLToPath(new URL("./claude-hook-entry.mjs", import.meta.url)), root, task.id];
+	const hookArgs = [hook.entry, hook.root, task.id];
 	const hooks = Object.fromEntries([
 		"UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop", "StopFailure", "SessionEnd", "Notification",
-	].map((event) => [event, [{ hooks: [{ type: "command", command: process.execPath, args: hookArgs, timeout: 10 }] }]]));
+	].map((event) => [event, [{ hooks: [{ type: "command", command: hook.node, args: hookArgs, timeout: 10 }] }]]));
 	const args = ["--session-id", sessionId, "--settings", JSON.stringify({ hooks }), "--name", task.id];
 	if (task.model) args.push("--model", task.model);
 	if (task.thinking) args.push("--effort", task.thinking);

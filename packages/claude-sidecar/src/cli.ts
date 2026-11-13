@@ -1,22 +1,32 @@
 // The sidecar launcher's runner front-end: Claude Code owns persistent Pi or Claude Code sidecars that herdr-runner
 // launches, supervises and resumes. scripts/sidecar delegates here when SIDECAR_RUNNER=1.
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { HerdrParent, type ParentOptions } from "../herdr-runner/src/parent.ts";
 import { qualifiedAgentId, type HerdrRunner, type SpawnRequest } from "../herdr-runner/src/runner.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "../herdr-runner/src/state.ts";
-import { answerPrompt, claudeQuestion, notePrompt, roleInstructions } from "./prompts.ts";
+import { Checks } from "./checks.ts";
+import { toplevel } from "./git.ts";
+import { answerPrompt, claudeQuestion, notePrompt, profileInstructions, roleInstructions } from "./prompts.ts";
+import { loadProfile, profileSkills, profileTools, type Profile } from "./profile.ts";
+import { pushGate } from "./push-gate.ts";
+import { Rejections, rejectionPrompt } from "./rejections.ts";
+import { latestReviewedFile, planPrompt, prepareDiff, unreviewedSince } from "./review.ts";
+import { parseSessionStart, recordTranscript, recordedTranscript } from "./session.ts";
 import { ROLES, SlotState, ownerName, requestId, slotName, stateDir, type Backend, type Role, type SlotRecord } from "./state.ts";
 
 /** Exit codes shared with the Bash launcher and the plugin's job messages. */
 export const EXIT = { report: 0, failed: 1, noReport: 2, question: 3, duplicate: 4, blocked: 5, busy: 7 } as const;
 
 /** Commands this front-end runs; the others stay with the Bash launcher. */
-export const RUNNER_COMMANDS = new Set(["ask", "answer", "note", "steer", "status", "report", "stop", "wait", "maintain"]);
+export const RUNNER_COMMANDS = new Set([
+	"ask", "answer", "note", "steer", "status", "report", "stop", "wait", "maintain",
+	"plan", "diff", "unreviewed", "push-gate", "reject", "keep", "unkeep", "session-start",
+]);
 
 export interface Io {
 	stdout(text: string): void;
@@ -37,9 +47,22 @@ export interface CliOptions {
 	maintainMs?: number;
 }
 
-interface Globals { slot: string; role?: Role; agent?: Backend; machine?: string; remoteCwd?: string }
+interface Globals { slot: string; role?: Role; agent?: Backend; machine?: string; remoteCwd?: string; profileFile?: string }
+
+/** Hook entries and read-only checks that need no runner. */
+const LIGHT = new Set(["unreviewed", "push-gate", "session-start"]);
+/** Requests whose report the launcher checks after delivery. */
+const CHECKED = new Set(["ask", "answer", "steer"]);
 
 class UsageError extends Error {}
+
+interface RequestOptions {
+	keep?: boolean;
+	/** Identifies the request for duplicate detection; defaults to the text's digest. */
+	key?: string;
+	/** Builds the prompt under the slot lock, once the slot's role and machine are known. */
+	build?: (slot: { role: Role; machine?: string }) => string;
+}
 
 function parse(argv: string[]): { globals: Globals; command: string; rest: string[] } {
 	const globals: Globals = { slot: "1" };
@@ -53,6 +76,7 @@ function parse(argv: string[]): { globals: Globals; command: string; rest: strin
 			case "--agent": if (value !== "pi" && value !== "claude") throw new UsageError("--agent must be pi or claude"); globals.agent = value; break;
 			case "--machine": globals.machine = value; break;
 			case "--remote-cwd": globals.remoteCwd = value; break;
+			case "--profile-file": globals.profileFile = value; break;
 			default: throw new UsageError(`${argv[i]} is not supported with SIDECAR_RUNNER=1`);
 		}
 	}
@@ -60,8 +84,7 @@ function parse(argv: string[]): { globals: Globals; command: string; rest: strin
 }
 
 /** The Claude conversation that owns sidecars: its transcript, matched by Herdr against the session ID it reports. */
-export function claudeTranscript(env: NodeJS.ProcessEnv): string | undefined {
-	const id = env.CLAUDE_CODE_SESSION_ID;
+export function claudeTranscript(env: NodeJS.ProcessEnv, id = env.CLAUDE_CODE_SESSION_ID): string | undefined {
 	if (!id || !/^[A-Za-z0-9-]+$/.test(id)) return undefined;
 	const projects = join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
 	try {
@@ -72,6 +95,12 @@ export function claudeTranscript(env: NodeJS.ProcessEnv): string | undefined {
 	} catch {}
 	// Only the name identifies the owner; a session that has not written its transcript yet still has this one.
 	return join(projects, `${id}.jsonl`);
+}
+
+function repoSkills(cwd: string): string[] {
+	const root = toplevel(cwd);
+	const path = root ? join(root, ".claude", "skills") : undefined;
+	return path && existsSync(path) && statSync(path).isDirectory() ? [path] : [];
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -97,18 +126,30 @@ export class SidecarCli {
 		this.ownerSession = claudeTranscript(this.env);
 	}
 
+	private profile: Profile | undefined;
+
 	async run(argv: string[]): Promise<number> {
 		try {
 			const { globals, command, rest } = parse(argv);
 			if (!RUNNER_COMMANDS.has(command)) throw new UsageError(`${command || "no command"} is not supported with SIDECAR_RUNNER=1; unset it to use the Bash launcher`);
+			if (command === "unreviewed") return this.unreviewed();
+			if (command === "push-gate") return await this.pushGate();
+			if (command === "session-start") return await this.sessionStart();
+			if (command === "reject" && rest[0] === "--overrule") return await this.overrule(globals, rest);
 			if (!this.parent.paneId && command !== "maintain") throw new UsageError("run inside a herdr pane or a Herdr app terminal");
 			await this.parent.load();
+			if (globals.profileFile) this.profile = this.bindProfile(globals);
 			const slot = new SlotState(this.dir, slotName(this.owner, globals.slot));
 			switch (command) {
 				case "ask": return await this.ask(slot, globals, rest);
 				case "answer": return await this.answer(slot, globals, rest);
 				case "note": return await this.request(slot, globals, "note", notePrompt(await this.text(rest)));
 				case "steer": return await this.steer(slot, globals, rest);
+				case "plan": return await this.plan(slot, globals, rest);
+				case "diff": return await this.diff(slot, globals, rest);
+				case "reject": return await this.reject(slot, globals, rest);
+				case "keep": return await this.keep(slot, globals, rest, true);
+				case "unkeep": return await this.keep(slot, globals, rest, false);
 				case "status": return await this.status();
 				case "report": return this.report(slot);
 				case "stop": return await this.stop(slot, globals, rest);
@@ -124,6 +165,13 @@ export class SidecarCli {
 		}
 	}
 
+	private bindProfile(globals: Globals): Profile {
+		const profile = loadProfile(resolve(this.cwd, globals.profileFile!));
+		if (globals.role && globals.role !== profile.role) throw new UsageError(`--role conflicts with profile role ${profile.role}`);
+		globals.role = profile.role;
+		return profile;
+	}
+
 	private async text(rest: string[]): Promise<string> {
 		if (rest.length === 1 && rest[0] === "-") return (await this.io.stdin()).trim();
 		const text = rest.join(" ").trim();
@@ -133,13 +181,36 @@ export class SidecarCli {
 
 	private async ask(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
 		let keep: boolean | undefined;
+		let clear = false;
+		const accept: string[] = [];
+		const scope: string[] = [];
 		const words = [...rest];
-		while (words[0]?.startsWith("--")) {
-			const flag = words.shift()!;
+		for (;;) {
+			const flag = words[0];
 			if (flag === "--keep") keep = true;
-			else throw new UsageError(`ask ${flag} is not supported with SIDECAR_RUNNER=1`);
+			else if (flag === "--no-checks") clear = true;
+			else if (flag === "--accept" || flag === "--scope") {
+				if (!words[1]) throw new UsageError(flag === "--accept" ? "--accept requires a command" : "--scope requires a path glob");
+				(flag === "--accept" ? accept : scope).push(words[1]);
+				words.shift();
+			} else break;
+			words.shift();
 		}
-		return this.request(slot, globals, "ask", await this.text(words), keep);
+		const text = await this.text(words);
+		const checked = accept.length + scope.length > 0 || clear;
+		const checks = new Checks(this.dir, slot.name);
+		// An ask that changes checks identifies itself by its arguments, since its prompt depends on the checks.
+		const key = checked ? sha256([text, ...accept, "--", ...scope, clear ? "clear" : ""].join("\0")) : undefined;
+		return this.request(slot, globals, "ask", text, {
+			keep, key,
+			build: ({ role, machine }) => {
+				if (checked) {
+					if (machine && !clear) throw new UsageError("--accept and --scope run in this checkout; they are not supported for a slot on another machine");
+					if (clear) checks.clear(); else checks.save(this.cwd, accept, scope);
+				}
+				return role === "implementer" ? `${text}\n\n${checks.contract()}` : text;
+			},
+		});
 	}
 
 	private async answer(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
@@ -165,8 +236,8 @@ export class SidecarCli {
 	}
 
 	/** Starts or resumes the slot's agent with TEXT, waits for its report and prints it. */
-	private async request(slot: SlotState, globals: Globals, kind: string, text: string, keep?: boolean): Promise<number> {
-		const hash = sha256(text);
+	private async request(slot: SlotState, globals: Globals, kind: string, text: string, options: RequestOptions = {}): Promise<number> {
+		const hash = options.key ?? sha256(text);
 		const existing = slot.read();
 		if (existing?.inflight === hash) {
 			this.io.stderr("sidecar: an identical request is already in flight on this slot; wait for it\n");
@@ -176,8 +247,11 @@ export class SidecarCli {
 		try {
 			let record = slot.read();
 			if (record) this.assertBinding(record, globals);
+			this.assertProfile(record, globals);
+			const prompt = options.build?.({ role: record?.role ?? globals.role ?? "reviewer", machine: record ? record.machine : globals.machine }) ?? text;
 			const local = await this.parent.local();
 			await this.publishOwner();
+			await this.adoptTranscript(local).catch(() => undefined);
 			let ref: RunRef;
 			let runner: HerdrRunner;
 			if (record) {
@@ -187,16 +261,17 @@ export class SidecarCli {
 				// A run left by a killed launcher finishes before this one starts.
 				const previous = await this.settle(local, runner, { agentId: routed.id, runId: agent.currentRunId });
 				if (previous.phase === "blocked") return this.blocked(agent.herdrName);
+				if (options.keep) await runner.store.setKeep(routed.id, true);
 				const caller = await this.parent.caller(runner, agent.cwd ?? this.cwd, this.ownerSession);
-				ref = await runner.resume(routed.id, text, undefined, true, caller);
+				ref = await runner.resume(routed.id, prompt, undefined, true, caller);
 			} else {
 				const role = globals.role ?? "reviewer";
 				const agent = globals.agent ?? "pi";
 				const machine = globals.machine;
 				runner = machine ? await this.parent.machine(machine) : local;
 				if (machine) this.parent.remember(machine);
-				ref = await runner.spawn(await this.spawnRequest(runner, role, agent, text, globals, keep));
-				record = { agentId: qualifiedAgentId(ref.agentId, runner.machine), role, agent, ...(machine ? { machine } : {}) };
+				ref = await runner.spawn(await this.spawnRequest(runner, role, agent, prompt, globals, options.keep));
+				record = { agentId: qualifiedAgentId(ref.agentId, runner.machine), role, agent, ...(machine ? { machine } : {}), ...(this.profile ? { profile: this.profile.hash } : {}) };
 			}
 			slot.write({ ...record, inflight: hash });
 			const id = requestId(kind, slot.name);
@@ -206,7 +281,7 @@ export class SidecarCli {
 			if (kind === "answer") slot.pending(slot.pendingId(), id);
 			try {
 				const snapshot = await this.settle(local, runner, ref, id);
-				return await this.deliver(slot, record, runner, ref, snapshot, id, kind);
+				return await this.deliver(slot, record, runner, ref, snapshot, id, kind, globals.slot);
 			} finally {
 				slot.write({ ...record, inflight: undefined });
 				slot.finishRequest(Math.floor(Date.now() / 1000));
@@ -215,6 +290,16 @@ export class SidecarCli {
 			release();
 			this.options.maintainLater?.();
 		}
+	}
+
+	/** A profile binds a fresh local Pi conversation; later requests must carry the same profile or none. */
+	private assertProfile(record: SlotRecord | undefined, globals: Globals): void {
+		const profile = this.profile;
+		if (!profile) return;
+		if ((record ? record.agent : globals.agent ?? "pi") !== "pi") throw new UsageError("role profiles support --agent pi only");
+		if (record ? record.machine : globals.machine) throw new UsageError("role profiles run on this machine only with SIDECAR_RUNNER=1");
+		if (record && !record.profile) throw new UsageError("cannot attach a profile to an unprofiled conversation; use stop --fresh first");
+		if (record && record.profile !== profile.hash) throw new UsageError("slot profile differs; use stop --fresh before attaching a different profile");
 	}
 
 	private assertBinding(record: SlotRecord, globals: Globals): void {
@@ -227,6 +312,9 @@ export class SidecarCli {
 		const machine = runner.machine;
 		const cwd = machine ? this.parent.machineCwd(machine, globals.remoteCwd) || this.cwd : this.cwd;
 		const reviewer = role === "reviewer";
+		const profile = this.profile;
+		// Pi finds .pi/skills itself; Claude Code repositories keep theirs in .claude/skills. A profile names its own.
+		const skills = profile ? profileSkills(profile, this.env.HOME || homedir()) : !machine && agent === "pi" ? repoSkills(this.cwd) : [];
 		const model = agent === "claude"
 			? this.env.SIDECAR_CLAUDE_MODEL || (reviewer ? "opus" : "sonnet")
 			: this.env.SIDECAR_MODEL || "openai-codex/gpt-6.1-sol";
@@ -242,7 +330,10 @@ export class SidecarCli {
 			keep,
 			cwd,
 			definitionsCwd: this.cwd,
-			resolved: { instructions: roleInstructions(role, agent) },
+			resolved: profile
+				? { instructions: profileInstructions(profile.prompt), allowedTools: profileTools(profile) }
+				: { instructions: roleInstructions(role, agent) },
+			...(skills.length ? { skills } : {}),
 			agentDir: this.parent.deps.agentDir,
 			...(await this.parent.caller(runner, cwd, this.ownerSession)),
 		};
@@ -280,7 +371,7 @@ export class SidecarCli {
 		return EXIT.blocked;
 	}
 
-	private async deliver(slot: SlotState, record: SlotRecord, runner: HerdrRunner, ref: RunRef, snapshot: RunSnapshot, id: string, kind: string): Promise<number> {
+	private async deliver(slot: SlotState, record: SlotRecord, runner: HerdrRunner, ref: RunRef, snapshot: RunSnapshot, id: string, kind: string, slotNumber: string): Promise<number> {
 		if (snapshot.phase === "blocked") return this.blocked((await runner.resolve(ref.agentId)).herdrName);
 		let report = snapshot.result ?? "";
 		let question: string | undefined;
@@ -291,7 +382,17 @@ export class SidecarCli {
 			await runner.store.acknowledgeNotice(ref.runId).catch(() => undefined);
 			return snapshot.phase === "stopped" ? EXIT.failed : EXIT.noReport;
 		}
-		const body = question && snapshot.phase === "needs-answer" ? `## Question\n\n${question}\n` : report;
+		let body = question && snapshot.phase === "needs-answer" ? `## Question\n\n${question}\n` : report;
+		if (kind !== "wait") {
+			for (const held of await new Rejections(this.dir, slot.name).apply(body)) {
+				this.io.stderr(`sidecar: the reviewer holds ${held}; fix it, or reject again with new evidence, or overrule it with: sidecar --slot ${slotNumber} reject --overrule ${held} REASON (then tell the user)\n`);
+			}
+			const checks = new Checks(this.dir, slot.name);
+			if (!question && CHECKED.has(kind) && checks.active()) {
+				this.io.stderr("sidecar: running launcher checks\n");
+				body = await checks.run(body, slot.reportPath(id), this.env);
+			}
+		}
 		slot.saveReport(id, body);
 		this.io.stdout(kind === "note" && !question ? "noted\n" : `${body.trimEnd()}\n`);
 		// The job's output file is the notice's destination; it is written before the outbox entry is acknowledged.
@@ -304,6 +405,106 @@ export class SidecarCli {
 		return EXIT.report;
 	}
 
+	/** Plans and diffs are copied to files the sidecar reads here; another machine could not read them. */
+	private assertLocal(slot: SlotState, globals: Globals, command: string): void {
+		const record = slot.read();
+		if (record ? record.machine : globals.machine) throw new UsageError(`${command} on another machine is not supported with SIDECAR_RUNNER=1: its file cannot be copied there`);
+	}
+
+	private async plan(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
+		const file = rest[0] ? resolve(this.cwd, rest[0]) : "";
+		if (!file || !existsSync(file) || !statSync(file).isFile()) throw new UsageError("usage: sidecar plan FILE [CONTEXT]");
+		this.assertLocal(slot, globals, "plan");
+		return this.request(slot, globals, "plan", planPrompt(realpathSync(file), rest[1]));
+	}
+
+	private async diff(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
+		this.assertLocal(slot, globals, "diff");
+		const prepared = prepareDiff({
+			cwd: this.cwd, base: rest[0] || "HEAD", context: rest[1], slot: slot.name, slotNumber: globals.slot, dir: this.dir,
+			rejected: new Rejections(this.dir, slot.name).unsettled(), warn: (text) => this.io.stderr(text),
+		});
+		const code = await this.request(slot, globals, "diff", prepared.prompt);
+		// Reached only when a report was delivered; the review covered exactly the files fingerprinted above.
+		if (code === EXIT.report) prepared.record();
+		return code;
+	}
+
+	private async reject(slot: SlotState, globals: Globals, rest: string[]): Promise<number> {
+		const text = await this.text(rest);
+		const id = await new Rejections(this.dir, slot.name).add(text);
+		this.io.stderr(`sidecar: recorded rejection ${id}\n`);
+		return this.request(slot, globals, "reject", rejectionPrompt(id, text));
+	}
+
+	/** `reject --overrule R<n> REASON`: settles a rejection without the reviewer's agreement. */
+	private async overrule(globals: Globals, rest: string[]): Promise<number> {
+		const [, id, ...reason] = rest;
+		if (!/^R\d+$/.test(id ?? "") || !reason.length) throw new UsageError("usage: sidecar reject --overrule R<n> REASON");
+		if (!await new Rejections(this.dir, slotName(this.owner, globals.slot)).set(id, "overruled", reason.join(" "))) throw new UsageError(`slot ${globals.slot} has no rejection ${id}`);
+		this.io.stdout(`sidecar: ${id} overruled; tell the user, with the reviewer's failure scenario and your reason\n`);
+		return EXIT.report;
+	}
+
+	private async keep(slot: SlotState, globals: Globals, rest: string[], on: boolean): Promise<number> {
+		if (rest.length) throw new UsageError("usage: sidecar [--slot N] keep|unkeep");
+		const record = slot.read();
+		if (!record) throw new UsageError(`no sidecar in slot ${globals.slot}; start it pinned with ask --keep`);
+		const { id, runner } = await this.parent.routeLive(record.agentId);
+		if (!await runner.store.setKeep(id, on)) throw new Error(`${record.agentId} is no longer known to the runner`);
+		this.io.stdout(`${on ? "pinned" : "unpinned"}: ${record.agentId}\n`);
+		// Unpinning after a delivered report closes the pane as that completion would have.
+		if (!on) this.options.maintainLater?.();
+		return EXIT.report;
+	}
+
+	private unreviewed(): number {
+		const root = toplevel(this.cwd);
+		if (!root) throw new UsageError("not a git repository");
+		const result = unreviewedSince(root, latestReviewedFile(this.dir, this.owner, root), this.dir);
+		this.io.stdout(`${result.text}\n`);
+		return result.code;
+	}
+
+	/** PreToolUse hook: reads the hook JSON on stdin and prints a deny decision, or nothing. */
+	private async pushGate(): Promise<number> {
+		if (!this.parent.paneId) return EXIT.report;
+		const answer = pushGate(await this.io.stdin(), { dir: this.dir, owner: this.owner, home: this.env.HOME || homedir(), cwd: this.cwd });
+		if (answer) this.io.stdout(`${answer}\n`);
+		return EXIT.report;
+	}
+
+	/** SessionStart hook: prints nothing; the Bash launcher prints the hook's context. */
+	private async sessionStart(): Promise<number> {
+		if (!this.parent.paneId) return EXIT.report;
+		const input = parseSessionStart(await this.io.stdin());
+		const transcript = input.transcript ?? (input.sessionId ? claudeTranscript(this.env, input.sessionId) : undefined);
+		if (!transcript) return EXIT.report;
+		await this.parent.load();
+		await this.adoptTranscript(await this.parent.local(), transcript);
+		return EXIT.report;
+	}
+
+	/** Hands the pane's sidecars to TRANSCRIPT when the conversation continues under a new one (/clear). */
+	private async adoptTranscript(local: HerdrRunner, transcript = this.ownerSession): Promise<void> {
+		if (!transcript) return;
+		const previous = recordedTranscript(this.dir, this.owner);
+		if (previous === transcript) return;
+		if (previous) {
+			const machines = new Set<string>();
+			for (const number of SlotState.slots(this.dir, this.owner)) {
+				const machine = new SlotState(this.dir, slotName(this.owner, number)).read()?.machine;
+				if (machine) machines.add(machine);
+			}
+			await local.store.transferOwnership(this.parent.parentKey(), previous, transcript);
+			// A machine that cannot be reached keeps its agents for the next request there to claim.
+			for (const machine of machines) {
+				try { await (await this.parent.machine(machine)).store.transferOwnership(this.parent.parentKey(machine), previous, transcript); } catch {}
+			}
+		}
+		recordTranscript(this.dir, this.owner, transcript);
+	}
+
 	private async waitCurrent(slot: SlotState): Promise<number> {
 		const record = slot.read();
 		if (!record) throw new UsageError("no sidecar in this slot");
@@ -314,7 +515,7 @@ export class SidecarCli {
 		const snapshot = await this.settle(local, runner, ref);
 		const reqId = requestId("wait", slot.name);
 		this.io.stdout(`# Sidecar report (${slot.reportPath(reqId)})\n`);
-		return this.deliver(slot, record, runner, ref, snapshot, reqId, "wait");
+		return this.deliver(slot, record, runner, ref, snapshot, reqId, "wait", "");
 	}
 
 	private report(slot: SlotState): number {
@@ -361,6 +562,8 @@ export class SidecarCli {
 			this.io.stdout(`${snapshot.phase === "stopped" ? "stopped" : "stop requested"}: ${agent.herdrName}\n`);
 		} else this.io.stdout(agent.paneState ? `${agent.herdrName} is idle and its pane is closed\n` : `${agent.herdrName} is idle; its pane closes once it settles\n`);
 		if (fresh) {
+			// A rebound profiled worker must not run the previous checkout's acceptance commands.
+			if (record.profile) new Checks(this.dir, slot.name).clear();
 			slot.forget();
 			this.io.stdout(`slot ${globals.slot} forgotten; the next request starts a new conversation\n`);
 		}

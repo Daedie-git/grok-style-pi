@@ -34,6 +34,11 @@ export function roleInstructions(role: Role, backend: Backend): string {
 	return [PROTOCOL, ASK[backend], roleGuidance(file)].join("\n\n");
 }
 
+/** A Fleet profile's prompt replaces the role guidance and is always last. */
+export function profileInstructions(prompt: string): string {
+	return [PROTOCOL, ASK.pi, prompt].join("\n\n");
+}
+
 export function answerPrompt(text: string): string {
 	return `# Answer from Claude\n\nYou were blocked and asked a question. Answer: ${text}\n\nContinue that original task to completion with this answer; do not restart finished work.`;
 }

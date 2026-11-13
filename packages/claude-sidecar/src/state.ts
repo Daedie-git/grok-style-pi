@@ -14,6 +14,8 @@ export interface SlotRecord {
 	role: Role;
 	agent: Backend;
 	machine?: string;
+	/** sha256 of the canonical role profile the conversation was started with. */
+	profile?: string;
 	/** sha256 of the request text in flight, for duplicate detection. */
 	inflight?: string;
 }
@@ -111,26 +113,9 @@ export class SlotState {
 
 	latestReport(): string | undefined { return readText(this.path(".report")); }
 
-	/** One launcher per slot at a time. A holder whose process is gone leaves a stale lock, which is taken over. */
-	async lock(signal?: AbortSignal): Promise<() => void> {
-		const path = join(this.dir, "runner", `${this.name}.lock`);
-		for (;;) {
-			try {
-				const fd = openSync(path, "wx");
-				writeSync(fd, `${process.pid}\n`);
-				closeSync(fd);
-				return () => { if (readText(path) === String(process.pid)) rmSync(path, { force: true }); };
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			}
-			const holder = Number(readText(path));
-			if (!Number.isInteger(holder) || holder <= 0 || !alive(holder)) {
-				rmSync(path, { force: true });
-				continue;
-			}
-			if (signal?.aborted) throw new Error("aborted");
-			await new Promise((resolve) => setTimeout(resolve, 500));
-		}
+	/** One launcher per slot at a time. */
+	lock(signal?: AbortSignal): Promise<() => void> {
+		return acquireLock(join(this.dir, "runner", `${this.name}.lock`), signal);
 	}
 
 	/** Slots of this owner that the runner front-end manages. */
@@ -141,6 +126,27 @@ export class SlotState {
 			const match = pattern.exec(name);
 			return match ? [match[1] ?? "1"] : [];
 		}).sort((a, b) => Number(a) - Number(b));
+	}
+}
+
+/** An exclusive lock file holding the owner's PID. A holder whose process is gone leaves a stale lock, which is taken over. */
+export async function acquireLock(path: string, signal?: AbortSignal, pollMs = 500): Promise<() => void> {
+	for (;;) {
+		try {
+			const fd = openSync(path, "wx");
+			writeSync(fd, `${process.pid}\n`);
+			closeSync(fd);
+			return () => { if (readText(path) === String(process.pid)) rmSync(path, { force: true }); };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		const holder = Number(readText(path));
+		if (!Number.isInteger(holder) || holder <= 0 || !alive(holder)) {
+			rmSync(path, { force: true });
+			continue;
+		}
+		if (signal?.aborted) throw new Error("aborted");
+		await new Promise((resolve) => setTimeout(resolve, pollMs));
 	}
 }
 

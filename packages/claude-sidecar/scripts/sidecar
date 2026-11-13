@@ -2708,7 +2708,14 @@ runner_command() {
 }
 if [[ ${SIDECAR_RUNNER:-} == 1 ]]; then
   case $(runner_command "$@") in
-    ask|answer|note|steer|status|report|stop|wait) exec node "$PLUGIN_ROOT/src/cli.ts" "$@" ;;
+    ask|answer|note|steer|status|report|stop|wait|plan|diff|unreviewed|push-gate|reject|keep|unkeep) exec node "$PLUGIN_ROOT/src/cli.ts" "$@" ;;
+    session-start)
+      # The front-end hands the pane's sidecars to a cleared conversation; this script still prints the hook's context.
+      runner_input=$(cat)
+      runner_owner=0
+      interactive_claude_owner || runner_owner=$?
+      (( runner_owner != 0 )) || node "$PLUGIN_ROOT/src/cli.ts" session-start <<<"$runner_input" >/dev/null 2>&1 || true
+      exec <<<"$runner_input" ;;
     session-end|sweep) (node "$PLUGIN_ROOT/src/cli.ts" maintain </dev/null >/dev/null 2>&1 &) ;;
   esac
 fi

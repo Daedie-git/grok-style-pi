@@ -80,14 +80,19 @@ If the slot is idle and its request lock is free, `steer TEXT` behaves like `ask
 
 ## Runner front-end (preview)
 
-With `SIDECAR_RUNNER=1`, `ask`, `answer`, `note`, `steer`, `status`, `report`, `stop` and `wait` run on [herdr-runner](../herdr-runner/README.md), the core that Grok's Pi subagents use, through `src/cli.ts`. Sidecars become runner agents owned by this Claude conversation: the same database, pane placement, close-on-completion, owner-gone cleanup, cold resume and remote machines as Pi subagents. Other commands and options refuse while the flag is set.
+With `SIDECAR_RUNNER=1`, `ask`, `answer`, `note`, `steer`, `plan`, `diff`, `reject`, `keep`, `unkeep`, `status`, `report`, `stop`, `wait`, `unreviewed` and the `push-gate` and `session-start` hooks run on [herdr-runner](../herdr-runner/README.md), the core that Grok's Pi subagents use, through `src/cli.ts`. Sidecars become runner agents owned by this Claude conversation: the same database, pane placement, close-on-completion, owner-gone cleanup, cold resume and remote machines as Pi subagents. `coop-review`, `start`, `restart`, `reload` and `sync-machine` stay with the Bash launcher and refuse while the flag is set, as does any other option.
 
 Differences from the Bash launcher:
 
 - A sidecar's final reply is its report; there is no `submit_review`. Pi asks with `needs_answer`; Claude Code ends its report with `NEEDS_ANSWER: <question>`.
 - Pi children need herdr-subagents or Grok's subagent integration loaded, which reports their runs to the runner.
-- Slots live under `~/.cache/claude-sidecar/runner/`; existing Bash slots are not migrated.
+- Slots live under `~/.cache/claude-sidecar/runner/`; existing Bash slots are not migrated. Review records (`<slot>.reviewed.*`), the rejection ledger and checks keep the Bash launcher's names and formats, so `unreviewed` and the push gate read what `diff` wrote; checks hold their pre-task manifest inline.
 - After each request, a detached `maintain` pass (at most one per Claude pane) keeps closing finished panes for three minutes; `session-end` and `sweep` start one too.
+- `plan` and `diff` run on this machine only: their files cannot be copied to another. `ask --accept`, `--scope` and `--no-checks` work for local slots, as in Bash.
+- `keep` and `unkeep` need a started sidecar (`ask --keep` pins at start or on a running slot) and print `pinned:` or `unpinned:`.
+- `session-start` still prints the hook's context from the Bash launcher; the front-end additionally hands the pane's sidecars to the new transcript when the conversation changes (`/clear`), recording the pane's last transcript in `runner/<owner>.transcript`. It acts only for an identified interactive Claude.
+- Local Pi sidecars load `<git toplevel>/.claude/skills`, as in Bash.
+- `--profile-file` binds a Fleet profile to local Pi slots. The prompt replaces the role guidance; `allow` and `deny` become the child's closed tool list (`allow: null` starts from Pi's read, bash, edit and write, and `read` is always kept); `skills` load as `--skill`. The runner cannot enforce everything, so it refuses `mcp: true` and `allow` entries with `*`, and `--machine` or `--agent claude` with a profile. It cannot disable ambient extensions, skills, prompt templates or MCP servers either: `mcp: false` only hides their tools, and a profiled sidecar still loads the user's ambient extensions and skills. The slot keeps its profile hash; follow-ups may omit the file, a different profile or a profile on an unprofiled slot needs `stop --fresh` (which also clears checks). Model and thinking stay the agent's own; Bash's saved startup pair and cwd binding are not separate files.
 
 `herdr-runner` is a symlink to the shared package; Claude Code copies its target into the plugin cache.
 

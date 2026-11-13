@@ -66,4 +66,5 @@ test("sync options map this checkout's path onto the machine and validate the ti
 test("path mappings match native Windows directories", () => {
 	assert.equal(mapPath({ paths: { "C:\\work\\": "D:/repos" } }, "C:\\work\\project"), "D:/repos/project");
 	assert.equal(mapPath({ paths: { "/home/me/git": "C:/git" } }, "/home/me/gitx"), undefined);
+	assert.equal(mapPath({ paths: { "/home/me/git": "/srv" } }, "/home/me/git/a\\b"), "/srv/a\\b");
 });

@@ -84,7 +84,9 @@ export class WorkflowActivities {
 			state: finished ? meta.status === "completed" ? "done" : "failed" : "running", agentId: meta.agentId, attempt: provenance.attempt,
 			startedAt: meta.startedAt ?? (sameAgent ? previous?.startedAt : undefined) ?? (finished ? undefined : Date.now()), endedAt: finished ? meta.endedAt : undefined,
 			tokens: meta.usage?.latestFootprint ?? (sameAgent ? previous?.tokens : undefined) ?? 0,
-			output: meta.usage?.billable.output ?? (sameAgent ? previous?.output : undefined) ?? 0, earlierOutput: previous?.earlierOutput,
+			output: meta.usage?.billable.output ?? (sameAgent ? previous?.output : undefined) ?? 0,
+			// Reattachment replays each attempt's agent in turn; a replaced one keeps its output in the total.
+			earlierOutput: previous?.agentId !== undefined && !sameAgent ? (previous.earlierOutput ?? 0) + (previous.output ?? 0) : previous?.earlierOutput,
 		})) this.refresh(workflow, false, true);
 	}
 	/** Restore logical call states after hydrating child-run metrics; a completed child can still fail its workflow call. */

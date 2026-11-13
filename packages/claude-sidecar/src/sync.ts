@@ -19,7 +19,9 @@ export function machineConfig(machine: { id: string; label: string }, env: NodeJ
 /** CWD under the longest matching local prefix in `paths`, rewritten to its remote counterpart. */
 export function mapPath(config: MachineConfig, cwd: string): string | undefined {
 	// Windows directories may use either separator; the remote suffix uses `/`, which both conventions accept.
-	const slashes = (path: string) => path.replaceAll("\\", "/");
+	// A backslash in a POSIX name is a literal character.
+	const windows = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(cwd);
+	const slashes = (path: string) => windows ? path.replaceAll("\\", "/") : path;
 	const local = slashes(cwd);
 	const mapping = Object.entries(config.paths ?? {}).map(([prefix, value]) => [slashes(prefix).replace(/\/+$/, ""), value] as const)
 		.filter(([prefix]) => local === prefix || local.startsWith(prefix + "/"))

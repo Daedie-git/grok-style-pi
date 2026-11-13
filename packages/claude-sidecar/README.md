@@ -22,7 +22,7 @@ The marketplace is this repository's root:
 /plugin install claude-sidecar@daedie-sidecar
 ```
 
-Run `npm install` in the checkout first, and restart Claude inside Herdr after installing. `herdr-runner` in this directory is a symlink to the shared package; Claude Code copies its target into the plugin cache.
+Run `npm install` in the checkout first, and restart Claude inside Herdr after installing. `herdr-runner` in this directory is a symlink to the shared package; Claude Code copies its target into the plugin cache. On Windows, the checkout needs `git config core.symlinks true` (Developer Mode) before that file is checked out.
 
 ## Develop
 
@@ -85,7 +85,7 @@ The prompt follows the shared protocol in place of the role file. `allow`/`deny`
 
 ## Sidecars on another machine
 
-`--machine NAME` runs a slot on a saved Herdr machine, which needs an up-to-date grok-style-pi checkout (`npm install` run) that its pi loads. `--remote-cwd DIR` sets the directory there, else the per-machine `cwd` in `~/.pi/agent/herdr-subagents.json`, else this directory. Remote setup and protocol rules are in the [herdr-subagents README](../herdr-subagents/README.md#remote-machines).
+`--machine NAME` runs a slot on a saved Herdr machine, which needs an up-to-date grok-style-pi checkout (`npm install` run) that its pi loads. `--remote-cwd DIR` sets the directory there, else this directory mapped through the machine's `paths` in `~/.config/claude-sidecar/machines.json`, else the per-machine `cwd` in `~/.pi/agent/herdr-subagents.json`, else this directory. Remote setup and protocol rules are in the [herdr-subagents README](../herdr-subagents/README.md#remote-machines).
 
 `sync-machine NAME` fast-forwards the machine's grok-style-pi checkout from `origin` by running `scripts/sync-machine.cjs` there over SSH. It refuses local changes, local-only or diverged commits, ambiguous checkouts and detached HEADs. `~/.config/claude-sidecar/machines.json` may set, per machine label or ID, `tooling.grok-style-pi` (the checkout), `home`, and `paths` (local-to-remote prefixes).
 

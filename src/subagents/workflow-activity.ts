@@ -83,7 +83,7 @@ export class WorkflowActivities {
 			index: provenance.logicalIndex, label: provenance.label ?? previous?.label, phase: provenance.phase ?? previous?.phase,
 			state: finished ? meta.status === "completed" ? "done" : "failed" : "running", agentId: meta.agentId, attempt: provenance.attempt,
 			startedAt: meta.startedAt ?? (sameAgent ? previous?.startedAt : undefined) ?? (finished ? undefined : Date.now()), endedAt: finished ? meta.endedAt : undefined,
-			tokens: meta.usage?.billable.totalTokens ?? (sameAgent ? previous?.tokens : undefined) ?? 0,
+			tokens: meta.usage?.liveMetric ?? (sameAgent ? previous?.tokens : undefined) ?? 0,
 		})) this.refresh(workflow, false, true);
 	}
 	/** Restore logical call states after hydrating child-run metrics; a completed child can still fail its workflow call. */
@@ -147,12 +147,12 @@ export class WorkflowActivities {
 			else if (event.event.type === "tool") text = `${event.event.toolName} · ${event.event.phase}`;
 			else if (event.event.type === "usage") {
 				const slot = workflow.slots.get(child.logicalIndex);
-				if (slot?.agentId === event.agentId && slot.endedAt === undefined && !workflow.terminal) changed = this.slot(workflow, { ...slot, tokens: event.event.usage.billable.totalTokens });
+				if (slot?.agentId === event.agentId && slot.endedAt === undefined && !workflow.terminal) changed = this.slot(workflow, { ...slot, tokens: event.event.usage.liveMetric });
 			}
 		} else if (event.type === "settled") {
 			const slot = workflow.slots.get(child.logicalIndex);
 			if (slot?.agentId === event.agentId && !workflow.terminal) changed = this.slot(workflow, {
-				...slot, state: event.outcome.status === "completed" ? "done" : "failed", endedAt: slot.endedAt ?? Date.now(), tokens: event.outcome.usage.billable.totalTokens,
+				...slot, state: event.outcome.status === "completed" ? "done" : "failed", endedAt: slot.endedAt ?? Date.now(), tokens: event.outcome.usage.liveMetric,
 			});
 			text = event.outcome.error ?? event.outcome.resultText;
 		}

@@ -91,7 +91,9 @@ test("workflow agent rows update metered tokens, freeze elapsed time, and fence 
 	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
 	const panel = new ActivityPanel(() => [...h.entries.values()], theme, () => {}, () => {}, () => {}, () => {});
 	const usage = outcome().usage;
-	usage.billable = { input: 100, output: 200, cacheRead: 1000, cacheWrite: 200, totalTokens: 1500, cost: 0 };
+	// The row shows the context in use plus output, not every turn's re-read context summed.
+	usage.billable.totalTokens = 1_657_658;
+	usage.liveMetric = 1500;
 	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage } });
 	assert.deepEqual(panel.render(160).slice(2), [
 		"  running · 1m0s · 1,500 tokens · Inspect resource ownership",
@@ -99,7 +101,7 @@ test("workflow agent rows update metered tokens, freeze elapsed time, and fence 
 	]);
 	now = 121000;
 	assert.match(panel.render(160)[2], /running · 2m0s/);
-	const result = outcome(); result.usage.billable.totalTokens = 2400;
+	const result = outcome(); result.usage.liveMetric = 2400;
 	h.engine.emit({ type: "settled", agentId: child.agentId, runId: "child-run", outcome: result });
 	now = 181000;
 	assert.match(panel.render(160)[2], /done · 2m0s · 2,400 tokens/);
@@ -167,7 +169,7 @@ test("active workflow child snapshots restore a nested workflow, not a top-level
 	const child = meta("restored", "child-run");
 	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 2, label: "Restored child", phase: "Inspect" };
 	const engine = new WorkflowEngine();
-	const usage = outcome().usage; usage.billable.totalTokens = 12345;
+	const usage = outcome().usage; usage.liveMetric = 12345;
 	engine.snapshots = [{ ...agentSnapshot(child.agentId, "child-run"), workflow: child.workflow, usage, startedAt: 42000 }];
 	const entries: Activity[] = [];
 	const adapter = new SubagentAdapter(engine, (entry) => { if (!entries.includes(entry)) entries.push(entry); });
@@ -181,7 +183,7 @@ test("active workflow child snapshots restore a nested workflow, not a top-level
 test("reattachment restores finished siblings only for the same active workflow invocation", (t) => {
 	const engine = new WorkflowEngine();
 	const workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Finished child" };
-	const usage = outcome().usage; usage.billable.totalTokens = 2300;
+	const usage = outcome().usage; usage.liveMetric = 2300;
 	engine.snapshots = [
 		{ ...agentSnapshot("finished", "finished-run"), workflow, running: false, status: "completed", startedAt: 1000, endedAt: 61000, usage },
 		{ ...agentSnapshot("failed", "failed-run"), workflow: { ...workflow, logicalIndex: 2, label: "Failed child" }, running: false, status: "failed", startedAt: 2000, endedAt: 62000, usage },
@@ -204,7 +206,7 @@ test("reattachment restores finished siblings only for the same active workflow 
 test("reattachment preserves authoritative workflow failure, queued and cached slots even between child runs", (t) => {
 	for (const runningSibling of [false, true]) {
 		const engine = new WorkflowEngine();
-		const usage = outcome().usage; usage.billable.totalTokens = 700;
+		const usage = outcome().usage; usage.liveMetric = 700;
 		const failedWorkflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Validate structured output" };
 		engine.snapshots = [{ ...agentSnapshot("schema-child", "schema-run"), workflow: failedWorkflow, running: false, status: "completed", usage, startedAt: 1000, endedAt: 3000 }];
 		if (runningSibling) engine.snapshots.push({ ...agentSnapshot("sibling", "sibling-run"), workflow: { ...failedWorkflow, logicalIndex: 4, label: "Inspect" } });
@@ -230,7 +232,7 @@ test("reattachment preserves authoritative workflow failure, queued and cached s
 test("workflow snapshot attempt identity preserves teardown metrics and rejects unspawned retry accounting", (t) => {
 	for (const retryFailed of [false, true]) {
 		const engine = new WorkflowEngine();
-		const usage = outcome().usage; usage.billable.totalTokens = 2400;
+		const usage = outcome().usage; usage.liveMetric = 2400;
 		engine.snapshots = [{ ...agentSnapshot("previous", "child-run"), running: false, status: "completed", startedAt: 1000, endedAt: 3000, usage,
 			workflow: { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Inspect", attempt: 1 } }];
 		const source = Object.assign(engine, { workflowSnapshots: () => [{ taskId: "task-1", runId: "run-1", name: "Review", status: "running" as const, startedAt: 500,
@@ -253,7 +255,7 @@ test("retry start clears prior metrics before spawn while duplicate starts prese
 	const child = meta("child", "child-run"); child.runs[0].startedAt = 1000;
 	child.workflow = { taskId: "task-1", runId: "run-1", logicalIndex: 1, label: "Retry child" };
 	h.engine.emit({ type: "spawned", agentId: child.agentId, runId: "child-run", meta: child });
-	const result = outcome(); result.usage.billable.totalTokens = 2400;
+	const result = outcome(); result.usage.liveMetric = 2400;
 	h.engine.emit({ type: "run-event", agentId: child.agentId, runId: "child-run", event: { type: "usage", usage: result.usage } });
 	const running = h.entry().children;
 	h.engine.progress({ type: "agent", logicalIndex: 1, state: "start" });

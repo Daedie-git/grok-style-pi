@@ -10,7 +10,7 @@ import { HerdrParent, type ParentOptions } from "../herdr-runner/src/parent.ts";
 import { qualifiedAgentId, type HerdrRunner, type SpawnRequest } from "../herdr-runner/src/runner.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "../herdr-runner/src/state.ts";
 import { Checks } from "./checks.ts";
-import { syncMachine } from "./sync.ts";
+import { machineConfig, mapPath, syncMachine } from "./sync.ts";
 import { claudeAncestry, onPath, sessionContext } from "./hook.ts";
 import { coopReview } from "./coop.ts";
 import { bashQuote, toplevel } from "./git.ts";
@@ -333,7 +333,10 @@ export class SidecarCli {
 
 	private async spawnRequest(runner: HerdrRunner, role: Role, agent: Backend, prompt: string, globals: Globals, keep?: boolean): Promise<SpawnRequest> {
 		const machine = runner.machine;
-		const cwd = machine ? this.parent.machineCwd(machine, globals.remoteCwd) || this.cwd : this.cwd;
+		// --remote-cwd, then this directory mapped through machines.json `paths`, then the machine's configured cwd.
+		const cwd = !machine ? this.cwd : globals.remoteCwd?.trim()
+			|| mapPath(machineConfig(await this.parent.findMachine(machine), this.env), this.cwd)
+			|| this.parent.machineCwd(machine) || this.cwd;
 		const reviewer = role === "reviewer";
 		const profile = this.profile;
 		// Pi finds .pi/skills itself; Claude Code repositories keep theirs in .claude/skills. A profile names its own.

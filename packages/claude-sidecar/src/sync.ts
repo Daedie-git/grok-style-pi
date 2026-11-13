@@ -6,17 +6,32 @@ import { join } from "node:path";
 
 interface MachineConfig { tooling?: Record<string, unknown>; home?: string; paths?: Record<string, string> }
 
+/** `~/.config/claude-sidecar/machines.json`, keyed by machine ID or label. */
+export function machineConfig(machine: { id: string; label: string }, env: NodeJS.ProcessEnv): MachineConfig {
+	const file = env.SIDECAR_MACHINES_FILE || join(env.HOME || homedir(), ".config", "claude-sidecar", "machines.json");
+	if (!existsSync(file)) return {};
+	try {
+		const all = JSON.parse(readFileSync(file, "utf8")) as Record<string, MachineConfig>;
+		return all[machine.id] ?? all[machine.label] ?? {};
+	} catch { throw new Error(`invalid machine configuration: ${file}`); }
+}
+
+/** CWD under the longest matching local prefix in `paths`, rewritten to its remote counterpart. */
+export function mapPath(config: MachineConfig, cwd: string): string | undefined {
+	const mapping = Object.entries(config.paths ?? {}).map(([prefix, value]) => [prefix.replace(/\/+$/, ""), value] as const)
+		.filter(([prefix]) => cwd === prefix || cwd.startsWith(prefix + "/"))
+		.sort((a, b) => a[0].length - b[0].length).at(-1);
+	return mapping ? mapping[1] + cwd.slice(mapping[0].length) : undefined;
+}
+
 /** Options for the remote program, as the Bash launcher computed them. */
 export function syncOptions(config: MachineConfig, cwd: string, env: NodeJS.ProcessEnv): Record<string, unknown> {
 	const timeout = Number(env.SIDECAR_SYNC_TIMEOUT_S ?? 60);
 	if (!Number.isInteger(timeout) || timeout <= 0) throw new Error("SIDECAR_SYNC_TIMEOUT_S must be a positive integer");
-	const mapping = Object.entries(config.paths ?? {}).map(([prefix, value]) => [prefix.replace(/\/+$/, ""), value] as const)
-		.filter(([prefix]) => cwd === prefix || cwd.startsWith(prefix + "/"))
-		.sort((a, b) => a[0].length - b[0].length).at(-1);
 	return {
 		tooling: config.tooling ?? {},
 		runtimeHome: env.SIDECAR_REMOTE_HOME || config.home || null,
-		workDir: mapping ? mapping[1] + cwd.slice(mapping[0].length) : null,
+		workDir: mapPath(config, cwd) ?? null,
 		timeoutMs: timeout * 1000,
 	};
 }
@@ -28,14 +43,7 @@ export function remoteNodeCommand(program: string, args: unknown[]): string {
 }
 
 export function syncMachine(machine: { id: string; label: string; target: string }, cwd: string, env: NodeJS.ProcessEnv, out: (text: string) => void): number {
-	const file = env.SIDECAR_MACHINES_FILE || join(env.HOME || homedir(), ".config", "claude-sidecar", "machines.json");
-	let config: MachineConfig = {};
-	if (existsSync(file)) {
-		try {
-			const all = JSON.parse(readFileSync(file, "utf8")) as Record<string, MachineConfig>;
-			config = all[machine.id] ?? all[machine.label] ?? {};
-		} catch { throw new Error(`invalid machine configuration: ${file}`); }
-	}
+	const config = machineConfig(machine, env);
 	const program = readFileSync(new URL("../scripts/sync-machine.cjs", import.meta.url), "utf8");
 	const result = spawnSync("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", machine.target,
 		remoteNodeCommand('eval(fs.readFileSync(0,"utf8"));', [JSON.stringify(syncOptions(config, cwd, env))])], { input: program, stdio: ["pipe", "inherit", "inherit"] });

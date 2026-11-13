@@ -1,0 +1,2773 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016  # remote scripts are single-quoted on purpose: the machine expands them
+# Persistent review sidecars, hosted in Herdr panes beside Claude.
+#
+#   sidecar [--slot N] [--role reviewer|implementer|researcher|explorer] [--agent pi|claude] [--profile-file FILE] [--machine NAME [--remote-cwd DIR]] COMMAND
+#                                --profile-file binds a resolved version 1 Fleet role profile to a fresh pi conversation
+#                                select an independent persistent sidecar (default 1), optionally on a saved herdr
+#                                machine (herdr 0.9.1+); a slot stays on the machine it started on
+#                                native claude agents support reports and answers; reload and busy steer require pi
+#   sidecar session-start        SessionStart hook entry (reads hook JSON on stdin)
+#   sidecar session-end          SessionEnd hook entry; stop this owner's panes unless clearing
+#   sidecar sweep                close panes whose owner is gone
+#   sidecar keep|unkeep          pin or unpin this slot's pane against closing after its report
+#   sidecar start [PANE]         ensure the sidecar is running (idempotent); PANE reuses an idle shell pane
+#   sidecar restart              start the sidecar in a new pane when its name belongs to another session
+#   sidecar reload               wait between requests, then reload pi resources without losing its report channel
+#   sidecar stop [--force] [--fresh] [--all]
+#                                close the sidecar's pane; the next request resumes its session. Refuses (exit 7)
+#                                while a request runs unless --force; --fresh drops the saved session so the next
+#                                start begins a new one; --all stops every slot of this Claude pane
+#   sidecar sync-machine NAME    fast-forward the machine's tooling checkouts from origin (no slot binding)
+#   sidecar status               show agent state, request age and whether its last report was printed
+#   sidecar wait                 wait for the slot's launcher request; print its report path (run as a harness background task)
+#   sidecar report               print the latest saved report, including any pending question
+#   sidecar note TEXT|-          share context on ongoing work; no review
+#   sidecar plan FILE [CONTEXT]  review a plan; prints the report
+#   sidecar diff [BASE] [CONTEXT]  adversarial review of changes since BASE (default HEAD); prints the report
+#   sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]
+#                                cooperative diff review by a pi and a Claude Code reviewer (default dedicated slots 98 and 99): both
+#                                review in parallel, check each other's findings, and one combined report is printed
+#   sidecar unreviewed           list files changed since the last diff review from any slot (exit 1 when there are any)
+#   sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-
+#                                follow-up request (- reads TEXT from stdin); prints the report. --accept runs CMD here
+#                                after the report and --scope flags changed files outside GLOB; both persist on the slot
+#   sidecar reject TEXT|-        tell the reviewer a finding is rejected and why; it withdraws with evidence or stands
+#   sidecar reject --overrule R<n> REASON
+#                                settle a standing rejection without the reviewer's agreement
+#   sidecar push-gate            PreToolUse hook entry: deny pushes while files changed since the latest diff review
+#   sidecar answer TEXT|-        answer the sidecar's pending question (exit 3 from a request); resumes that task
+#   sidecar steer TEXT|-         redirect busy work now; when idle, run a request and print its report
+set -euo pipefail
+
+STATE_DIR="$HOME/.cache/claude-sidecar"
+REQUEST_DIR="$STATE_DIR/requests"
+REPORT_DIR="$STATE_DIR/reports"
+PLUGIN_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SIDECAR_HOME="$PLUGIN_ROOT/sidecar"
+MODEL="${SIDECAR_MODEL:-openai-codex/gpt-6.1-sol}"
+THINKING=
+ROLE=reviewer
+BACKEND=pi
+INFLIGHT=
+ACTIVE_REQUEST=
+REQUEST_KEY=
+PROGRESS_TIMER=
+NOTE_TIMEOUT_MS=300000
+REVIEW_TIMEOUT_MS=3600000
+# After the sidecar settles without a report, recheck for this long before declaring the request abandoned.
+SETTLE_GRACE_S="${SIDECAR_SETTLE_GRACE_S:-15}"
+# While a request runs, print a status line to stderr this often (seconds); 0 disables it.
+PROGRESS_S="${SIDECAR_PROGRESS_S:-60}"
+# Where pi finds its extension and prompt. Remote defaults preserve the path relative to our home,
+# rooted at the remote home on Linux or C:/ on Windows.
+AGENT_HOME="$SIDECAR_HOME"
+# Set by resolve_machine for a slot on a saved herdr machine; empty for the local one.
+MACHINE=
+MACHINE_LABEL=
+MACHINE_TARGET=
+REMOTE_STATE=
+REMOTE_TRANSPORT='sh'
+# The directory sidecar panes open in: here, or its counterpart on the machine.
+WORK_DIR=$PWD
+RESOLVED=
+ADMISSION_CAPTURED=
+ADMITTED_SESSION=
+ADMITTED_FRESH=
+HOST_WINDOWS=
+case $(uname -s) in MINGW*|MSYS*|CYGWIN*) HOST_WINDOWS=1 ;; esac
+TARGET_WINDOWS=$HOST_WINDOWS
+# Native jq emits CRLF; strip only the record-ending CR, not escaped JSON string content.
+if [[ -n $HOST_WINDOWS ]]; then
+  jq() { command jq "$@" | sed 's/\r$//'; }
+fi
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+
+die() { echo "sidecar: $*" >&2; exit 1; }
+
+# Slots run in the innermost terminal host: a herdr TUI pane, else a Herdr app (hc) terminal. SIDECAR_MUX forces one.
+MUX=${SIDECAR_MUX:-}
+if [[ -z $MUX ]]; then
+  if [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]]; then MUX=herdr; elif [[ -n ${HC_TERMINAL_ID:-} ]]; then MUX=hc; fi
+fi
+case $MUX in
+  herdr) [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || MUX= ;;
+  hc) [[ -n ${HC_TERMINAL_ID:-} ]] || MUX= ;;
+  '') ;;
+  *) die "SIDECAR_MUX must be herdr or hc" ;;
+esac
+# shellcheck source=scripts/mux/herdr disable=SC1090,SC1091
+source "$PLUGIN_ROOT/scripts/mux/${MUX:-herdr}"
+
+# Every command that talks to the terminal host starts here, so the target machine is resolved once before any call.
+require_mux() {
+  [[ -n $MUX ]] || die "not running inside a herdr pane or Herdr app terminal"
+  local dependency
+  for dependency in "$MUX_CLI" jq flock; do
+    type -P "$dependency" >/dev/null || die "missing dependency $dependency; install it on PATH before using sidecar"
+  done
+  {
+    flock 7
+    admit_generation_unlocked
+    if [[ -z ${PROFILE_RESET:-} ]]; then profile_input_unlocked; fi
+  } 7>"$STATE_DIR/$(agent_name).identity.lock"
+  [[ -n $RESOLVED ]] || resolve_machine
+  resolve_role
+  resolve_backend
+  if [[ -z ${PROFILE_RESET:-} ]]; then
+    { flock 7; profile_check_unlocked; } 7>"$STATE_DIR/$(agent_name).identity.lock"
+  fi
+  if [[ -n $PROFILE_JSON && -f "$STATE_DIR/$(agent_name).cwd" ]]; then
+    WORK_DIR=$(<"$STATE_DIR/$(agent_name).cwd")
+  fi
+  # Unlike legacy remote slots, profiled sessions always bind their execution directory.
+  if [[ -n $PROFILE_JSON && -n $MACHINE ]]; then REMOTE_CWD=$WORK_DIR; fi
+}
+
+# Admission precedes request-lock waits and is independent of whether a profile exists.
+# A same-profile fresh restart still replaces the conversation and must not inherit queued work.
+# Call these helpers under the slot identity lock; normal pane recreation keeps this identity.
+admit_generation_unlocked() {
+  [[ -z $ADMISSION_CAPTURED ]] || return 0
+  local file
+  file="$STATE_DIR/$(agent_name).fresh"
+  ADMITTED_SESSION=$(pi_session_id)
+  [[ ! -f $file ]] || ADMITTED_FRESH=$(<"$file")
+  ADMISSION_CAPTURED=1
+}
+
+validate_generation_unlocked() {
+  local file fresh=''
+  file="$STATE_DIR/$(agent_name).fresh"
+  [[ ! -f $file ]] || fresh=$(<"$file")
+  [[ $ADMITTED_FRESH == "$fresh" && $ADMITTED_SESSION == "$(pi_session_id)" ]] ||
+    die "slot session generation changed while waiting; nothing was sent. Submit the assignment again explicitly"
+}
+
+# Fleet owns profile policy. The launcher accepts only this resolved, versioned Pi contract.
+# All snapshot reads, validation, hashing and publication happen under the slot identity lock.
+profile_input_unlocked() {
+  local file source=${PROFILE_ARG:-} saved='' role expected=${PROFILE_HASH:-}
+  file="$STATE_DIR/$(agent_name).profile.json"
+  [[ ! -f $file ]] || saved=$(<"$file")
+  if [[ -z $source && -n $saved ]]; then source=$file; fi
+  PROFILE_JSON=
+  PROFILE_HASH=
+  if [[ -z $source ]]; then
+    [[ -z $expected ]] || die "slot profile was reset while waiting; retry the command"
+    return 0
+  fi
+  [[ -f $source ]] || die "profile file does not exist: $source"
+  PROFILE_JSON=$(jq -sceS '
+    def strings: type == "array" and all(.[]; type == "string" and (contains("\u0000") | not));
+    def tools: strings and all(.[]; length > 0 and (test("[,\\s]|^[+-]") | not));
+    if length == 1 then .[0] else error("expected one profile") end
+    | select(type == "object" and keys == ["allow","deny","mcp","prompt","role","skills","version"])
+    | select(.version == 1 and (.role == "reviewer" or .role == "implementer")
+      and (.prompt | type == "string" and (contains("\u0000") | not))
+      and (.allow == null or (.allow | tools)) and (.deny | tools)
+      and (.skills | strings and all(.[]; length > 0 and (test("[\\r\\n]") | not)
+        and (startswith("/") or startswith("~/") or test("^[A-Za-z]:[/\\\\]")))) and (.mcp | type == "boolean"))' "$source") || die "invalid version 1 role profile: $source"
+  [[ -z $saved || $saved == "$PROFILE_JSON" ]] || die "slot profile differs; use stop --fresh before attaching a different profile"
+  PROFILE_HASH=$(printf '%s\n' "$PROFILE_JSON" | sha256sum | cut -d' ' -f1)
+  [[ -z $expected || $expected == "$PROFILE_HASH" ]] || die "slot profile changed while waiting; retry the command"
+  role=$(jq -r .role <<<"$PROFILE_JSON")
+  [[ -z $ROLE_ARG || $ROLE_ARG == "$role" ]] || die "--role conflicts with profile role $role"
+  ROLE_ARG=$role
+  local pattern mandatory
+  while IFS= read -r pattern; do
+    # Pi patterns support only '*'; quote Bash's other glob metacharacters.
+    pattern=${pattern//\\/\\\\}; pattern=${pattern//\?/\\?}; pattern=${pattern//\[/\\[}
+    for mandatory in read submit_review; do
+      # shellcheck disable=SC2053 # Deliberately match Pi's '*' denial patterns.
+      [[ $mandatory != $pattern ]] || die "profile cannot deny mandatory tool $mandatory"
+    done
+  done < <(jq -r '.deny[]' <<<"$PROFILE_JSON")
+}
+
+profile_check_unlocked() {
+  [[ -n $PROFILE_JSON ]] || return 0
+  [[ $BACKEND == pi ]] || die "role profiles support --agent pi only"
+  local name hname
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  if [[ ! -f "$STATE_DIR/$name.profile.json" && ! -f "$STATE_DIR/$name.profile-fresh" ]]; then
+    if [[ -f "$STATE_DIR/$name.session" || -f "$STATE_DIR/$name.agent" || -f "$STATE_DIR/$name.role" || -f "$STATE_DIR/$name.claude-started" ]] || [[ $(agent_status "$hname") != missing ]]; then
+      die "cannot attach a profile to an unprofiled conversation; use stop --fresh first"
+    fi
+  fi
+  if [[ -f "$STATE_DIR/$name.profile.json" ]]; then
+    [[ $(<"$STATE_DIR/$name.profile.json") == "$PROFILE_JSON" ]] || die "slot profile differs; use stop --fresh first"
+    [[ -s "$STATE_DIR/$name.cwd" ]] || die "profile cwd binding is missing; use stop --fresh first"
+    [[ -s "$STATE_DIR/$name.startup.json" ]] || die "profile startup binding is missing; use stop --fresh first"
+  fi
+  profile_startup_unlocked
+}
+
+# A selected reviewer pair must describe the running worker, not just its prompt.
+# Omitted overrides resume the saved pair; explicit overrides may not change it.
+profile_startup_unlocked() {
+  [[ -n $PROFILE_JSON ]] || return 0
+  local file saved_model saved_thinking
+  file="$STATE_DIR/$(agent_name).startup.json"
+  [[ -f $file ]] || return 0
+  jq -e 'type == "object" and keys == ["model","thinking"]
+    and (.model | type == "string" and length > 0)
+    and (.thinking | type == "string" and length > 0)' "$file" >/dev/null || die "invalid profile startup binding; use stop --fresh first"
+  saved_model=$(jq -r .model "$file")
+  saved_thinking=$(jq -r .thinking "$file")
+  [[ ! -v SIDECAR_MODEL || $MODEL == "$saved_model" ]] || die "profile model differs; use stop --fresh before changing the startup pair"
+  [[ ! -v SIDECAR_THINKING || $THINKING == "$saved_thinking" ]] || die "profile thinking differs; use stop --fresh before changing the startup pair"
+  MODEL=$saved_model
+  THINKING=$saved_thinking
+}
+
+profile_bind_unlocked() {
+  [[ -n $PROFILE_JSON ]] || return 0
+  profile_check_unlocked
+  local base tmp
+  base="$STATE_DIR/$(agent_name)"
+  if [[ ! -f $base.profile.json ]]; then
+    if [[ -z $MACHINE ]]; then
+      WORK_DIR=$(cd -- "$WORK_DIR" && pwd -P) || die "cannot resolve profile working directory"
+    fi
+    tmp=$(mktemp "$base.startup.json.XXXXXX")
+    jq -cn --arg model "$MODEL" --arg thinking "$THINKING" '{model:$model,thinking:$thinking}' >"$tmp"
+    mv -f -- "$tmp" "$base.startup.json"
+    tmp=$(mktemp "$base.profile.json.XXXXXX")
+    printf '%s\n' "$PROFILE_JSON" >"$tmp"; mv -f -- "$tmp" "$base.profile.json"
+    tmp=$(mktemp "$base.profile.sha256.XXXXXX")
+    printf '%s\n' "$PROFILE_HASH" >"$tmp"; mv -f -- "$tmp" "$base.profile.sha256"
+    tmp=$(mktemp "$base.cwd.XXXXXX")
+    printf '%s\n' "$WORK_DIR" >"$tmp"; mv -f -- "$tmp" "$base.cwd"
+  fi
+}
+
+# Resolve home-relative resources only where the worker runs. Return a concrete CLI path
+# after checking Pi's skill layout, without changing the canonical Fleet manifest.
+profile_skill_path() {
+  local skill=$1
+  if [[ -n $MACHINE && $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'const skill=args[0].startsWith("~/")?path.join(os.homedir(),args[0].slice(2)):args[0];
+      if(!fs.existsSync(skill))process.exit(1);
+      const stat=fs.statSync(skill),entry=path.join(skill,"SKILL.md");
+      if(stat.isDirectory()? !fs.existsSync(entry)||!fs.statSync(entry).isFile(): !stat.isFile()||!(/\.md$/i.test(skill)))process.exit(1);
+      console.log(skill);' "$skill" </dev/null
+  elif [[ -n $MACHINE ]]; then
+    remote 'skill=$1
+      case "$skill" in "~/"*) skill="$HOME/${skill#\~/}" ;; esac
+      if test -d "$skill"; then test -f "$skill/SKILL.md" || exit 1
+      else case "$skill" in *.[mM][dD]) test -f "$skill" || exit 1 ;; *) exit 1 ;; esac; fi
+      printf "%s\n" "$skill"' "$skill" </dev/null
+  else
+    # shellcheck disable=SC2088 # Match a literal Fleet home-relative resource path.
+    [[ $skill != '~/'* ]] || skill="$HOME/${skill:2}"
+    if [[ -d $skill ]]; then
+      [[ -f $skill/SKILL.md ]] || return 1
+    else
+      [[ -f $skill && ${skill,,} == *.md ]] || return 1
+    fi
+    printf '%s\n' "$skill"
+  fi
+}
+
+# Role prompt files, in order, for Claude Code, which takes one instructions file.
+role_prompt_files() {
+  if [[ $ROLE != reviewer ]]; then
+    printf '%s\n' "$SIDECAR_HOME/profile.md" "$SIDECAR_HOME/$ROLE.md"
+  else
+    printf '%s\n' "$SIDECAR_HOME/reviewer.md"
+  fi
+}
+
+
+# Materialize text locally and transfer it, never interpolate profile content into shell argv.
+# Skills are execution-machine paths, not local resources implicitly copied to another host.
+profile_launch_args() {
+  local base prompt delivery skill tools
+  base="$STATE_DIR/$(agent_name)"
+  prompt="$base.profile-prompt.md"
+  delivery="$SIDECAR_HOME/profile.md"
+  jq -j .prompt <<<"$PROFILE_JSON" >"$prompt"
+  if [[ -n $MACHINE ]]; then
+    publish_file "$base.profile.json" >/dev/null || return 1
+    prompt=$(publish_file "$prompt") || return 1
+    delivery=$(publish_file "$delivery" "$(agent_name).profile-delivery.md") || return 1
+  fi
+  PROFILE_LAUNCH_ARGS=(--no-extensions --no-skills --no-prompt-templates -e "$AGENT_HOME/sidecar.ts")
+  if [[ $(jq -r .mcp <<<"$PROFILE_JSON") == true ]]; then
+    # MCP's default codemode/deferred exposure needs these built-ins too; ambient adapters stay excluded.
+    PROFILE_LAUNCH_ARGS+=(-e builtin:mcp -e builtin:codemode -e builtin:tool-search)
+  else
+    PROFILE_LAUNCH_ARGS+=(--no-mcp)
+  fi
+  if [[ $(jq -r '.allow == null' <<<"$PROFILE_JSON") == true ]]; then
+    tools=+read,+submit_review
+  else
+    tools=$(jq -r '(.allow + ["read","submit_review"] | unique) | join(",")' <<<"$PROFILE_JSON")
+  fi
+  PROFILE_LAUNCH_ARGS+=(--tools "$tools")
+  tools=$(jq -r '.deny | join(",")' <<<"$PROFILE_JSON")
+  [[ -z $tools ]] || PROFILE_LAUNCH_ARGS+=(--exclude-tools "$tools")
+  while IFS= read -r skill; do
+    [[ -n $skill && $skill != *$'\n'* && $skill != *$'\r'* ]] || die "profile skill paths must be nonempty single-line paths"
+    local resolved_skill
+    resolved_skill=$(profile_skill_path "$skill") || die "profile skill must be a Markdown file or a directory with regular SKILL.md${MACHINE_LABEL:+ on $MACHINE_LABEL}: $skill"
+    PROFILE_LAUNCH_ARGS+=(--skill "$resolved_skill")
+  done < <(jq -r '.skills[]' <<<"$PROFILE_JSON")
+  # The delivery protocol grants no permissions; Fleet's literal role guidance is always last.
+  PROFILE_LAUNCH_ARGS+=(--append-system-prompt "$delivery" --append-system-prompt "$prompt")
+}
+
+# Slots retain their role; do not silently reuse an implementer's context as a reviewer (or vice versa).
+resolve_role() {
+  local file saved=
+  file="$STATE_DIR/$(agent_name).role"
+  if [[ -f $file ]]; then saved=$(<"$file"); fi
+  # A fresh conversation may bind a new Fleet role without adopting old role context.
+  if [[ -n $PROFILE_JSON && -f "$STATE_DIR/$(agent_name).profile-fresh" ]]; then saved=; fi
+  [[ -z $saved || $saved == @(reviewer|implementer|researcher|explorer) ]] || die "invalid slot role in $file"
+  if [[ -n $saved && -n $ROLE_ARG && $saved != "$ROLE_ARG" ]]; then
+    die "slot is already a $saved; use a new slot for $ROLE_ARG"
+  fi
+  ROLE=${saved:-${ROLE_ARG:-reviewer}}
+  if [[ -z $saved && $ROLE != reviewer && $(agent_status "$(herdr_agent)") != missing ]]; then
+    die "slot already has a running reviewer; use a new slot for $ROLE"
+  fi
+  local default=high
+  [[ $ROLE == reviewer ]] || default=medium
+  THINKING=${SIDECAR_THINKING:-$default}
+}
+
+# A slot keeps its backend and conversation.
+resolve_backend() {
+  local file saved=
+  file="$STATE_DIR/$(agent_name).agent"
+  if [[ -f $file ]]; then saved=$(<"$file"); fi
+  [[ -z $saved || $saved == pi || $saved == claude ]] || die "invalid slot agent in $file"
+  if [[ -n $saved && -n $AGENT_ARG && $saved != "$AGENT_ARG" ]]; then
+    die "slot already runs $saved; use a new slot for $AGENT_ARG"
+  fi
+  BACKEND=${saved:-${AGENT_ARG:-pi}}
+  if [[ -z $saved && $BACKEND != pi && $(agent_status "$(herdr_agent)") != missing ]]; then
+    die "slot already has a running pi; use a new slot for $BACKEND"
+  fi
+}
+
+# Claude needs a UUID session id; derive it from the slot's session id so restarts resume the same conversation.
+claude_session_uuid() {
+  local h
+  h=$(sha256sum <<<"$(pi_session_id)")
+  echo "${h:0:8}-${h:8:4}-4${h:13:3}-a${h:17:3}-${h:20:12}"
+}
+
+shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
+
+# Replace a background subshell with the client so its PID remains directly cancellable, including in Git Bash.
+exec_detached() {
+  if command -v setsid >/dev/null 2>&1; then exec setsid "$@"; else exec "$@"; fi
+}
+
+# Runs a POSIX sh script on the machine; SCRIPT sees ARGS as $1... Everything is quoted, so any path is safe. SSH
+# never prompts (BatchMode) and drops silent connections. Exit status 255 is SSH's own failure. Reads this shell's stdin.
+remote() {
+  local script=$1 cmd arg
+  shift
+  cmd="sh -c $(shq "$script") sh"
+  for arg in "$@"; do cmd+=" $(shq "$arg")"; done
+  ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "$cmd"
+}
+
+# Node is already required by pi. A base64 program inside double quotes works with both cmd.exe and POSIX shells,
+# without changing the SSH server's default shell. Arguments are encoded with the program, never shell-interpolated.
+remote_node() {
+  local script=$1 args encoded
+  shift
+  args=$(jq -cn --args '$ARGS.positional' "$@")
+  encoded=$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script" | base64 -w0)
+  local invoke=()
+  [[ ${NODE_DETACH:-} != 1 ]] || invoke=(exec_detached)
+  "${invoke[@]}" ssh "${SSH_OPTS[@]}" -- "$MACHINE_TARGET" "node -e \"eval(Buffer.from('$encoded','base64').toString())\""
+}
+
+# Execute the same Node program locally or through the existing Windows-safe remote transport.
+run_node() {
+  if [[ -n $MACHINE ]]; then remote_node "$@"; return; fi
+  local script=$1 args
+  shift
+  args=$(jq -cn --args '$ARGS.positional' "$@")
+  local invoke=()
+  [[ ${NODE_DETACH:-} != 1 ]] || invoke=(exec_detached)
+  "${invoke[@]}" node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$args" "$script")"
+}
+
+machine_binding_file() { echo "$STATE_DIR/$(agent_name).machine"; }
+
+# Finds a saved machine the way `herdr --machine` does: profile ID first, then a unique label.
+find_machine() {
+  local selector=$1 machines found
+  if ! machines=$(mux_list_machines); then
+    [[ $MUX == hc ]] && die "cannot list hc machines (hc machine ls)"
+    die "cannot list herdr machines; --machine needs herdr 0.9.1+ (herdr machine list --json)"
+  fi
+  found=$(jq -c --arg s "$selector" '(map(select(.id == $s)) | first) // (map(select(.label == $s)) | if length > 1 then "ambiguous" else first end)' <<<"$machines")
+  [[ $found != null ]] || die "unknown $MUX_CLI machine '$selector'; add it with: $MUX_CLI machine add TARGET (see $MUX_MACHINE_LIST)"
+  [[ $found != '"ambiguous"' ]] || die "$MUX_CLI machine label '$selector' is ambiguous; use its profile ID"
+  [[ $(jq -r '.enabled' <<<"$found") == true ]] || die "$MUX_CLI machine '$selector' is disabled"
+  echo "$found"
+}
+
+# Decides where this slot runs. A slot remembers its machine, so follow-ups need no flag; asking for another one is an
+# error because the slot's context, session and pending questions live on the machine it started on.
+resolve_machine() {
+  RESOLVED=1
+  local bound file wanted=${MACHINE_ARG:-} record id bound_cwd=
+  file=$(machine_binding_file)
+  bound=
+  if [[ -s $file ]]; then
+    bound=$(head -n 1 "$file")
+    bound_cwd=$(sed -n 2p "$file")
+  fi
+  if [[ $bound == local ]]; then
+    [[ -z $wanted ]] || die "slot $SLOT already runs locally; use another slot for --machine $wanted"
+    [[ -z $REMOTE_CWD ]] || die "--remote-cwd needs a slot on a machine"
+    return
+  elif [[ -n $bound ]]; then
+    record=$(find_machine "$bound")
+    if [[ -n $wanted ]]; then
+      id=$(find_machine "$wanted")
+      [[ $(jq -r '.id' <<<"$id") == "$bound" ]] ||
+        die "slot $SLOT is bound to machine '$(jq -r '.label' <<<"$record")'; use another slot for --machine $wanted"
+    fi
+    # The checkout chosen at start belongs to the slot, like its machine: follow-ups reuse it.
+    if [[ -n $REMOTE_CWD && $REMOTE_CWD != "${bound_cwd:-$PWD}" ]]; then
+      die "slot $SLOT is bound to cwd ${bound_cwd:-$PWD} on that machine; slots cannot be rebound. Pick a free slot: sidecar --slot N --machine $(jq -r '.label' <<<"$record") --remote-cwd $REMOTE_CWD ask TEXT"
+    fi
+    # A binding without a saved directory predates mappings: it keeps $PWD and must not acquire one.
+    REMOTE_CWD=$bound_cwd
+    [[ -n $bound_cwd ]] || KEEP_PWD=1
+  else
+    wanted=${wanted:-${SIDECAR_MACHINE:-}}
+    if [[ -z $wanted ]]; then
+      [[ -z $REMOTE_CWD ]] || die "--remote-cwd needs --machine"
+      return
+    fi
+    if [[ -n ${MACHINE_ARG:-} && $(agent_status "$(agent_name)") != missing ]]; then
+      die "slot $SLOT already runs locally; use another slot for --machine $MACHINE_ARG"
+    fi
+    record=$(find_machine "$wanted")
+  fi
+  id=$(jq -r '.id' <<<"$record")
+  MACHINE=$id
+  TARGET_WINDOWS=
+  MACHINE_LABEL=$(jq -r '.label' <<<"$record")
+  MACHINE_TARGET=$(jq -r '.target' <<<"$record")
+  [[ -n $MACHINE_TARGET ]] || die "$MUX_CLI machine '$MACHINE_LABEL' has no SSH target"
+  command -v ssh >/dev/null || die "ssh is required for --machine"
+  # Per-machine settings avoid repeating checkout paths and support Windows without a POSIX SSH shell.
+  local config='{}' config_file=${SIDECAR_MACHINES_FILE:-$HOME/.config/claude-sidecar/machines.json} mapped=
+  if [[ -f $config_file ]]; then
+    config=$(jq -ce --arg id "$MACHINE" --arg label "$MACHINE_LABEL" '.[$id] // .[$label] // {}' "$config_file") || die "invalid machine configuration: $config_file"
+  fi
+  REMOTE_TRANSPORT=$(jq -r '.transport // "sh"' <<<"$config")
+  [[ $REMOTE_TRANSPORT == sh || $REMOTE_TRANSPORT == node ]] || die "unknown remote transport: $REMOTE_TRANSPORT"
+  [[ -n ${KEEP_PWD:-} ]] || mapped=$(jq -r --arg cwd "$PWD" '[.paths // {} | to_entries | map(.key |= rtrimstr("/")) | .[] | .key as $prefix | select($cwd == $prefix or ($cwd | startswith($prefix + "/")))] | sort_by(.key | length) | last | if . then .value + $cwd[(.key | length):] else empty end' <<<"$config")
+  AGENT_HOME=${SIDECAR_REMOTE_HOME:-$(jq -r '.home // ""' <<<"$config")}
+  local runtime_relative=${SIDECAR_HOME#"$HOME/"}
+  # Checkouts outside our home have no home-relative counterpart; use the conventional checkout layout.
+  [[ $SIDECAR_HOME == "$HOME/"* ]] || runtime_relative=git/claude-sidecar/sidecar
+  WORK_DIR=${REMOTE_CWD:-${mapped:-$PWD}}
+  # A sweep only closes the pane, so it needs no checkout; the sweeper's directory may not exist there.
+  [[ -z ${SWEEPING:-} ]] || WORK_DIR=.
+  # Persist the mapped checkout too: changing settings must not silently move an existing slot.
+  if [[ -n $mapped || $REMOTE_TRANSPORT == node ]]; then REMOTE_CWD=$WORK_DIR; fi
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    local info
+    info=$(remote_node 'const home=os.homedir().replace(/\\/g,"/");
+      if(!fs.existsSync(args[0]) || !fs.statSync(args[0]).isDirectory()) process.exit(12);
+      const root=os.platform()==="win32" ? "C:/" : home+"/";
+      console.log(JSON.stringify({home,windows:os.platform()==="win32",agentHome:args[1] || root+args[2]}));' "$WORK_DIR" "$AGENT_HOME" "$runtime_relative" </dev/null) || die "cannot access checkout $WORK_DIR on $MACHINE_LABEL; check SSH, Node and the machine path mapping"
+    AGENT_HOME=$(jq -r '.agentHome' <<<"$info")
+    [[ $(jq -r '.windows' <<<"$info") != true ]] || TARGET_WINDOWS=1
+    REMOTE_STATE="$(jq -r '.home' <<<"$info")/.cache/claude-sidecar"
+    # A sweep only stops an agent; deploying could overwrite remote runtime edits.
+    [[ -z ${SWEEPING:-} ]] || return 0
+    # Deploy runtime resources, not a checkout or any credentials. Do not rewrite unchanged files: a Windows checkout
+    # holds them with CRLF endings, and rewriting identical content dirties it and blocks sync-machine.
+    local runtime_file
+    for runtime_file in sidecar.ts reviewer.md profile.md implementer.md researcher.md explorer.md reload.mjs windows-runtime.mjs; do
+      remote_node 'const dest=args[0],data=fs.readFileSync(0),lf=b=>b.toString("utf8").replace(/\r\n/g,"\n");fs.mkdirSync(path.dirname(dest),{recursive:true});
+        if(!fs.existsSync(dest)||lf(fs.readFileSync(dest))!==lf(data)){const tmp=dest+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,data);fs.renameSync(tmp,dest);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}}' "$AGENT_HOME/$runtime_file" <"$SIDECAR_HOME/$runtime_file" || die "could not deploy $runtime_file to $MACHINE_LABEL"
+    done
+    return
+  fi
+  # One round trip checks the connection, finds the remote home (it may differ from ours), and confirms what pi needs.
+  local home info status=0
+  info=$(remote 'agent_home=${1:-"$HOME/$3"}
+    printf "%s\n%s\n" "$HOME" "$agent_home"
+    # A sweep ($4) only stops an agent, which needs no runtime files.
+    if [ -z "$4" ]; then
+      test -f "$agent_home/sidecar.ts" && test -f "$agent_home/reviewer.md" && test -f "$agent_home/implementer.md" && test -f "$agent_home/researcher.md" && test -f "$agent_home/explorer.md" || exit 11
+    fi
+    test -d "$2" || exit 12' "$AGENT_HOME" "$WORK_DIR" "$runtime_relative" "${SWEEPING:-}" </dev/null) || status=$?
+  home=${info%%$'\n'*}
+  AGENT_HOME=${info#*$'\n'}
+  case $status in
+    0) ;;
+    11) die "the claude-sidecar plugin is not at $AGENT_HOME on $MACHINE_LABEL; install or sync it there (sidecar sync-machine) or set SIDECAR_REMOTE_HOME to the directory containing sidecar.ts and reviewer.md (not the user home or plugin root)" ;;
+    12) die "$WORK_DIR does not exist on $MACHINE_LABEL; check out the repository there or pass --remote-cwd DIR" ;;
+    *) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH (BatchMode: load its key in ssh-agent). Test: ssh $MACHINE_TARGET true" ;;
+  esac
+  REMOTE_STATE="$home/.cache/claude-sidecar"
+}
+
+# Copies a local file into the machine's request directory and prints its path there.
+publish_file() {
+  local path=$1 name=${2:-} target
+  name=${name:-${1##*/}}
+  target="$REMOTE_STATE/requests/$name"
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'fs.mkdirSync(path.dirname(args[0]),{recursive:true});const tmp=args[0]+"."+process.pid+"."+Math.random().toString(36).slice(2)+".tmp";try{fs.writeFileSync(tmp,fs.readFileSync(0));fs.renameSync(tmp,args[0]);}catch(e){try{fs.unlinkSync(tmp)}catch(_){}throw e}' "$target" <"$path" || die "could not copy $path to $MACHINE_LABEL"
+  else
+    remote 'mkdir -p "${1%/*}" && cat >"$1.tmp" && mv -f "$1.tmp" "$1"' "$target" <"$path" || die "could not copy $path to $MACHINE_LABEL"
+  fi
+  echo "$target"
+}
+
+# Reports are written by the sidecar under its own home, which is on the machine for a remote slot.
+report_exists() {
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'process.exit(fs.existsSync(args[0])&&fs.statSync(args[0]).isFile()?0:1);' "$1" </dev/null
+  elif [[ -n $MACHINE ]]; then remote 'test -f "$1"' "$1" </dev/null; else [[ -f $1 ]]; fi
+}
+
+# First line of a non-empty marker file, or nothing.
+marker_line() {
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'if(fs.existsSync(args[0])){const text=fs.readFileSync(args[0],"utf8");if(text.length)console.log(text.split(/\r?\n/)[0]);}' "$1" </dev/null
+  elif [[ -n $MACHINE ]]; then
+    remote 'if [ -s "$1" ]; then head -n 1 "$1"; fi' "$1" </dev/null
+  elif [[ -s $1 ]]; then
+    head -n 1 "$1"
+  fi
+}
+
+fetch_file() {
+  if [[ $REMOTE_TRANSPORT == node ]]; then
+    remote_node 'process.stdout.write(fs.readFileSync(args[0]));' "$1" </dev/null
+  elif [[ -n $MACHINE ]]; then remote 'cat -- "$1"' "$1" </dev/null; else cat -- "$1"; fi
+}
+
+# Sidecars belong to the Claude pane; numbered slots keep independent context.
+owner_name() {
+  echo "${SIDECAR_AGENT:-sc-$(mux_owner_id | tr 'A-Z:' 'a-z-')}"
+}
+
+agent_name() {
+  local owner
+  owner=$(owner_name)
+  if [[ $SLOT == 1 ]]; then echo "$owner"; else echo "$owner-$SLOT"; fi
+}
+
+# The name the terminal host knows the agent by. Agent names are scoped to one machine, and a Claude on the machine may start its
+# own sidecars there, so remote names carry a short tag of this machine.
+herdr_agent() {
+  local name
+  name=$(agent_name)
+  if [[ -z $MACHINE ]]; then echo "$name"; else echo "sc-$(machine_tag)-${name#sc-}"; fi
+}
+
+machine_tag() {
+  local id
+  if [[ -n ${SIDECAR_MACHINE_TAG:-} ]]; then echo "$SIDECAR_MACHINE_TAG"; return; fi
+  id=$(cat /etc/machine-id 2>/dev/null || hostname)
+  sha256sum <<<"$id" | cut -c1-4
+}
+
+# The pi session is keyed by the Claude session, so a restarted sidecar resumes its context.
+# Numbered slots keep their own marker and otherwise derive from slot 1's session.
+pi_session_id() {
+  local marker owner_marker base
+  marker="$STATE_DIR/$(agent_name).session"
+  owner_marker="$STATE_DIR/$(owner_name).session"
+  # After `stop --fresh`, a generation suffix gives the slot a new session. The SessionStart hook re-exports the
+  # effective id, so an id that already ends with the suffix keeps it once.
+  local fresh="" fresh_file
+  fresh_file="$STATE_DIR/$(agent_name).fresh"
+  if [[ -s $fresh_file ]]; then fresh="-$(head -n 1 "$fresh_file")"; fi
+  if [[ $SLOT == 1 && -n "${SIDECAR_PI_SESSION:-}" ]]; then
+    if [[ -n $fresh && $SIDECAR_PI_SESSION == *"$fresh" ]]; then echo "$SIDECAR_PI_SESSION"; else echo "$SIDECAR_PI_SESSION$fresh"; fi
+  elif [[ -s "$marker" ]]; then
+    head -n 1 "$marker"
+  else
+    base=${SIDECAR_PI_SESSION:-}
+    if [[ -z $base && -s "$owner_marker" ]]; then base=$(head -n 1 "$owner_marker"); fi
+    base=${base:-cc-pane-$(mux_owner_id | tr 'A-Z:' 'a-z-')}
+    if [[ $SLOT != 1 ]]; then base="$base-$SLOT"; fi
+    if [[ -n $fresh && $base == *"$fresh" ]]; then echo "$base"; else echo "$base$fresh"; fi
+  fi
+}
+
+# Verify the actual Windows pane process, not a name reused by a restored bare pi.
+windows_pid() {
+  local processes session wrapper
+  processes=$(mux_processes "$1" pi) || return 1
+  session=$(pi_session_id)
+  if jq -er --arg session "$session" '
+    [.[] | select(
+      .argv as $a | any(range(0; ($a | length) - 1); $a[.] == "--session-id" and $a[. + 1] == $session)) | .pid]
+    | if length == 1 then .[0] else empty end' <<<"$processes"; then
+    return
+  fi
+  # A pi installed as pi.cmd runs under `cmd.exe /c "…pi.cmd --session-id ID …"`: the foreground process is cmd.exe and
+  # its command line is one string. The pi process, whose pid the runtime records, is its node.exe child.
+  wrapper=$(jq -er --arg session "$session" '
+    [.[]
+      | select(((.cmdline // ((.argv // []) | join(" "))) + " ") | contains(" --session-id " + $session + " ")) | .pid]
+    | if length == 1 then .[0] else empty end' <<<"$processes") || return 1
+  run_node 'const out=require("child_process").execFileSync("powershell.exe",["-NoProfile","-NonInteractive","-Command",
+      "Get-CimInstance Win32_Process -Filter \"ParentProcessId="+Number(args[0])+"\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"],
+      {encoding:"utf8",stdio:["ignore","pipe","ignore"]}).trim();
+    let list=out?JSON.parse(out):[];if(!Array.isArray(list))list=[list];
+    const own=list.filter(p=>(p.CommandLine||"").split(/\s+/).some((w,i,a)=>w==="--session-id"&&a[i+1]===args[1]));
+    if(own.length!==1)process.exit(1);console.log(own[0].ProcessId);' "$wrapper" "$session" </dev/null
+}
+
+windows_control() {
+  local action=$1 text=${2:-} report=${3:-} request_id=${4:-} pid options startup_timeout=0
+  if [[ $action == ready ]]; then
+    startup_timeout=${SIDECAR_STARTUP_TIMEOUT_S:-300}
+    [[ $startup_timeout =~ ^[1-9][0-9]*$ ]] || die "SIDECAR_STARTUP_TIMEOUT_S must be a positive integer"
+  fi
+  pid=$(windows_pid "$(herdr_agent)") || die "cannot verify the Windows pi process of this sidecar; nothing was sent"
+  if [[ -z $MACHINE && -n $report ]]; then report=$(cygpath -m "$report"); fi
+  options=$(jq -cn --arg action "$action" --arg session "$(pi_session_id)" --argjson pid "$pid" \
+    --arg report "$report" --arg requestId "$request_id" --argjson progress "$PROGRESS_S" --argjson startupTimeout "$((startup_timeout * 1000))" \
+    '{action:$action,session:$session,pid:$pid,report:$report,requestId:$requestId,progress:$progress,startupTimeout:$startupTimeout}')
+  # Status is a short-lived probe; blocking operations must use Bash's interruptible wait builtin.
+  if [[ $action == status ]]; then
+    { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } |
+      run_node 'eval(fs.readFileSync(0,"utf8"));' "$options"
+    return
+  fi
+  # Install operation cleanup only after admission/slot locks have been acquired. Trapping TERM before a
+  # foreground flock would defer cancellation of lock-waiting commands until another request finished.
+  if [[ -z $ACTIVE_REQUEST ]]; then
+    trap 'stop_prompt' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+  # Feed code/text on stdin without a foreground pipeline that would defer the launcher's signal traps.
+  CONTROL_PROGRAM=$(mktemp "$STATE_DIR/windows-control.XXXXXX")
+  { printf 'const text=%s;\n' "$(jq -cn --arg text "$text" '$text')"; cat "$PLUGIN_ROOT/scripts/windows-control.cjs"; } >"$CONTROL_PROGRAM"
+  NODE_DETACH=1 run_node 'eval(fs.readFileSync(0,"utf8"));' "$options" <"$CONTROL_PROGRAM" 9>&- &
+  PROMPT_PID=$!
+  local result=0
+  wait "$PROMPT_PID" || result=$?
+  PROMPT_PID=
+  rm -f -- "$CONTROL_PROGRAM"
+  CONTROL_PROGRAM=
+  return "$result"
+}
+
+agent_status() {
+  local status runtime
+  status=$(mux_status "$1")
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi && -n $status ]]; then
+    if runtime=$(windows_control status 2>/dev/null); then status=$(jq -r '.status' <<<"$runtime"); else status=unknown; fi
+  fi
+  echo "${status:-missing}"
+}
+
+agent_session_file() { mux_session_file "$1"; }
+
+# True when the pi in the sidecar's pane runs the session this sidecar was started with. herdr relaunches a bare `pi`
+# (no session id, tools or extension) in panes it restores after a reboot; that pi cannot submit reviews.
+agent_runs_sidecar_session() {
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    windows_pid "$1" >/dev/null 2>&1
+    return
+  fi
+  # No session file is published for Claude Code agents; the name and the agent kind are the identity.
+  if [[ $BACKEND == claude ]]; then
+    [[ $(mux_kind "$1") == claude ]]
+    return
+  fi
+  mux_runs_pi_session "$1" "$(pi_session_id)"
+}
+
+# Call while holding the per-agent identity lock. Atomic replacement also
+# protects readers that only need the already-published session identifier.
+publish_session() {
+  local marker
+  marker=$(mktemp "$STATE_DIR/$1.session.XXXXXX")
+  printf '%s\n' "$2" >"$marker"
+  mv -f -- "$marker" "$STATE_DIR/$1.session"
+}
+
+# Records where the slot runs ("local" or the machine's profile ID, then the remote checkout if one was chosen) for
+# later commands. Call under the identity lock: resolve_machine ran earlier, so a concurrent start may have bound the
+# slot elsewhere meanwhile, and that must fail rather than hide the other agent.
+bind_machine() {
+  local file marker want
+  file=$(machine_binding_file)
+  want="${MACHINE:-local}
+${REMOTE_CWD}"
+  if [[ -s $file && $(cat "$file") != "${want%$'\n'}" ]]; then
+    die "slot $SLOT is already bound to $(head -n 1 "$file") (checkout: $(sed -n 2p "$file")); use another slot"
+  fi
+  marker=$(mktemp "$file.XXXXXX")
+  printf '%s\n' "${want%$'\n'}" >"$marker"
+  mv -f -- "$marker" "$file"
+  owner_name >"$STATE_DIR/$(agent_name).owner"
+  mux_owner_id >"$STATE_DIR/$(agent_name).owner-pane"
+  echo "$MUX" >"$STATE_DIR/$(agent_name).mux"
+}
+
+cmd_start() {
+  require_mux
+  ( flock 8; start_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+cmd_restart() {
+  require_mux
+  ( flock 8; restart_unlocked "$@"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+# No session is published for Claude agents, so before a destructive action prove the pane's Claude runs this slot's
+# conversation: its foreground process must carry the slot's UUID. Other backends are already verified by session.
+owns_pane_process() {
+  [[ $BACKEND == claude ]] || return 0
+  local uuid
+  uuid=$(claude_session_uuid)
+  mux_processes "$1" 2>/dev/null | jq -e --arg uuid "$uuid" '
+    any(.[]; .argv as $a |
+      any(range(0; ($a | length) - 1); ($a[.] == "--session-id" or $a[.] == "--resume") and $a[. + 1] == $uuid))' >/dev/null
+}
+
+# Stops the slot's agent by closing its pane. Everything the next start needs stays: the session record, role, agent and
+# machine binding, so the next request resumes the conversation. --fresh forgets the session instead.
+cmd_stop() {
+  local force="" fresh="" all="" arg slot code=0 file
+  for arg in "$@"; do
+    case $arg in
+      --force) force=1 ;;
+      --fresh) fresh=1 ;;
+      --all) all=1 ;;
+      *) die "usage: sidecar [--slot N] stop [--force] [--fresh] [--all]" ;;
+    esac
+  done
+  if [[ -n $all ]]; then
+    require_identity
+    local owner flags=()
+    owner=$(owner_name)
+    [[ -z $force ]] || flags+=(--force)
+    [[ -z $fresh ]] || flags+=(--fresh)
+    shopt -s nullglob
+    for file in "$STATE_DIR/$owner.agent" "$STATE_DIR/$owner"-*.agent; do
+      slot=${file##*/}
+      slot=${slot%.agent}
+      if [[ $slot == "$owner" ]]; then slot=1; else slot=${slot#"$owner"-}; fi
+      [[ $slot =~ ^[1-9][0-9]*$ ]] || continue
+      "$0" --slot "$slot" stop "${flags[@]}" || code=$?
+    done
+    return "$code"
+  fi
+  local PROFILE_RESET=$fresh
+  require_mux
+  ( flock 8; stop_unlocked "$force" "$fresh"; ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+stop_unlocked() {
+  local force=$1 fresh=$2 name hname pane
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  resolve_backend
+  exec 9>"$STATE_DIR/$name.lock"
+  if ! flock -n 9; then
+    if [[ -z $force ]]; then
+      echo "sidecar: $hname is handling a request; wait for it or use stop --force" >&2
+      exit 7
+    fi
+    echo "sidecar: stopping $hname during a request (--force); that request will end without a report" >&2
+  fi
+  if [[ ${3:-} == sweep ]]; then
+    sweep_eligible "$name" "$hname" || return 0
+  fi
+  if [[ $(agent_status "$hname") == missing ]]; then
+    echo "$hname is not running"
+  elif agent_runs_sidecar_session "$hname" && owns_pane_process "$hname"; then
+    # Every later check and the close act on this location: the name may move to another agent meanwhile.
+    pane=$(mux_locate "$hname") || die "cannot find the pane of $hname"
+    if [[ ${3:-} == sweep ]]; then
+      # Refresh live state after the session checks, which can take time.
+      [[ $(agent_status "$hname") == @(idle|done) ]] || return 0
+      mux_unfocused "$pane" || return 0
+    fi
+    mux_close "$pane" || die "could not close pane $pane of $hname"
+    echo "$hname stopped (closed $pane)"
+  else
+    # Another session took the pane over; it is not ours to close.
+    echo "$hname: its pane runs $(agent_session_file "$hname"), not the sidecar session; left it running" >&2
+  fi
+  mux_forget "$name"
+  if [[ -n $fresh ]]; then
+    {
+      flock 7
+      # Preserve baseline unprofiled machine/check/question bindings. A profiled reset,
+      # or an explicit --profile-file rebind, may clear the expanded Fleet identity.
+      rm -f -- "$STATE_DIR/$name.claude-started" "$STATE_DIR/$name.session" "$STATE_DIR/$name.keep"
+      if [[ -f "$STATE_DIR/$name.profile.json" || -n $PROFILE_ARG ]]; then
+        rm -f -- "$STATE_DIR/$name.profile.json" "$STATE_DIR/$name.profile.sha256" "$STATE_DIR/$name.profile-prompt.md" \
+          "$STATE_DIR/$name.cwd" "$STATE_DIR/$name.machine" "$STATE_DIR/$name.startup.json" \
+          "$STATE_DIR/$name.checks.json" "$STATE_DIR/$name.pending"
+      fi
+      printf 'f%s\n' "$(date +%s%N)" >"$STATE_DIR/$name.fresh"
+      : >"$STATE_DIR/$name.profile-fresh"
+    } 7>"$STATE_DIR/$name.identity.lock"
+    echo "$hname: the next start begins a new $BACKEND session"
+  fi
+  : >"$STATE_DIR/$name.stopped"
+}
+
+cmd_reload() {
+  require_mux
+  [[ $# == 0 ]] || die "usage: sidecar reload"
+  [[ $BACKEND == pi ]] || die "reload applies to pi sidecars only; use restart"
+  local name hname session session_file dir id mode native_reload=
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  # Keep the existing ask's launcher and report channel intact: it releases this lock only after reading its report.
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  [[ $(agent_status "$hname") != missing ]] || die "no running sidecar to reload; use start first"
+  agent_runs_sidecar_session "$hname" || die "$hname does not run this sidecar session; use restart first"
+  session=$(pi_session_id)
+  dir="${REMOTE_STATE:-$STATE_DIR}/reload"
+  if [[ -n $TARGET_WINDOWS ]]; then
+    local pid
+    pid=$(windows_pid "$hname") || die "cannot verify the Windows process for reload"
+    if windows_control status >/dev/null 2>&1; then
+      windows_control wait
+      native_reload=1
+    else
+      echo "sidecar: upgrading an older Windows runtime through $MUX_CLI; if it is busy, retry reload once its work finishes" >&2
+    fi
+    if [[ -z $MACHINE ]]; then dir=$(cygpath -m "$dir"); fi
+    # Older Windows runtimes already publish reload receipts. Verify against the pane's actual native PID.
+    session_file=$(run_node 'const ready=JSON.parse(fs.readFileSync(path.join(args[0],args[1]+".ready"),"utf8"));
+      if(ready.pid!==Number(args[2]))throw Error("reload receiver is not the process in this pane");
+      console.log(ready.sessionFile);' "$dir" "$session" "$pid" </dev/null) || die "cannot verify the Windows reload receiver"
+  else
+    wait_until_ready "$hname"
+    session_file=$(agent_session_file "$hname")
+  fi
+  [[ -n $session_file ]] || die "cannot verify the sidecar session file for reload"
+  id="reload-$(date +%s)-$$-$RANDOM"
+  mode=$(run_node 'const norm=s=>{s=String(s||"").replace(/\\/g,"/");return /^[A-Za-z]:/.test(s)?s.toLowerCase():s};
+    if(!/^[A-Za-z0-9._-]+$/.test(args[1]))throw Error("invalid session id");
+    fs.mkdirSync(args[0],{recursive:true});
+    const p=path.join(args[0],args[1]+".pending"),tmp=p+"."+args[2]+".tmp";
+    fs.writeFileSync(tmp,JSON.stringify({id:args[2],sessionFile:args[3]}));fs.renameSync(tmp,p);
+    let ready;try{ready=JSON.parse(fs.readFileSync(path.join(args[0],args[1]+".ready"),"utf8"))}catch(e){}
+    let live=false;if(ready)try{process.kill(ready.pid,0);live=true}catch(e){live=e.code==="EPERM"}
+    console.log(live&&norm(ready.sessionFile)===norm(args[3])?"command":"bootstrap");' "$dir" "$session" "$id" "$session_file" </dev/null)
+  # Built-in /reload bootstraps old runtime versions after the same idle/request guard. New versions additionally
+  # wait through compaction/preparation with documented ExtensionCommandContext.waitForIdle().
+  if [[ $mode == command && -n $native_reload ]]; then
+    windows_control reload "/sidecar-reload $id" >/dev/null
+  elif [[ $mode == command ]]; then
+    mux_prompt "$hname" "/sidecar-reload $id" || true
+  else
+    mux_prompt "$hname" "/reload" || true
+  fi
+  if ! run_node 'const ack=path.join(args[0],args[2]+".ack"),pending=path.join(args[0],args[1]+".pending");
+    (async()=>{
+      for(let end=Date.now()+Number(args[3]);Date.now()<end&&!fs.existsSync(ack);)await new Promise(r=>setTimeout(r,100));
+      if(!fs.existsSync(ack)){
+        try{if(JSON.parse(fs.readFileSync(pending,"utf8")).id===args[2])fs.unlinkSync(pending)}catch(e){}
+        console.error("reload was not confirmed; check the pane before retrying (request/report files are unchanged)");process.exit(1)
+      }
+      const reply=JSON.parse(fs.readFileSync(ack,"utf8"));fs.unlinkSync(ack);
+      if(reply.status!=="reloaded")process.exit(1);
+    })().catch(e=>{console.error(String(e));process.exit(1)});' "$dir" "$session" "$id" "$(("${SIDECAR_RELOAD_TIMEOUT_S:-30}" * 1000))" </dev/null; then
+    die "could not confirm reload of $hname"
+  fi
+  echo "$hname reloaded between requests; session and pending answers preserved"
+}
+
+# These helpers run with the startup lock held; recursive calls keep that lock.
+start_unlocked() {
+  require_mux
+  local name hname session pane
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  {
+    flock 7
+    profile_input_unlocked
+    profile_check_unlocked
+    profile_bind_unlocked
+    session=$(pi_session_id)
+    publish_session "$name" "$session"
+    bind_machine
+    resolve_role
+    resolve_backend
+    profile_startup_unlocked
+    if [[ ! -f "$STATE_DIR/$name.role" || ( -n $PROFILE_JSON && -f "$STATE_DIR/$name.profile-fresh" ) ]]; then
+      printf '%s\n' "$ROLE" >"$STATE_DIR/$name.role"
+    fi
+    if [[ ! -f "$STATE_DIR/$name.agent" ]]; then
+      printf '%s\n' "$BACKEND" >"$STATE_DIR/$name.agent"
+    fi
+  } 7>"$STATE_DIR/$name.identity.lock"
+  rm -f -- "$STATE_DIR/$name.stopped"
+  if [[ $(agent_status "$hname") != missing ]]; then
+    if agent_runs_sidecar_session "$hname"; then
+      if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then windows_control ready >/dev/null || return $?; fi
+      echo "$hname already running"
+    else
+      restart_unlocked
+    fi
+    return
+  fi
+  local PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/reviewer.md")
+  if [[ $ROLE != reviewer ]]; then
+    PROFILE_LAUNCH_ARGS=(-e "$AGENT_HOME/sidecar.ts" --append-system-prompt "$AGENT_HOME/profile.md" --append-system-prompt "$AGENT_HOME/$ROLE.md")
+  fi
+  if [[ -n $PROFILE_JSON ]]; then profile_launch_args || die "could not prepare role profile launch"; fi
+  # Pi discovers .pi/skills and .agents/skills itself; Claude Code repositories keep theirs in .claude/skills.
+  local repo_root
+  if [[ -z $PROFILE_JSON && -z $MACHINE ]] && repo_root=$(git rev-parse --show-toplevel 2>/dev/null) && [[ -d $repo_root/.claude/skills ]]; then
+    PROFILE_LAUNCH_ARGS+=(--skill "$repo_root/.claude/skills")
+  fi
+  # A subsequent generic start is a real unprofiled conversation, not permission to adopt it later.
+  rm -f -- "$STATE_DIR/$name.profile-fresh"
+  if [[ $BACKEND == claude ]]; then
+    start_claude "$hname" "${1:-}" "$name"
+    return
+  fi
+  pane=$(mux_launch "$hname" pi "${1:-}" --session-id "$session" -n claude-sidecar \
+    --model "$MODEL" --thinking "$THINKING" "${PROFILE_LAUNCH_ARGS[@]}") || exit 1
+  # The host can detect Pi before asynchronous session_start handlers publish the receiver.
+  if [[ -n $TARGET_WINDOWS ]]; then windows_control ready >/dev/null || return $?; fi
+  echo "$hname started in $pane (pi session $session)"
+}
+
+# Starts a Claude Code agent in PANE (empty: a new one). The first start creates the session; later ones resume it.
+start_claude() {
+  local hname=$1 pane=$2 name=$3 uuid model session_flag=--session-id started="$STATE_DIR/$3.claude-started" prompt role
+  uuid=$(claude_session_uuid)
+  model=${SIDECAR_CLAUDE_MODEL:-opus}
+  [[ $ROLE == reviewer ]] || model=${SIDECAR_CLAUDE_MODEL:-sonnet}
+  if [[ -f $started ]]; then session_flag=--resume; fi
+  # Herdr refuses multi-line agent arguments, so the prompt travels as a file, read where the agent runs.
+  prompt="$STATE_DIR/$name.claude-prompt.md"
+  mapfile -t role < <(role_prompt_files)
+  cat "${role[@]}" "$SIDECAR_HOME/claude-delivery.md" >"$prompt"
+  if [[ -n $MACHINE ]]; then prompt=$(publish_file "$prompt") || die "could not copy the Claude prompt to $MACHINE_LABEL"; fi
+  local permission=()
+  if [[ -n ${SIDECAR_CLAUDE_PERMISSION_MODE:-} ]]; then permission=(--permission-mode "$SIDECAR_CLAUDE_PERMISSION_MODE"); fi
+  pane=$(mux_launch "$hname" claude "$pane" "$session_flag" "$uuid" -n claude-sidecar --model "$model" \
+    --effort "$THINKING" "${permission[@]}" --append-system-prompt-file "$prompt") || exit 1
+  : >"$started"
+  echo "$hname started in $pane (claude session $uuid)"
+}
+
+# Preserve a foreign session under another name and resume the sidecar in a new pane.
+restart_unlocked() {
+  require_mux
+  local name hname other
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  if [[ $(agent_status "$hname") == missing ]] || agent_runs_sidecar_session "$hname"; then
+    start_unlocked
+    return
+  fi
+  other="$hname-other-$(date +%H%M%S)"
+  mux_rename "$hname" "$other" || die "could not rename $hname"
+  # The renamed agent still owns its pane; allocate a different one.
+  mux_forget "$name"
+  echo "$hname: the agent in that pane runs $(agent_session_file "$other"), not the sidecar session; left it running as $other and starting the sidecar in a new pane" >&2
+  start_unlocked
+}
+
+# SessionStart hook: publish the sidecar identity to this Claude session's
+# Bash environment. Panes and agents are created only by the first request.
+cmd_session_start() {
+  local input sid ancestry=0
+  input=$(cat)
+  [[ -n $MUX ]] || exit 0
+  local dependency
+  for dependency in "$MUX_CLI" jq flock; do
+    if ! type -P "$dependency" >/dev/null 2>&1; then
+      echo "sidecar: missing dependency $dependency; skipping startup" >&2
+      exit 0
+    fi
+  done
+  if ! command -v pi >/dev/null 2>&1 && ! command -v claude >/dev/null 2>&1; then
+    echo "sidecar: missing agent CLI (pi or claude); skipping startup" >&2
+    exit 0
+  fi
+  interactive_claude_owner || ancestry=$?
+  (( ancestry != 1 )) || return 0
+  sid=$(jq -r '.session_id // empty' <<<"$input")
+  [[ -n "$sid" ]] || exit 0
+  export SIDECAR_AGENT SIDECAR_PI_SESSION
+  SIDECAR_AGENT=$(agent_name)
+  # Publish identity atomically, including while detached startup is pending.
+  # A separate short-lived lock keeps /clear from waiting for pane startup.
+  {
+    flock 7
+    rm -f -- "$STATE_DIR/$SIDECAR_AGENT.ended"
+    if (( ancestry == 0 )); then
+      printf '%s\n' "$sid" >"$STATE_DIR/$SIDECAR_AGENT.claude-owner-session"
+    else
+      rm -f -- "$STATE_DIR/$SIDECAR_AGENT.claude-owner-session"
+    fi
+    if [[ -s "$STATE_DIR/$SIDECAR_AGENT.session" ]]; then
+      SIDECAR_PI_SESSION=$(<"$STATE_DIR/$SIDECAR_AGENT.session")
+    else
+      SIDECAR_PI_SESSION="cc-$sid"
+    fi
+    publish_session "$SIDECAR_AGENT" "$SIDECAR_PI_SESSION"
+    if [[ -n "${CLAUDE_ENV_FILE:-}" ]]; then
+      printf 'export SIDECAR_AGENT=%q SIDECAR_PI_SESSION=%q\n' "$SIDECAR_AGENT" "$SIDECAR_PI_SESSION" >>"$CLAUDE_ENV_FILE"
+    fi
+  } 7>"$STATE_DIR/$SIDECAR_AGENT.identity.lock"
+  schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
+  jq -n --arg machines "$(machine_guidance)" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext:
+    ("Persistent pi and Claude Code sidecars are available on demand in Herdr; none is started at startup. Follow the claude-sidecar:sidecar-review skill and drive them with the mcp__claude-sidecar__sidecar tool, one call per request; each result arrives as a message. Requests start their sidecar automatically. Use --slot N before a command for independent parallel sidecars; reuse that slot for follow-ups and answers." + $machines)}}'
+}
+
+# 0: identified interactive owner; 1: excluded Claude; 2: ancestry unavailable or unidentified.
+interactive_claude_owner() {
+  local pid argv i executable script
+  # Tests can bound the walk without depending on the invoking agent's ancestors.
+  pid=${SIDECAR_TEST_ANCESTRY_PID:-$PPID}
+  [[ $pid =~ ^[0-9]+$ ]] || return 2
+  while (( pid > 1 )); do
+    mapfile -d '' argv <"/proc/$pid/cmdline" 2>/dev/null || argv=()
+    executable=${argv[0]:-}
+    executable=${executable//\\//}
+    executable=${executable,,}
+    executable=${executable##*/}
+    script=${argv[1]:-}
+    script=${script//\\//}
+    script=${script,,}
+    # Normalize native Windows names and npm CLI paths before classifying the nearest Claude.
+    if [[ $executable == claude || $executable == claude.exe ||
+          ( ( $executable == node || $executable == node.exe ) &&
+            ( ${script##*/} == claude || ${script##*/} == claude.exe || $script == */claude-code/cli.js ) ) ]]; then
+      for ((i = 1; i < ${#argv[@]}; i++)); do
+        [[ ${argv[i]} == -p || ${argv[i]} == --print || ${argv[i]} == --print=* ]] && return 1
+        # A Claude sidecar (see start_claude) must not start sidecars of its own.
+        [[ ( ${argv[i]} == -n || ${argv[i]} == --name ) && ${argv[i + 1]:-} == claude-sidecar ||
+           ${argv[i]} == --name=claude-sidecar ]] && return 1
+      done
+      return 0
+    fi
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+  done
+  return 2
+}
+
+# Names the enabled saved machines so "run it on the laptop" maps to a label. Empty when herdr cannot list them (older
+# than 0.9) or has none; bounded because the hook has a short deadline.
+machine_guidance() {
+  local list
+  list=$(mux_list_machines 5 | jq -r '[.[] | select(.enabled == true) | if .label == .target then .label else "\(.label) (\(.target))" end] | join(", ")' 2>/dev/null) || return 0
+  [[ -n $list ]] || return 0
+  echo " Use --machine NAME before a command to run that slot's sidecar on a saved $MUX_CLI machine, only when the user asks; the slot then stays on that machine, and edits it makes land in that machine's checkout. Saved machines: $list."
+}
+
+# Wait until the sidecar can take a prompt; the human may be talking to it.
+wait_until_ready() {
+  local name=$1 status
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    if [[ $(agent_status "$name") == missing ]]; then
+      cmd_start >&2 || return $?
+    else
+      # Retrying an existing pane must wait too: an earlier caller may have timed out during startup.
+      windows_control ready >/dev/null || return $?
+    fi
+    # The request lock serializes requests. The native channel can queue behind an existing turn safely.
+    return
+  fi
+  status=$(agent_status "$name")
+  if [[ $status == missing ]]; then
+    cmd_start >&2
+    status=$(agent_status "$name")
+  fi
+  if [[ $status == working || $status == unknown ]]; then
+    mux_wait "$name" "$REVIEW_TIMEOUT_MS" >/dev/null || true
+    status=$(agent_status "$name")
+  fi
+  if [[ $status != missing ]] && ! agent_runs_sidecar_session "$name"; then
+    cmd_restart >&2
+    status=$(agent_status "$name")
+    if [[ $status == working || $status == unknown ]]; then
+      mux_wait "$name" "$REVIEW_TIMEOUT_MS" >/dev/null || true
+      status=$(agent_status "$name")
+    fi
+  fi
+  case $status in
+    idle|done) ;;
+    blocked) die "$name is blocked on a question or approval in its pane; ask the user to handle it" ;;
+    *) die "$name is not ready (status: $status)" ;;
+  esac
+}
+
+send() {
+  local name=$1 text=$2 timeout=$3
+  mux_prompt_wait "$name" "$text" "$timeout"
+}
+
+cmd_note() {
+  require_mux
+  [[ $# -ge 1 ]] || die "usage: sidecar note TEXT"
+  local name hname
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  wait_until_ready "$hname"
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    windows_control note "[note] $*"
+  else
+    send "$hname" "[note] $*" "$NOTE_TIMEOUT_MS"
+  fi
+  echo "noted"
+}
+
+# Returns once the report exists, the sidecar is blocked in its pane, or it stays settled without a report
+# (an aborted turn, failed compaction, or a forgotten submit_review).
+await_report() {
+  local name=$1 report=$2 status
+  while ! report_exists "$report"; do
+    status=$(agent_status "$name")
+    case $status in
+      working|unknown) mux_wait "$name" >/dev/null 2>&1 || sleep 5 ;;
+      blocked)
+        echo "sidecar: $name is blocked on a question or approval in its pane; ask the user to handle it" >&2
+        exit 5 ;;
+      *)
+        sleep "$SETTLE_GRACE_S"
+        if report_exists "$report" || [[ $(agent_status "$name") == working ]]; then continue; fi
+        return 0 ;;
+    esac
+  done
+}
+
+PROMPT_PID=
+CONTROL_PROGRAM=
+# shellcheck disable=SC2329  # run from the EXIT trap
+stop_prompt() {
+  [[ -z $PROGRESS_TIMER ]] || kill "$PROGRESS_TIMER" 2>/dev/null || true
+  if [[ -n $PROMPT_PID ]]; then
+    # Signal the client group only when setsid created one. Git Bash needs only the exec'd native client PID.
+    if command -v setsid >/dev/null 2>&1; then kill -TERM -- "-$PROMPT_PID" 2>/dev/null || true; fi
+    kill "$PROMPT_PID" 2>/dev/null || true
+    wait "$PROMPT_PID" 2>/dev/null || true
+  fi
+  [[ -z $CONTROL_PROGRAM ]] || rm -f -- "$CONTROL_PROGRAM"
+}
+
+# Waits for the background prompt PID. A request can run for hours, so every PROGRESS_S seconds it prints how long
+# the sidecar has been working and the last line of its pane.
+wait_with_progress() {
+  local pid=$1 name=$2 id=$3 start=$SECONDS elapsed last
+  # Block in the interruptible `wait` builtin; a timer job only wakes it for progress lines.
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( PROGRESS_S <= 0 )); then break; fi
+    # The timer must not inherit the slot or coop locks, or a killed launcher would hold them until it fires.
+    # Background jobs ignore SIGINT here, so stop_prompt kills it and it holds no output pipe.
+    sleep "$PROGRESS_S" >/dev/null 2>&1 9>&- 8>&- 7>&- &
+    PROGRESS_TIMER=$!
+    wait -n "$pid" "$PROGRESS_TIMER" 2>/dev/null || true
+    if kill -0 "$PROGRESS_TIMER" 2>/dev/null; then
+      kill "$PROGRESS_TIMER" 2>/dev/null; wait "$PROGRESS_TIMER" 2>/dev/null || true; PROGRESS_TIMER=; break
+    fi
+    wait "$PROGRESS_TIMER" 2>/dev/null || true
+    PROGRESS_TIMER=
+    kill -0 "$pid" 2>/dev/null || break
+    elapsed=$((SECONDS - start))
+    last=$(mux_read "$name" 20 2>/dev/null | tr -d '\000-\010\013-\037' | awk 'NF && !/ │ / {l=$0} END {print substr(l, 1, 120)}' || true)
+    echo "sidecar: $id still working ($((elapsed / 60))m$((elapsed % 60))s)${last:+; last output: $last}" >&2
+  done
+  PROMPT_STATUS=0
+  wait "$pid" || PROMPT_STATUS=$?
+}
+
+PROMPT_STATUS=
+# Once an answer reached the sidecar, mark its question answered; the band stops showing it. The file stays so an answer
+# whose turn ends without a report can be retried. An answer the host refused leaves the question open.
+mark_answered() {
+  local kind=$1 name=$2 id=$3 tmp
+  [[ $kind == answer ]] && jq -e 'type == "object"' "$STATE_DIR/$name.pending" >/dev/null 2>&1 || return 0
+  tmp=$(mktemp "$STATE_DIR/$name.pending.XXXXXX")
+  jq --arg id "$id" '.answered = $id' "$STATE_DIR/$name.pending" >"$tmp"
+  mv -f -- "$tmp" "$STATE_DIR/$name.pending"
+}
+
+# Appended to every request of a remote slot: the sidecar cannot see Claude's machine.
+remote_notice() {
+  cat <<EOF
+
+## Where you run
+You run on the machine \`$MACHINE_LABEL\`, not on Claude's. Work in \`$WORK_DIR\` there (Claude's same directory is \`$PWD\`). Files this request names were copied to this machine. Edits and commits you make land in this machine's checkout, not in Claude's.
+EOF
+}
+
+# For a remote plan or diff: Claude's commits and uncommitted state need not exist in the machine's checkout. Takes
+# Claude's HEAD and, for a diff, the review base; the surrounding code to read is the code at HEAD, not at the base.
+remote_checkout_note() {
+  local head=${1:-} base=${2:-} lack="that commit"
+  [[ -n $MACHINE ]] || return 0
+  if [[ -n $base ]]; then lack="either of them"; fi
+  if [[ -n $head ]]; then
+    echo "Claude's checkout is at commit \`$head\`${base:+ and the review base is commit \`$base\`}. The checkout on this machine may lack $lack; \`git fetch\` there if \`git cat-file -e $head\`${base:+ or \`git cat-file -e $base\`} fails, then inspect \`$head\` read-only (\`git show $head:PATH\`, \`git diff${base:+ $base} $head\`, \`git grep -e PATTERN $head\`) instead of trusting what is checked out, which may be older. It does not contain Claude's uncommitted or untracked changes, which exist only in the files named above. Never run git checkout, reset or stash in that checkout to reach a state; use those read-only commands or a separate \`git worktree\`."
+  else
+    echo "The checkout on this machine may differ from Claude's and does not contain Claude's uncommitted changes. Never run git checkout, reset or stash in it to reach a state; use a separate \`git worktree\`."
+  fi
+}
+
+# Saved reports are local even for remote slots, so recovery never needs a working SSH connection.
+# A printed marker means stdout accepted the full report, not that the orchestrator or a human read it.
+print_saved_report() {
+  local report=$1 question
+  [[ -f $report ]] || die "no saved report at $report; use sidecar --slot $SLOT wait for an active request"
+  question=
+  if [[ -s ${report%.md}.needs-answer ]]; then
+    IFS= read -r question <"${report%.md}.needs-answer" || true
+  fi
+  [[ -z $question ]] || echo "NEEDS_ANSWER: $question"
+  cat -- "$report" || return $?
+  date +%s >"${report%.md}.printed"
+}
+
+# Atomically finish the request's persistent status on every exit, including failures and signals.
+# Takes the slot's request lock on descriptor 9, queueing behind a running request; exit 4 when HASH is already in flight.
+lock_slot() {
+  local hash=$1 name
+  name=$(agent_name)
+  exec 9>"$STATE_DIR/$name.lock"
+  if ! flock -n 9; then
+    [[ -z ${SIDECAR_NO_QUEUE:-} ]] || die "slot $SLOT is busy with another request"
+    if [[ -n $hash && -s "$STATE_DIR/$name.inflight" && $(<"$STATE_DIR/$name.inflight") == "$hash" ]]; then
+      echo "sidecar: an identical request is already in flight; not queueing a duplicate" >&2
+      exit 4
+    fi
+    echo "sidecar: another request is in flight; waiting for it" >&2
+    flock 9
+  fi
+  # Also protect callers that update acceptance checks before entering request().
+  { flock 7; validate_generation_unlocked; } 7>"$STATE_DIR/$name.identity.lock"
+}
+
+finish_request() {
+  local code=$1 tmp
+  [[ -n $ACTIVE_REQUEST ]] || return 0
+  tmp=$(mktemp "$ACTIVE_REQUEST.XXXXXX")
+  jq --argjson finished "$(date +%s)" --argjson code "$code" \
+    '. + {finished: $finished, exit_code: $code}' "$ACTIVE_REQUEST" >"$tmp"
+  mv -f -- "$tmp" "$ACTIVE_REQUEST"
+  ACTIVE_REQUEST=
+  [[ $code != 0 ]] || schedule_done_close
+}
+
+# Sends a request and prints the submitted report. Exit codes: 0 report delivered, 2 no report,
+# 3 the sidecar is blocked on a question (`NEEDS_ANSWER: ...`; reply with `sidecar answer`),
+# 4 an identical request is already in flight, 5 the sidecar is blocked in its pane.
+request() {
+  local kind=$1 body=$2 lock_mode=${3:-acquire} name hname id req report status hash question prompt_path
+  name=$(agent_name)
+  hname=$(herdr_agent)
+  # An ask that changes checks identifies itself by its arguments (REQUEST_KEY), since its body depends on the checks.
+  hash=${REQUEST_KEY:-$(sha256sum <<<"$body" | cut -d' ' -f1)}
+  # The idle-steer caller already holds descriptor 9 so its idle decision and request are serialized together.
+  [[ $lock_mode != acquire ]] || lock_slot "$hash"
+  # A slot may have been rebound while this request waited for the lock.
+  { flock 7; validate_generation_unlocked; profile_input_unlocked; profile_check_unlocked; } 7>"$STATE_DIR/$name.identity.lock"
+  resolve_backend
+  INFLIGHT="$STATE_DIR/$name.inflight"
+  printf '%s\n' "$hash" >"$INFLIGHT"
+  # The background prompt must not outlive the launcher (Ctrl-C leaves it running otherwise).
+  trap 'code=$?; finish_request "$code"; rm -f -- "$INFLIGHT"; stop_prompt' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  req=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-$kind-$name.XXXXXX.md")
+  id=${req##*/}
+  id=${id%.md}
+  local saved_report="$REPORT_DIR/$id.md" state_tmp
+  report=$saved_report
+  # Print the durable LOCAL path before startup, upload or waiting, not only at completion.
+  echo "# Sidecar report ($saved_report)"
+  ACTIVE_REQUEST="$STATE_DIR/$name.request.json"
+  state_tmp=$(mktemp "$ACTIVE_REQUEST.XXXXXX")
+  # The band shows the machine by its label.
+  jq -n --arg id "$id" --arg report "$saved_report" --argjson started "$(date +%s)" --arg machine "${MACHINE_LABEL:-}" \
+    '{id: $id, report: $report, started: $started} + (if $machine == "" then {} else {machine: $machine} end)' >"$state_tmp"
+  mv -f -- "$state_tmp" "$ACTIVE_REQUEST"
+  prompt_path=$req
+  if [[ -n $MACHINE ]]; then
+    body+="
+$(remote_notice)"
+    report="$REMOTE_STATE/reports/$id.md"
+  fi
+  printf '%s\n' "$body" >"$req"
+  # The sidecar reads the request where it runs, and writes its report under its own home.
+  if [[ -n $MACHINE ]]; then prompt_path=$(publish_file "$req"); fi
+  wait_until_ready "$hname"
+  # Requests may run for hours: wait without a deadline until a report arrives or the sidecar settles without one.
+  local finish="Finish by calling submit_review with request_id $id."
+  if [[ $BACKEND == claude ]]; then
+    finish="Finish by writing your report to $report with the Write tool; for a blocking question, first write it to ${report%.md}.needs-answer."
+  fi
+  if [[ -n $TARGET_WINDOWS && $BACKEND == pi ]]; then
+    if [[ -z $MACHINE ]]; then prompt_path=$(cygpath -m "$prompt_path"); fi
+    local result=0
+    windows_control request "[request $id] Read $prompt_path and do what it asks. $finish" "$report" "$id" || result=$?
+    [[ $result == 0 || $result == 2 ]] || exit "$result"
+    mark_answered "$kind" "$name" "$id"
+  else
+    mux_prompt_detached "$hname" "[request $id] Read $prompt_path and do what it asks. $finish" >/dev/null 9>&- &
+    PROMPT_PID=$!
+    wait_with_progress "$PROMPT_PID" "$hname" "$id"
+    PROMPT_PID=
+    # The client exits 0 only once the host took the prompt.
+    if [[ $PROMPT_STATUS == 0 ]]; then mark_answered "$kind" "$name" "$id"; fi
+    await_report "$hname" "$report"
+  fi
+  if report_exists "$report"; then
+    question=$(marker_line "${report%.md}.needs-answer")
+    if [[ -n $MACHINE ]]; then
+      # Fetch completely before exposing the local report; a failed transfer must not look complete.
+      local copy
+      copy=$(mktemp "$saved_report.XXXXXX")
+      fetch_file "$report" >"$copy" || { rm -f -- "$copy"; die "could not save report from $MACHINE_LABEL: $report"; }
+      mv -f -- "$copy" "$saved_report"
+      [[ -z $question ]] || printf '%s\n' "$question" >"${saved_report%.md}.needs-answer"
+    fi
+    rejections_parse "$saved_report"
+    if [[ -z $question && ( $kind == ask || $kind == answer ) ]] && checks_match_request; then
+      echo "sidecar: running launcher checks" >&2
+      run_checks "$saved_report"
+    fi
+    state_tmp=$(mktemp "$STATE_DIR/$name.report.XXXXXX")
+    printf '%s\n' "$saved_report" >"$state_tmp"
+    mv -f -- "$state_tmp" "$STATE_DIR/$name.report"
+    if [[ -n $question ]]; then
+      state_tmp=$(mktemp "$STATE_DIR/$name.pending.XXXXXX")
+      jq -n --arg id "$id" --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+        '{id:$id,generation:{session:$session,fresh:$fresh}}' >"$state_tmp"
+      mv -f -- "$state_tmp" "$STATE_DIR/$name.pending"
+    else
+      rm -f -- "$STATE_DIR/$name.pending"
+    fi
+    [[ -z $MACHINE ]] || echo "# Sidecar report ($MACHINE_LABEL:$report)"
+    if [[ -n $question ]]; then
+      print_saved_report "$saved_report"
+      echo "sidecar: blocked on a question; reply with: sidecar --slot $SLOT answer TEXT" >&2
+      exit 3
+    fi
+    print_saved_report "$saved_report"
+    finish_request 0
+    return
+  fi
+  status=$(agent_status "$hname")
+  echo "sidecar: no report submitted for $id (status: $status). Recent pane output:" >&2
+  mux_read "$hname" 60 >&2 || true
+  if ! agent_runs_sidecar_session "$hname"; then
+    echo "sidecar: $hname runs a different session '$(agent_session_file "$hname")'; run: sidecar restart" >&2
+  fi
+  if [[ -n $MACHINE ]]; then
+    echo "sidecar: $MACHINE_LABEL may also be unreachable; check: ssh $MACHINE_TARGET true" >&2
+  fi
+  exit 2
+}
+
+cmd_plan() {
+  require_mux
+  [[ $# -ge 1 && -f "$1" ]] || die "usage: sidecar plan FILE [CONTEXT]"
+  local file copy sha=
+  file=$(realpath "$1")
+  if [[ -n $MACHINE ]]; then
+    sha=$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)
+    # Requests of one slot are serialized later, so each upload gets its own unique name.
+    copy=$(mktemp "$REQUEST_DIR/$(date +%Y%m%d-%H%M%S)-planfile-$(agent_name).XXXXXX.md")
+    cp -- "$file" "$copy"
+    file=$(publish_file "$copy")
+  fi
+  request plan "# Plan review
+
+Review the plan in \`$file\` before implementation starts.
+$(remote_checkout_note "$sha")
+
+Look for: wrong assumptions about the existing code, missing steps or cases, ownership/lifecycle/concurrency problems, conflicts with ADRs and documented contracts, ordering mistakes, and simpler alternatives that would clearly be better. Verify claims against the repository.
+
+Flag every claim about performance, cost or frequency (a speedup, frame time, memory, \"hot path\", \"rarely happens\") that cites no measurement, profile or capture, and name the measurement that would settle it.
+
+## Context from Claude
+${2:-(none)}"
+}
+
+# One line per path that differs from BASE: its escaped name, mode, object id and status. Everything is staged into a
+# throwaway index first, so untracked files, deletions, symlinks (by link text), executable bits and submodule commits
+# are compared as Git sees them, whatever the real index or diff.relative says. LC_ALL=C keeps names and order stable.
+change_manifest() {
+  local base=$1 names=${2:-} root index raw status=0 meta path
+  root=$(git rev-parse --show-toplevel) || return 1
+  index=$(mktemp "$STATE_DIR/index.XXXXXX") || return 1
+  raw=$(mktemp "$STATE_DIR/raw.XXXXXX") || { rm -f -- "$index"; return 1; }
+  rm -f -- "$index"
+  # -p keeps the index timestamp, which Git needs to notice same-size edits made right after a commit.
+  cp -p -- "$(git -C "$root" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || true
+  # --sparse: a tracked path outside the sparse cone can reappear and change; a failing step must fail the whole manifest.
+  GIT_INDEX_FILE=$index git -C "$root" add -A --sparse >/dev/null || status=1
+  if (( status == 0 )); then
+    GIT_INDEX_FILE=$index git -C "$root" -c diff.relative=false diff --cached --raw -z --no-renames --no-ext-diff --no-abbrev "$base" >"$raw" || status=1
+  fi
+  if (( status == 0 )); then
+    [[ -z $names ]] || : >"$names"
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+      LC_ALL=C printf '%q\t%s\n' "$path" "${meta#:* }"
+      # NAMES, when given, maps each escaped name to the real path (NUL-separated pairs).
+      [[ -z $names ]] || LC_ALL=C printf '%q\0%s\0' "$path" "$path" >>"$names"
+    done <"$raw"
+  fi
+  rm -f -- "$index" "$raw"
+  return "$status"
+}
+
+# Remembers what the last diff review covered, per slot and repository.
+reviewed_file() {
+  echo "$STATE_DIR/$(agent_name).reviewed.$(git rev-parse --show-toplevel | sha256sum | cut -c1-12)"
+}
+
+cmd_unreviewed() {
+  unreviewed_since "$(latest_reviewed_file "$(git rev-parse --show-toplevel)")"
+}
+
+# The newest diff review of a repository from any slot of this Claude.
+latest_reviewed_file() {
+  local file latest=
+  for file in "$STATE_DIR/$(owner_name)"{,-*}".reviewed.$(sha256sum <<<"$1" | cut -c1-12)"; do
+    if [[ -s $file && ( -z $latest || $file -nt $latest ) ]]; then latest=$file; fi
+  done
+  echo "$latest"
+}
+
+unreviewed_since() {
+  local file=$1 base now changed
+  if [[ ! -s $file ]]; then
+    now=$(change_manifest HEAD) || die "could not fingerprint the working tree"
+    [[ -z $now ]] && { echo "no changes, and no diff review recorded"; return 0; }
+    echo "no diff review recorded for this repository; changed: $(cut -f1 <<<"$now" | paste -sd' ')"
+    return 1
+  fi
+  base=$(sed -n '1s/^base=//p' "$file")
+  git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "reviewed base $base no longer exists"
+  now=$(change_manifest "$base") || die "could not fingerprint the working tree"
+  changed=$(LC_ALL=C comm -3 <(tail -n +2 "$file" | LC_ALL=C sort) <(LC_ALL=C sort <<<"$now") | sed 's/^\t//' | cut -f1 | sort -u)
+  if [[ -z $changed ]]; then
+    echo "nothing changed since the last diff review"
+    return 0
+  fi
+  echo "changed since the last diff review: $(paste -sd' ' <<<"$changed")"
+  return 1
+}
+
+# PreToolUse hook: refuse `git push` and PR/MR creation while files changed since this Claude's latest diff review in the
+# repository the command publishes from (any slot). Repositories with no recorded review pass, as do commands run with
+# SIDECAR_REVIEW_SKIP=<why> in their environment assignments.
+cmd_push_gate() {
+  local input command cwd dir repo latest reason reasons=()
+  [[ -n $MUX ]] || return 0
+  input=$(cat)
+  command=$(jq -r '.tool_input.command // empty' <<<"$input")
+  # Cheap filter first: this hook runs for every Bash call.
+  [[ $command == *push* || $command == *create* ]] || return 0
+  cwd=$(jq -r '.cwd // empty' <<<"$input")
+  type -P node >/dev/null || return 0
+  SLOT=1
+  while IFS= read -r -d '' dir; do
+    [[ -d $dir ]] || continue
+    repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
+    latest=$(latest_reviewed_file "$repo")
+    [[ -n $latest ]] || continue
+    if ! reason=$(cd -- "$repo" && unreviewed_since "$latest" 2>&1); then reasons+=("$repo: $reason"); fi
+  done < <(node -e "$PUBLISH_DIRS_JS" "$command" "${cwd:-$PWD}" "$HOME")
+  (( ${#reasons[@]} )) || return 0
+  jq -n --arg reason "Sidecar review gate: ${reasons[*]}. Run \`sidecar diff <base>\` over them first. Only if this push needs no review (tickets, docs), run it with SIDECAR_REVIEW_SKIP=<why> and tell the user." \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
+}
+
+# Prints, NUL-separated, the directory each publishing command in a shell command line runs in: `git [global options]
+# push`, `gh pr create`, `glab mr create`. Quotes, escapes, line continuations, `( … )` subshell scope, `cd DIR` and
+# `git -C DIR` are followed. A directory it cannot resolve (an expansion, `cd -`, a missing path) leaves the previous one,
+# so an unknown `cd` never moves the check away from a repository. Heredocs are not followed.
+PUBLISH_DIRS_JS='
+const [command, start, home] = process.argv.slice(1);
+const path = require("path"), fs = require("fs");
+const items = [];
+let words = [], word = "", has = false, raw = false, quote = "";
+const endWord = () => { if (has) words.push({ text: word, plain: !raw }); word = ""; has = false; raw = false; };
+const endSegment = () => { endWord(); if (words.length) items.push(words); words = []; };
+for (let i = 0; i < command.length; i++) {
+  const c = command[i];
+  if (c === "\\" && command[i + 1] === "\n" && quote !== "\x27") { i++; continue; }
+  if (quote) {
+    if (c === quote) quote = "";
+    else if (c === "\\" && quote === "\"" && i + 1 < command.length) word += command[++i];
+    else { if (c === "$" || c === "`") raw = true; word += c; }
+  } else if (c === "\x27" || c === "\"") { quote = c; has = true; }
+  else if (c === "\\" && i + 1 < command.length) { word += command[++i]; has = true; }
+  else if (/\s/.test(c) && c !== "\n") endWord();
+  else if (c === "(" || c === ")") { endSegment(); items.push(c); }
+  else if (";&|\n".includes(c)) endSegment();
+  else { if (c === "$" || c === "`" || (c === "~" && has)) raw = true; word += c; has = true; }
+}
+endSegment();
+const resolve = (dir, to) => {
+  if (to === undefined) return home;
+  if (!to.plain || to.text === "-") return dir;
+  const next = path.resolve(dir, to.text.replace(/^~(?=\/|$)/, home));
+  return fs.existsSync(next) ? next : dir;
+};
+const stack = [];
+let dir = start;
+for (const item of items) {
+  if (item === "(") { stack.push(dir); continue; }
+  if (item === ")") { if (stack.length) dir = stack.pop(); continue; }
+  let words = item, skip = false;
+  while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text) || ["env", "command", "builtin"].includes(words[0].text))) {
+    if (words[0].text.startsWith("SIDECAR_REVIEW_SKIP=")) skip = true;
+    words = words.slice(1);
+  }
+  const name = words[0]?.text, rest = words.slice(1);
+  if (name === "cd" || name === "pushd") {
+    let i = 0;
+    while (i < rest.length && /^-[LPe@]*$/.test(rest[i].text) && rest[i].text !== "-") { const end = rest[i].text === "--"; i++; if (end) break; }
+    dir = resolve(dir, rest[i]);
+    continue;
+  }
+  if (skip) continue;
+  if (name === "git") {
+    let target = dir, i = 0;
+    while (i < rest.length && rest[i].text.startsWith("-")) {
+      if (rest[i].text === "-C") { target = resolve(target, rest[i + 1]); i += 2; }
+      else if (["-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].includes(rest[i].text)) i += 2;
+      else i++;
+    }
+    if (rest[i]?.text === "push") process.stdout.write(target + "\0");
+  } else if ((name === "gh" && rest[0]?.text === "pr" && rest[1]?.text === "create") || (/^glab(-bot)?$/.test(name ?? "") && rest[0]?.text === "mr" && rest[1]?.text === "create")) {
+    process.stdout.write(dir + "\0");
+  }
+}
+'
+
+# Untracked files as new-file diffs, from one git run: they are added intent-to-add to a copy of the index.
+untracked_diff() {
+  local root=$1 index
+  index=$(mktemp "$STATE_DIR/index.XXXXXX") || return 1
+  rm -f -- "$index"
+  cp -p -- "$(git -C "$root" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || true
+  # Literal pathspecs: an untracked name such as `:(exclude)x` is a file, not pathspec magic. No renames: a moved
+  # tracked file's new name must still show as an addition.
+  local out f
+  out=$(mktemp "$STATE_DIR/untracked.XXXXXX") || { rm -f -- "$index"; return 1; }
+  if git -C "$root" ls-files --others --exclude-standard -z |
+    GIT_INDEX_FILE=$index git -C "$root" --literal-pathspecs add --intent-to-add --sparse --pathspec-from-file=- --pathspec-file-nul >/dev/null 2>&1 &&
+    GIT_INDEX_FILE=$index git -C "$root" -c diff.relative=false diff --no-ext-diff --no-renames --diff-filter=A >"$out" 2>/dev/null; then
+    cat -- "$out"
+  else
+    # One unindexable entry (a nested repository without commits) fails the batch; keep every other file.
+    while IFS= read -r -d '' f; do
+      git -C "$root" diff --no-index -- /dev/null "$f" || true
+    done < <(git -C "$root" ls-files --others --exclude-standard -z)
+  fi
+  rm -f -- "$index" "$out"
+}
+
+cmd_diff() {
+  require_mux
+  local base=${1:-HEAD} id diff root diff_path repo sha head rel manifest label fork rejected
+  [[ $base != *..* ]] || die "diff takes a single base ref, not a range ($base). Use: sidecar --slot $SLOT diff ${base%%..*} CONTEXT; it reviews that base through the working tree"
+  git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "unknown base: $base"
+  label=$base
+  # A base that moved past the work (origin/main after a fetch) would show its new commits as removals.
+  if ! git merge-base --is-ancestor "$base" HEAD; then
+    fork=$(git merge-base "$base" HEAD) || die "$base and HEAD share no history"
+    echo "sidecar: $base is not an ancestor of HEAD; reviewing changes since their merge-base ${fork:0:12}" >&2
+    label="$base (merge-base ${fork:0:12})"
+    base=$fork
+  fi
+  root=$(git rev-parse --show-toplevel)
+  id="$(date +%Y%m%d-%H%M%S)-$(agent_name)"
+  diff=$(mktemp "$REQUEST_DIR/$id.XXXXXX.diff")
+  {
+    echo "# Commits since $base"
+    git log --oneline "$base..HEAD"
+    echo
+    echo "# Diff: $base..working tree"
+    git -c diff.relative=false diff "$base"
+    echo
+    echo "# Untracked files"
+    untracked_diff "$root"
+  } >"$diff"
+  [[ -s "$diff" ]] || die "no changes since $base"
+  # An unfingerprintable tree is still reviewed, but never recorded as covered.
+  manifest=$(change_manifest "$base") || manifest=
+  diff_path=$diff
+  repo=$root
+  sha=$(git rev-parse "$base^{commit}")
+  head=$(git rev-parse HEAD)
+  if [[ -n $MACHINE ]]; then
+    diff_path=$(publish_file "$diff")
+    # The machine's checkout of the same repository: WORK_DIR is the counterpart of this directory.
+    rel=${PWD#"$root"}
+    repo=${WORK_DIR%"$rel"}
+  fi
+  rejected=$(rejections_unsettled)
+  if [[ -n $rejected ]]; then
+    rejected="
+## Findings Claude rejected earlier
+Re-check each against the current code. Report one that still holds as a finding again. Add a section \`## Rejected findings re-check\` with one line per entry: \`R<n>: withdrawn\` or \`R<n>: stands\`, and the reason.
+$rejected
+"
+  fi
+  request diff "# Adversarial implementation review
+
+Find bugs in the change in \`$diff_path\` (repository: \`$repo\`, base \`$label\`, commit \`$sha\`).
+$(remote_checkout_note "$head" "$sha")
+The change is exactly what the diff shows. Code that exists only on a newer upstream branch is not part of it, and the change does not remove it.
+
+Read the diff, then read the surrounding code it touches and its callers. Hunt for real defects: logic errors, broken invariants, lifecycle and ownership mistakes, races, missed error paths, edge inputs, stale callers, and behaviour that contradicts the intent below or earlier agreed decisions. Give each finding a concrete failure scenario. Skip style.
+
+Reproduce each finding before you report it: run the existing tests or a short script that triggers it, and quote the command and its output in the finding. Mark a finding you could not reproduce \`unverified\` and say why.
+
+Give each finding an origin: \`introduced\` when the change adds or exposes it, \`pre-existing\` when the same defect exists at the base (check with \`git show $sha:<path>\`). Put pre-existing findings last, under \`## Pre-existing (not blocking)\`, and only when the change makes them more reachable or they defeat its intent.
+$rejected
+
+## Intent and context from Claude
+${2:-(none)}"
+  # Reached only when a report was delivered; the review covered exactly the files hashed above.
+  if [[ -n $manifest ]]; then
+    printf 'base=%s\n%s\n' "$sha" "$manifest" >"$(reviewed_file)"
+  else
+    rm -f -- "$(reviewed_file)"
+    echo "sidecar: could not fingerprint the working tree; this review is not recorded as covering it" >&2
+  fi
+}
+
+cmd_ask() {
+  local accept=() scope=() clear='' text keep=''
+  while [[ ${1:-} == --accept || ${1:-} == --scope || ${1:-} == --no-checks || ${1:-} == --keep ]]; do
+    case $1 in
+      --accept) [[ -n ${2:-} ]] || die "--accept requires a command"; accept+=("$2"); shift 2 ;;
+      --scope) [[ -n ${2:-} ]] || die "--scope requires a path glob"; scope+=("$2"); shift 2 ;;
+      --no-checks) clear=1; shift ;;
+      --keep) keep=1; shift ;;
+    esac
+  done
+  require_mux
+  [[ $# -ge 1 ]] || die "usage: sidecar ask [--keep] [--accept CMD]... [--scope GLOB]... [--no-checks] TEXT|-"
+  [[ -z $keep ]] || set_keep keep
+  schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
+  text="$*"
+  if [[ $# == 1 && $1 == - ]]; then text=$(cat); fi
+  local lock_mode=acquire
+  if (( ${#accept[@]} + ${#scope[@]} )) || [[ -n $clear ]]; then
+    [[ -z $MACHINE || -n $clear ]] || die "--accept and --scope run in this checkout; they are not supported for a slot on another machine"
+    # A running request still owns the current checks; replace them only once it has finished.
+    REQUEST_KEY=$(printf '%s\0' ask "$text" "${accept[@]}" -- "${scope[@]}" "$clear" | sha256sum | cut -d' ' -f1)
+    lock_slot "$REQUEST_KEY"
+    lock_mode=held
+    if [[ -n $clear ]]; then rm -f -- "$(checks_file)"; else save_checks accept scope; fi
+  fi
+  if [[ $ROLE == implementer ]]; then
+    text+="
+
+$(implementer_contract)"
+  fi
+  request ask "# Follow-up from Claude
+
+$text" "$lock_mode"
+}
+
+# Launcher-run checks of an implementer's work: they persist on the slot (so answers and idle steers rerun them) until
+# replaced by another ask with --accept/--scope, or cleared with --no-checks.
+checks_file() { echo "$STATE_DIR/$(agent_name).checks.json"; }
+
+# Validate ownership at use time, not during startup: another launcher may bind
+# the profile while this assignment installs checks. Unprofiled slots retain
+# baseline persistence across resets, regardless of generation metadata.
+generation_matches_request() {
+  jq -e --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+    '.generation == {session:$session,fresh:$fresh}' "$1" >/dev/null 2>&1
+}
+
+checks_match_request() {
+  local file
+  file=$(checks_file)
+  [[ -s $file ]] || return 1
+  [[ -n $PROFILE_JSON ]] || return 0
+  generation_matches_request "$file"
+}
+
+save_checks() {
+  local -n accept_ref=$1 scope_ref=$2
+  local root start before file tmp
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die "--accept and --scope need a git checkout; run the ask from the implementer's checkout"
+  start=$(git rev-parse HEAD)
+  file=$(checks_file)
+  before="${file%.json}.before"
+  # Files already dirty before the task are not the implementer's unless they change again.
+  change_manifest "$start" "$before.names" >"$before" || die "could not fingerprint the working tree"
+  tmp=$(mktemp "$file.XXXXXX")
+  jq -n --arg cwd "$PWD" --arg root "$root" --arg start "$start" --arg before "$before" \
+    --arg session "$ADMITTED_SESSION" --arg fresh "$ADMITTED_FRESH" \
+    '{generation: {session:$session,fresh:$fresh}, cwd: $cwd, root: $root, start: $start, before: $before, accept: $ARGS.positional[0:($n|tonumber)], scope: $ARGS.positional[($n|tonumber):]}' \
+    --arg n "${#accept_ref[@]}" --args "${accept_ref[@]}" "${scope_ref[@]}" >"$tmp"
+  mv -f -- "$tmp" "$file"
+}
+
+implementer_contract() {
+  local file cmd glob
+  file=$(checks_file)
+  echo "## Completion contract"
+  echo
+  echo "- First line of your report: \`Status: done\`, \`Status: partial\` or \`Status: blocked\`. Partial work is never done."
+  echo "- Exercise the change through the real entry point a user or caller uses (the CLI command, editor action, app or service run), not only tests that call internals directly. A section \`## Verified\` quotes each command you ran and its result."
+  echo "- A section \`## Not verified\` lists what you did not run (GPU, other platforms, slow suites) and why."
+  echo "- Change only what the task needs, as the smallest diff in the surrounding code's style. List anything else you think should change under \`## Suggested follow-ups\` instead of doing it. A section \`## Files changed\` lists every file you touched."
+  echo "- A section \`## Additions\` names each new function, type, option, flag, fallback, file or dependency you added and the part of the task that required it, or says \`none\`. Remove any addition the task does not require before reporting."
+  checks_match_request || return 0
+  while IFS= read -r -d '' cmd; do
+    echo "- After your report, the launcher runs \`$cmd\` itself in \`$(jq -r .cwd "$file")\` and shows its result to Claude. Run it first."
+  done < <(jq -j '.accept[] | . + "\u0000"' "$file")
+  if [[ $(jq '.scope | length' "$file") != 0 ]]; then
+    echo "- Scope: change only files matching $(jq -r '.scope | map("`" + . + "`") | join(", ")' "$file"). The launcher flags any other file you change."
+  fi
+  return 0
+}
+
+# Prepends the launcher's own scope and acceptance results to REPORT.
+run_checks() {
+  local report=$1 file cwd root start before out now changed outside=() path glob matched cmd n=0 code log key raw
+  local -A names=()
+  checks_match_request || return 0
+  file=$(checks_file)
+  cwd=$(jq -r .cwd "$file")
+  root=$(jq -r .root "$file")
+  start=$(jq -r .start "$file")
+  before=$(jq -r .before "$file")
+  out=$(mktemp "$report.checks.XXXXXX")
+  {
+    echo "## Launcher checks"
+    echo
+    echo "Run by the launcher after the sidecar reported, in \`$cwd\`."
+    echo
+    if [[ $(jq '.scope | length' "$file") != 0 ]]; then
+      if now=$(cd -- "$root" && change_manifest "$start" "$before.after-names"); then
+        # Escaped manifest names map back to real paths, recorded before and after the task.
+        for raw in "$before.names" "$before.after-names"; do
+          while IFS= read -r -d '' key && IFS= read -r -d '' path; do names[$key]=$path; done <"$raw"
+        done
+        # Both sides: a file the task created or edited, and a dirty file it reverted or deleted.
+        changed=$(LC_ALL=C comm -3 <(LC_ALL=C sort "$before") <(LC_ALL=C sort <<<"$now") | sed 's/^\t//' | cut -f1 | LC_ALL=C sort -u)
+        while IFS= read -r key; do
+          [[ -n $key ]] || continue
+          path=${names[$key]:-$key}
+          matched=
+          while IFS= read -r -d '' glob; do
+            # shellcheck disable=SC2053  # the glob is a pattern on purpose
+            if [[ $path == $glob ]]; then matched=1; break; fi
+          done < <(jq -j '.scope[] | . + "\u0000"' "$file")
+          [[ -n $matched ]] || outside+=("$key")
+        done <<<"$changed"
+        if (( ${#outside[@]} )); then
+          echo "- **Outside the stated scope:** ${outside[*]}"
+        else
+          echo "- Scope: every changed file is within $(jq -r '.scope | join(", ")' "$file")."
+        fi
+      else
+        echo "- Scope: could not fingerprint \`$root\`."
+      fi
+    fi
+    while IFS= read -r -d '' cmd; do
+      n=$((n + 1))
+      log="${report%.md}.accept-$n.log"
+      code=0
+      # The command's own background children must not inherit the slot lock (descriptor 9) or the ledger lock.
+      (cd -- "$cwd" && timeout "${SIDECAR_ACCEPT_TIMEOUT_S:-1800}" bash -c "$cmd") </dev/null >"$log" 2>&1 9>&- 6>&- || code=$?
+      if [[ $code == 0 ]]; then echo "- Acceptance \`$cmd\`: **PASS** (log: $log)"; else echo "- Acceptance \`$cmd\`: **FAIL, exit $code** (log: $log)"; fi
+      echo
+      echo '```'
+      tail -n 20 -- "$log"
+      echo '```'
+    done < <(jq -j '.accept[] | . + "\u0000"' "$file")
+    echo
+    cat -- "$report"
+  } >"$out"
+  mv -f -- "$out" "$report"
+}
+
+# Findings Claude rejected, per slot, so the reviewer can hold its ground and later diff reviews re-check them.
+rejections_file() { echo "$STATE_DIR/$(agent_name).rejections.jsonl"; }
+
+# Every ledger read-modify-write holds this lock, so concurrent rejections get distinct IDs and no update is lost.
+rejection_add() {
+  local file id
+  file=$(rejections_file)
+  exec 6>"$file.lock"
+  flock 6
+  id="R$(( $( [[ -s $file ]] && wc -l <"$file" || echo 0) + 1 ))"
+  jq -cn --arg id "$id" --arg text "$1" '{id: $id, text: $text, status: "open"}' >>"$file"
+  exec 6>&-
+  echo "$id"
+}
+
+rejection_set() {
+  local id=$1 status=$2 reason=${3:-} file tmp result=0
+  file=$(rejections_file)
+  exec 6>"$file.lock"
+  flock 6
+  if [[ -s $file ]] && jq -e --arg id "$id" 'select(.id == $id)' "$file" >/dev/null; then
+    tmp=$(mktemp "$file.XXXXXX")
+    jq -c --arg id "$id" --arg status "$status" --arg reason "$reason" \
+      'if .id == $id then .status = $status | (if $reason != "" then .reason = $reason else . end) else . end' "$file" >"$tmp"
+    mv -f -- "$tmp" "$file"
+  else
+    result=1
+  fi
+  exec 6>&-
+  return "$result"
+}
+
+# Rejections the reviewer has not withdrawn and Claude has not overruled.
+rejections_unsettled() {
+  local file
+  file=$(rejections_file)
+  [[ -s $file ]] || return 0
+  jq -r 'select(.status == "open" or .status == "stands") | "- \(.id) (\(.status)): \(.text)"' "$file"
+}
+
+# Applies `R<n>: withdrawn|stands` verdicts from REPORT and tells Claude about the ones still standing.
+rejections_parse() {
+  local report=$1 id verdict
+  [[ -s $(rejections_file) ]] || return 0
+  while read -r id verdict; do
+    rejection_set "$id" "$verdict" || true
+    [[ $verdict != stands ]] || echo "sidecar: the reviewer holds $id; fix it, or reject again with new evidence, or overrule it with: sidecar --slot $SLOT reject --overrule $id REASON (then tell the user)" >&2
+  done < <(awk '
+    /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
+    !fenced && match($0, /^[[:space:]]*([-*][[:space:]]+)?`?R[0-9]+: *(withdrawn|stands)/) {
+      line = substr($0, RSTART, RLENGTH); gsub(/^[[:space:]]*([-*][[:space:]]+)?`?/, "", line)
+      split(line, part, /: */); id = part[1]; v = part[2]
+      # Conflicting verdicts for one finding resolve to stands: a finding is withdrawn only unambiguously.
+      if (!(id in verdict) || v == "stands") verdict[id] = v
+    }
+    END { for (id in verdict) print id, verdict[id] }' "$report")
+}
+
+cmd_reject() {
+  if [[ ${1:-} == --overrule ]]; then
+    [[ ${2:-} =~ ^R[0-9]+$ && -n ${3:-} ]] || die "usage: sidecar reject --overrule R<n> REASON"
+    rejection_set "$2" overruled "${*:3}" || die "slot $SLOT has no rejection $2"
+    echo "sidecar: $2 overruled; tell the user, with the reviewer's failure scenario and your reason"
+    return
+  fi
+  require_mux
+  [[ $# -ge 1 ]] || die "usage: sidecar reject 'FINDING: REASON' | --overrule R<n> REASON"
+  local id
+  id=$(rejection_add "$*")
+  echo "sidecar: recorded rejection $id" >&2
+  request reject "# Claude rejected one of your findings ($id)
+
+$*
+
+Re-check the finding against the current code. Concede only to evidence that refutes your failure scenario; agreement, authority or repetition is not evidence.
+- If the rejection holds, start your report with \`$id: withdrawn\` and name the evidence that convinced you.
+- If it does not, start with \`$id: stands\` and restate the failure scenario with a reproduction: the command and its output."
+}
+
+COOP_PIDS=()
+COOP_LABELS=()
+COOP_ERRS=()
+COOP_SEEN=()
+COOP_DIR=
+COOP_KEEP=
+COOP_PHASE=
+COOP_COMBINED=
+# Dedicated slots, away from the default slot 1 and the low numbers used for everyday parallel work.
+COOP_PI_SLOT=98
+COOP_CLAUDE_SLOT=99
+
+# Runs an external command without the slot reservations (descriptors 7 and 8), so a helper that outlives this launcher
+# cannot keep the slots reserved.
+coop_x() { "$@" 7>&- 8>&-; }
+
+# Cancelling coop-review signals nothing. The reviewer launchers hold only files and their own slot request locks, so they
+# finish their requests on their own (the reviewers' turns would continue anyway); a later coop-review on the same slots
+# reports them as busy until they do.
+# shellcheck disable=SC2329  # run from the EXIT trap
+coop_cleanup() {
+  [[ -z $COOP_DIR || -n $COOP_KEEP ]] || coop_x rm -rf -- "$COOP_DIR"
+}
+
+# True while a launched reviewer launcher is still running (read-only; never used to signal).
+coop_busy() { [[ -n $(jobs -rp) ]]; }
+
+# Interrupted by INT or TERM: save and print what is available, leave the launchers running, exit with STATUS.
+# shellcheck disable=SC2329  # run from the INT and TERM traps
+coop_interrupt() {
+  local status=$1 side
+  COOP_KEEP=1
+  coop_relay
+  {
+    echo "# Cooperative review interrupted (during $COOP_PHASE)"
+    echo
+    echo "The reviewer launchers keep running and finish their own requests; coop-review on these slots reports them busy until then."
+    for side in pi claude; do
+      if [[ $COOP_PHASE == verify ]]; then echo "- $side review: $(coop_report_path "$COOP_DIR/$side.review")"; fi
+    done
+    echo "- Read a slot's latest report when it finishes: sidecar --slot N report"
+  } >"$COOP_COMBINED"
+  coop_x cat -- "$COOP_COMBINED"
+  exit "$status"
+}
+
+# Runs this launcher for one reviewer in the background, so each request keeps its own locking, progress and exit code.
+# Usage: coop_launch OUT LABEL SLOT AGENT STDIN COMMAND...  (OUT gets stdout, OUT.err stderr; coop_wait relays stderr)
+coop_launch() {
+  local out=$1 label=$2 slot=$3 agent=$4 input=$5
+  shift 5
+  local opts=(--slot "$slot" --agent "$agent" --role reviewer)
+  [[ -z $MACHINE_ARG ]] || opts+=(--machine "$MACHINE_ARG")
+  [[ -z $REMOTE_CWD ]] || opts+=(--remote-cwd "$REMOTE_CWD")
+  SIDECAR_NO_QUEUE=1 "$0" "${opts[@]}" "$@" <"$input" >"$out" 2>"$out.err" 7>&- 8>&- &
+  COOP_PIDS+=($!)
+  COOP_LABELS+=("$label")
+  COOP_ERRS+=("$out.err")
+  COOP_SEEN+=(0)
+}
+
+# Prints the complete lines each reviewer wrote to its stderr since the last call, prefixed with its label.
+coop_relay() {
+  local i line count
+  for i in ${COOP_PIDS[@]+"${!COOP_PIDS[@]}"}; do
+    [[ -r ${COOP_ERRS[i]} ]] || continue
+    count=0
+    while IFS= read -r line; do
+      count=$((count + 1))
+      if (( count > COOP_SEEN[i] )); then printf '[%s] %s\n' "${COOP_LABELS[i]}" "$line" >&2; fi
+    done <"${COOP_ERRS[i]}"
+    COOP_SEEN[i]=$count
+  done
+}
+
+# Waits for the launched reviewers, relaying their progress. Sets COOP_CODE_1 and COOP_CODE_2 (pi, then Claude Code).
+coop_wait() {
+  while coop_busy; do
+    coop_relay
+    coop_x sleep 0.2
+  done
+  coop_relay
+  COOP_CODE_1=0 COOP_CODE_2=0
+  wait "${COOP_PIDS[0]}" || COOP_CODE_1=$?
+  wait "${COOP_PIDS[1]}" || COOP_CODE_2=$?
+}
+
+# First stdout line of a finished request: its saved local report.
+coop_report_path() { coop_x sed -n '1s/^# Sidecar report (\(.*\))$/\1/p' "$1"; }
+
+# A reviewer's findings are its `### N. Title` headings, numbered in order and tagged with PREFIX (P1, C2, ...). Prints one
+# record per finding: ID, title and body (newlines as \037), separated by tabs.
+coop_inventory() {
+  coop_x awk -v prefix="$2" '
+    function fence(line,   lead, t, ch, n, rest) {
+      if (!match(line, /^ *(```+|~~~+)/)) return 0
+      t = substr(line, RSTART, RLENGTH); rest = substr(line, RLENGTH + 1); sub(/^ +/, "", t)
+      if (RLENGTH - length(t) > 3) return 0
+      ch = substr(t, 1, 1); n = length(t)
+      if (!infence) {
+        if (ch == "`" && index(rest, "`")) return 0
+        infence = 1; fch = ch; fn = n; return 1
+      }
+      if (ch == fch && n >= fn && rest ~ /^[ \t]*$/) { infence = 0; return 1 }
+      return 0
+    }
+    function flush() { if (open) { sub(/\n+$/, "", body); gsub(/\n/, "\037", body); printf "%s%d\t%s\t%s\n", prefix, n, title, body } open = 0 }
+    { sub(/\r$/, "") }
+    fence($0) || infence { if (open) body = body $0 "\n"; next }
+    /^# / || /^## / || /^### / { flush() }
+    /^### / {
+      title = $0; sub(/^### +/, "", title); sub(/^[0-9]+[.):]? +/, "", title); sub(/[ \t]+$/, "", title); gsub(/\t/, " ", title)
+      n++; body = ""; open = 1; next
+    }
+    open { body = body $0 "\n" }
+    END { flush() }' "$1"
+}
+
+# The cross-verification request: the peer's report to check, the IDs to cite, and the entry format coop_combine parses.
+# Usage: coop_verify_request PEER_LABEL PEER_REPORT PEER_INVENTORY OWN_INVENTORY
+coop_verify_request() {
+  local peer=$1 report=$2 peer_inventory=$3 own_inventory=$4
+  cat <<EOF
+# Cooperative review: check $peer's findings
+
+$peer reviewed the same change independently. Its report is below. Do not re-review the change from scratch: check each of its findings against the code, reproducing where you can.
+
+## Findings to check
+
+$(coop_x cut -f1,2 "$peer_inventory" | coop_x sed 's/\t/: /; s/^/- /')
+$(if [[ ! -s $peer_inventory ]]; then echo "(none found: its report has no \`###\` finding headings)"; fi)
+
+Answer with exactly one entry per finding above, citing its ID, using exactly these headings so the launcher can combine the reports:
+
+\`\`\`
+### [CONFIRMED] <ID> <title>
+Evidence: <command and its output, or file:line>
+
+### [REJECTED] <ID> <title>
+Reason: <why it is wrong, with evidence>
+\`\`\`
+
+Use \`[UNVERIFIED]\` with the reason only when you cannot decide either way. If you reported the same issue yourself, say so in the evidence. Findings with no entry count as unchecked.
+
+## Your own findings
+
+$(coop_x cut -f1,2 "$own_inventory" | coop_x sed 's/\t/: /; s/^/- /')
+
+If this report shows one of your own findings to be wrong, add \`### [WITHDRAWN] <your ID> <title>\` with the reason. Do not edit files. Use \`###\` headings only for these entries.
+
+## $peer's report
+
+$(coop_x cat -- "$report")
+EOF
+}
+
+# Combines the two reviews and their checks into the three sections of the final report. Arguments: PI_LABEL CLAUDE_LABEL
+# PI_INVENTORY CLAUDE_INVENTORY PI_VERIFICATION CLAUDE_VERIFICATION. Every inventoried finding lands in exactly one
+# section. Confirmed by both: confirmed by the peer and not withdrawn. Rejected by both: rejected by the peer and withdrawn
+# by its author. Everything else (rejected only, unverified, unchecked, duplicate, or a lone withdrawal) is disputed.
+# Entries that match no finding are flagged, never reported as findings.
+coop_combine() {
+  coop_x awk -v label1="$1" -v label2="$2" -v q="'" '
+    function norm(s) { s = tolower(s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function chomp(s) { sub(/\n+$/, "", s); return s }
+    function who(i) { return i == 1 ? label1 : label2 }
+    function fence(line,   lead, t, ch, n, rest) {
+      if (!match(line, /^ *(```+|~~~+)/)) return 0
+      t = substr(line, RSTART, RLENGTH); rest = substr(line, RLENGTH + 1); sub(/^ +/, "", t)
+      if (RLENGTH - length(t) > 3) return 0
+      ch = substr(t, 1, 1); n = length(t)
+      if (!infence) {
+        if (ch == "`" && index(rest, "`")) return 0
+        infence = 1; fch = ch; fn = n; return 1
+      }
+      if (ch == fch && n >= fn && rest ~ /^[ \t]*$/) { infence = 0; return 1 }
+      return 0
+    }
+    function save() {
+      if (!cur) return
+      ne[r]++; ek[r, ne[r]] = kind; ei[r, ne[r]] = id; et[r, ne[r]] = title; eb[r, ne[r]] = chomp(body); cur = 0
+    }
+    { sub(/\r$/, "") }
+    FILENAME != last { save(); infence = 0; last = FILENAME; for (k = 1; k <= 4; k++) if (ARGV[k] == FILENAME) f = k; r = f - 2 }
+    f <= 2 {
+      a = index($0, "\t"); rest = substr($0, a + 1); b = index(rest, "\t")
+      o = f; ni[o]++; iid[o, ni[o]] = substr($0, 1, a - 1); it[o, ni[o]] = substr(rest, 1, b - 1)
+      ib[o, ni[o]] = substr(rest, b + 1); gsub(/\037/, "\n", ib[o, ni[o]])
+      ido[toupper(iid[o, ni[o]])] = o; idi[toupper(iid[o, ni[o]])] = ni[o]
+      k = norm(it[o, ni[o]]); tc[o, k]++; if (tc[o, k] == 1) tf[o, k] = ni[o]
+      next
+    }
+    fence($0) || infence { if (cur) body = body $0 "\n"; next }
+    toupper($0) !~ /^### *\[(CONFIRMED|REJECTED|UNVERIFIED|WITHDRAWN)\]/ && ($0 ~ /^# / || $0 ~ /^## /) { save(); next }
+    toupper($0) ~ /^### *\[(CONFIRMED|REJECTED|UNVERIFIED|WITHDRAWN)\]/ {
+      save(); u = toupper($0); match(u, /\[[A-Z]+\]/)
+      kind = substr(u, RSTART + 1, RLENGTH - 2); rest = trim(substr($0, RSTART + RLENGTH)); id = ""
+      w = rest; sub(/[ \t].*/, "", w)
+      if (toupper(w) ~ /^[A-Z][0-9]+:?$/) { id = toupper(w); sub(/:$/, "", id); rest = trim(substr(rest, length(w) + 1)) }
+      title = rest; body = ""; cur = 1; next
+    }
+    cur { body = body $0 "\n" }
+    END {
+      save()
+      for (r = 1; r <= 2; r++) for (e = 1; e <= ne[r]; e++) {
+        want = (ek[r, e] == "WITHDRAWN") ? r : 3 - r; i = 0; why = ""
+        if (ei[r, e] != "" && (ei[r, e] in ido)) {
+          if (ido[ei[r, e]] != want) why = "ID " ei[r, e] " belongs to " who(ido[ei[r, e]]) q "s findings"
+          else {
+            i = idi[ei[r, e]]; k = norm(et[r, e])
+            if (k != "" && k != norm(it[want, i]) && tc[want, k] >= 1) {
+              why = "it cites " ei[r, e] " but its title matches another finding"; i = 0
+            }
+          }
+        } else {
+          k = norm(et[r, e])
+          if (tc[want, k] == 1) i = tf[want, k]
+          else if (tc[want, k] > 1) why = "its title matches several of " who(want) q "s findings and it cites no ID"
+          else why = "no finding of " who(want) " has this ID or title"
+        }
+        if (i == 0) { nu++; un = un "- " who(r) " entry `[" ek[r, e] "] " ei[r, e] " " et[r, e] "` matches no finding (" why "); ignored.\n"; continue }
+        if (ek[r, e] == "WITHDRAWN") { wd[want, i]++; if (wd[want, i] == 1) wdb[want, i] = eb[r, e] }
+        else { vc[want, i]++; vk[want, i, vc[want, i]] = ek[r, e]; vb[want, i, vc[want, i]] = eb[r, e] }
+      }
+      for (o = 1; o <= 2; o++) for (i = 1; i <= ni[o]; i++) {
+        v = 3 - o; n = vc[o, i]; w = wd[o, i] > 0
+        head = "### " iid[o, i] ": " it[o, i] "\nOrigin: " who(o) ". "
+        arg = "\n\n**" who(o) q "s finding:**\n\n" ib[o, i]
+        if (n == 1 && vk[o, i, 1] == "CONFIRMED" && !w) {
+          nb++; both = both head "Confirmed by " who(v) "." arg "\n\n**" who(v) q "s evidence:** " vb[o, i, 1] "\n\n"
+        } else if (n == 1 && vk[o, i, 1] == "REJECTED" && w) {
+          nr++; rej = rej head "Rejected by " who(v) " and withdrawn by " who(o) "." arg "\n\n**" who(v) " rejected:** " vb[o, i, 1] "\n\n**" who(o) " withdrew:** " wdb[o, i] "\n\n"
+        } else {
+          nd++
+          if (n == 0) st = who(v) " did not check it; unverified"
+          else if (n > 1) st = who(v) " gave " n " conflicting or repeated entries (flagged); unverified"
+          else if (vk[o, i, 1] == "REJECTED") st = who(v) " rejected it"
+          else if (vk[o, i, 1] == "CONFIRMED") st = who(v) " confirmed it"
+          else st = who(v) " could not decide; unverified"
+          out = head st (w ? "; " who(o) " withdrew it" : "") "." arg
+          for (c = 1; c <= n; c++) out = out "\n\n**" who(v) q "s check (" tolower(vk[o, i, c]) "):** " vb[o, i, c]
+          if (w) out = out "\n\n**" who(o) " withdrew:** " wdb[o, i]
+          disp = disp out "\n\n"
+        }
+      }
+      for (o = 1; o <= 2; o++) {
+        if (ni[o] == 0) warn = warn "- No findings were extracted from " who(o) q "s review (expected `### N. Title` headings); if it reported any, they are not covered below. Read its report.\n"
+        if (ni[3 - o] > 0 && ne[o] == 0) warn = warn "- " who(o) " returned no parseable verdicts; every finding of " who(3 - o) " is listed as unchecked.\n"
+      }
+      printf "Findings: %d from %s, %d from %s. Confirmed by both %d, disputed %d, rejected by both %d.\n\n", ni[1], label1, ni[2], label2, nb, nd, nr
+      if (warn != "" || un != "") printf "## Warnings\n\n%s%s\n", warn, un
+      printf "## Confirmed by both (%d)\n\n%s", nb, nb ? both : "None.\n\n"
+      printf "## Disputed (%d)\n\n%s", nd, nd ? disp : "None.\n\n"
+      printf "## Rejected by both (%d)\n\n%s", nr, nr ? rej : "None.\n\n"
+    }' "$3" "$4" "$5" "$6"
+}
+
+# Reserves a reviewer slot for this whole coop-review: a per-slot lock held on descriptor FD until exit, so two
+# coop-reviews cannot both pass admission. A slot busy with an unrelated request is refused rather than queued behind;
+# the reviewer launchers also fail fast instead of queueing (SIDECAR_NO_QUEUE).
+coop_reserve() {
+  local fd=$1 slot=$2 flag=$3 name lock
+  name=$(owner_name)
+  [[ $slot == 1 ]] || name+="-$slot"
+  if [[ $fd == 7 ]]; then exec 7>"$STATE_DIR/$name.coop.lock"; else exec 8>"$STATE_DIR/$name.coop.lock"; fi
+  if ! flock -n "$fd"; then
+    die "slot $slot is in use by another coop-review; choose another slot with $flag"
+  fi
+  lock="$STATE_DIR/$name.lock"
+  if ! ( coop_x flock -n 9 ) 9>"$lock"; then
+    die "slot $slot is busy with another request; wait for it or choose another slot with $flag"
+  fi
+}
+
+# Cooperative review: a pi and a Claude Code reviewer each review the diff, then each checks the other's findings.
+# The combined report decides nothing; the caller adjudicates. Exit codes follow the other requests: 0 combined report,
+# 3 a reviewer asked a question (answer it on its slot), otherwise the first reviewer's nonzero exit.
+cmd_coop_review() {
+  local pi_slot=$COOP_PI_SLOT claude_slot=$COOP_CLAUDE_SLOT base context combined pi_label claude_label phase
+  while [[ ${1:-} == --* ]]; do
+    case $1 in
+      --pi-slot|--claude-slot)
+        [[ ${2:-} =~ ^[1-9][0-9]{0,3}$ ]] || die "$1 requires an integer from 1 to 9999"
+        if [[ $1 == --pi-slot ]]; then pi_slot=$2; else claude_slot=$2; fi ;;
+      *) die "unknown coop-review option $1" ;;
+    esac
+    shift 2
+  done
+  [[ $# -le 2 ]] || die "usage: sidecar coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]"
+  [[ -z $SLOT_ARG && -z $ROLE_ARG && -z $AGENT_ARG ]] || die "coop-review chooses its own slots, agents and roles; use --pi-slot and --claude-slot"
+  [[ $pi_slot != "$claude_slot" ]] || die "--pi-slot and --claude-slot must differ"
+  require_identity
+  type -P flock >/dev/null || die "missing dependency flock; install it on PATH before using sidecar"
+  coop_reserve 7 "$pi_slot" --pi-slot
+  coop_reserve 8 "$claude_slot" --claude-slot
+  base=${1:-HEAD}
+  context="${2:-(none)}
+
+## Report format (cooperative review)
+Give each finding its own \`### N. Title\` heading, numbered from 1, and use no other \`###\` headings. The other reviewer will check every finding by its number."
+  pi_label="pi (slot $pi_slot)"
+  claude_label="Claude Code (slot $claude_slot)"
+  combined=$(coop_x mktemp "$REPORT_DIR/$(coop_x date +%Y%m%d-%H%M%S)-coop-review.XXXXXX.md")
+  COOP_DIR=$(coop_x mktemp -d "$REQUEST_DIR/coop.XXXXXX")
+  trap 'coop_cleanup' EXIT
+  COOP_COMBINED=$combined
+  trap 'coop_interrupt 130' INT
+  trap 'coop_interrupt 143' TERM
+  echo "# Sidecar report ($combined)"
+
+  # Phase 1: both reviewers review the same change; phase 2: each checks the other's report.
+  for phase in review verify; do
+    COOP_PHASE=$phase
+    COOP_PIDS=() COOP_LABELS=() COOP_ERRS=() COOP_SEEN=()
+    if [[ $phase == review ]]; then
+      coop_launch "$COOP_DIR/pi.$phase" "pi slot $pi_slot" "$pi_slot" pi /dev/null diff "$base" "$context"
+      coop_launch "$COOP_DIR/claude.$phase" "claude slot $claude_slot" "$claude_slot" claude /dev/null diff "$base" "$context"
+    else
+      coop_inventory "$(coop_report_path "$COOP_DIR/pi.review")" P >"$COOP_DIR/pi.inventory"
+      coop_inventory "$(coop_report_path "$COOP_DIR/claude.review")" C >"$COOP_DIR/claude.inventory"
+      coop_verify_request "$claude_label" "$(coop_report_path "$COOP_DIR/claude.review")" "$COOP_DIR/claude.inventory" "$COOP_DIR/pi.inventory" >"$COOP_DIR/pi.request"
+      coop_verify_request "$pi_label" "$(coop_report_path "$COOP_DIR/pi.review")" "$COOP_DIR/pi.inventory" "$COOP_DIR/claude.inventory" >"$COOP_DIR/claude.request"
+      coop_launch "$COOP_DIR/pi.$phase" "pi slot $pi_slot" "$pi_slot" pi "$COOP_DIR/pi.request" ask -
+      coop_launch "$COOP_DIR/claude.$phase" "claude slot $claude_slot" "$claude_slot" claude "$COOP_DIR/claude.request" ask -
+    fi
+    coop_wait
+    local pi_code=$COOP_CODE_1 claude_code=$COOP_CODE_2
+    if (( pi_code != 0 || claude_code != 0 )); then
+      coop_incomplete "$phase" "$combined" "$pi_code" "$claude_code" "$pi_slot" "$claude_slot" "$pi_label" "$claude_label"
+    fi
+  done
+
+  {
+    echo "# Cooperative review"
+    echo
+    echo "Base \`$base\`. Reviewers: $pi_label and $claude_label. Each finding names its origin. This report decides nothing: the caller settles disputes and fixes."
+    echo
+    echo "- $pi_label review: $(coop_report_path "$COOP_DIR/pi.review")"
+    echo "- $claude_label review: $(coop_report_path "$COOP_DIR/claude.review")"
+    echo "- $pi_label check of $claude_label's findings: $(coop_report_path "$COOP_DIR/pi.verify")"
+    echo "- $claude_label check of $pi_label's findings: $(coop_report_path "$COOP_DIR/claude.verify")"
+    echo
+    coop_combine "$pi_label" "$claude_label" "$COOP_DIR/pi.inventory" "$COOP_DIR/claude.inventory" \
+      "$(coop_report_path "$COOP_DIR/pi.verify")" "$(coop_report_path "$COOP_DIR/claude.verify")"
+  } >"$combined"
+  coop_x cat -- "$combined"
+}
+
+# Writes and prints the report of a coop-review that stopped in PHASE, then exits: 3 when a reviewer asked a question.
+coop_incomplete() {
+  local phase=$1 combined=$2 pi_code=$3 claude_code=$4 pi_slot=$5 claude_slot=$6 pi_label=$7 claude_label=$8
+  local code slot label question path status=0 side
+  {
+    echo "# Cooperative review incomplete (during $phase)"
+    echo
+    for side in pi claude; do
+      if [[ $side == pi ]]; then code=$pi_code slot=$pi_slot label=$pi_label; else code=$claude_code slot=$claude_slot label=$claude_label; fi
+      path=$(coop_report_path "$COOP_DIR/$side.$phase")
+      case $code in
+        0) echo "- $label: done${path:+; report $path}" ;;
+        3)
+          question=$(coop_x sed -n 's/\r$//; s/^NEEDS_ANSWER: //p' "$COOP_DIR/$side.$phase" | coop_x head -n 1)
+          echo "- $label: asked a question: $question"
+          echo "  Reply with: sidecar --slot $slot answer TEXT${path:+ (report $path)}" ;;
+        *) echo "- $label: failed with exit $code${path:+; report $path}" ;;
+      esac
+    done
+  } >"$combined"
+  coop_x cat -- "$combined"
+  if [[ $pi_code == 3 || $claude_code == 3 ]]; then
+    status=3
+    echo "sidecar: coop-review is blocked on a question; answer it with sidecar --slot N answer TEXT, then run coop-review again" >&2
+  else
+    status=$pi_code
+    [[ $status != 0 ]] || status=$claude_code
+    echo "sidecar: coop-review stopped during $phase (pi exit $pi_code, claude exit $claude_code)" >&2
+  fi
+  exit "$status"
+}
+
+cmd_answer() {
+  require_mux
+  [[ $# -ge 1 ]] || die "usage: sidecar answer TEXT"
+  local name prev
+  name=$(agent_name)
+  lock_slot ''
+  [[ -s "$STATE_DIR/$name.pending" ]] || die "no pending question in slot $SLOT; use: sidecar --slot $SLOT ask TEXT for a new request"
+  if jq -e 'type == "object"' "$STATE_DIR/$name.pending" >/dev/null 2>&1; then
+    if [[ -n $PROFILE_JSON ]]; then
+      generation_matches_request "$STATE_DIR/$name.pending" || die "pending question belongs to another session generation; use ask for a new request"
+    fi
+    prev=$(jq -er '.id | select(type == "string" and length > 0)' "$STATE_DIR/$name.pending") || die "invalid pending question"
+  else
+    # Older launchers stored only the request ID. Preserve live unprofiled
+    # conversations across upgrades, but never import those questions into a profile.
+    [[ -z $PROFILE_JSON ]] || die "pending question belongs to another session generation; use ask for a new request"
+    prev=$(<"$STATE_DIR/$name.pending")
+    [[ $prev =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid pending question"
+  fi
+  request answer "# Answer from Claude
+
+You were blocked on request \`$prev\` and asked a question. Answer: $*
+
+Continue that original task to completion with this answer; do not restart finished work. If a genuinely new blocker appears, submit it with needs_answer." held
+}
+
+# Delivers TEXT through the session's steering inbox (grok-style-pi, src/steering/inbox.ts): a file the running pi
+# picks up within a fraction of a second and shows as a user message, mid-turn when it is working. It takes none of
+# the slot's locks, so a long ask never delays it. Runs on the machine for a remote slot (node is already required there).
+# The text travels on stdin, so the remote command has a fixed size whatever the text length (cmd.exe caps it at 8191).
+# Before publishing it checks that the inbox's owner (a record the receiving pi writes) runs the targeted agent's pi
+# session file as herdr reports it, so a different pi that reuses the session id is never addressed; unverifiable fails.
+# The message names the verified owner instance (its token); a different instance rejects it ("owner changed"). Herdr
+# exposes no pid for an agent, so two pi processes on the very same session file cannot be told apart.
+# Exit 0 delivered, or queued behind the running turn but not yet seen in its conversation (the output says which);
+# 1 refused, unverifiable target or failure;
+# 4 not picked up, and the message was withdrawn (safe to resend); 6 outcome unknown: claimed but not confirmed by pi,
+# so it may still be delivered (do not resend blindly).
+cmd_steer() {
+  require_mux
+  [[ $# -ge 1 ]] || die "usage: sidecar steer TEXT"
+  local hname session session_file attempt script payload result status=0 timeout_ms=$((${SIDECAR_STEER_TIMEOUT_S:-8} * 1000)) grace_ms=$((${SIDECAR_STEER_CLAIM_GRACE_S:-7} * 1000))
+  hname=$(herdr_agent)
+  local agent_state name
+  agent_state=$(agent_status "$hname")
+  [[ $agent_state != missing ]] || die "no running sidecar in slot $SLOT${MACHINE:+ on $MACHINE_LABEL} to steer; use ask to start one"
+  if [[ $agent_state == idle || $agent_state == 'done' ]]; then
+    name=$(agent_name)
+    exec 9>"$STATE_DIR/$name.lock"
+    if flock -n 9; then
+      agent_state=$(agent_status "$hname")
+      if [[ $agent_state == idle || $agent_state == 'done' ]]; then
+        request ask "# Follow-up from Claude
+
+$*" held
+        return
+      fi
+    fi
+    # An in-flight request owns the channel, even if Pi has not started its prompt yet. Steer it without waiting.
+    exec 9>&-
+  fi
+  [[ $BACKEND == pi ]] || die "a busy $BACKEND sidecar cannot be steered; wait for its report, then ask"
+  if [[ -n $TARGET_WINDOWS ]]; then
+    windows_control steer "[steer from Claude] $*"
+    return
+  fi
+  [[ -z $PROFILE_JSON ]] || die "busy steering is unavailable for profiled Linux pi workers (ambient steering extensions are disabled); nothing was sent. Wait for the report, then ask"
+  session=$(pi_session_id)
+  # The host can publish a new pi's session file late (notably on Windows); the owner check needs it.
+  for ((attempt = 0; attempt < 10; attempt++)); do
+    session_file=$(agent_session_file "$hname")
+    [[ -z $session_file ]] || break
+    sleep 0.5
+  done
+  payload=$(jq -cn --arg text "$*" --arg from "Claude Code" '{text: $text, from: $from}')
+  script='const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+    const root=process.env.GROK_STEER_DIR||path.join(process.env.XDG_STATE_HOME||path.join(os.homedir(),".local","state"),"grok-style-pi","steer");
+    const dir=path.join(root,args[0]),id=Date.now().toString(36)+"-"+process.pid+"-"+Math.random().toString(36).slice(2,8);
+    const file=path.join(dir,id+".json"),ack=path.join(dir,id+".ack"),tmp=path.join(dir,id+".tmp");
+    const out=(o,c)=>{console.log(JSON.stringify(o));process.exit(c)};
+    const norm=p=>{p=String(p||"").replace(/\\/g,"/");return /^[A-Za-z]:/.test(p)?p.toLowerCase():p};
+    (async()=>{
+      let rec=null;try{rec=JSON.parse(fs.readFileSync(path.join(dir,".owner"),"utf8"))}catch(e){}
+      if(!rec)out({status:"owner",reason:"no steering receiver owns this session inbox: the sidecar pi predates steering (update grok-style-pi, then /reload in its pane) or is not running"},7);
+      let live=true;try{process.kill(rec.pid,0)}catch(e){live=e.code==="EPERM"}
+      if(!live)out({status:"owner",reason:"the inbox receiver (pid "+rec.pid+") is gone; restart or /reload the sidecar pi"},7);
+      if(!args[3])out({status:"owner",reason:"cannot tell which session file this sidecar runs, so the receiver cannot be verified; nothing was sent"},7);
+      if(norm(rec.sessionFile)!==norm(args[3]))out({status:"owner",reason:"the inbox is owned by pi pid "+rec.pid+" running "+rec.sessionFile+", not by this sidecar ("+args[3]+"); nothing was sent"},7);
+      const msg=JSON.parse(fs.readFileSync(0,"utf8"));msg.sentAt=Date.now();msg.owner=rec.token;
+      fs.mkdirSync(dir,{recursive:true});
+      fs.writeFileSync(tmp,JSON.stringify(msg));fs.renameSync(tmp,file);
+      for(let end=Date.now()+Number(args[1]);Date.now()<end&&!fs.existsSync(ack);)await sleep(100);
+      if(!fs.existsSync(ack)){
+        let removed=true;
+        try{fs.unlinkSync(file)}catch(e){removed=false}
+        if(removed)out({status:"timeout"},4);
+        // Already claimed: the session may still deliver it. Give its admission window time to finish.
+        for(let end=Date.now()+Number(args[2]);Date.now()<end&&!fs.existsSync(ack);)await sleep(100);
+        if(!fs.existsSync(ack))out({status:"unknown"},6);
+      }
+      const reply=fs.readFileSync(ack,"utf8");fs.unlinkSync(ack);console.log(reply);
+      const st=JSON.parse(reply).status;process.exit(st==="delivered"||st==="queued"?0:st==="unconfirmed"?6:3);
+    })().catch(e=>{console.error(String(e));process.exit(5)});'
+  # A claimed message may wait up to the receiver's 5s admission window for its acknowledgement.
+  if [[ -n $MACHINE ]]; then
+    result=$(remote_node "$script" "$session" "$timeout_ms" "$grace_ms" "$session_file" <<<"$payload") || status=$?
+  else
+    result=$(node -e "$(printf 'const fs=require("fs"),path=require("path"),os=require("os");const args=%s;\n%s' "$(jq -cn --args '$ARGS.positional' "$session" "$timeout_ms" "$grace_ms" "$session_file")" "$script")" <<<"$payload") || status=$?
+  fi
+  case $status in
+    0)
+      case $(jq -r '.status + "/" + (.delivery // "")' <<<"$result") in
+        delivered/steer) echo "steered: delivered into $hname's conversation (applied after its current tool call)" ;;
+        queued/) echo "queued (not yet confirmed in conversation): $hname's pi accepted it behind its running turn; a later input handler could still consume it" ;;
+        *) echo "delivered to idle $hname as a prompt" ;;
+      esac ;;
+    7) die "cannot steer $hname: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
+    3) die "the sidecar refused the steering message: $(jq -r '.reason // "unknown"' <<<"$result")" ;;
+    4)
+      echo "sidecar: $hname did not pick the message up within $((timeout_ms / 1000))s and it was withdrawn; it is safe to resend. Its pi may predate steering (update grok-style-pi there and /reload in its pane), or be compacting." >&2
+      exit 4 ;;
+    6)
+      echo "sidecar: outcome unknown: pi did not confirm that the message entered $hname's conversation (it may be compacting, preparing a prompt, or an input handler took it), so it may still be delivered. Check the pane before resending." >&2
+      exit 6 ;;
+    255) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH (BatchMode: load its key in ssh-agent). Test: ssh $MACHINE_TARGET true" ;;
+    *) die "could not deliver the steering message (exit $status; is node on PATH${MACHINE:+ on $MACHINE_LABEL}?)" ;;
+  esac
+}
+
+# Machine maintenance is independent of the current slot's binding and does not deploy or reload a live sidecar.
+cmd_sync_machine() {
+  [[ -n $MUX ]] || die "not running inside a herdr pane or Herdr app terminal"
+  [[ $# == 1 ]] || die "usage: sidecar sync-machine NAME"
+  local record config='{}' config_file=${SIDECAR_MACHINES_FILE:-$HOME/.config/claude-sidecar/machines.json} options status=0
+  record=$(find_machine "$1")
+  MACHINE=$(jq -r '.id' <<<"$record")
+  MACHINE_LABEL=$(jq -r '.label' <<<"$record")
+  MACHINE_TARGET=$(jq -r '.target' <<<"$record")
+  [[ -n $MACHINE_TARGET && $MACHINE_TARGET != null ]] || die "$MUX_CLI machine '$MACHINE_LABEL' has no SSH target"
+  command -v ssh >/dev/null || die "ssh is required for sync-machine"
+  if [[ -f $config_file ]]; then
+    config=$(jq -ce --arg id "$MACHINE" --arg label "$MACHINE_LABEL" '.[$id] // .[$label] // {}' "$config_file") || die "invalid machine configuration: $config_file"
+  fi
+  [[ ${SIDECAR_SYNC_TIMEOUT_S:-60} =~ ^[1-9][0-9]*$ ]] || die "SIDECAR_SYNC_TIMEOUT_S must be a positive integer"
+  options=$(jq -cn --argjson config "$config" --arg cwd "$PWD" --arg runtime "${SIDECAR_REMOTE_HOME:-}" --argjson timeout "$((${SIDECAR_SYNC_TIMEOUT_S:-60} * 1000))" '
+    ($config.paths // {} | to_entries | map(.key |= rtrimstr("/")) | map(.key as $prefix | select($cwd == $prefix or ($cwd | startswith($prefix + "/")))) | sort_by(.key | length) | last) as $mapping |
+    {tooling: ($config.tooling // {}), runtimeHome: (if $runtime != "" then $runtime else $config.home end),
+     workDir: (if $mapping then $mapping.value + $cwd[($mapping.key | length):] else null end), timeoutMs: $timeout}')
+  remote_node 'eval(fs.readFileSync(0,"utf8"));' "$options" <"$PLUGIN_ROOT/scripts/sync-machine.cjs" || status=$?
+  case $status in
+    0) echo "$MACHINE_LABEL tooling synchronized; use sidecar reload on its slots to load the new resources" ;;
+    255) die "cannot reach $MACHINE_LABEL ($MACHINE_TARGET) over SSH; test: ssh $MACHINE_TARGET true" ;;
+    *) die "tooling sync failed on $MACHINE_LABEL (exit $status); check the checkout/SSH/Git messages above" ;;
+  esac
+}
+
+# Report recovery is entirely local and intentionally does not resolve/deploy a remote runtime.
+require_identity() {
+  [[ -n ${SIDECAR_AGENT:-} || -n $MUX ]] || die "no slot identity; run from the owning herdr pane or Herdr app terminal"
+}
+
+# Older launcher versions saved local reports without a latest-report pointer or printed markers.
+latest_saved_report() {
+  local pointer
+  pointer="$STATE_DIR/$(agent_name).report"
+  if [[ -s $pointer ]]; then
+    head -n 1 "$pointer"
+  else
+    find "$REPORT_DIR" -maxdepth 1 -type f -name "*-$(agent_name).*.md" -printf '%T@ %p\n' |
+      LC_ALL=C sort -nr | cut -d' ' -f2- | awk 'NR == 1'
+  fi
+}
+
+cmd_report() {
+  require_identity
+  [[ $# == 0 ]] || die "usage: sidecar [--slot N] report"
+  local report
+  report=$(latest_saved_report)
+  [[ -n $report ]] || die "no saved report for slot $SLOT; use sidecar --slot $SLOT wait if a request is running"
+  echo "# Sidecar report ($report)"
+  print_saved_report "$report"
+}
+
+cmd_wait() {
+  require_identity
+  [[ $# == 0 ]] || die "usage: sidecar [--slot N] wait (run with run_in_background: true)"
+  local name state report code
+  name=$(agent_name)
+  # The original launcher holds this lock until it has cached its report and finished cleanup.
+  exec 9>"$STATE_DIR/$name.lock"
+  flock 9
+  state="$STATE_DIR/$name.request.json"
+  [[ -s $state ]] || die "no request recorded for slot $SLOT; use sidecar --slot $SLOT ask TEXT"
+  report=$(jq -r '.report' "$state")
+  echo "# Sidecar report ($report)"
+  [[ -f $report ]] || die "request ended without a saved report; inspect sidecar --slot $SLOT status and its pane"
+  code=$(jq -r '.exit_code // 1' "$state")
+  [[ $code == 0 || $code == 3 ]] || die "request did not finish normally (exit $code); inspect the pane and recover with sidecar --slot $SLOT report"
+  # Waiting does not count as printing/reading the report. Use `report` to retrieve its contents.
+  return "$code"
+}
+
+age_ago() {
+  local elapsed=$(( $(date +%s) - $1 ))
+  (( elapsed >= 0 )) || elapsed=0
+  if (( elapsed >= 86400 )); then echo "$((elapsed / 86400))d ago"
+  elif (( elapsed >= 3600 )); then echo "$((elapsed / 3600))h ago"
+  elif (( elapsed >= 60 )); then echo "$((elapsed / 60))m ago"
+  else echo "${elapsed}s ago"; fi
+}
+
+cmd_status() {
+  require_mux
+  local name state started finished code report printed session
+  name=$(herdr_agent)
+  case $BACKEND in
+    claude) session=$(claude_session_uuid) ;;
+    *) session=$(pi_session_id) ;;
+  esac
+  local live
+  live=$(agent_status "$name")
+  if [[ $live == missing && -f "$STATE_DIR/$(agent_name).stopped" ]]; then live=stopped; fi
+  echo "$name: $live ($BACKEND session ${session:-not started})${MACHINE:+ on $MACHINE_LABEL}"
+  state="$STATE_DIR/$(agent_name).request.json"
+  if [[ -s $state ]]; then
+    started=$(jq -r '.started' "$state")
+    finished=$(jq -r '.finished // empty' "$state")
+    code=$(jq -r '.exit_code // empty' "$state")
+    if [[ -n $finished ]]; then
+      echo "request: done $(age_ago "$finished") (exit $code); started $(age_ago "$started")"
+    else
+      echo "request: started $(age_ago "$started"); completion not recorded (use sidecar --slot $SLOT wait)"
+    fi
+  fi
+  report=$(latest_saved_report)
+  if [[ -n $report ]]; then
+    printed=unprinted
+    [[ ! -f ${report%.md}.printed ]] || printed=printed
+    echo "last report $printed: $report"
+  fi
+  if [[ $(agent_status "$name") != missing ]] && ! agent_runs_sidecar_session "$name"; then
+    echo "$name runs $(agent_session_file "$name"), not the sidecar session; run: sidecar restart" >&2
+    return 1
+  fi
+}
+
+# shellcheck source=scripts/sweep-trigger disable=SC1091
+source "$PLUGIN_ROOT/scripts/sweep-trigger"
+
+owner_ended() {
+  [[ -s $STATE_DIR/$1.ended && -s $STATE_DIR/$1.claude-owner-session &&
+     $(<"$STATE_DIR/$1.ended") == "$(<"$STATE_DIR/$1.claude-owner-session")" ]]
+}
+
+# Whether the slot's task is over: its owner ended or is gone, or (for done-close) its request delivered a report and it
+# is not pinned. Reads only local state and Claude's own terminal host, so remote slots cost no SSH unless this holds.
+sweep_decided() {
+  local name=$1 owner candidate owner_pane presence other
+  if [[ -n ${SWEEP_REQUEST:-} ]]; then
+    [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 1
+  fi
+  owner=$name
+  if [[ -s $STATE_DIR/$name.owner ]]; then
+    owner=$(<"$STATE_DIR/$name.owner")
+    candidate=$owner
+  else
+    # Legacy slots have no owner record; either spelling may be an owner with a numeric pane ID.
+    candidate=${name%-*}
+  fi
+  if owner_ended "$owner"; then return 0; fi
+  if [[ ! -s $STATE_DIR/$name.owner ]] && owner_ended "$candidate"; then return 0; fi
+  if ! mux_owner_listed "$owner" "$candidate"; then
+    if [[ -s $STATE_DIR/$name.owner-pane ]]; then
+      owner_pane=$(<"$STATE_DIR/$name.owner-pane")
+      presence=$(mux_owner_presence "$owner_pane")
+    else
+      # Old Herdr public IDs use wN:pN; preserve aliases for legacy slot records too.
+      owner_pane=${owner#sc-}
+      presence=$(mux_owner_presence "${owner_pane/-p/:p}")
+      owner_pane=${candidate#sc-}
+      other=$(mux_owner_presence "${owner_pane/-p/:p}")
+      if [[ $presence == alive || $other == alive ]]; then presence=alive
+      elif [[ $presence != gone || $other != gone ]]; then presence=unknown; fi
+    fi
+    [[ $presence != gone ]] || return 0
+  fi
+  # Only the completed request's own close reaches here: a delivered report, and no pin.
+  [[ -n ${SWEEP_REQUEST:-} && ! -e $STATE_DIR/$name.keep ]] || return 1
+  [[ $(jq -r '.exit_code // empty' "$STATE_DIR/$name.request.json") == 0 ]]
+}
+
+# Runs under the slot's startup and request locks, immediately before stop's ownership checks.
+sweep_eligible() {
+  local name=$1 hname=$2 status pane
+  sweep_decided "$name" || return 1
+  status=$(agent_status "$hname")
+  [[ $status == idle || $status == 'done' ]] || return 1
+  [[ ! -s $STATE_DIR/$name.pending ]] || return 1
+  pane=$(mux_locate "$hname") || return 1
+  mux_unfocused "$pane"
+}
+
+# Points host calls at the slot's machine. Resolution costs SSH round trips, so a machine stays resolved across calls.
+sweep_resolve() {
+  local name=$1 binding=$2
+  if [[ $binding == local ]]; then MACHINE=''; TARGET_WINDOWS=$HOST_WINDOWS; return; fi
+  [[ $MACHINE != "$binding" ]] || return 0
+  SIDECAR_AGENT=$name SLOT=1 MACHINE_ARG='' REMOTE_CWD='' KEEP_PWD='' SWEEPING=1 resolve_machine
+}
+
+cmd_sweep() {
+  local file name binding slot owner candidate host
+  mux_snapshot
+  shopt -s nullglob
+  for file in "$STATE_DIR"/sc-*.agent; do
+    name=${file##*/}; name=${name%.agent}
+    [[ $# == 0 || $name == "$1" ]] || continue
+    # Only the host a slot started in can tell whether its owner lives; slots from before hc support are herdr's.
+    host=herdr
+    if [[ -s $STATE_DIR/$name.mux ]]; then read -r host <"$STATE_DIR/$name.mux"; fi
+    [[ $host == "${MUX:-herdr}" ]] || continue
+    if [[ -n ${SWEEP_OWNER:-} ]]; then
+      slot=${name#"$SWEEP_OWNER"-}
+      [[ $name == "$SWEEP_OWNER" || ( $name == "$SWEEP_OWNER"-* && $slot =~ ^[1-9][0-9]*$ ) ]] || continue
+      [[ ! -s $STATE_DIR/$name.owner || $(<"$STATE_DIR/$name.owner") == "$SWEEP_OWNER" ]] || continue
+    fi
+    binding=local
+    if [[ -s $STATE_DIR/$name.machine ]]; then read -r binding <"$STATE_DIR/$name.machine"; fi
+    (
+      export SIDECAR_AGENT=$name
+      unset SIDECAR_PI_SESSION SIDECAR_MACHINE
+      SLOT=1 ROLE_ARG='' AGENT_ARG='' MACHINE_ARG='' REMOTE_CWD='' RESOLVED=1
+      flock -n 8 || exit 0
+      sweep_decided "$name" || exit 0
+      sweep_resolve "$name" "$binding"
+      owner=$name
+      if [[ -s $STATE_DIR/$name.owner ]]; then
+        owner=$(<"$STATE_DIR/$name.owner")
+      else
+        # Legacy eligibility accepts either owner spelling; serialize both against SessionStart.
+        candidate=${name%-*}
+        exec 5>"$STATE_DIR/$candidate.identity.lock"
+        flock -n 5 || exit 0
+      fi
+      exec 7>"$STATE_DIR/$owner.identity.lock"
+      flock -n 7 || exit 0
+      stop_unlocked '' '' sweep
+    ) 8>"$STATE_DIR/$name.startup.lock" || true
+  done
+}
+
+# A delivered report ends the sidecar's task, so its pane closes like a finished subagent; the session stays for the next request.
+# Takes the request ID that permits closing; defaults to the current request.
+schedule_done_close() {
+  local name id=${1:-}
+  [[ ${SIDECAR_CLOSE_WHEN_DONE:-1} != 0 ]] || return 0
+  name=$(agent_name)
+  [[ -n $id ]] || id=$(jq -r '.id' "$STATE_DIR/$name.request.json")
+  (
+    exec_detached "$PLUGIN_ROOT/scripts/sidecar" done-close "$name" "$id"
+  ) </dev/null >>"$STATE_DIR/sweep.log" 2>&1 6>&- 7>&- 8>&- 9>&- &
+}
+
+# Waits for the launcher to release the slot, then up to DONE_CLOSE_WAIT_S for the agent to settle after its report.
+cmd_done_close() {
+  local name=$1 SWEEP_REQUEST=$2 deadline binding=local
+  flock "$STATE_DIR/$name.lock" true
+  # Resolve a remote machine once, not on every retry.
+  if [[ -s $STATE_DIR/$name.machine ]]; then read -r binding <"$STATE_DIR/$name.machine"; fi
+  sweep_resolve "$name" "$binding"
+  deadline=$((SECONDS + ${DONE_CLOSE_WAIT_S:-120}))
+  while [[ ! -e $STATE_DIR/$name.keep && ! -e $STATE_DIR/$name.stopped ]] && (( SECONDS < deadline )); do
+    # A newer request owns the slot now; its own completion decides.
+    [[ -s $STATE_DIR/$name.request.json && $(jq -r '.id' "$STATE_DIR/$name.request.json") == "$SWEEP_REQUEST" ]] || return 0
+    cmd_sweep "$name"
+    [[ -e $STATE_DIR/$name.stopped ]] || sleep 2
+  done
+}
+
+cmd_keep() {
+  require_identity
+  [[ $# == 1 ]] || die "usage: sidecar [--slot N] keep|unkeep"
+  set_keep "$1"
+  # Unpinning after a delivered report closes the pane as that completion would have.
+  local id
+  # One read: the ID must belong to the completion that permits closing, or done-close cannot detect a newer request.
+  if [[ $1 == unkeep ]] && id=$(jq -er 'select(.exit_code == 0) | .id' "$STATE_DIR/$(agent_name).request.json" 2>/dev/null); then
+    schedule_done_close "$id"
+  fi
+  schedule_sweep "$PLUGIN_ROOT/scripts/sidecar"
+}
+
+set_keep() {
+  (
+    flock 8
+    if [[ $1 == keep ]]; then : >"$STATE_DIR/$(agent_name).keep"; else rm -f -- "$STATE_DIR/$(agent_name).keep"; fi
+  ) 8>"$STATE_DIR/$(agent_name).startup.lock"
+}
+
+cmd_session_end() {
+  local input reason sid owner
+  input=$(cat)
+  [[ -n $MUX ]] || return 0
+  reason=$(jq -r '.reason // empty' <<<"$input")
+  [[ $reason != clear ]] || return 0
+  interactive_claude_owner || return 0
+  sid=$(jq -r '.session_id // empty' <<<"$input")
+  owner=$(owner_name)
+  [[ -n $sid ]] || return 0
+  {
+    flock 7
+    [[ -s $STATE_DIR/$owner.claude-owner-session && $(<"$STATE_DIR/$owner.claude-owner-session") == "$sid" ]] || return 0
+    printf '%s\n' "$sid" >"$STATE_DIR/$owner.ended"
+  } 7>"$STATE_DIR/$owner.identity.lock"
+  local SWEEP_OWNER=$owner
+  cmd_sweep
+}
+
+SLOT=1
+SLOT_ARG=
+ROLE_ARG=
+AGENT_ARG=
+PROFILE_ARG=
+PROFILE_JSON=
+PROFILE_HASH=
+MACHINE_ARG=
+REMOTE_CWD=
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --slot)
+      [[ ${2:-} =~ ^[1-9][0-9]{0,3}$ ]] || die "--slot requires an integer from 1 to 9999"
+      SLOT=$2
+      SLOT_ARG=$2 ;;
+    --role)
+      [[ ${2:-} == @(reviewer|implementer|researcher|explorer) ]] || die "--role requires reviewer, implementer, researcher or explorer"
+      ROLE_ARG=$2 ;;
+    --agent)
+      [[ ${2:-} == pi || ${2:-} == claude ]] || die "--agent requires pi or claude"
+      AGENT_ARG=$2 ;;
+    --profile-file)
+      [[ -n ${2:-} ]] || die "--profile-file requires a JSON file"
+      if [[ $2 == /* || $2 =~ ^[A-Za-z]:[/\\] ]]; then PROFILE_ARG=$2; else PROFILE_ARG="$PWD/$2"; fi ;;
+    --machine)
+      [[ -n ${2:-} ]] || die "--machine requires a saved herdr or hc machine label or ID"
+      MACHINE_ARG=$2 ;;
+    --remote-cwd)
+      [[ ${2:-} == /* || ${2:-} =~ ^[A-Za-z]:[/\\] ]] || die "--remote-cwd requires an absolute path on the machine"
+      REMOTE_CWD=${2%/} ;;
+    *) break ;;
+  esac
+  shift 2
+done
+mkdir -p "$REQUEST_DIR" "$REPORT_DIR"
+# Parse dispatch and exit together before starting long-running work. Otherwise Bash reads past this command
+# after it returns; an in-place plugin update can move that offset into unrelated text in the new file.
+{
+# TEXT given as - is read from stdin (ask parses its own options first).
+case ${1:-} in
+  note|reject|answer|steer)
+    if [[ $# == 2 && $2 == - ]]; then
+      # A failed read may have captured part of the text; send none of it.
+      stdin_text=$(cat) || die "$1 -: reading stdin failed; nothing was sent"
+      [[ -n ${stdin_text//[[:space:]]/} ]] || die "$1 -: no text on stdin"
+      set -- "$1" "$stdin_text"
+    fi ;;
+esac
+case ${1:-} in
+  sweep|done-close|push-gate|session-start|session-end|ask|keep|unkeep) ;;
+  *) schedule_sweep "$PLUGIN_ROOT/scripts/sidecar" ;;
+esac
+case "${1:-}" in
+  sweep) shift; cmd_sweep "$@" ;;
+  done-close) shift; cmd_done_close "$@" ;;
+  keep|unkeep) cmd_keep "$@" ;;
+  session-end) shift; cmd_session_end "$@" ;;
+  session-start) shift; cmd_session_start "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  restart) shift; cmd_restart "$@" ;;
+  reload) shift; cmd_reload "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  sync-machine) shift; cmd_sync_machine "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  wait) shift; cmd_wait "$@" ;;
+  report) shift; cmd_report "$@" ;;
+  note) shift; cmd_note "$@" ;;
+  plan) shift; cmd_plan "$@" ;;
+  diff) shift; cmd_diff "$@" ;;
+  coop-review) shift; cmd_coop_review "$@" ;;
+  unreviewed) shift; cmd_unreviewed "$@" ;;
+  push-gate) shift; cmd_push_gate "$@" ;;
+  reject) shift; cmd_reject "$@" ;;
+  ask) shift; cmd_ask "$@" ;;
+  answer) shift; cmd_answer "$@" ;;
+  steer) shift; cmd_steer "$@" ;;
+  *) sed -n '3,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 64 ;;
+esac
+exit $?
+}

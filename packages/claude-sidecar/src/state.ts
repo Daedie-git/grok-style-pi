@@ -130,24 +130,31 @@ export class SlotState {
 }
 
 /**
- * An exclusive lock held as a SQLite write lock on PATH: the OS releases it when the holder exits, so a crashed holder
- * never leaves a lock to reclaim. An aborted SIGNAL makes a held lock fail at once.
+ * An exclusive lock held as a SQLite write lock on `PATH.sqlite`: the OS releases it when the holder exits, so a crashed
+ * holder never leaves a lock to reclaim. An aborted SIGNAL makes a held lock fail at once.
  */
 export async function acquireLock(path: string, signal?: AbortSignal, pollMs = 500): Promise<() => void> {
 	const { DatabaseSync } = await import("node:sqlite");
-	let db = new DatabaseSync(path);
+	const db = new DatabaseSync(`${path}.sqlite`);
 	for (;;) {
 		try {
 			db.exec("BEGIN EXCLUSIVE");
-			return () => { try { db.close(); } catch {} };
+			// Launchers before SQLite locks held PATH with their PID; one still running keeps its slot.
+			if (!legacyHolder(path)) return () => { try { db.close(); } catch {} };
+			db.exec("ROLLBACK");
 		} catch (error) {
-			// A PID file from an earlier launcher version; nothing holds it.
-			if ((error as { errcode?: number }).errcode === 26) { db.close(); rmSync(path, { force: true }); db = new DatabaseSync(path); continue; }
 			if ((error as { errcode?: number }).errcode !== 5) { db.close(); throw error; }
 		}
 		if (signal?.aborted) { db.close(); throw new Error("aborted"); }
 		await new Promise((resolve) => setTimeout(resolve, pollMs));
 	}
+}
+
+function legacyHolder(path: string): boolean {
+	const pid = Number(readText(path));
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try { process.kill(pid, 0); return true; }
+	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
 /** The band labels a request by the third dash-separated word of its id. */

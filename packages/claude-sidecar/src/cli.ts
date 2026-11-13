@@ -680,12 +680,12 @@ export class SidecarCli {
 		try { release = await acquireLock(`${base}.lock`, now.signal); } catch { return EXIT.report; }
 		try {
 			const local = await this.parent.local();
-			// Remote slots' panes close only while their machines' channels are serviced.
-			for (const number of SlotState.slots(this.dir, this.owner)) {
-				const machine = new SlotState(this.dir, slotName(this.owner, number)).read()?.machine;
-				if (machine) this.parent.remember(machine);
-			}
 			while (this.parent.deps.now() < Number(readFileSync(`${base}.until`, "utf8"))) {
+				// Remote slots' panes close only while their machines' channels are serviced; slots appear during the pass.
+				for (const number of SlotState.slots(this.dir, this.owner)) {
+					const machine = new SlotState(this.dir, slotName(this.owner, number)).read()?.machine;
+					if (machine) this.parent.remember(machine);
+				}
 				await this.parent.tick(local, { service: async () => undefined, reportError: () => undefined });
 				await this.parent.deps.sleep(this.options.pollMs ?? 1000);
 			}

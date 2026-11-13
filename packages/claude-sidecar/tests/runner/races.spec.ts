@@ -35,6 +35,17 @@ test("the slot lock admits one holder across processes", async (t) => {
 	assert.deepEqual(codes, Array(8).fill(0));
 });
 
+test("a live launcher's PID lock from before SQLite locks still holds its slot", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "sidecar-lock-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const now = new AbortController();
+	now.abort();
+	writeFileSync(join(dir, "slot.lock"), `${process.pid}\n`);
+	await assert.rejects(acquireLock(join(dir, "slot.lock"), now.signal), /aborted/);
+	writeFileSync(join(dir, "slot.lock"), "2147483646\n");
+	(await acquireLock(join(dir, "slot.lock"), now.signal))();
+});
+
 test("a request takes its owner from the transcript SessionStart recorded", async (t) => {
 	const f = fixture(t, () => ({ type: "completed", result: "done" }));
 	const transcript = join(f.root, "claude", "projects", "p", `${"0b0c0d0e-0000-4000-8000-00000000000a"}.jsonl`);

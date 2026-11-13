@@ -2700,6 +2700,18 @@ PROFILE_JSON=
 PROFILE_HASH=
 MACHINE_ARG=
 REMOTE_CWD=
+# SIDECAR_RUNNER=1 runs requests on the shared herdr-runner core through the Node front-end (src/cli.ts); other
+# commands stay here. Hook entries also start the front-end's maintenance, which closes its finished panes.
+runner_command() {
+  while [[ ${1:-} == --* && $# -ge 2 ]]; do shift 2; done
+  echo "${1:-}"
+}
+if [[ ${SIDECAR_RUNNER:-} == 1 ]]; then
+  case $(runner_command "$@") in
+    ask|answer|note|steer|status|report|stop|wait) exec node "$PLUGIN_ROOT/src/cli.ts" "$@" ;;
+    session-end|sweep) (node "$PLUGIN_ROOT/src/cli.ts" maintain </dev/null >/dev/null 2>&1 &) ;;
+  esac
+fi
 while [[ ${1:-} == --* ]]; do
   case $1 in
     --slot)

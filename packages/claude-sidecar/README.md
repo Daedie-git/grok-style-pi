@@ -78,6 +78,19 @@ If the slot is idle and its request lock is free, `steer TEXT` behaves like `ask
 
 `sidecar [--slot N] [--machine NAME] steer TEXT` delivers a message to the running sidecar immediately, even while a long `ask` holds the slot. It writes the message into the pi session's steering inbox (`<state>/grok-style-pi/steer/<pi session id>/`, from the [grok-style-pi](https://github.com/Daedie-git/grok-style-pi) extension, which must be loaded in the sidecar's pi) and waits up to `SIDECAR_STEER_TIMEOUT_S` seconds (default 8) for that extension to acknowledge it. pi shows it as a user message, mid-turn when the sidecar is working or as a normal prompt when idle. The text travels on stdin, so any length works, including through a Windows `cmd.exe` SSH shell. Before publishing, it checks that the inbox's owner record names the session file Herdr reports for the targeted agent (and that the owning process is alive), so another pi that reuses the session id is never addressed; if Herdr has not published the session file, the command says so and sends nothing. The message names the verified owner instance, so a different instance that takes over the inbox rejects it (exit 1, "owner changed"). Herdr exposes no pid for an agent, so two pi processes on the very same session file are indistinguishable. Exit 0 means the message entered the sidecar's conversation, or pi queued it behind the running turn but it was not yet seen in the conversation (the output says `queued (not yet confirmed in conversation)`, and a later input handler could still consume it); 1 refused, unverifiable target or failure; 4 not picked up and withdrawn (safe to resend); 6 outcome unknown (pi never confirmed it, for example during compaction), so it may still arrive. After a 15 s hold on earlier unconfirmed messages, an unconfirmed idle prompt may race, be dropped, or run out of order relative to later steers. The busy path never waits for a slot lock. For a slot on a machine it runs over the same SSH connection as other commands, using the machine's Node. A pi that started before the extension was updated needs `/reload` in its pane (or a restart).
 
+## Runner front-end (preview)
+
+With `SIDECAR_RUNNER=1`, `ask`, `answer`, `note`, `steer`, `status`, `report`, `stop` and `wait` run on [herdr-runner](../herdr-runner/README.md), the core that Grok's Pi subagents use, through `src/cli.ts`. Sidecars become runner agents owned by this Claude conversation: the same database, pane placement, close-on-completion, owner-gone cleanup, cold resume and remote machines as Pi subagents. Other commands and options refuse while the flag is set.
+
+Differences from the Bash launcher:
+
+- A sidecar's final reply is its report; there is no `submit_review`. Pi asks with `needs_answer`; Claude Code ends its report with `NEEDS_ANSWER: <question>`.
+- Pi children need herdr-subagents or Grok's subagent integration loaded, which reports their runs to the runner.
+- Slots live under `~/.cache/claude-sidecar/runner/`; existing Bash slots are not migrated.
+- After each request, a detached `maintain` pass (at most one per Claude pane) keeps closing finished panes for three minutes; `session-end` and `sweep` start one too.
+
+`herdr-runner` is a symlink to the shared package; Claude Code copies its target into the plugin cache.
+
 ## Install from GitHub
 
 This repository includes a single-plugin marketplace. In Claude Code:

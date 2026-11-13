@@ -387,6 +387,23 @@ const operations = {
 			db.prepare("UPDATE agents SET binding=NULL WHERE id=?").run(agentId);
 		});
 	},
+	/** Pins or unpins a pane against completion closing; owner-gone cleanup still applies. */
+	setKeep(agentId: string, keep: boolean): boolean {
+		return transaction(() => {
+			const record = agent(agentId);
+			if (!record) return false;
+			saveAgent({ ...record, keep });
+			return true;
+		});
+	},
+	/**
+	 * A front-end whose conversation continues under a new session (Claude's /clear) moves its children and their
+	 * pending notices to it, so owner-gone cleanup does not take them for orphans.
+	 */
+	transferOwnership(parentPaneId: string, fromSessionFile: string, toSessionFile: string): string[] {
+		return transaction(() => (db.prepare("SELECT data FROM agents").all().map((row) => decode<AgentRecord>(row)!)).filter((record) => record.parentPaneId === parentPaneId && record.parentSessionFile === fromSessionFile)
+			.map((record) => { saveAgent({ ...record, parentSessionFile: toSessionFile }); return record.id; }));
+	},
 	adoptAgent(agentId: string, previousRunId: string, ownership: AgentOwnership, _now: number): boolean {
 		return transaction(() => {
 			const record = agent(agentId);

@@ -175,6 +175,32 @@ test("a Claude Code owner, reported by session ID, owns children it records by t
 	assert.equal(f.closed.length, 1);
 });
 
+test("a conversation that continues under a new session keeps its children after transferring ownership", async (t) => {
+	const owner = { sessionFile: "/home/me/.claude/projects/-repo/aaaa.jsonl", reported: "aaaa" };
+	const f = await fixture(t, { keep: true, closeWhenDone: false, owner });
+	// Claude's /clear: the pane now reports another session.
+	f.panes.set("w1:p1", { paneId: "w1:p1", session: "bbbb", focused: false });
+	assert.deepEqual(await f.runner.store.transferOwnership("w1:p1", owner.sessionFile, "/home/me/.claude/projects/-repo/bbbb.jsonl"), [f.ref.agentId]);
+	f.advance(10_000);
+	await f.runner.maintain();
+	assert.notEqual((await f.runner.read(f.ref)).phase, "stopped");
+	assert.deepEqual(f.closed, []);
+});
+
+test("setKeep pins and unpins a completed pane against closing", async (t) => {
+	const f = await fixture(t);
+	await f.complete();
+	assert.equal(await f.runner.store.setKeep(f.ref.agentId, true), true);
+	f.advance();
+	await f.runner.maintain();
+	assert.deepEqual(f.closed, []);
+	await f.runner.store.setKeep(f.ref.agentId, false);
+	f.advance();
+	await f.runner.maintain();
+	assert.equal(f.closed.length, 1);
+	assert.equal(await f.runner.store.setKeep("missing", true), false);
+});
+
 for (const stage of ["initial", "final"] as const) {
 	for (const occupant of ["shell", "agent", "malformed", "missing"] as const) {
 		test(`${stage} native ${occupant} metadata ${occupant === "shell" ? "permits" : "preserves uncertainty during"} owner-gone cleanup`, async (t) => {

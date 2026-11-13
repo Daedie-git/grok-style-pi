@@ -52,6 +52,8 @@ export interface SpawnRequest {
 	definitionsCwd?: string;
 	/** A caller's resolved definition, used instead of an agent file. `allowedTools` undefined allows every tool. */
 	resolved?: { instructions?: string; allowedTools?: string[] };
+	/** Pi skill paths on the child's machine, passed as --skill. */
+	skills?: string[];
 	paneId: string;
 	tabId?: string;
 	workspaceId?: string;
@@ -577,6 +579,7 @@ export class HerdrRunner {
 				runtime: request.runtime, id, herdrName: id, paneId: "", depth, type: request.subagentType,
 				description: request.description, prompt: request.prompt, instructions: (request.resolved ? request.resolved.instructions : definition?.body) || undefined,
 				allowedTools: tools,
+				...(request.skills?.length && !claude ? { skills: request.skills } : {}),
 				projectTrusted: request.projectTrusted === false ? false : this.machine ? undefined : request.projectTrusted,
 				// A machine's providers are unknown here, so its Pi uses its own default unless the caller names a model.
 				maxTurns, model: request.model ?? (this.machine && !claude ? undefined : definition?.model),
@@ -1242,6 +1245,7 @@ function piArgs(task: HerdrTask, sessionFile: string): string[] {
 	if (task.projectTrusted !== undefined) args.push(task.projectTrusted ? "--approve" : "--no-approve");
 	if (task.model) args.push("--model", task.model);
 	if (task.thinking) args.push("--thinking", task.thinking);
+	for (const skill of task.skills ?? []) args.push("--skill", skill);
 	return args;
 }
 

@@ -1,0 +1,13 @@
+{
+  "name": "daedie-sidecar",
+  "owner": { "name": "Daedie-git" },
+  "metadata": { "version": "0.20.3", "description": "Persistent pi and Claude Code sidecars." },
+  "plugins": [
+    {
+      "name": "claude-sidecar",
+      "version": "0.20.3",
+      "source": "./packages/claude-sidecar",
+      "description": "Persistent pi and Claude Code sidecars in Herdr."
+    }
+  ]
+}

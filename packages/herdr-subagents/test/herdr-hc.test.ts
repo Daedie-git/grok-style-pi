@@ -7,7 +7,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCliError, type HerdrAgentRef, type HerdrClient } from "../src/herdr/client.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { createHcCli, HC_AGENT_LABEL, HC_SESSION_LABEL, HcError, hcConnect, hcCoreId, hcRef, hcSession, hcSessionTag, hcTerminalName, listHcMachines, type HcCall } from "../src/herdr/hc.ts";
+import { createHcCli, HC_AGENT_LABEL, HC_SESSION_LABEL, HcError, hcConnect, hcCoreId, hcRef, hcSession, hcSessionTag, hcTerminalName, listHcMachines, type HcCall, type HcFocus } from "../src/herdr/hc.ts";
 import { hostPaneId, terminalHost } from "../src/herdr/host.ts";
 import { HerdrRunner } from "../src/herdr/runner.ts";
 import type { ChildBinding } from "../src/herdr/store.ts";
@@ -139,6 +139,69 @@ test("a terminal's conversation is proven only by its program", () => {
 	assert.equal(hcRef({ ...base, status: null, labels: {} }, "t3").status, "unknown");
 });
 
+test("a Windows Pi launcher proves its original session without confusing a shell or another conversation", () => {
+	const session = "C:\\sessions\\child.jsonl";
+	const terminal = {
+		address: "t3", state: "live", pid: 50, argv: ["pi", "--session", session],
+		foreground: { pid: 50, name: "cmd.exe", argv: ["cmd.exe", "/e:ON", "/v:OFF", "/d", "/c", `C:\\bin\\pi.CMD --session ${session}`] },
+		labels: { [HC_AGENT_LABEL]: "a", [HC_SESSION_LABEL]: "60:child.jsonl" }, status: { app: "pi", state: "done" },
+	};
+	assert.equal(hcSession(terminal), "child.jsonl");
+	assert.equal(hcSession({ ...terminal, foreground: { ...terminal.foreground, argv: ["cmd.exe", "/c", `"C:\\Program Files\\Pi\\pi.cmd" --session "${session}"`] } }), "child.jsonl");
+	for (const uncertain of [
+		{ labels: { ...terminal.labels, [HC_SESSION_LABEL]: "60:another.jsonl" } },
+		{ labels: { ...terminal.labels, [HC_SESSION_LABEL]: "bad:child.jsonl" } },
+		{ labels: { ...terminal.labels, [HC_AGENT_LABEL]: "" } },
+		{ status: null },
+		{ foreground: { ...terminal.foreground, pid: 70 } },
+		{ foreground: { ...terminal.foreground, name: "powershell.exe" } },
+		{ foreground: { ...terminal.foreground, argv: ["cmd.exe", "/k", "pi.cmd"] } },
+		{ foreground: { ...terminal.foreground, argv: ["cmd.exe", "/c", "other.cmd"] } },
+		{ foreground: { ...terminal.foreground, argv: ["cmd.exe", "/c", "pi.cmd --session C:\\sessions\\another.jsonl"] } },
+		{ foreground: { ...terminal.foreground, argv: ["cmd.exe", "/c", `pi.cmd --session ${session} & other.cmd`] } },
+		{ argv: ["cmd.exe", "/c", `pi.cmd --session ${session}`] },
+		{ state: "finished" },
+	]) assert.equal(hcSession({ ...terminal, ...uncertain }), undefined, JSON.stringify(uncertain));
+});
+
+test("Windows launcher session checks ignore quoted flag text and reject duplicate session selectors", () => {
+	const session = "C:\\sessions\\child.jsonl";
+	const identity = (command: string, args = ["--session", session]) => hcSession({
+		address: "t3", state: "live", pid: 50, argv: ["pi", ...args],
+		foreground: { pid: 50, name: "cmd.exe", argv: ["cmd.exe", "/c", command] },
+		labels: { [HC_AGENT_LABEL]: "a", [HC_SESSION_LABEL]: "60:child.jsonl" }, status: { app: "pi", state: "done" },
+	});
+	assert.equal(identity(`pi.cmd --session C:\\sessions\\other.jsonl --append-system-prompt "keep --session ${session} "`), undefined);
+	for (const flag of ["--session", "--session-id", "--resume"]) {
+		assert.equal(identity(`pi.cmd --session ${session} ${flag} ${session}`, ["--session", session, flag, session]), undefined, flag);
+		assert.equal(identity(`pi.cmd --session ${session} ${flag}=${session}`, ["--session", session, `${flag}=${session}`]), undefined, `${flag}=`);
+	}
+	const prompt = `keep --session C:\\sessions\\other.jsonl `;
+	assert.equal(identity(`pi.cmd --session ${session} --append-system-prompt "${prompt}"`, ["--session", session, "--append-system-prompt", prompt]), "child.jsonl");
+	assert.equal(identity(`pi.cmd --session ${session} --append-system-prompt ""`, ["--session", session, "--append-system-prompt", ""]), "child.jsonl");
+	assert.equal(identity(`pi.cmd --session ${session} --model other`), undefined, "the entire launcher argument list must match");
+	for (const command of [
+		`pi.cmd --session "${session}`,
+		`pi.cmd --session C:\\sessions\\"child.jsonl"`,
+		`pi.cmd --session ${session} ^& other.cmd`,
+		`pi.cmd --session ${session} | other.cmd`,
+		`pi.cmd --session ${session} > other.txt`,
+		`pi.cmd --session ${session} (other.cmd)`,
+	]) assert.equal(identity(command), undefined, command);
+});
+
+test("Windows launcher arguments preserve quoted literal path characters without accepting shell expansion", () => {
+	for (const directory of ["A&B", "A B", "A(B)", "A^B", "A%B", "A!B"]) {
+		const session = `C:\\Users\\${directory}\\sessions\\child.jsonl`;
+		const terminal = {
+			address: "t3", state: "live", pid: 50, argv: ["pi", "--session", session],
+			foreground: { pid: 50, name: "cmd.exe", argv: ["cmd.exe", "/c", `"C:\\Program Files\\Pi\\pi.cmd" --session "${session}"`] },
+			labels: { [HC_AGENT_LABEL]: "a", [HC_SESSION_LABEL]: "60:child.jsonl" }, status: { app: "pi", state: "done" },
+		};
+		assert.equal(hcSession(terminal), /[%!]/.test(directory) ? undefined : "child.jsonl", directory);
+	}
+});
+
 test("hc launches a nested, labelled terminal and retries only a taken name", async () => {
 	const hc = fakeHc();
 	hc.add("t9", { name: "hermes-reviewer" });
@@ -258,19 +321,23 @@ createInterface({ input: process.stdin }).once('line', (line) => {
 });
 
 /** An hc runner whose parent Pi runs in t1 and whose subagents attach when their program starts. */
-async function fixture(t: test.TestContext, tag = hcSessionTag("core-a")) {
+async function fixture(t: test.TestContext, tag = hcSessionTag("core-a"), windows = false, focus: HcFocus = async () => null) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-hc-"));
 	let now = 1_000_000;
 	let runner!: HerdrRunner;
 	let binding: ChildBinding | undefined;
 	const hc = fakeHc({
 		async onRun(terminal) {
-			terminal.foreground = { pid: terminal.pid, name: "pi", argv: ["pi"], cwd: terminal.cwd };
+			if (windows) {
+				terminal.foreground = { pid: terminal.pid, name: "cmd.exe", argv: ["cmd.exe", "/d", "/c", `C:\\bin\\pi.CMD ${terminal.argv.slice(1).join(" ")}`], cwd: terminal.cwd };
+				const session = terminal.argv[terminal.argv.indexOf("--session") + 1];
+				terminal.labels[HC_SESSION_LABEL] = `${terminal.pid + 100}:${session.split(/[\\/]/).pop()}`;
+			} else terminal.foreground = { pid: terminal.pid, name: "pi", argv: ["pi"], cwd: terminal.cwd };
 		},
 	});
 	const parent = hc.add("t1", { argv: ["pi"], status: { app: "pi", state: "working" } });
 	parent.labels[HC_SESSION_LABEL] = `${parent.pid}:owner.jsonl`;
-	const client = createHcCli({ HC_TERMINAL_ID: "t1" }, { call: hc.call, focus: async () => null });
+	const client = createHcCli({ HC_TERMINAL_ID: "t1" }, { call: hc.call, focus });
 	runner = new HerdrRunner({ root, client, herdrSession: tag, now: () => now, sleep: async (ms) => { now += ms; } });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const ref = await runner.spawn({
@@ -313,6 +380,40 @@ test("an hc subagent runs in a child terminal, closes when done and reopens cold
 	assert.equal(reopened.sessionFile, record.sessionFile);
 	assert.deepEqual(f.hc.runs()[1].params.argv, ["pi", "--session", record.sessionFile, "--model", "test-model", "--thinking", "medium"]);
 	assert.equal((await f.runner.store.launches()).find((item) => item.agentId === record.id)?.stage, "published");
+});
+
+test("completed Windows Pi child terminals close without losing their result or cold-resume conversation", async (t) => {
+	const f = await fixture(t, hcSessionTag("core-a"), true);
+	const original = await f.runner.resolve(f.ref.agentId);
+	await f.complete();
+	f.advance();
+	await f.runner.maintain();
+	assert.equal(f.hc.terminals.has(original.paneId), false, "the cmd.exe launcher must not keep a completed child alive");
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked");
+	assert.equal((await f.runner.read(f.ref)).result, "remembered");
+	const followUp = await f.runner.resume(f.ref.agentId, "continue");
+	const reopened = await f.runner.resolve(f.ref.agentId);
+	assert.notEqual(followUp.runId, f.ref.runId);
+	assert.notEqual(reopened.paneId, original.paneId);
+	assert.equal(reopened.sessionFile, original.sessionFile);
+});
+
+test("Windows launcher recognition still preserves focused, unknown-focus and working children", async (t) => {
+	let focused: string | null | undefined = "t2";
+	const f = await fixture(t, hcSessionTag("core-a"), true, async () => focused);
+	await f.complete();
+	for (const state of ["focused", "unknown", "working"] as const) {
+		focused = state === "focused" ? "t2" : state === "unknown" ? undefined : null;
+		f.hc.terminals.get("t2")!.status = { app: "pi", state: state === "working" ? "working" : "done" };
+		f.advance(2000);
+		await f.runner.maintain();
+		assert.equal(f.hc.terminals.get("t2")?.state, "live", state);
+		assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, undefined, state);
+	}
+	f.hc.terminals.get("t2")!.status = { app: "pi", state: "done" };
+	f.advance(2000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked");
 });
 
 test("an hc subagent whose owner's terminal finished is stopped and closed", async (t) => {

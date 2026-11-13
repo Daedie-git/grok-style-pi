@@ -131,17 +131,69 @@ export function hcSession(terminal: HcTerminal): string | undefined {
 	const published = terminal.labels?.[HC_SESSION_LABEL];
 	if (published) {
 		const colon = published.indexOf(":");
+		const pid = Number(published.slice(0, colon));
+		const session = published.slice(colon + 1);
+		if (colon <= 0 || !Number.isSafeInteger(pid) || pid <= 0 || !session) return undefined;
 		// Pi retitles itself, so its argv cannot tell; its PID ties the label to the process that wrote it.
-		return Number(published.slice(0, colon)) === terminal.foreground.pid && colon > 0 ? published.slice(colon + 1) || undefined : undefined;
+		if (pid === terminal.foreground.pid) return session;
+		// Windows reports the dedicated pi.cmd launcher's PID, not its Node child. Its one-shot command and
+		// unchanged root PID prove only the original launch session, never a label left by another conversation.
+		const launched = launchSession(terminal);
+		return launched && session === launched.split(/[\\/]/).pop() && windowsPiLauncher(terminal) ? session : undefined;
 	}
 	// A subagent's launched program, still in the foreground, runs the session it was started with.
 	if (!terminal.labels?.[HC_AGENT_LABEL] || terminal.foreground.pid !== terminal.pid) return undefined;
+	return launchSession(terminal);
+}
+
+function launchSession(terminal: HcTerminal): string | undefined {
 	const argv = terminal.argv ?? [];
 	for (const flag of ["--session", "--session-id", "--resume"]) {
 		const index = argv.indexOf(flag);
 		if (index >= 0 && argv[index + 1]) return argv[index + 1];
 	}
 	return undefined;
+}
+
+function windowsPiLauncher(terminal: HcTerminal): boolean {
+	const foreground = terminal.foreground;
+	if (!terminal.labels?.[HC_AGENT_LABEL] || terminal.status?.app !== "pi" || foreground?.pid !== terminal.pid
+		|| !/^(?:.*[\\/])?cmd\.exe$/i.test(foreground?.name ?? "") || !/^(?:.*[\\/])?pi(?:\.cmd)?$/i.test(terminal.argv?.[0] ?? "")) return false;
+	const argv = foreground?.argv ?? [];
+	const index = argv.findIndex(arg => arg.toLowerCase() === "/c");
+	const command = index >= 0 && index === argv.length - 2 ? argv[index + 1] : "";
+	const parsed = windowsLauncherArgs(command);
+	if (!parsed || !/^(?:.*[\\/])?pi\.cmd$/i.test(parsed[0] ?? "")) return false;
+	const expected = (terminal.argv ?? []).slice(1);
+	// Match the entire original argv, not flag-looking text inside a quoted prompt, and refuse ambiguous selectors.
+	return parsed.length === expected.length + 1 && expected.every((arg, i) => parsed[i + 1] === arg)
+		&& expected.filter(arg => /^--(?:session(?:-id)?|resume)(?:=|$)/.test(arg)).length === 1;
+}
+
+/** Only the launcher's unexpanded words and whole-argument quotes are supported; ambiguous cmd syntax fails closed. */
+function windowsLauncherArgs(command: string): string[] | undefined {
+	const args: string[] = [];
+	let word = "";
+	let started = false;
+	let quoted = false;
+	let closed = false;
+	for (const char of command) {
+		if (/[\r\n%!]/.test(char)) return undefined; // Expansion can change even quoted arguments.
+		if (char === '"') {
+			if (!started) { started = true; quoted = true; }
+			else if (quoted && !word.endsWith("\\")) { quoted = false; closed = true; }
+			else return undefined;
+		} else if (!quoted && /\s/.test(char)) {
+			if (started) { args.push(word); word = ""; started = false; closed = false; }
+		} else {
+			if (closed || (!quoted && /[&|<>^()]/.test(char))) return undefined;
+			word += char;
+			started = true;
+		}
+	}
+	if (quoted) return undefined;
+	if (started) args.push(word);
+	return args;
 }
 
 const AGENT_PROGRAM = /^(pi|claude|node|bun)(\.cmd|\.exe)?$/i;

@@ -7,3 +7,4 @@ export * from "./hc.ts";
 export * from "./host.ts";
 export * from "./state.ts";
 export * from "./config.ts";
+export * from "./parent.ts";

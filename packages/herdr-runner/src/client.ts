@@ -73,7 +73,8 @@ export interface HerdrClient {
 	/** The permanent id of the host these commands reach, for hosts whose sessions the environment cannot name reliably. */
 	hostId?(): Promise<string>;
 	/** Records which conversation this process runs in its pane, for hosts that cannot see it; undefined withdraws it. */
-	publishSession?(paneId: string, sessionFile: string | undefined): Promise<void>;
+	/** `pid` is the process that runs the conversation, by default this one. */
+	publishSession?(paneId: string, sessionFile: string | undefined, pid?: number): Promise<void>;
 }
 
 export function paneIdFromSplit(payload: unknown): string {

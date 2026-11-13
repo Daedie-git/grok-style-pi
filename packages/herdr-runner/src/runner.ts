@@ -151,9 +151,12 @@ export function agentPresence(record: Pick<AgentRecord, "herdrName" | "paneId" |
 	return named.paneId === record.paneId ? "alive" : "unknown";
 }
 
-/** Session files have unique names, and Claude reports its session ID or a transcript named after it. */
+/**
+ * Session files have unique names, and Claude reports its session ID or a transcript named after it. A Claude owner
+ * records its transcript, which Herdr reports as the bare ID, so the extension does not count.
+ */
 function sameSession(reported: string, record: Pick<AgentRecord, "sessionFile" | "sessionId">): boolean {
-	const file = (path: string) => path.split(/[\\/]/).pop();
+	const file = (path: string) => path.split(/[\\/]/).pop()?.replace(/\.jsonl$/, "");
 	return file(reported) === file(record.sessionFile) || (!!record.sessionId && reported.includes(record.sessionId));
 }
 

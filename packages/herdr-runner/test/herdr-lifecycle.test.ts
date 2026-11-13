@@ -21,12 +21,12 @@ const stoppable = (client: HerdrClient, up: () => boolean): HerdrClient => {
 	return { ...client, listAgents: guard(client.listAgents), listPanes: guard(client.listPanes), getAgent: guard(client.getAgent), getPane: guard(client.getPane!) };
 };
 
-async function fixture(t: test.TestContext, options: { herdrSession?: string; keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string; sleep?: (ms: number) => Promise<void> } = {}) {
+async function fixture(t: test.TestContext, options: { herdrSession?: string; keep?: boolean; closeWhenDone?: boolean; ownerSession?: boolean; runtime?: "claude-code"; machine?: string; parentPaneId?: string; workspaceId?: string; sleep?: (ms: number) => Promise<void>; owner?: { sessionFile: string; reported: string } } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-lifecycle-"));
 	let now = 1_000_000;
 	let sequence = 1;
 	let binding: ChildBinding | undefined;
-	const parent: HerdrAgentRef = { paneId: options.parentPaneId ?? "w1:p1", session: "/owner.jsonl", focused: false };
+	const parent: HerdrAgentRef = { paneId: options.parentPaneId ?? "w1:p1", session: options.owner?.reported ?? "/owner.jsonl", focused: false };
 	const panes = new Map<string, HerdrAgentRef>([[parent.paneId!, parent]]);
 	const named = new Map<string, HerdrAgentRef>();
 	const starts: Array<{ name: string; paneId: string; args: string[] }> = [];
@@ -73,7 +73,7 @@ async function fixture(t: test.TestContext, options: { herdrSession?: string; ke
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const ref = await runner.spawn({
 		prompt: "remember this", description: "test", subagentType: "test", runtime: options.runtime,
-		cwd: root, paneId: parent.paneId!, workspaceId: options.workspaceId, sessionFile: options.ownerSession === false ? undefined : parent.session,
+		cwd: root, paneId: parent.paneId!, workspaceId: options.workspaceId, sessionFile: options.ownerSession === false ? undefined : options.owner?.sessionFile ?? parent.session,
 		runInBackground: true, keep: options.keep, model: "test-model", thinking: "high",
 		resolved: { instructions: "test instructions", allowedTools: ["read"] },
 	});
@@ -160,6 +160,19 @@ test("owner disappearance stops an active pinned child independently of completi
 	assert.equal(f.closed.length, 1);
 	assert.equal((await f.runner.read(f.ref)).phase, "stopped");
 	assert.equal((await f.runner.resolve(f.ref.agentId)).paneState, "parked");
+});
+
+test("a Claude Code owner, reported by session ID, owns children it records by transcript", async (t) => {
+	const owner = { sessionFile: "/home/me/.claude/projects/-repo/1b2c3d4e-0000-4000-8000-000000000001.jsonl", reported: "1b2c3d4e-0000-4000-8000-000000000001" };
+	const f = await fixture(t, { keep: true, closeWhenDone: false, owner });
+	await f.runner.maintain();
+	assert.notEqual((await f.runner.read(f.ref)).phase, "stopped");
+	assert.deepEqual(f.closed, []);
+	f.panes.delete("w1:p1");
+	f.advance(10_000);
+	await f.runner.maintain();
+	assert.equal((await f.runner.read(f.ref)).phase, "stopped");
+	assert.equal(f.closed.length, 1);
 });
 
 for (const stage of ["initial", "final"] as const) {

@@ -252,6 +252,9 @@ test("hc lookups stay on the client's machine and find agents by label", async (
 	await local.closePane("t2");
 	await local.publishSession!("t3", "/home/me/.pi/sessions/x_1.jsonl");
 	assert.equal(hc.terminals.get("t3")!.labels[HC_SESSION_LABEL], `${process.pid}:x_1.jsonl`);
+	// A Claude Code owner's helper labels the terminal for Claude's process, not its own.
+	await local.publishSession!("t3", "/home/me/.claude/projects/-repo/abc.jsonl", 4242);
+	assert.equal(hc.terminals.get("t3")!.labels[HC_SESSION_LABEL], "4242:abc.jsonl");
 	await local.publishSession!("t3", undefined);
 	assert.equal(hc.terminals.get("t3")!.labels[HC_SESSION_LABEL], undefined);
 	await assert.rejects(local.split({ paneId: "t3", direction: "right", cwd: "/" }), /Use launch/);

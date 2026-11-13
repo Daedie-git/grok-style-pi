@@ -326,8 +326,8 @@ export function createHcCli(env: NodeJS.ProcessEnv = process.env, options: HcOpt
 			const focused = await focus();
 			return terminals.map((terminal) => hcRef(terminal, paneOf(terminal), focused));
 		},
-		async publishSession(paneId, sessionFile) {
-			const value = sessionFile ? `${process.pid}:${sessionFile.split(/[\\/]/).pop()}` : "";
+		async publishSession(paneId, sessionFile, pid = process.pid) {
+			const value = sessionFile ? `${pid}:${sessionFile.split(/[\\/]/).pop()}` : "";
 			await call("terminal.label", { terminal: address(paneId), labels: { [HC_SESSION_LABEL]: value } }, { timeout: 5000 });
 		},
 	};

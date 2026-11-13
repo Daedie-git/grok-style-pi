@@ -3,9 +3,9 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionFactory, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { herdrIntegrationEnvironment, loadSubagentExtension } from "../integrations/subagents.ts";
 import { createHerdrSubagents, remoteWorkerEntry } from "../packages/herdr-subagents/src/herdr/extension.ts";
-import { HerdrStore } from "../packages/herdr-subagents/src/herdr/store.ts";
-import { HerdrRunner } from "../packages/herdr-subagents/src/herdr/runner.ts";
-import type { HerdrClient } from "../packages/herdr-subagents/src/herdr/client.ts";
+import { HerdrStore } from "../packages/herdr-runner/src/store.ts";
+import { HerdrRunner } from "../packages/herdr-runner/src/runner.ts";
+import type { HerdrClient } from "../packages/herdr-runner/src/client.ts";
 import { Worker } from "node:worker_threads";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-test("the Grok package ships the standalone runner and both compatibility entries", { timeout: 30_000 }, () => {
+test("the Grok package ships the shared runner, the standalone package and both compatibility entries", { timeout: 30_000 }, () => {
 	// Windows ships npm as a command script, which cannot be launched directly by execFileSync.
 	const command = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : "npm";
 	const args = process.platform === "win32" ? ["/d", "/s", "/c", "npm pack --dry-run --json --ignore-scripts"] : ["pack", "--dry-run", "--json", "--ignore-scripts"];
@@ -26,6 +26,7 @@ test("the Grok package ships the standalone runner and both compatibility entrie
 		"packages/herdr-subagents/package.json", "packages/herdr-subagents/src/herdr/extension.ts",
 		"packages/herdr-subagents/src/herdr/worker-entry.mjs", "packages/herdr-subagents/src/herdr/claude-hook-entry.mjs",
 		"src/herdr/worker-entry.mjs", "src/herdr/claude-hook-entry.mjs",
+		"packages/herdr-runner/package.json", "packages/herdr-runner/src/worker-entry.mjs", "packages/herdr-runner/src/claude-hook-entry.mjs",
 	]) assert.ok(paths.includes(path), `${path} must ship with Grok`);
 });
 

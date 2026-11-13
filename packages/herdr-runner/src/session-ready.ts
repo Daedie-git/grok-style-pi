@@ -1,4 +1,44 @@
-import { buildSessionContext, CURRENT_SESSION_VERSION, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const PI_PACKAGE = "@earendil-works/pi-coding-agent";
+
+/** The part of Pi's public API that reconstructs a saved session. */
+export interface PiSessionApi {
+	CURRENT_SESSION_VERSION: number;
+	buildSessionContext(entries: never[]): { messages: unknown[] };
+}
+
+/**
+ * Pi's own package when this runs inside Pi or a checkout that installs it; otherwise the Pi on PATH, which a Claude
+ * Code parent launches children with. Undefined when neither exists: readiness then fails closed.
+ */
+export async function loadPiSessionApi(env: NodeJS.ProcessEnv = process.env): Promise<PiSessionApi | undefined> {
+	try { return await import(PI_PACKAGE) as PiSessionApi; } catch {}
+	for (const dir of (env.PATH ?? "").split(delimiter)) {
+		for (const name of process.platform === "win32" ? ["pi.cmd", "pi"] : ["pi"]) {
+			const root = piPackageRoot(join(dir, name));
+			if (!root) continue;
+			try { return await import(pathToFileURL(join(root, "dist", "index.js")).href) as PiSessionApi; } catch {}
+		}
+	}
+	return undefined;
+}
+
+/** Walks up from an executable's real path to Pi's package root. npm's Windows shims sit beside node_modules. */
+function piPackageRoot(executable: string): string | undefined {
+	if (!existsSync(executable)) return undefined;
+	const candidates = [realpathSync(executable), join(dirname(executable), "node_modules", ...PI_PACKAGE.split("/"), "package.json")];
+	for (let dir = candidates[0]; dir !== dirname(dir); dir = dirname(dir)) {
+		if (isPiPackage(join(dir, "package.json"))) return dir;
+	}
+	return isPiPackage(candidates[1]) ? dirname(candidates[1]) : undefined;
+}
+
+function isPiPackage(file: string): boolean {
+	try { return JSON.parse(readFileSync(file, "utf8")).name === PI_PACKAGE; } catch { return false; }
+}
 
 function object(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -64,10 +104,11 @@ function entryPayload(entry: Record<string, unknown>, ids: Set<string>): boolean
 }
 
 /** Read-only validation: never opens a writable manager or migrates a live child's session file. */
-export function piSessionReady(text: string, expected: { sessionId?: string; cwd: string }): boolean {
+export function piSessionReady(text: string, expected: { sessionId?: string; cwd: string }, pi: PiSessionApi | undefined): boolean {
+	if (!pi) return false;
 	try {
 		const [header, ...entries]: unknown[] = text.trim().split("\n").map((line) => JSON.parse(line));
-		if (!object(header) || header.type !== "session" || header.version !== CURRENT_SESSION_VERSION
+		if (!object(header) || header.type !== "session" || header.version !== pi.CURRENT_SESSION_VERSION
 			|| typeof header.id !== "string" || header.id !== expected.sessionId || header.cwd !== expected.cwd) return false;
 		const ids = new Set<string>();
 		for (const entry of entries) {
@@ -78,6 +119,6 @@ export function piSessionReady(text: string, expected: { sessionId?: string; cwd
 			ids.add(entry.id);
 		}
 		// This is the same exported reconstruction used by SessionManager, without writes or resource discovery.
-		return buildSessionContext(entries as SessionEntry[]).messages.every(message);
+		return pi.buildSessionContext(entries as never[]).messages.every(message);
 	} catch { return false; }
 }

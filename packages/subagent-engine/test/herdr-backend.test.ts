@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { HerdrBackendHandle, HerdrBackendNotice } from "../../herdr-subagents/src/herdr/backend.ts";
+import type { HerdrBackendHandle, HerdrBackendNotice } from "herdr-runner/backend.ts";
 import { HerdrBackendAdapter } from "../src/backends/herdr.ts";
 import type { AgentMeta, Envelope } from "../src/types.ts";
 

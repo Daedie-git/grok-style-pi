@@ -1,4 +1,4 @@
-import { terminalHost, type TerminalHost } from "../../packages/herdr-subagents/src/herdr/host.ts";
+import { terminalHost, type TerminalHost } from "../../packages/herdr-runner/src/host.ts";
 
 /** Detect a terminal host for the combined entrypoint; the engine remains the default runner in either environment. */
 export function selectSubagentRuntime(env: NodeJS.ProcessEnv): TerminalHost | "engine" {

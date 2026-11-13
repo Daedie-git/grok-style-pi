@@ -7,8 +7,8 @@ import { Type } from "typebox";
 import { createAssistantMessageEventStream, getModel, type AssistantMessage } from "@earendil-works/pi-ai/compat";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { HerdrRunner } from "../src/herdr/runner.ts";
-import type { HerdrClient } from "../src/herdr/client.ts";
+import { HerdrRunner } from "herdr-runner/runner.ts";
+import type { HerdrClient } from "herdr-runner/client.ts";
 
 test("real Pi nested calls obey Herdr scope without activating allowed deferred tools", { timeout: 15_000 }, async (t) => {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });

@@ -10,11 +10,13 @@ import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef
 import { HERDR_REMOTE_PROTOCOL, agentNamePrefix, agentNumbers, herdrSubagentRoot, type MaintenanceObservation } from "./store.ts";
 import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, AgentOwnership, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
-import { piSessionReady } from "./session-ready.ts";
+import { loadPiSessionApi, piSessionReady } from "./session-ready.ts";
 
 // A worker thread receives its root; a remote stdio process takes an optional root argument.
 const root = (workerData as { root?: string } | null)?.root ?? process.argv[2] ?? herdrSubagentRoot();
 mkdirSync(root, { recursive: true });
+/** Without Pi, no saved Pi session counts as loadable, so nothing that needs one closes or cold-resumes. */
+const piSession = await loadPiSessionApi();
 const BUSY_MS = 5000;
 const MAINTENANCE_BUSY_MS = 250;
 
@@ -367,7 +369,7 @@ const operations = {
 					&& ["user", "assistant"].includes(entry.type) && entry.message?.role === entry.type
 					&& (typeof entry.message.content === "string" || Array.isArray(entry.message.content)));
 			}
-			return piSessionReady(readFileSync(record.sessionFile, "utf8"), { sessionId: record.sessionId, cwd: record.cwd });
+			return piSessionReady(readFileSync(record.sessionFile, "utf8"), { sessionId: record.sessionId, cwd: record.cwd }, piSession);
 		} catch { return false; }
 	},
 	rebindPane(agentId: string, previousRunId: string, paneId: string, herdrName: string): void {

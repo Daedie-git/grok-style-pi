@@ -7,7 +7,7 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { createAssistantMessageEventStream, getModel, type AssistantMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "../../herdr-subagents/src/herdr/backend.ts";
+import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "herdr-runner/backend.ts";
 import { HerdrBackendAdapter } from "../src/backends/herdr.ts";
 import { HerdrRuns, type HerdrRunsHost, type HerdrRunHandle, type HerdrCapturedSummary } from "../src/backends/herdr-runs.ts";
 import { Control } from "../src/control.ts";

@@ -295,7 +295,9 @@ Both full Grok entrypoints call `extensions/install.ts` once to wire Pi's editor
 | `src/activity/` | Activity panel state and presentation |
 | `src/subagents/` | Public-snapshot/event activity projections, result styling and Herdr availability detection |
 | `packages/subagent-engine/` | Engine admission, agent sessions, messaging, shared tasks, workflows and backend routing |
-| `packages/herdr-subagents/` | Standalone Herdr package: extension, runner, child sessions, CLI client, database worker, and runner tests |
+| `packages/herdr-runner/` | Shared core: runner, child sessions, Herdr and hc clients, database worker, Claude hook bridge, and their tests |
+| `packages/herdr-subagents/` | Standalone Herdr Pi package: extension, tools and backend wiring over the runner |
+| `packages/claude-sidecar/` | Claude Code plugin: persistent Pi and Claude Code sidecars in Herdr |
 | `src/herdr/*.mjs` | Compatibility forwarding entries for legacy remote Grok package roots and existing Claude hook commands |
 | `src/steering/` | Per-session inbox that delivers externally submitted steering messages |
 | `src/utils/` | Shared bounded text helpers |
@@ -325,4 +327,4 @@ Requires Node 22.18+ on the 22.x line, or Node 24+ (type stripping) and `@earend
 
 Engine `spawned`, `run-event`, `settled`, and diagnostic events drive activity. Explicit run IDs distinguish continuations even when timestamps coincide. Completed rows retain at most 64,000 characters and no child-session references. Engine children load user extensions normally, but Grok's full entrypoints return early in child context so they do not install chrome, duplicate tools or steering watchers.
 
-`npm test` runs strict typechecks and the Grok, engine and standalone Herdr suites. `npm run typecheck` runs the checks alone; `npm run test:herdr` runs the standalone package gate. `node --test test/activity.test.ts test/subagent-contract.test.ts test/workflow-activity.test.ts test/herdr-integration.test.ts` exercises integration contracts, including real Pi sessions with scripted offline models, reload hydration, cancellation and workflow rendering. Herdr tests use SQLite workers and separate processes with mocked pane operations; no live model requests are needed.
+`npm test` runs strict typechecks and the Grok, engine, runner and standalone Herdr suites. `npm run typecheck` runs the checks alone; `npm run test:herdr` runs the standalone package gate. `node --test test/activity.test.ts test/subagent-contract.test.ts test/workflow-activity.test.ts test/herdr-integration.test.ts` exercises integration contracts, including real Pi sessions with scripted offline models, reload hydration, cancellation and workflow rendering. Herdr tests use SQLite workers and separate processes with mocked pane operations; no live model requests are needed.

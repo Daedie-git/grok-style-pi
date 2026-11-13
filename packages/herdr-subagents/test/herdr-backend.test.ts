@@ -5,10 +5,10 @@ import { join, resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, getModel, type AssistantMessage } from "@earendil-works/pi-ai/compat";
 import { createHerdrSubagents, type HerdrBackendHandle, type HerdrBackendNotice, type HerdrSubagentOptions } from "../src/herdr/extension.ts";
-import { workerChannel } from "../src/herdr/store.ts";
-import type { HerdrClient } from "../src/herdr/client.ts";
-import { createChildSession } from "../src/herdr/child.ts";
-import { HerdrRunner } from "../src/herdr/runner.ts";
+import { workerChannel } from "herdr-runner/store.ts";
+import type { HerdrClient } from "herdr-runner/client.ts";
+import { createChildSession } from "herdr-runner/child.ts";
+import { HerdrRunner } from "herdr-runner/runner.ts";
 
 async function until(check: () => boolean | Promise<boolean>) {
 	for (let i = 0; i < 300; i++) { if (await check()) return; await new Promise((done) => setTimeout(done, 10)); }

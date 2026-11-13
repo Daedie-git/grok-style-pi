@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
-import { claudeArgs, claudeTools, handleClaudeHook } from "../src/herdr/claude.ts";
-import type { HerdrClient } from "../src/herdr/client.ts";
-import { HerdrRunner, type SpawnRequest } from "../src/herdr/runner.ts";
+import { claudeArgs, claudeTools, handleClaudeHook } from "../src/claude.ts";
+import type { HerdrClient } from "../src/client.ts";
+import { HerdrRunner, type SpawnRequest } from "../src/runner.ts";
 
 function fixture(t: TestContext, extra: Partial<HerdrClient> = {}) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-claude space-'$`&-é-"));
@@ -192,7 +192,7 @@ test("Claude tool selection maps built-ins without granting permission bypass", 
 	assert.ok(args.includes("--strict-mcp-config"));
 	assert.ok(!args.includes("--allowedTools"));
 	const hooks = JSON.parse(args[args.indexOf("--settings") + 1]).hooks;
-	const entry = fileURLToPath(new URL("../src/herdr/claude-hook-entry.mjs", import.meta.url));
+	const entry = fileURLToPath(new URL("../src/claude-hook-entry.mjs", import.meta.url));
 	for (const event of Object.keys(hooks)) {
 		assert.deepEqual(hooks[event][0].hooks, [{
 			type: "command", command: process.execPath, args: [entry, "/state path/'quoted", "agent"], timeout: 10,

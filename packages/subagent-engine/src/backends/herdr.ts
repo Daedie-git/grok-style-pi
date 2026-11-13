@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "../../../herdr-subagents/src/herdr/backend.ts";
+import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "herdr-runner/backend.ts";
 import type { AgentMeta, BackendCapabilities, DeliveryResult, Envelope } from "../types.ts";
 
 export interface HerdrProxyNotice {

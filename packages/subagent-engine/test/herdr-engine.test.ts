@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
-import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "../../herdr-subagents/src/herdr/backend.ts";
+import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "herdr-runner/backend.ts";
 import { HerdrBackendAdapter } from "../src/backends/herdr.ts";
 import { createHarness, toolResultText, until, type Harness, type Script } from "./fixtures/harness.ts";
 import { ROOT_CALLER, type AgentDefaults } from "../src/engine.ts";

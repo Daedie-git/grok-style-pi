@@ -11,8 +11,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
-import { createHerdrCli } from "../../src/herdr/client.ts";
-import { HerdrRunner, spawnHerdrAgent, type SpawnRequest } from "../../src/herdr/runner.ts";
+import { createHerdrCli } from "../../src/client.ts";
+import { HerdrRunner, spawnHerdrAgent, type SpawnRequest } from "../../src/runner.ts";
 
 assert.equal(process.env.HERDR_ENV, "1", "Run inside a Herdr pane");
 const captures = resolve("captures");
@@ -25,7 +25,7 @@ if (process.argv.includes("--upgrade-db")) {
 	legacy.close();
 }
 const extension = join(root, "extension.ts");
-const factory = new URL("../../src/herdr/extension.ts", import.meta.url).pathname;
+const factory = new URL("../../src/extension.ts", import.meta.url).pathname;
 writeFileSync(extension, `import { createHerdrSubagents } from ${JSON.stringify(factory)};\nexport default createHerdrSubagents({ root: ${JSON.stringify(root)}, agentDir: ${JSON.stringify(root)} });\n`);
 const native = createHerdrCli();
 const reporter = process.env.HERDR_PI_REPORTER || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "extensions", "herdr-agent-state.ts");
@@ -72,7 +72,7 @@ try {
 			assert.deepEqual(await runner.resolve(agentId), unchanged);
 			assert.equal(await native.getAgent(before.herdrName), undefined);
 		}
-		const command = fileURLToPath(new URL("../../src/herdr/lifecycle-upgrade.mjs", import.meta.url));
+		const command = fileURLToPath(new URL("../../src/lifecycle-upgrade.mjs", import.meta.url));
 		assert.equal(JSON.parse(execFileSync(process.execPath, [command, "--root", root, "--status"], { encoding: "utf8" })).allowed, false);
 		assert.equal(JSON.parse(execFileSync(process.execPath, [command, "--root", root, "--confirm-old-workers-stopped"], { encoding: "utf8" })).allowed, true);
 	}

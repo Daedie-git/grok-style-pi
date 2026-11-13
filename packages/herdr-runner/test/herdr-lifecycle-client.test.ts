@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { panesFromList } from "../src/herdr/client.ts";
+import { panesFromList } from "../src/client.ts";
 
 test("pane liveness preserves positive focus, status and conversation evidence", () => {
 	const [pane, incomplete] = panesFromList({ result: { panes: [

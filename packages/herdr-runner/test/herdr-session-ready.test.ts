@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as pi from "@earendil-works/pi-coding-agent";
 import { SessionManager, type FileEntry } from "@earendil-works/pi-coding-agent";
-import { piSessionReady } from "../src/herdr/session-ready.ts";
+import { piSessionReady } from "../src/session-ready.ts";
 
 const cwd = "/workspace";
 const timestamp = "2026-10-24T00:00:00.000Z";
@@ -16,7 +17,7 @@ const user = { ...base, message: { role: "user", content: "saved prompt", timest
 test("Pi readiness rejects the reviewer's parseable message that the real loader cannot reconstruct", () => {
 	const manager = SessionManager.inMemory(cwd, undefined, JSON.parse(`[${session([base]).trim().split("\n").join(",")}]`) as FileEntry[]);
 	assert.throws(() => manager.buildSessionContext(), /role/);
-	assert.equal(piSessionReady(session([base]), identity), false);
+	assert.equal(piSessionReady(session([base]), identity, pi), false);
 });
 
 test("Pi readiness rejects malformed tree and message structures without hanging", () => {
@@ -27,9 +28,9 @@ test("Pi readiness rejects malformed tree and message structures without hanging
 		[{ ...base, type: "compaction", summary: 42, firstKeptEntryId: "message", tokensBefore: 10 }],
 		[user, { ...base, id: "edit", type: "context_edit", parentId: "message", targetId: "message", replacement: {} }],
 	];
-	for (const entries of invalid) assert.equal(piSessionReady(session(entries), identity), false, JSON.stringify(entries));
-	assert.equal(piSessionReady(session([user]) + "{truncated", identity), false);
-	assert.equal(piSessionReady(session([user]), { ...identity, sessionId: "another" }), false);
+	for (const entries of invalid) assert.equal(piSessionReady(session(entries), identity, pi), false, JSON.stringify(entries));
+	assert.equal(piSessionReady(session([user]) + "{truncated", identity, pi), false);
+	assert.equal(piSessionReady(session([user]), { ...identity, sessionId: "another" }, pi), false);
 });
 
 test("Pi readiness accepts SDK-generated branching, compaction, custom data and edited context without rewriting it", () => {
@@ -45,6 +46,10 @@ test("Pi readiness accepts SDK-generated branching, compaction, custom data and 
 	manager.appendCompaction("retained summary", userId, 100);
 	const text = [manager.getHeader(), ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
 	assert.ok(manager.buildSessionContext().messages.length > 0);
-	assert.equal(piSessionReady(text, { cwd, sessionId: manager.getSessionId() }), true);
+	assert.equal(piSessionReady(text, { cwd, sessionId: manager.getSessionId() }, pi), true);
 	assert.equal(JSON.stringify(manager.getEntries()), JSON.stringify(JSON.parse(`[${text.trim().split("\n").slice(1).join(",")}]`)));
+});
+
+test("Pi readiness fails closed without Pi's session API", () => {
+	assert.equal(piSessionReady(session([user]), identity, undefined), false);
 });

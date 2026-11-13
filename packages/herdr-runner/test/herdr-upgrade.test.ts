@@ -8,9 +8,9 @@ import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import type { HerdrClient } from "../src/herdr/client.ts";
-import { HerdrRunner } from "../src/herdr/runner.ts";
-import { HerdrStore, type AgentRecord, type RunSnapshot } from "../src/herdr/store.ts";
+import type { HerdrClient } from "../src/client.ts";
+import { HerdrRunner } from "../src/runner.ts";
+import { HerdrStore, type AgentRecord, type RunSnapshot } from "../src/store.ts";
 
 const execute = promisify(execFile);
 const confirmation = "all-old-workers-stopped";
@@ -305,7 +305,7 @@ test("upgrade needs the exact explicit confirmation and survives a worker restar
 test("lifecycle-upgrade CLI status never creates a missing database or root", async (t) => {
 	const parent = mkdtempSync(join(tmpdir(), "herdr-status-missing-"));
 	t.after(() => { rmSync(parent, { recursive: true, force: true }); });
-	const cli = fileURLToPath(new URL("../src/herdr/lifecycle-upgrade.mjs", import.meta.url));
+	const cli = fileURLToPath(new URL("../src/lifecycle-upgrade.mjs", import.meta.url));
 	for (const root of [parent, join(parent, "missing-root")]) {
 		const { stdout } = await execute(process.execPath, [cli, "--root", root, "--status"]);
 		const status = JSON.parse(stdout) as { database: string; allowed: boolean; reason: string };
@@ -323,7 +323,7 @@ test("lifecycle-upgrade CLI status is read-only and explicit confirmation enable
 	await assertPaused(store);
 	await old.close();
 	await store.close();
-	const cli = fileURLToPath(new URL("../src/herdr/lifecycle-upgrade.mjs", import.meta.url));
+	const cli = fileURLToPath(new URL("../src/lifecycle-upgrade.mjs", import.meta.url));
 	const status = async () => {
 		const { stdout } = await execute(process.execPath, [cli, "--root", root, "--status"]);
 		return JSON.parse(stdout) as { allowed: boolean; reason: string };

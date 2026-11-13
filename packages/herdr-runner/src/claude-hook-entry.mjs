@@ -1,0 +1,22 @@
+import { importTs } from "./load-ts.mjs";
+
+const { HerdrStore } = await importTs("./store.ts");
+const { handleClaudeHook } = await importTs("./claude.ts");
+const store = new HerdrStore(process.argv[2]);
+let event;
+try {
+	let input = "";
+	for await (const chunk of process.stdin) {
+		input += chunk;
+		if (input.length > 1024 * 1024) throw new Error("Claude hook input exceeds 1 MB");
+	}
+	event = JSON.parse(input);
+	const output = await handleClaudeHook(store, process.argv[3], event);
+	if (output) process.stdout.write(JSON.stringify(output) + "\n");
+} catch (error) {
+	process.stderr.write(`Herdr Claude hook failed: ${error.message}\n`);
+	// Claude treats exit 2 as an input rejection, but StopFailure/SessionEnd ignore exit codes.
+	process.exitCode = event?.hook_event_name === "UserPromptSubmit" ? 2 : 1;
+} finally {
+	await store.close();
+}

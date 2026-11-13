@@ -3,11 +3,11 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { transition } from "../src/herdr/state.ts";
+import { transition } from "../src/state.ts";
 import test from "node:test";
-import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } from "../src/herdr/client.ts";
-import { HerdrRunner, spawnHerdrAgent } from "../src/herdr/runner.ts";
-import type { ChildBinding } from "../src/herdr/store.ts";
+import { HerdrCliError, panesFromList, type HerdrAgentRef, type HerdrClient } from "../src/client.ts";
+import { HerdrRunner, spawnHerdrAgent } from "../src/runner.ts";
+import type { ChildBinding } from "../src/store.ts";
 
 const emptyClient = () => ({ listAgents: async () => [], listPanes: async () => [], getAgent: async () => undefined, getPane: async () => undefined }) as unknown as HerdrClient;
 /** A server's client that reaches `sessions` by name, like `herdr --session`. */

@@ -5,12 +5,12 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { HerdrCliError, type HerdrAgentRef, type HerdrClient } from "../src/herdr/client.ts";
+import { HerdrCliError, type HerdrAgentRef, type HerdrClient } from "herdr-runner/client.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { createHcCli, HC_AGENT_LABEL, HC_SESSION_LABEL, HcError, hcConnect, hcCoreId, hcRef, hcSession, hcSessionTag, hcTerminalName, listHcMachines, type HcCall, type HcFocus } from "../src/herdr/hc.ts";
-import { hostPaneId, terminalHost } from "../src/herdr/host.ts";
-import { HerdrRunner } from "../src/herdr/runner.ts";
-import type { ChildBinding } from "../src/herdr/store.ts";
+import { createHcCli, HC_AGENT_LABEL, HC_SESSION_LABEL, HcError, hcConnect, hcCoreId, hcRef, hcSession, hcSessionTag, hcTerminalName, listHcMachines, type HcCall, type HcFocus } from "herdr-runner/hc.ts";
+import { hostPaneId, terminalHost } from "herdr-runner/host.ts";
+import { HerdrRunner } from "herdr-runner/runner.ts";
+import type { ChildBinding } from "herdr-runner/store.ts";
 
 interface Terminal {
 	address: string;

@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings, readMachineSettings, type MachineSettings } from "../src/herdr/config.ts";
-import { parseAgentFile } from "../src/herdr/agent-file.ts";
+import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings, readMachineSettings, type MachineSettings } from "herdr-runner/config.ts";
+import { parseAgentFile } from "herdr-runner/agent-file.ts";
 import { createHerdrSubagents, type HerdrBackendHandle } from "../src/herdr/extension.ts";
-import { HerdrRunner, type SpawnRequest } from "../src/herdr/runner.ts";
+import { HerdrRunner, type SpawnRequest } from "herdr-runner/runner.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const profiles = [{ id: "m1", label: "lappy", target: "aim-laptop", enabled: true }];

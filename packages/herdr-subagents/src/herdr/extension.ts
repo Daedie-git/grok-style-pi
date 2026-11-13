@@ -3,11 +3,11 @@ import { Type } from "typebox";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHerdrCli, findHerdrMachine, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrExec, type HerdrMachine } from "./client.ts";
-import { createChildSession, type ChildSession, type ChildIdentity } from "./child.ts";
-import { createBackendController, type HerdrBackendHandle } from "./backend.ts";
-export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "./backend.ts";
-import type { ExecutionEvent, RunRef } from "./state.ts";
+import { createHerdrCli, findHerdrMachine, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrExec, type HerdrMachine } from "herdr-runner/client.ts";
+import { createChildSession, type ChildSession, type ChildIdentity } from "herdr-runner/child.ts";
+import { createBackendController, type HerdrBackendHandle } from "herdr-runner/backend.ts";
+export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "herdr-runner/backend.ts";
+import type { ExecutionEvent, RunRef } from "herdr-runner/state.ts";
 import {
 	completionNotice,
 	qualifiedAgentId,
@@ -18,12 +18,12 @@ import {
 	steerHerdrAgent,
 	type SpawnRequest,
 	type ToolText,
-} from "./runner.ts";
+} from "herdr-runner/runner.ts";
 import { EXPLICIT_SUBAGENT_REQUEST } from "./policy.ts";
-import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings } from "./config.ts";
-import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
-import { createHcCli, hcConnect, hcSessionTag, listHcMachines } from "./hc.ts";
-import { hostPaneId, terminalHost, type TerminalHost } from "./host.ts";
+import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings } from "herdr-runner/config.ts";
+import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "herdr-runner/store.ts";
+import { createHcCli, hcConnect, hcSessionTag, listHcMachines } from "herdr-runner/hc.ts";
+import { hostPaneId, terminalHost, type TerminalHost } from "herdr-runner/host.ts";
 
 export interface HerdrSubagentDeps {
 	env: NodeJS.ProcessEnv;

@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createBackendController } from "../src/herdr/backend.ts";
-import type { HerdrClient } from "../src/herdr/client.ts";
-import { HerdrRunner, splitAgentId } from "../src/herdr/runner.ts";
-import { HerdrStore, type AgentOwnership } from "../src/herdr/store.ts";
+import { createBackendController } from "../src/backend.ts";
+import type { HerdrClient } from "../src/client.ts";
+import { HerdrRunner, splitAgentId } from "../src/runner.ts";
+import { HerdrStore, type AgentOwnership } from "../src/store.ts";
 
 async function finished(store: HerdrStore, cwd: string, id: string, paneId: string, ownership: AgentOwnership = {}) {
 	const file = await store.createSession({ type: "session", version: 3, id, cwd });

@@ -1,4 +1,2 @@
-// Pi loads TypeScript through jiti; workers need their own loader, including in npm installations.
-import { createJiti } from "jiti";
-
-await createJiti(import.meta.url).import("./worker.ts");
+// Forwarding entry: remote workers, saved Claude hook commands and upgrade instructions name this path.
+await import("herdr-runner/worker-entry.mjs");

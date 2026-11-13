@@ -8,7 +8,7 @@ import { createJiti } from "jiti";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionFactory, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import standalone from "../extensions/index.ts";
-import { herdrSubagentRoot } from "../src/herdr/store.ts";
+import { herdrSubagentRoot } from "herdr-runner/store.ts";
 
 function environment(t: { after(fn: () => void): void }, inside: boolean) {
 	const before = { HERDR_ENV: process.env.HERDR_ENV, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH, HC_TERMINAL_ID: process.env.HC_TERMINAL_ID, HERDR_SUBAGENTS_HOST: process.env.HERDR_SUBAGENTS_HOST };
@@ -97,7 +97,8 @@ test("the packed standalone package loads and runs its worker with only its own 
 	const { pi, tools } = registration();
 	await entry.default(pi);
 	assert.deepEqual(tools.map((tool) => tool.name), ["Agent", "get_subagent_result", "steer_subagent"]);
-	const { HerdrStore } = await jiti.import<typeof import("../src/herdr/store.ts")>(join(pkg, "src/herdr/store.ts"));
+	// The runner comes from the installed herdr-runner dependency, not from Grok.
+	const { HerdrStore } = await jiti.import<typeof import("herdr-runner/store.ts")>(join(modules, "herdr-runner", "src", "store.ts"));
 	const store = new HerdrStore(join(root, "state"));
 	try {
 		await store.assertProtocolReady();

@@ -1,21 +1,20 @@
 import assert from "node:assert/strict";
 import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, utimesSync, copyFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createJiti } from "jiti";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { defaultThinking, parseAgentFile } from "../src/herdr/agent-file.ts";
-import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFromCreate, type HerdrClient } from "../src/herdr/client.ts";
-import { createChildSession, type ChildMessenger, type ChildIdentity } from "../src/herdr/child.ts";
+import { defaultThinking, parseAgentFile } from "herdr-runner/agent-file.ts";
+import { createHerdrCli, agentsFromList, paneIdFromSplit, panesFromList, tabFromCreate, type HerdrClient } from "herdr-runner/client.ts";
+import { createChildSession, type ChildMessenger, type ChildIdentity } from "herdr-runner/child.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { HerdrRunner, agentPresence, completionNotice, formatStatus, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "../src/herdr/runner.ts";
-import { HerdrStore, agentNumbers, numberedAgentName, type HerdrTask } from "../src/herdr/store.ts";
-import { isTerminal, type RunRef, type ExecutionEvent } from "../src/herdr/state.ts";
+import { HerdrRunner, agentPresence, completionNotice, formatStatus, herdrAgentName, needsNewTab, readHerdrAgent, spawnHerdrAgent, type SpawnRequest } from "herdr-runner/runner.ts";
+import { HerdrStore, agentNumbers, numberedAgentName, type HerdrTask } from "herdr-runner/store.ts";
+import { isTerminal, type RunRef, type ExecutionEvent } from "herdr-runner/state.ts";
 
 function request(extra: Partial<SpawnRequest> = {}): SpawnRequest {
 	// Default to the dedicated-tab fallback; caller-tab placement tests supply tabId explicitly.
@@ -926,7 +925,7 @@ test("legacy active runs block new protocol launches without modifying legacy st
 });
 
 async function peer(t: TestContext, root: string) {
-	const child = fork(new URL("./fixtures/herdr-process.ts", import.meta.url), [root], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"] });
+	const child = fork(new URL("../../herdr-runner/test/fixtures/herdr-process.ts", import.meta.url), [root], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"] });
 	let stderr = "";
 	child.stderr!.on("data", (data) => { stderr += String(data); });
 	let sequence = 0;
@@ -1081,25 +1080,6 @@ test("confirmed departed agents release reservations without closing unrelated p
 	assert.equal(f.events.filter((event) => event === "tab").length, 1);
 	assert.equal((await f.runner.store.launches()).find((launch) => launch.agentId === first.agentId)?.stage, "closed");
 	assert.equal(f.events.filter((event) => event.startsWith("close:")).length, 0);
-});
-
-test("the worker loads from an installed package path without Node TypeScript stripping", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "herdr-package-"));
-	const pkg = join(dir, "node_modules", "herdr-subagents");
-	mkdirSync(join(pkg, "src", "herdr"), { recursive: true });
-	writeFileSync(join(pkg, "package.json"), '{"type":"module"}');
-	for (const name of ["store.ts", "state.ts", "worker.ts", "worker-entry.mjs", "claude.ts", "session-ready.ts"]) {
-		copyFileSync(fileURLToPath(new URL(`../src/herdr/${name}`, import.meta.url)), join(pkg, "src", "herdr", name));
-	}
-	symlinkSync(fileURLToPath(new URL(".", import.meta.resolve("jiti/package.json"))), join(dir, "node_modules", "jiti"), "dir");
-	mkdirSync(join(dir, "node_modules", "@earendil-works"));
-	symlinkSync(fileURLToPath(new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))), join(dir, "node_modules", "@earendil-works", "pi-coding-agent"), "dir");
-	try {
-		const loaded = await createJiti(import.meta.url).import<{ HerdrStore: typeof HerdrStore }>(join(pkg, "src", "herdr", "store.ts"));
-		const store = new loaded.HerdrStore(join(dir, "state"));
-		try { assert.deepEqual(await store.listAgents(), []); }
-		finally { await store.close(); }
-	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("the CLI distinguishes missing agents from transport failures on either output stream", async () => {

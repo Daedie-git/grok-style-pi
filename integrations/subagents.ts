@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-a
 import { installGrokStyle, type InstallDeps } from "../extensions/install.ts";
 import type { ToolTransform } from "../src/tools/register-extension.ts";
 import { createHerdrSubagents, type HerdrSubagentOptions } from "../packages/herdr-subagents/src/herdr/extension.ts";
-import type { HerdrBackendHandle } from "../packages/herdr-subagents/src/herdr/backend.ts";
+import type { HerdrBackendHandle } from "../packages/herdr-runner/src/backend.ts";
 import { HerdrBackendAdapter } from "../packages/subagent-engine/src/backends/herdr.ts";
 import type { Engine } from "../packages/subagent-engine/src/engine.ts";
 import { createSubagentEngine, inChildContext, type SubagentEngineOptions } from "../packages/subagent-engine/src/extension.ts";

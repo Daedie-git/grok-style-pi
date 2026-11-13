@@ -12,9 +12,9 @@ pi install /path/to/grok-style-pi/packages/herdr-subagents
 
 Install it in Pi's user settings on every machine where children run, so new Pi processes load it too. Run `/reload` in existing sessions. The standalone entrypoint activates only inside Herdr, a herdr pane (`HERDR_ENV=1`) or a Herdr app terminal (`HC_TERMINAL_ID`); outside Herdr it registers nothing. See [Herdr app](#herdr-app).
 
-The directory is a complete Pi package with its own manifest, dependencies, entrypoint, and license. It can be copied out of this repository, installed with `pi install /path/to/herdr-subagents`, or packed with `npm pack` from this directory. It is not yet published to npm.
+The directory is a complete Pi package with its own manifest, entrypoint, and license. It depends on [herdr-runner](../herdr-runner/README.md), the core it shares with the Claude Code sidecar plugin; outside this repository, install that package alongside it. Neither is published to npm yet.
 
-Requirements: Herdr, Pi **1.1.0+** with model credentials, and Node **22.18+ on the 22.x line, or Node 24+**. Local clone users run `npm install` before loading the package.
+Requirements: Herdr, Pi **1.1.0+** with model credentials, and Node **22.18+ on the 22.x line, or Node 24+**. Local clone users run `npm install` before loading the package, and again after pulling a change that adds a workspace package.
 
 ### With Grok styling
 
@@ -166,7 +166,7 @@ npm install
 npm test
 ```
 
-The package's strict typecheck and runner tests are independent of Grok sources. Tests use real SQLite workers and separate processes for concurrency, cancellation, reload, launch recovery, SSH transport, and notification delivery; Herdr pane operations are mocked. Grok's root `npm test` also runs these tests and checks the styling adapter. No live model requests are needed.
+The package's strict typecheck and tests are independent of Grok sources; the runner's own tests live in herdr-runner. Tests use real SQLite workers and separate processes for concurrency, cancellation, reload, launch recovery, SSH transport, and notification delivery; Herdr pane operations are mocked. Grok's root `npm test` also runs these tests and checks the styling adapter. No live model requests are needed.
 
 For embedding, the package exports `createHerdrSubagents(overrides?)`, a Pi extension factory with injectable runner dependencies. A caller may decorate tool registration without changing execution. Load the standalone entrypoint or embed the factory once per Pi session.
 

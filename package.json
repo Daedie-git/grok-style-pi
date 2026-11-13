@@ -15,10 +15,15 @@
     "url": "git+https://github.com/Daedie-git/grok-style-pi.git"
   },
   "workspaces": [
+    "packages/herdr-runner",
     "packages/herdr-subagents",
     "packages/subagent-engine"
   ],
   "files": [
+    "packages/herdr-runner/src",
+    "packages/herdr-runner/package.json",
+    "packages/herdr-runner/README.md",
+    "packages/herdr-runner/LICENSE",
     "packages/herdr-subagents/extensions",
     "packages/herdr-subagents/src",
     "packages/herdr-subagents/package.json",
@@ -39,15 +44,16 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "npm run typecheck && node --test test/*.test.ts packages/herdr-subagents/test/*.test.ts packages/subagent-engine/test/*.test.ts",
+    "test": "npm run typecheck && node --test test/*.test.ts packages/herdr-runner/test/*.test.ts packages/herdr-subagents/test/*.test.ts packages/subagent-engine/test/*.test.ts",
     "test:herdr": "npm test --workspace herdr-subagents",
     "bench:performance": "node scripts/benchmark-performance.ts",
     "setup:file-links": "node scripts/install-file-links.mjs",
     "test:bat": "GROK_BAT_INTEGRATION=1 node --test test/highlight-bat.test.ts",
     "typecheck:subagents": "tsc -p tsconfig.subagents.json",
     "test:current-pi": "node scripts/test-current-pi.ts",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json && npm run typecheck --workspace herdr-subagents && npm run typecheck --workspace subagent-engine",
-    "test:engine": "npm test --workspace subagent-engine"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.subagents.json && npm run typecheck --workspace herdr-runner && npm run typecheck --workspace herdr-subagents && npm run typecheck --workspace subagent-engine",
+    "test:engine": "npm test --workspace subagent-engine",
+    "test:runner": "npm test --workspace herdr-runner"
   },
   "pi": {
     "extensions": [
@@ -73,6 +79,7 @@
   },
   "dependencies": {
     "jiti": "^2.7.0",
-    "mdast-util-from-markdown": "^2.0.3"
+    "mdast-util-from-markdown": "^2.0.3",
+    "herdr-runner": "^0.1.0"
   }
 }

@@ -1,0 +1,33 @@
+{
+  "name": "herdr-runner",
+  "version": "0.1.0",
+  "description": "Runs Pi and Claude Code agents in Herdr panes and Herdr app terminals, locally or on saved machines, with durable runs, results, steering and pane lifecycle. Shared by the Pi and Claude Code front-ends.",
+  "type": "module",
+  "engines": {
+    "node": "^22.18.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Daedie-git/grok-style-pi.git",
+    "directory": "packages/herdr-runner"
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run typecheck && node --test test/*.test.ts"
+  },
+  "optionalDependencies": {
+    "jiti": "^2.7.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  }
+}

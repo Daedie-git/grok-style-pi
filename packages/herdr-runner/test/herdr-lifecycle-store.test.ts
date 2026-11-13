@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { HerdrStore, type HerdrTask } from "../src/herdr/store.ts";
+import { HerdrStore, type HerdrTask } from "../src/store.ts";
 
 async function fixture(t: test.TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-lifecycle-store-"));

@@ -139,8 +139,8 @@ export async function acquireLock(path: string, signal?: AbortSignal, pollMs = 5
 	for (;;) {
 		try {
 			db.exec("BEGIN EXCLUSIVE");
-			// Launchers before SQLite locks held PATH with their PID; one still running keeps its slot.
-			if (!legacyHolder(path)) return () => { try { db.close(); } catch {} };
+			// Earlier launchers locked PATH itself; one still running keeps its slot.
+			if (!legacyHolder(path, DatabaseSync)) return () => { try { db.close(); } catch {} };
 			db.exec("ROLLBACK");
 		} catch (error) {
 			if ((error as { errcode?: number }).errcode !== 5) { db.close(); throw error; }
@@ -150,11 +150,18 @@ export async function acquireLock(path: string, signal?: AbortSignal, pollMs = 5
 	}
 }
 
-function legacyHolder(path: string): boolean {
-	const pid = Number(readText(path));
-	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-	try { process.kill(pid, 0); return true; }
-	catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+/** A lock at PATH from an earlier launcher: a PID file, or a SQLite lock on PATH itself. */
+function legacyHolder(path: string, Database: typeof import("node:sqlite").DatabaseSync): boolean {
+	const text = readText(path);
+	if (text === undefined) return false;
+	if (/^\d+$/.test(text)) {
+		try { process.kill(Number(text), 0); return true; }
+		catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+	}
+	try {
+		const db = new Database(path);
+		try { db.exec("BEGIN EXCLUSIVE"); db.exec("ROLLBACK"); return false; } finally { db.close(); }
+	} catch (error) { return (error as { errcode?: number }).errcode === 5; }
 }
 
 /** The band labels a request by the third dash-separated word of its id. */

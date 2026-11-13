@@ -145,7 +145,11 @@ export class SidecarCli {
 			if (command === "push-gate") return await this.pushGate();
 			if (command === "session-start") { await this.parent.load(); return await this.sessionStart(); }
 			if (command === "reject" && rest[0] === "--overrule") return await this.overrule(globals, rest);
-			if (!this.parent.paneId && command !== "maintain") throw new UsageError("run inside a herdr pane or a Herdr app terminal");
+			if (!this.parent.paneId) {
+				// Hook entries start maintenance outside Herdr too; there is no owner to maintain.
+				if (command === "maintain") return EXIT.report;
+				throw new UsageError("run inside a herdr pane or a Herdr app terminal");
+			}
 			await this.parent.load();
 			if (globals.profileFile) this.profile = this.bindProfile(globals);
 			const slot = new SlotState(this.dir, slotName(this.owner, globals.slot));

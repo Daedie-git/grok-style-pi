@@ -35,7 +35,7 @@ test("the slot lock admits one holder across processes", async (t) => {
 	assert.deepEqual(codes, Array(8).fill(0));
 });
 
-test("a live launcher's PID lock from before SQLite locks still holds its slot", async (t) => {
+test("a live earlier launcher's lock, PID file or SQLite, still holds its slot", async (t) => {
 	const dir = mkdtempSync(join(tmpdir(), "sidecar-lock-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	const now = new AbortController();
@@ -43,6 +43,14 @@ test("a live launcher's PID lock from before SQLite locks still holds its slot",
 	writeFileSync(join(dir, "slot.lock"), `${process.pid}\n`);
 	await assert.rejects(acquireLock(join(dir, "slot.lock"), now.signal), /aborted/);
 	writeFileSync(join(dir, "slot.lock"), "2147483646\n");
+	(await acquireLock(join(dir, "slot.lock"), now.signal))();
+	// A SQLite lock on the path itself.
+	rmSync(join(dir, "slot.lock"));
+	const { DatabaseSync } = await import("node:sqlite");
+	const held = new DatabaseSync(join(dir, "slot.lock"));
+	held.exec("BEGIN EXCLUSIVE");
+	await assert.rejects(acquireLock(join(dir, "slot.lock"), now.signal), /aborted/);
+	held.close();
 	(await acquireLock(join(dir, "slot.lock"), now.signal))();
 });
 

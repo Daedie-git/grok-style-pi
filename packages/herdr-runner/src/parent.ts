@@ -30,6 +30,8 @@ export interface ParentOptions extends Partial<ParentDeps> {
 	host?: TerminalHost;
 	/** The worker a saved machine runs when neither its settings nor the environment name one. */
 	defaultWorkerEntry?: string;
+	/** How errors name the remote directory option. */
+	remoteCwdOption?: string;
 }
 
 /** Pi's agent directory, where herdr-subagents.json and user agent definitions live. */
@@ -98,6 +100,7 @@ export class HerdrParent {
 	onRemember?: (machine: string) => void;
 	stopped = false;
 	private readonly defaultWorkerEntry?: string;
+	private readonly remoteCwdOption: string;
 	private readonly hcCall: ReturnType<typeof hcConnect>;
 	private runner?: HerdrRunner;
 	private opening?: Promise<HerdrRunner>;
@@ -121,6 +124,7 @@ export class HerdrParent {
 		this.hcCall = hcConnect(env);
 		const hcCall = this.hcCall;
 		this.defaultWorkerEntry = options.defaultWorkerEntry;
+		this.remoteCwdOption = options.remoteCwdOption ?? "machine_cwd";
 		this.deps = {
 			env,
 			root: options.root ?? herdrSubagentRoot(env),
@@ -283,10 +287,10 @@ export class HerdrParent {
 		catch {}
 		// Pi stops at a startup prompt when its session directory is missing, so check on the machine itself.
 		const status = await source.store.directoryStatus(cwd);
-		if (status === "relative") throw new Error(`machine_cwd ${cwd} is not an absolute path on ${machine}. Pass machine_cwd or configure machines.${machine}.cwd in ${join(this.deps.agentDir, "herdr-subagents.json")}.`);
+		if (status === "relative") throw new Error(`${this.remoteCwdOption} ${cwd} is not an absolute path on ${machine}. Pass ${this.remoteCwdOption} or configure machines.${machine}.cwd in ${join(this.deps.agentDir, "herdr-subagents.json")}.`);
 		if (status === "missing") {
 			const open = [...new Set(panes.flatMap((pane) => pane.cwd ? [pane.cwd] : []))].slice(0, 8);
-			throw new Error(`Directory ${cwd} does not exist on ${machine}. Pass machine_cwd with the project's absolute path there.${open.length ? ` Herdr panes on ${machine} are open in: ${open.join(", ")}.` : ""}`);
+			throw new Error(`Directory ${cwd} does not exist on ${machine}. Pass ${this.remoteCwdOption} with the project's absolute path there.${open.length ? ` Herdr panes on ${machine} are open in: ${open.join(", ")}.` : ""}`);
 		}
 		// Reuse the workspace already open in that directory, so its tabs form the same grid.
 		return panes.find((pane) => pane.cwd && samePath(pane.cwd, cwd))?.workspaceId;

@@ -48,7 +48,7 @@ test('a request starts a detached job whose result arrives as a prompt once idle
   const s = setup(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const started = await $.tool.call({ tool: TOOL, args: ['--slot', '2', 'ask', 'Fix it'], cwd: '/repo' })
-  expect(started.result).toMatch(/^Started job 20261112090000-2-ask-[0-9a-f]{8}: sidecar --slot 2 ask 'Fix it'/)
+  expect(started.result).toMatch(/^Started job 20261112090000-2-ask-[0-9a-f]{8}; its result arrives as a message/)
   const run = s.runs.at(-1)!
   expect(run[1]).toMatch(/scripts\/sidecar-job$/)
   expect(run.slice(2)).toEqual([DIR, expect.stringMatching(/-2-ask-/), '--slot', '2', 'ask', 'Fix it'])
@@ -56,9 +56,7 @@ test('a request starts a detached job whose result arrives as a prompt once idle
   expect(s.submitted).toEqual([])
   await s.clock.advance(3000)
   expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toMatch(`Sidecar job ${id} finished`)
-  expect(s.submitted[0]).toMatch(/in \/repo/)
-  expect(s.submitted[0]).toMatch(/Exit 3: the sidecar asks a question/)
+  expect(s.submitted[0]).toMatch(`Sidecar job ${id} exited 3: the sidecar asks a question`)
   expect(s.submitted[0]).toMatch(/NEEDS_ANSWER: Keep the old API\?/)
   expect(s.submitted[0]).toMatch(/blocked on a question/)
   expect(s.submitted[0]).not.toMatch(/still working/)
@@ -78,7 +76,7 @@ test('a job that finishes mid-turn rides on the next main-thread tool result', a
   const subagent = await $.tool.call({ tool: 'Read', file_path: 'a', agentId: 'a1' })
   expect(subagent.context).toBe(undefined)
   const main = await $.tool.call({ tool: 'Read', file_path: 'a' })
-  expect(main.context?.[0]).toMatch(/Exit 0: report delivered[\s\S]*report body/)
+  expect(main.context?.[0]).toMatch(/exited 0: report delivered[\s\S]*report body/)
   const next = await $.tool.call({ tool: 'Read', file_path: 'b' })
   expect(next.context).toBe(undefined)
   expect(s.submitted).toEqual([])
@@ -93,7 +91,7 @@ test('a job held at turn end is submitted then', async ($, on) => {
   await s.clock.advance(3000)
   await $.turn.complete({ turnId: 't1', answer: 'done', durationMs: 1, isAborted: false, reason: 'completed' })
   expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toMatch(/Exit 2: no report submitted/)
+  expect(s.submitted[0]).toMatch(/exited 2: no report submitted/)
 })
 
 test('a finished job left by an earlier plugin copy is delivered at session start', async ($, on) => {
@@ -106,7 +104,7 @@ test('a finished job left by an earlier plugin copy is delivered at session star
   s.files[`${DIR}/20261112085800-4-ask-abcdef13.delivered`] = '1'
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toMatch(/sidecar --slot 3 ask x[\s\S]*late report/)
+  expect(s.submitted[0]).toMatch(/-3-ask-abcdef12 exited 0[\s\S]*late report/)
 })
 
 test('a job whose worker stopped beating is reported lost with its partial output', async ($, on) => {
@@ -119,7 +117,7 @@ test('a job whose worker stopped beating is reported lost with its partial outpu
   expect(s.submitted).toEqual([])
   await s.clock.advance(6000)
   expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toMatch(/Exit -1: the job runner died[\s\S]*partial output/)
+  expect(s.submitted[0]).toMatch(/exited -1: the job runner died[\s\S]*partial output/)
 })
 
 test('a job from a worker without heartbeats is waited for, not reported lost', async ($, on) => {
@@ -130,7 +128,7 @@ test('a job from a worker without heartbeats is waited for, not reported lost', 
   expect(s.submitted).toEqual([])
   s.files[`${DIR}/20261112085900-3-ask-abcdef12.done`] = '{"code":0,"finished":2}'
   await s.clock.advance(3000)
-  expect(s.submitted[0]).toMatch(/Exit 0: report delivered/)
+  expect(s.submitted[0]).toMatch(/exited 0: report delivered/)
 })
 
 test('quick commands answer inline; hook entries are refused', async ($, on) => {

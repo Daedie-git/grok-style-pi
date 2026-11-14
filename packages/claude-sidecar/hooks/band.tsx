@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register, ToolCallResult } from 'claude-code'
 
 import type { SlotRow } from '../types'
-import { bashDenial, DESCRIPTION, INPUT_SCHEMA, JOB_RECORD, jobId, jobMessage, LOST_CODE, LOST_MS, parseRequest, POLL_MS, shown, TOOL_NAME } from './jobs'
+import { bashDenial, DESCRIPTION, INPUT_SCHEMA, JOB_RECORD, jobId, jobMessage, LOST_CODE, LOST_MS, parseRequest, POLL_MS, TOOL_NAME } from './jobs'
 import type { Done, Job, Request } from './jobs'
 import { identity } from './owner'
 
@@ -214,7 +214,7 @@ export const register: Register = on => {
         jobTimer = $.clock.after(POLL_MS, () => void scanJobs())
       }
       return {
-        result: `Started job ${id}: ${shown(request.args)}. Its output and exit code arrive as a message when it ends; continue with other work or end your turn.`,
+        result: `Started job ${id}; its result arrives as a message. Continue other work or end your turn.`,
       }
     }
     // The band works without the tool.

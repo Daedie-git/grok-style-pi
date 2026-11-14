@@ -128,7 +128,7 @@ export class SidecarCli {
 		this.options = options;
 		this.env = options.env ?? process.env;
 		this.cwd = options.cwd ?? process.cwd();
-		this.parent = new HerdrParent({ env: this.env, ...options.parent });
+		this.parent = new HerdrParent({ env: this.env, remoteCwdOption: "--remote-cwd", ...options.parent });
 		this.owner = ownerName(this.env, this.parent.hc ? "hc" : "herdr");
 		this.dir = stateDir(this.env);
 		// SessionStart records the transcript for Claude versions that do not export their session ID.

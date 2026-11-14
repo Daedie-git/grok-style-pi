@@ -108,8 +108,6 @@ export function bashDenial(script: string): string | undefined {
   return undefined
 }
 
-const quote = (word: string) => (/^[\w./:=@%+-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`)
-export const shown = (argv: readonly string[]) => ['sidecar', ...argv].map(quote).join(' ')
 
 // A job's record: DIR/<id>.json. Slot and command in the id are only labels, reduced to what the record pattern takes.
 export const JOB_RECORD = /^(\d{14}-[a-z0-9-]+-[0-9a-f]{8})\.json$/
@@ -122,8 +120,7 @@ export const jobId = (ms: number, request: Request, random: string) =>
 export function jobMessage(dir: string, id: string, job: Job, done: Done, out: string, err: string): string {
   const stderr = err.split('\n').filter(line => line.trim() && !PROGRESS.test(line)).join('\n')
   return [
-    `Sidecar job ${id} finished: \`${shown(job.argv)}\`${job.cwd ? ` in ${job.cwd}` : ''}`,
-    `Exit ${done.code}: ${EXIT_MEANING[done.code] ?? 'failed'}.`,
+    `Sidecar job ${id} exited ${done.code}: ${EXIT_MEANING[done.code] ?? 'failed'}.`,
     out.trimEnd() && `Output (${dir}/${id}.out):\n${out.trimEnd()}`,
     stderr && `Stderr:\n${stderr}`,
   ].filter(Boolean).join('\n\n')

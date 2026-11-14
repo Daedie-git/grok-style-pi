@@ -35,7 +35,8 @@ Built-in types:
 - **`general-purpose`** has the parent's tools.
 - **`explore`** locates code and is read-only.
 - **`plan`** produces an implementation plan and is read-only.
-- **`review`** provides read-only adversarial review of a change or plan: assumptions, missing tests and incorrect claims. Use it only when asked for a review, not to self-review work a separate reviewer will check. It does not implement changes.
+- **`review`** provides read-only adversarial review of a change or plan on the parent's model: assumptions, missing tests and incorrect claims. It does not implement changes.
+- **`adversarial-reviewer`** is `review` run by Claude Code (`claude-opus-5-5`, `high` effort) in a Herdr pane, for a model family other than the parent's. It is offered only inside Herdr.
 - **`researcher`** answers questions from high-trust primary sources and is read-only. It inherits an available `web_search` tool even in the background; the engine does not bundle a web lookup provider. Research findings include source URLs or absolute paths and verification limits.
 - **`fork`** inherits the conversation, system prompt, model and tools. Disable it with `PI_SUBAGENT_FORK=0`.
 

@@ -18,6 +18,8 @@ export interface DiscoveryOptions {
 	policyDir?: string;
 	packageDirs?: { dir: string; namespace: string }[];
 	forkEnabled: boolean;
+	/** Offer the Claude Code adversarial reviewer. */
+	claudeCode?: boolean;
 	homeDir?: string;
 }
 
@@ -52,7 +54,7 @@ export async function discoverDefinitions(options: DiscoveryOptions): Promise<De
 		active.set(definition.agentType, definition);
 		for (const message of definition.diagnostics) diagnostics.push(`${definition.path ?? definition.agentType}: ${message}`);
 	};
-	for (const definition of builtInDefinitions({ forkEnabled: options.forkEnabled })) add(definition);
+	for (const definition of builtInDefinitions({ forkEnabled: options.forkEnabled, claudeCode: options.claudeCode })) add(definition);
 	async function directory(dir: string, source: DefinitionSource, namespace?: string): Promise<void> {
 		let names: string[];
 		try { names = (await readdir(dir)).filter((name) => name.endsWith(".md")).sort(compare); }

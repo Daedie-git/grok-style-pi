@@ -80,7 +80,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		const offer = (definitions: AgentDefinition[]): PolicyInput["offered"] =>
 			definitions.map((definition) => ({ agentType: definition.agentType, description: definition.description, tools: definition.tools }));
 		// Built-ins always exist, so the description registered before session start already reflects real routing.
-		let offered = offer(builtInDefinitions({ forkEnabled: forkEnabledByEnv(env) }));
+		let offered = offer(builtInDefinitions({ forkEnabled: forkEnabledByEnv(env), claudeCode: Boolean(options.panes) }));
 		const policy = (): PolicyInput => ({
 			autonomy: options.autonomy ?? (env.PI_SUBAGENT_AUTONOMY === "explicit" ? "explicit" : "positive"),
 			forkEnabled: engine.forkEnabled(),

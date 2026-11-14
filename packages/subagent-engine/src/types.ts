@@ -6,7 +6,7 @@ export type RunId = string;
 // ---- Definitions (plan §1) ----
 
 export type DefinitionSource = "built-in" | "package" | "user" | "project" | "flag" | "policy";
-export type BuiltInKind = "general-purpose" | "explore" | "plan" | "review" | "researcher" | "fork";
+export type BuiltInKind = "general-purpose" | "explore" | "plan" | "review" | "adversarial-reviewer" | "researcher" | "fork";
 export type MemoryScope = "user" | "project" | "local";
 
 export interface HookCommand {
@@ -53,6 +53,8 @@ export interface AgentDefinition {
 	omitClaudeMd?: boolean;
 	/** Built-in tools only: Herdr agent files' `isolated: true` or legacy `extensions: false`. */
 	isolated?: boolean;
+	/** Built-in only: launch in this runtime's Herdr pane unless the call names one. */
+	runtime?: "claude-code";
 	color?: string;
 	/** Parsed for diagnostics only; Pi has no permission modes. */
 	permissionMode?: string;

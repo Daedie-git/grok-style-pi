@@ -4,6 +4,8 @@ import type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from
 import { HerdrBackendAdapter } from "../src/backends/herdr.ts";
 import { createHarness, toolResultText, until, type Harness, type Script } from "./fixtures/harness.ts";
 import { ROOT_CALLER, type AgentDefaults } from "../src/engine.ts";
+import { runWorkflowAgent } from "../src/workflow-host.ts";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SubagentAdapter } from "../../../src/subagents/adapter.ts";
 
 type Status = "running" | "blocked" | "completed" | "failed" | "stopped" | "needs-answer";
@@ -238,6 +240,28 @@ test("SendMessage refuses live delivery to a Claude Code pane without calling st
 	assert.deepEqual(fake.steering, []);
 	assert.deepEqual(fake.resumes, []);
 	assert.deepEqual(harness.engine.inbox(firstProxy(harness).meta.agentId).all().map((envelope) => envelope.state), ["refused"]);
+});
+
+test("adversarial-reviewer launches a Claude Code pane on Opus 5.5 at high effort", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, subagent_type: "adversarial-reviewer" } }] } : { text: "Parent useful work" });
+	await harness.parent.prompt("Review it adversarially", { source: "extension" });
+	assert.equal(fake.spawns.length, 1);
+	assert.equal(fake.spawns[0].runtime, "claude-code");
+	assert.equal(fake.spawns[0].model, "claude-opus-5-5");
+	assert.equal(fake.spawns[0].thinking, "high");
+	assert.equal(firstProxy(harness).meta.model?.effective, "claude-opus-5-5");
+});
+
+test("adversarial-reviewer refuses in-process and workflow launches instead of misrouting them", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: "in-process", subagent_type: "adversarial-reviewer" } }] } : { text: "Parent useful work" });
+	await harness.parent.prompt("Review it in-process", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /Claude Code runs only in a Herdr pane; use review/);
+	const ctx = (harness.engine as unknown as { requireRoot(): { ctx: ExtensionContext } }).requireRoot().ctx;
+	const workflow = await runWorkflowAgent(harness.engine, ctx, { runId: "wf1", logicalIndex: 0, attempt: 0, prompt: "review it", agentType: "adversarial-reviewer", taskId: "t", label: "verify" } as Parameters<typeof runWorkflowAgent>[2]);
+	assert.match(JSON.stringify(workflow), /workflow agents run in-process; use review/);
+	assert.equal(fake.spawns.length, 0);
 });
 
 test("SendMessage resumes a finished pane with the same identity and a fresh Herdr/engine run", { timeout: 20_000 }, async (t) => {

@@ -10,9 +10,9 @@ Persistent pi or Claude Code agents in Herdr panes review or implement work and 
 ## Which review to run
 
 - The user asks you to review something: run your own review process (the repository's code-review skill or your own), not a sidecar.
-- The user asks for a sidecar review: run `diff` (or `plan`) on a pi reviewer slot.
+- The user asks for a sidecar review: run `diff` (or `plan`) on an adversarial-reviewer slot.
 - The user asks for a co-op review: run `coop-review`.
-- You finished an implementation: have a pi reviewer `diff` it (see Implementation review).
+- You finished an implementation: see Implementation review.
 
 ## Notification safety
 
@@ -32,7 +32,7 @@ sidecar --slot 2 answer "Yes, preserve backward compatibility."
 
 For long text, give `-` in place of TEXT to `ask`, `answer`, `steer`, `note` or `reject` and pass the text as the tool's `input`.
 
-Pick the role by the work, on a fresh slot: the default reviewer for reviews, audits, bug or security scans and anything that writes findings files; `--role implementer` for code changes; `--role explorer` only to find code and explain how it connects; `--role researcher` only to answer a question from primary sources (docs, specs, release notes). Explorers and researchers report inline and write nothing, so they refuse audits and file output. Implementers, explorers and researchers default to medium reasoning, reviewers to high. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work. `SIDECAR_THINKING` overrides reasoning at startup.
+Pick the role by the work, on a fresh slot: a reviewer for reviews, audits, bug or security scans and anything that writes findings files; `--role implementer` for code changes; `--role explorer` only to find code and explain how it connects; `--role researcher` only to answer a question from primary sources (docs, specs, release notes). Explorers and researchers report inline and write nothing, so they refuse audits and file output. Reviewers come in two roles: `adversarial-reviewer` (the default) runs pi on `gpt-6.1-sol`, a model family other than yours; `--role reviewer` runs Claude Code on Opus 5.5. Reviewers use high reasoning, every other role medium. Pass `--agent`, `SIDECAR_MODEL`, `SIDECAR_CLAUDE_MODEL` or `SIDECAR_THINKING` only when the user asks for another agent, model or reasoning level. A slot remembers its role for follow-ups; use a separate review slot to review an implementer's work.
 
 Implementer asks carry a completion contract: a `Status: done|partial|blocked` line, verification through the real entry point, the smallest diff in the surrounding style, and `Verified`, `Not verified`, `Files changed`, `Additions` and `Suggested follow-ups` sections. `Additions` justifies each new function, option, fallback or dependency against the task; unjustified ones signal drift. Run the ask with `cwd` set to the implementer's checkout (`../fury-wt` here) and give it launcher checks:
 
@@ -43,7 +43,7 @@ sidecar --slot 4 --role implementer ask \
 
 After the report, the launcher runs each `--accept` command itself (`SIDECAR_ACCEPT_TIMEOUT_S`, default 1800) and flags files changed outside the `--scope` globs (`*` crosses directories). Results lead the report under `## Launcher checks`. Make an accept command exercise the real user path, not the unit tests the implementer already ran. Checks persist on the slot through answers, steers and follow-up asks until another ask sets new ones or passes `--no-checks`. They run only for local slots.
 
-`--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi: Opus for reviewers, Sonnet for the other roles, with the same role effort defaults (`SIDECAR_CLAUDE_MODEL` overrides the model). The slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there, with an up-to-date grok-style-pi). A busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
+`--agent claude` (on a fresh slot) runs a persistent Claude Code agent instead of pi for implementers, explorers and researchers, on Opus 5.5. The slot keeps its agent. It also runs on another machine with `--machine` (Claude Code must be logged in there, with an up-to-date grok-style-pi). A busy one cannot be steered; use `ask` once it reports. It starts no sidecars of its own.
 
 Give each editing sidecar disjoint files or its own worktree and state the checkout path in the request. Sidecars on this machine share the filesystem, not conversation history; brief each on its own task. In the herdr TUI, sidecars fill Claude's current tab to four total panes, counting every pane open in it. With Claude alone, the first sidecar splits left/right, and the next two split top/bottom in each column. Further sidecars fill new tabs with the same four-pane layout without changing focus. In the Herdr app, sidecars are listed under Claude's terminal.
 
@@ -102,11 +102,13 @@ sidecar plan path/to/plan.md "What the user asked for and constraints they state
 
 ## Implementation review
 
-After every real implementation, before you report it done, run an **adversarial** review of the diff while you do your own review in parallel:
+After every real implementation, before you report it done, run an adversarial review of the diff while you do your own review in parallel:
 
 ```bash
 sidecar diff <base> "Intent of the change and anything non-obvious"
 ```
+
+For a complicated or risky change (it spans subsystems, touches ownership, lifecycle, concurrency, persistence, security or data migration, or is hard to undo), run `coop-review` instead: an adversarial and a same-model review, independently.
 
 `<base>` is a single ref for the commit the work started from (`HEAD` when all of it is uncommitted), not an `A..B` or `A...B` range. The review covers commits since base, uncommitted changes, and untracked files. A base that is not an ancestor of HEAD (an updated `origin/main`) is replaced by the merge-base. After committing or pushing, pass the pre-work commit as `<base>`; use `diff`, not `ask`, so the sidecar receives the diff.
 
@@ -116,13 +118,13 @@ A PreToolUse hook enforces this: in a repository with a recorded diff review fro
 
 ## Co-op review
 
-Run `coop-review` only when the user asks for a co-op review. It costs about three single reviews:
+Run `coop-review` for a complicated or risky implementation, or when the user asks for a co-op review:
 
 ```bash
 sidecar coop-review [--pi-slot N] [--claude-slot M] <base> "Intent of the change"
 ```
 
-A pi reviewer (slot 98) and a Claude Code reviewer (slot 99) review the diff in parallel, then check each other's numbered findings. The slots are dedicated and the command reserves them for the whole run and fails at once if one is busy or in another coop-review. The report accounts for every finding: confirmed by both, disputed (each side's argument, including unchecked ones), or rejected by both, each with its origin. It decides nothing: settle disputes and fixes yourself, verifying each as usual. After fixing, call `coop-review` again with the same slots so both reviewers keep their memory. Exit 3 names the slot that asked; reply with `sidecar --slot N answer`, then rerun. Cancelling it (exit 130/143) stops nothing: the reviewers finish their requests and the slots stay busy until then. It runs locally and does not accept `--slot`, `--agent` or `--role`.
+A pi adversarial reviewer (slot 98) and a Claude Code reviewer (slot 99) review the diff independently and in parallel. The slots are dedicated and the command reserves them for the whole run and fails at once if one is busy or in another coop-review. The report lists both reviews. Cross-reference them yourself: match findings that describe the same defect, verify each against the code, and handle them as in Handle the report, rejecting through the slot that raised the finding. After fixing, call `coop-review` again with the same slots so both reviewers keep their memory. Exit 3 names the slot that asked; reply with `sidecar --slot N answer`, then rerun. Cancelling it (exit 130/143) stops nothing: the reviewers finish their requests and the slots stay busy until then. It runs locally and does not accept `--slot`, `--agent` or `--role`.
 
 ## Reviewing a merge request
 

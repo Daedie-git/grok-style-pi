@@ -19,7 +19,7 @@ test("ask starts a Pi sidecar owned by the Claude session and prints its report"
 	assert.match(f.prompts[0], /your final reply is the report/);
 	assert.deepEqual(f.starts[0].slice(2), ["--model", "openai-codex/gpt-6.1-sol", "--thinking", "high"]);
 	const status = await f.run("--slot", "2", "status");
-	assert.match(status.stdout, /^slot 2: reviewer · pi · sidecar-2-reviewer · completed/m);
+	assert.match(status.stdout, /^slot 2: adversarial-reviewer · pi · sidecar-2-adversarial-reviewer · completed/m);
 	const report = await f.run("--slot", "2", "report");
 	assert.match(report.stdout, /## Verdict\nship/);
 });
@@ -50,6 +50,24 @@ test("a slot keeps its role, and unsupported launcher features refuse", async (t
 	assert.equal(mismatch.code, EXIT.failed);
 	assert.match(mismatch.stderr, /already a implementer/);
 	assert.match((await f.run("reload")).stderr, /reload is not a sidecar command/);
+});
+
+test("reviewers run Claude Code and adversarial reviewers run pi; a conflicting --agent refuses", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	assert.match((await f.run("--slot", "2", "--role", "adversarial-reviewer", "--agent", "claude", "ask", "x")).stderr, /--role adversarial-reviewer runs pi; --role reviewer runs claude/);
+	assert.match((await f.run("--slot", "3", "--role", "reviewer", "--agent", "pi", "ask", "x")).stderr, /--role reviewer runs claude; --role adversarial-reviewer runs pi/);
+	assert.equal(f.starts.length, 0);
+});
+
+test("a slot recorded as a pi reviewer is the adversarial reviewer", async (t) => {
+	const { SlotState } = await import("../../src/state.ts");
+	const root = mkdtempSync(join(tmpdir(), "sidecar-legacy-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const slot = new SlotState(root, "s");
+	slot.write({ agentId: "a1", role: "reviewer", agent: "pi" });
+	assert.equal(slot.read()?.role, "adversarial-reviewer");
+	slot.write({ agentId: "a2", role: "reviewer", agent: "claude" });
+	assert.equal(slot.read()?.role, "reviewer");
 });
 
 test("a failed run reports no report and exits 2", async (t) => {

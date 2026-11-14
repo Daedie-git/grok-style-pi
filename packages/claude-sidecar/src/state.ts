@@ -4,9 +4,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-export const ROLES = ["reviewer", "implementer", "researcher", "explorer"] as const;
+export const ROLES = ["reviewer", "adversarial-reviewer", "implementer", "researcher", "explorer"] as const;
 export type Role = typeof ROLES[number];
 export type Backend = "pi" | "claude";
+
+/** Reviewers run on Claude's own model family; adversarial reviewers on the other. */
+export const REVIEW_AGENTS: Partial<Record<Role, Backend>> = { reviewer: "claude", "adversarial-reviewer": "pi" };
 
 export interface SlotRecord {
 	/** Qualified runner agent ID: `<id>` or `<id>@<machine>`. */
@@ -60,7 +63,11 @@ export class SlotState {
 	read(): SlotRecord | undefined {
 		const text = readText(join(this.dir, "runner", `${this.name}.json`));
 		if (!text) return undefined;
-		try { return JSON.parse(text) as SlotRecord; } catch { return undefined; }
+		let record: SlotRecord;
+		try { record = JSON.parse(text) as SlotRecord; } catch { return undefined; }
+		// Slots recorded before the split: a pi reviewer is the adversarial one.
+		if (record.role === "reviewer" && record.agent === "pi") record.role = "adversarial-reviewer";
+		return record;
 	}
 
 	write(record: SlotRecord): void {

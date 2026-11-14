@@ -4,7 +4,7 @@ A Claude Code plugin that runs persistent [pi](https://github.com/badlogic/pi-mo
 
 Sidecars run on [herdr-runner](../herdr-runner/README.md), the core that Grok's Pi subagents use: one coordination database, pane placement, close-on-completion, owner-gone cleanup, cold resume and saved machines. A sidecar is a runner agent owned by the Claude conversation in its pane.
 
-The default backend is pi with `openai-codex/gpt-6.1-sol` and `high` thinking for reviewers.
+Roles pick the backend: `reviewer` runs Claude Code and `adversarial-reviewer` (the default) runs pi; other roles default to pi. Pi uses `openai-codex/gpt-6.1-sol` (`SIDECAR_MODEL`), Claude Code `claude-opus-5-5` (`SIDECAR_CLAUDE_MODEL`). Reviewers think at `high`, other roles at `medium` (`SIDECAR_THINKING`).
 
 ## Requirements
 
@@ -59,7 +59,7 @@ Closing needs a process that maintains coordination. Each request runs a detache
 
 ## Cooperative review
 
-`coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]` has a pi reviewer and a Claude Code reviewer (slots 98 and 99) review the same diff in parallel, then check each other's numbered findings. Both slots are reserved for the run; a busy slot fails at once. The combined report puts every finding under **Confirmed by both**, **Disputed** or **Rejected by both**, with its origin and the four underlying reports linked. Check entries that match no finding are listed under Warnings. It decides nothing. Fixtures recorded from the former Bash launcher pin its output (`tests/runner/fixtures/coop`).
+`coop-review [--pi-slot N] [--claude-slot M] [BASE] [CONTEXT]` has a pi adversarial reviewer and a Claude Code reviewer (slots 98 and 99) review the same diff independently and in parallel. Both slots are reserved for the run; a busy slot fails at once. The report lists both reviews with their report paths; Claude cross-references them.
 
 ## Implementer checks
 

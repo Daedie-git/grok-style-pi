@@ -111,7 +111,7 @@ test("keep and unkeep pin the runner agent; ask --keep pins an existing slot", a
 	assert.equal((await f.run("ask", "first")).code, EXIT.report);
 	const kept = async () => (await f.store()!.listAgents())[0].keep;
 	assert.notEqual(await kept(), true);
-	assert.match((await f.run("keep")).stdout, /^pinned: sidecar-1-reviewer/);
+	assert.match((await f.run("keep")).stdout, /^pinned: sidecar-1-adversarial-reviewer/);
 	assert.equal(await kept(), true);
 	assert.match((await f.run("unkeep")).stdout, /^unpinned/);
 	assert.equal(await kept(), false);

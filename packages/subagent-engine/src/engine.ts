@@ -349,7 +349,7 @@ export class Engine {
 		const ctx = this.requireRoot().ctx;
 		const set = await discoverDefinitions({
 			cwd: ctx.cwd, agentDir: this.deps.agentDir, projectTrusted: ctx.isProjectTrusted(),
-			forkEnabled: this.forkEnabled(), flagJson: this.deps.env.PI_AGENTS_JSON, policyDir: this.deps.env.PI_AGENTS_POLICY_DIR,
+			forkEnabled: this.forkEnabled(), claudeCode: this.paneRuns.available(), flagJson: this.deps.env.PI_AGENTS_JSON, policyDir: this.deps.env.PI_AGENTS_POLICY_DIR,
 			homeDir: this.deps.homeDir,
 		});
 		this.definitionCache = { at: this.now(), set };
@@ -386,6 +386,13 @@ export class Engine {
 			...(defaults?.effort !== undefined ? { effort: defaults.effort } : {}),
 			...(invocation.internal ? { disallowedTools: [...selected.definition.disallowedTools, ...invocation.internal.extraDenied] } : {}),
 		};
+		if (params.backend === "in-process" && (params.runtime ?? definition.runtime) === "claude-code") {
+			return error(`Claude Code runs only in a Herdr pane${definition.runtime ? `; use review for an in-process ${definition.agentType}` : ""}.`);
+		}
+		if (definition.runtime && params.runtime === undefined) {
+			if (invocation.internal) return error(`${definition.agentType} runs in a Claude Code pane, and workflow agents run in-process; use review.`);
+			params = { ...params, runtime: definition.runtime };
+		}
 		if (skill) params = { ...params, prompt: [skill.skill.content, params.prompt ?? ""].filter((part) => part.trim()).join("\n\n") };
 		if (!params.prompt?.trim()) return error("Agent needs a prompt.");
 		if (caller.allowedAgentTypes && !caller.allowedAgentTypes.some((type) => canonicalAgentType(type) === canonicalAgentType(definition.agentType))) {
@@ -448,8 +455,8 @@ export class Engine {
 		if (invocation.internal?.workflow) meta.workflow = invocation.internal.workflow;
 		if (skill) meta.skill = { name: skill.skill.name, path: skill.skill.path, scope: skill.skill.allowedTools ?? [] };
 		if (pane) meta.backend = "herdr";
-		// The local resolution says nothing about a machine's Pi, which runs the named model or its own default.
-		if (pane && params.machine?.trim() && params.runtime !== "claude-code") {
+		// The local resolution says nothing about a machine's Pi or Claude Code, which run the named model or their own default.
+		if (pane && (params.machine?.trim() || params.runtime === "claude-code")) {
 			const requestedModel = params.model ?? (definition.model === "inherit" ? undefined : definition.model);
 			if (requestedModel) meta.model = { requested: requestedModel, effective: requestedModel };
 			else delete meta.model;
@@ -857,6 +864,7 @@ export class Engine {
 	/** Attach (or, after a reload, re-attach) the Herdr transport; identity routing is restored before notices flow. */
 	attachHerdr(port: HerdrRunsPort): () => void {
 		const detach = this.paneRuns.rebind(port);
+		this.definitionCache = undefined;
 		// Re-send stops that were requested while no transport could carry them (restore, reload handover).
 		for (const conversation of this.control.conversations.values()) {
 			if (conversation.meta.backend === "herdr" && conversation.active?.cancelRequested) this.cancelRun(conversation.meta.agentId, conversation.active.cancelRequested);

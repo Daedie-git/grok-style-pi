@@ -20,7 +20,7 @@ import { pushGate } from "./push-gate.ts";
 import { Rejections, rejectionPrompt } from "./rejections.ts";
 import { latestReviewedFile, planPrompt, prepareDiff, unreviewedSince } from "./review.ts";
 import { parseSessionStart, recordTranscript, recordedTranscript } from "./session.ts";
-import { ROLES, SlotState, acquireLock, ownerName, requestId, slotName, stateDir, type Backend, type Role, type SlotRecord } from "./state.ts";
+import { REVIEW_AGENTS, ROLES, SlotState, acquireLock, ownerName, requestId, slotName, stateDir, type Backend, type Role, type SlotRecord } from "./state.ts";
 
 /** Exit codes the plugin's job messages and the skill rely on. */
 export const EXIT = { report: 0, failed: 1, noReport: 2, question: 3, duplicate: 4, blocked: 5, busy: 7 } as const;
@@ -187,8 +187,10 @@ export class SidecarCli {
 
 	private bindProfile(globals: Globals): Profile {
 		const profile = loadProfile(resolve(this.cwd, globals.profileFile!));
-		if (globals.role && globals.role !== profile.role) throw new UsageError(`--role conflicts with profile role ${profile.role}`);
-		globals.role = profile.role;
+		// Profiles run pi, so their reviewer is Claude's adversarial reviewer.
+		const role = profile.role === "reviewer" ? "adversarial-reviewer" : profile.role;
+		if (globals.role && globals.role !== role) throw new UsageError(`--role conflicts with profile role ${profile.role}`);
+		globals.role = role;
 		return profile;
 	}
 
@@ -270,7 +272,7 @@ export class SidecarCli {
 			let record = slot.read();
 			if (record) this.assertBinding(record, globals);
 			this.assertProfile(record, globals);
-			const prompt = options.build?.({ role: record?.role ?? globals.role ?? "reviewer", machine: record ? record.machine : globals.machine }) ?? text;
+			const prompt = options.build?.({ role: record?.role ?? globals.role ?? "adversarial-reviewer", machine: record ? record.machine : globals.machine }) ?? text;
 			const local = await this.parent.local();
 			await this.publishOwner();
 			await this.adoptTranscript(local).catch(() => undefined);
@@ -287,8 +289,9 @@ export class SidecarCli {
 				const caller = await this.parent.caller(runner, agent.cwd ?? this.cwd, this.ownerSession);
 				ref = await runner.resume(routed.id, prompt, undefined, true, caller);
 			} else {
-				const role = globals.role ?? "reviewer";
-				const agent = globals.agent ?? "pi";
+				const role = globals.role ?? "adversarial-reviewer";
+				const agent = REVIEW_AGENTS[role] ?? globals.agent ?? "pi";
+				if (globals.agent && globals.agent !== agent) throw new UsageError(`--role ${role} runs ${agent}; --role ${role === "reviewer" ? "adversarial-reviewer" : "reviewer"} runs ${globals.agent}`);
 				const machine = globals.machine;
 				runner = machine ? await this.parent.machine(machine) : local;
 				if (machine) this.parent.remember(machine);
@@ -319,7 +322,7 @@ export class SidecarCli {
 	private assertProfile(record: SlotRecord | undefined, globals: Globals): void {
 		const profile = this.profile;
 		if (!profile) return;
-		if ((record ? record.agent : globals.agent ?? "pi") !== "pi") throw new UsageError("role profiles support --agent pi only");
+		if ((record ? record.agent : globals.agent ?? REVIEW_AGENTS[globals.role!] ?? "pi") !== "pi") throw new UsageError("role profiles support --agent pi only");
 		if (record ? record.machine : globals.machine) throw new UsageError("role profiles run on this machine only");
 		if (record && !record.profile) throw new UsageError("cannot attach a profile to an unprofiled conversation; use stop --fresh first");
 		if (record && record.profile !== profile.hash) throw new UsageError("slot profile differs; use stop --fresh before attaching a different profile");
@@ -337,12 +340,12 @@ export class SidecarCli {
 		const cwd = !machine ? this.cwd : globals.remoteCwd?.trim()
 			|| mapPath(machineConfig(await this.parent.findMachine(machine), this.env), this.cwd)
 			|| this.parent.machineCwd(machine) || this.cwd;
-		const reviewer = role === "reviewer";
+		const reviewer = role in REVIEW_AGENTS;
 		const profile = this.profile;
 		// Pi finds .pi/skills itself; Claude Code repositories keep theirs in .claude/skills. A profile names its own.
 		const skills = profile ? profileSkills(profile, this.env.HOME || homedir()) : !machine && agent === "pi" ? repoSkills(this.cwd) : [];
 		const model = agent === "claude"
-			? this.env.SIDECAR_CLAUDE_MODEL || (reviewer ? "opus" : "sonnet")
+			? this.env.SIDECAR_CLAUDE_MODEL || "claude-opus-5-5"
 			: this.env.SIDECAR_MODEL || "openai-codex/gpt-6.1-sol";
 		return {
 			runtime: agent === "claude" ? "claude-code" : "pi",

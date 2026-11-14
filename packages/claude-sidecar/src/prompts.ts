@@ -21,7 +21,7 @@ const ASK = {
 };
 
 export function roleInstructions(role: Role, backend: Backend): string {
-	const file = readFileSync(new URL(`${role}.md`, SIDECAR_HOME), "utf8");
+	const file = readFileSync(new URL(`${role === "adversarial-reviewer" ? "reviewer" : role}.md`, SIDECAR_HOME), "utf8");
 	return [PROTOCOL, ASK[backend], file.trim()].join("\n\n");
 }
 

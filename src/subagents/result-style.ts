@@ -25,6 +25,6 @@ export async function registerStyledSubagents(pi: ExtensionAPI, factory: Extensi
 	await registerToolExtension(pi, factory, (tool) => {
 		// The engine renders its own autonomy policy. Only the legacy Herdr route keeps this gate.
 		const gated = herdrPolicy ? withoutSubagentInitiative(tool) : tool;
-		return enabled && ["Agent", "SendMessage", "TaskStop", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "get_subagent_result", "steer_subagent", "Workflow", "RunWorkflow"].includes(gated.name) ? styleTool(gated) : gated;
+		return enabled && ["Agent", "SendMessage", "MessageQueue", "TaskStop", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "get_subagent_result", "steer_subagent", "Workflow", "RunWorkflow"].includes(gated.name) ? styleTool(gated) : gated;
 	});
 }

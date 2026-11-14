@@ -28,7 +28,7 @@ export const CLAUDE_TOOL_ALIASES: Record<string, string> = {
 };
 export const BACKGROUND_ALLOWED: ReadonlySet<string> = new Set([
 	"read", "grep", "find", "ls", "bash", "powershell", "edit", "write",
-	"SendMessage", "TaskList", "TaskStop",
+	"SendMessage", "MessageQueue", "TaskList", "TaskStop",
 ]);
 /** An isolated definition may use only these. */
 export const BUILTIN_TOOLS: ReadonlySet<string> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);

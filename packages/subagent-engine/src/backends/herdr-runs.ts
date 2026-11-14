@@ -32,7 +32,11 @@ export interface HerdrRunHandle extends Omit<RunHandle, "cancel" | "deliver"> {
 	deliver(envelope: Envelope): Promise<DeliveryResult | RunSettlingResult>;
 }
 /** Persisted on each engine run, not just the agent's latest Herdr pointer. */
-export interface HerdrReceiptIdentity { agentId: string; runId: string; machine?: string; destinationCommitted?: boolean }
+export interface HerdrReceiptIdentity {
+	agentId: string; runId: string; machine?: string; destinationCommitted?: boolean;
+	/** Input the pane accepted with this run, saved with the association so a restart cannot run it again. */
+	envelopeIds?: string[];
+}
 export type HerdrCapturedSummary = AgentMeta["runs"][number] & { herdr?: HerdrReceiptIdentity };
 export interface PaneToolResult { text: string; isError?: boolean; details: Record<string, unknown> }
 export interface HerdrRunsHost {
@@ -201,11 +205,11 @@ export class HerdrRuns {
 		if (meta.runs.some((other) => other !== summary && (other as HerdrCapturedSummary).herdr?.agentId === ref!.agentId && (other as HerdrCapturedSummary).herdr?.runId === ref!.runId)) throw new Error(`Captured Herdr identity is shared by different engine runs: ${runId}`);
 		return structuredClone(ref);
 	}
-	private saveAssociation(meta: AgentMeta, runId: string, ref: { agentId: string; runId?: string; machine?: string }, destinationCommitted = false): void {
+	private saveAssociation(meta: AgentMeta, runId: string, ref: { agentId: string; runId?: string; machine?: string }, destinationCommitted = false, envelopeIds: string[] = []): void {
 		const summary = meta.runs.find((run) => run.runId === runId) as HerdrCapturedSummary | undefined;
 		if (!summary || !ref.agentId || !ref.runId) throw new Error("Cannot persist a pane receipt without engine and source run identities");
 		if (summary.herdr && (summary.herdr.agentId !== ref.agentId || summary.herdr.runId !== ref.runId || summary.herdr.machine !== ref.machine)) throw new Error(`Cannot change captured Herdr identity for ${runId}`);
-		summary.herdr = { ...summary.herdr, agentId: ref.agentId, runId: ref.runId, ...(ref.machine ? { machine: ref.machine } : {}), ...(destinationCommitted ? { destinationCommitted: true } : {}) };
+		summary.herdr = { ...summary.herdr, agentId: ref.agentId, runId: ref.runId, ...(ref.machine ? { machine: ref.machine } : {}), ...(destinationCommitted ? { destinationCommitted: true } : {}), ...(envelopeIds.length ? { envelopeIds } : {}) };
 		this.host.persist(meta);
 	}
 	private queueDestinationWrite(run: ReceiptRun): void {
@@ -283,7 +287,7 @@ export class HerdrRuns {
 			const resumed = await this.transport().resume(meta, prompt, ctx);
 			meta.herdr = resumed.meta.herdr;
 			if (!meta.herdr) throw new Error("Herdr resume did not return run identity");
-			this.saveAssociation(meta, runId, meta.herdr);
+			this.saveAssociation(meta, runId, meta.herdr, false, envelopeIds);
 			const run = this.register(meta, runId, true);
 			registered = true;
 			await this.host.forwardPendingStop(meta.agentId, runId, run.handle);

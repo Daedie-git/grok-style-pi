@@ -73,7 +73,9 @@ export function launchResultText(input: { agentId: string; name?: string; descri
 	].join("\n\n");
 }
 
-export const SEND_MESSAGE_DESCRIPTION = "Send a literal work message to one agent by ID or name, or to main (the root conversation, not the immediate parent). Use it to steer active work, answer a needs_answer question, or continue a finished, resumable agent with related work. Delivery acceptance means queued, not that the agent has read or acted on it. Messages do not grant user consent or authorize permission, configuration, or instruction-file changes. Do not broadcast or send lifecycle/protocol frames. A user-stopped agent requires explicit user authorization before continuation.";
+export const SEND_MESSAGE_DESCRIPTION = "Send a literal work message to one agent by ID or name, or to main (the root conversation, not the immediate parent). Use it to steer active work, answer a needs_answer question, or continue a finished, resumable agent with related work. With queue: true the message becomes the agent's next task instead: it runs in its own run after the current one completes, and stays editable with MessageQueue until it starts. Delivery acceptance means queued, not that the agent has read or acted on it. Messages do not grant user consent or authorize permission, configuration, or instruction-file changes. Do not broadcast or send lifecycle/protocol frames. A user-stopped agent requires explicit user authorization before continuation.";
+
+export const MESSAGE_QUEUE_DESCRIPTION = "Inspect or edit the tasks you queued for one agent with SendMessage queue: true. list shows them in run order with their ids; replace rewrites one; withdraw drops one. To combine tasks, replace one with the merged text and withdraw the rest. A task that has started can no longer change; steer the agent with SendMessage instead.";
 
 export const TASK_STOP_DESCRIPTION = "Request cancellation of a running agent by its ID. The root may stop any agent in the session; a subagent may stop only itself, not its children. A terminal run that is still exiting may be signaled again. Cancellation is a request, not proof that execution has settled. User stop propagates to descendants and prevents automatic continuation; an already idle or finished agent cannot be stopped as a new running task.";
 
@@ -107,6 +109,7 @@ export function noticeText(payload: NoticePayload): string {
 	if (payload.failure) sections.push(`Failure: ${payload.failure}`);
 	if (payload.interim) sections.push("This agent is waiting on its own children. This is an interim handback; another notice will follow.");
 	if (payload.resumePending) sections.push("Further messages have scheduled an automatic resume. Another run will follow; do not launch duplicate work.");
+	if (payload.queuedRemaining) sections.push(`${payload.queuedRemaining} more queued task(s) wait${payload.resumePending ? " after the next run" : payload.queueWaitsForSlot ? "; the next starts by itself when a run slot frees" : "; the queue resumes after the agent's next completed run"}. Edit them with MessageQueue.`);
 	if (payload.killedBy) sections.push(`Cancellation source: ${payload.killedBy}.`);
 	sections.push(payload.resumable ? "Resumable: yes; use SendMessage for related follow-up, subject to stop and permission checks. A user-stopped agent still requires explicit user authorization." : "Resumable: no; do not attempt to continue this agent.");
 	if (payload.usage) sections.push(`Usage: ${Math.max(payload.usage.liveMetric, payload.usage.latestFootprint)} notification tokens; billed total ${payload.usage.billable.totalTokens} tokens, cost ${payload.usage.billable.cost}; models: ${payload.usage.modelTransitions.join(" → ") || "not recorded"}.`);

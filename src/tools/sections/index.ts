@@ -26,6 +26,7 @@ export const DEFAULT_SECTIONS: SectionTable = Object.freeze({
 	RunWorkflow: workflowSection,
 	Agent: { ...agent, summary: (view) => ({ title: agentSummary(view.args) }) },
 	SendMessage: { ...textSection("Message"), summary: (view) => ({ title: `Message ${String(view.args?.to ?? "agent")}` }) },
+	MessageQueue: { ...textSection("Message queue"), summary: (view) => ({ title: `Queue ${String(view.args?.action ?? "")} ${String(view.args?.to ?? "agent")}`.replace(/\s+/g, " ") }) },
 	TaskStop: { ...textSection("Stop agent"), summary: (view) => ({ title: `Stop agent ${String(view.args?.task_id ?? view.args?.agent_id ?? "")}`.trim() }) },
 	TaskCreate: taskSection("Create task"),
 	TaskGet: taskSection("Read task"),

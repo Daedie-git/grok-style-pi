@@ -1,6 +1,7 @@
 // Conversation control: the single place that changes run ownership, admission, owner edges, wakes and stops.
 // Every mutating method is synchronous. JavaScript runs it to completion, so each call is one transaction
 // and nothing is ever awaited while state is inconsistent (plan §16.1, invariant 7).
+import { nextRunInput } from "./store/inbox.ts";
 import type { AgentId, AgentMeta, Envelope, InvocationKind, KilledBy, RunHandle, RunId, RunOutcome, RunSummary } from "./types.ts";
 
 export interface ControlLimits {
@@ -34,6 +35,8 @@ export interface ActiveRun {
 	cancelRequested?: KilledBy;
 	/** Ids of inbox envelopes this run was started to deliver. */
 	envelopeIds: string[];
+	/** Started for a queued task: a separate assignment that reports on its own. */
+	queuedTask?: boolean;
 }
 
 export interface OwnerEdge {
@@ -57,6 +60,8 @@ export interface Conversation {
 	/** Edges where this conversation is the owner. */
 	edges: Map<string, OwnerEdge>;
 	wakePending?: string;
+	/** Parked only until a run slot frees for its next queued task (no report or child is outstanding). */
+	queueParked?: boolean;
 	evictAt?: number;
 	notified: boolean;
 }
@@ -246,7 +251,8 @@ export class Control {
 		}
 		// A run that failed without delivering the messages it was started for must not relaunch for them at once (that would
 		// repeat a permanent failure forever); they stay pending until a new message or wake arrives. Newer arrivals still continue.
-		const undelivered = this.inboxOf(agentId).undelivered().filter((envelope) => outcome.status !== "failed" || !ownEnvelopes.has(envelope.id));
+		const pending = this.inboxOf(agentId).undelivered();
+		const undelivered = pending.filter((envelope) => !envelope.queued && (outcome.status !== "failed" || !ownEnvelopes.has(envelope.id)));
 		if (undelivered.length > 0 && outcome.status !== "killed") {
 			// The report still goes out; its notice says another run follows (plan §7, §8).
 			const reserved = this.reserveRun(conversation, "continue", undelivered.map((envelope) => envelope.id));
@@ -256,6 +262,14 @@ export class Control {
 		}
 		// An owner still waiting on its own children parks and withholds its report (plan §4.3).
 		if (this.heldEdges(conversation).length > 0 && outcome.status === "completed") return finish("parked");
+		// Only a completed run advances the queue; after a failure or stop it waits for a steer to resume the agent.
+		if (outcome.status === "completed" && pending.some((envelope) => envelope.queued)) {
+			const reserved = this.reserveRun(conversation, "continue", []);
+			if (reserved.kind === "reserved") return finish("active", report, reserved.runId);
+			conversation.wakePending = "queued task";
+			conversation.queueParked = true;
+			return finish("parked", report);
+		}
 		conversation.evictAt = this.now() + EVICTION_GRACE_MS;
 		return finish("evictable", report);
 	}
@@ -417,6 +431,32 @@ export class Control {
 
 	// ---- Internals ----
 
+	/** A wake found nothing left to run (its input was withdrawn): leave the conversation idle instead of starting an empty run. */
+	dropWake(agentId: AgentId): void {
+		const conversation = this.conversations.get(agentId);
+		if (!conversation || conversation.active) return;
+		conversation.wakePending = undefined;
+		conversation.queueParked = undefined;
+		const index = this.waiting.indexOf(agentId);
+		if (index >= 0) this.waiting.splice(index, 1);
+		if (conversation.disposition === "parked" && this.heldEdges(conversation).length === 0) {
+			conversation.disposition = "evictable";
+			conversation.evictAt = this.now() + EVICTION_GRACE_MS;
+			conversation.meta.finished = true;
+			this.persist(conversation.meta);
+		}
+	}
+
+	/**
+	 * Whether an idle conversation may start its next queued task: its latest run completed, the user has not stopped it, and it
+	 * is not parked on its own children (their reports resume it first). A finished child's steer re-attaches an edge to an idle
+	 * owner without parking it, so edges alone do not close the queue.
+	 */
+	queueOpen(conversation: Conversation): boolean {
+		return !conversation.active && !conversation.meta.stoppedByUser && conversation.meta.runs.at(-1)?.status === "completed"
+			&& !(conversation.disposition === "parked" && this.heldEdges(conversation).length > 0);
+	}
+
 	private reserveRun(conversation: Conversation, invocation: InvocationKind, envelopeIds: string[]): ReserveResult {
 		if (this.running >= this.limits.maxConcurrent) {
 			conversation.wakePending = "admission limit";
@@ -428,13 +468,17 @@ export class Control {
 		conversation.revision++;
 		conversation.disposition = "active";
 		conversation.wakePending = undefined;
+		conversation.queueParked = undefined;
 		conversation.evictAt = undefined;
 		conversation.notified = false;
 		conversation.meta.finished = false;
 		// An explicit retry also owns older undelivered input. Otherwise two failed messages can alternate forever:
 		// each finalizer mistakes the other message for a new arrival and reserves another continuation.
-		envelopeIds = [...new Set([...this.inboxOf(conversation.meta.agentId).undelivered().map((envelope) => envelope.id), ...envelopeIds])];
+		const undelivered = this.inboxOf(conversation.meta.agentId).undelivered();
+		const steers = new Set(undelivered.filter((envelope) => !envelope.queued).map((envelope) => envelope.id));
+		envelopeIds = [...new Set([...nextRunInput(undelivered, this.queueOpen(conversation)).map((envelope) => envelope.id), ...envelopeIds.filter((id) => steers.has(id))])];
 		conversation.active = { runId, phase: "reserved", invocation, startedAt: this.now(), background: true, envelopeIds };
+		if (envelopeIds.some((id) => !steers.has(id))) conversation.active.queuedTask = true;
 		conversation.meta.runs.push({ runId, invocation, startedAt: conversation.active.startedAt, status: "running" });
 		this.running++;
 		this.reattachEdge(conversation.meta.agentId, runId);

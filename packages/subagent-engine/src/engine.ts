@@ -19,13 +19,13 @@ import { buildForkEntries, writeForkSession } from "./context/fork.ts";
 import { WorkflowTasks, type WorkflowSnapshot } from "./workflow-tool.ts";
 import type { WorkflowProgress } from "./workflow/host.ts";
 import type { WorkflowRunResult } from "./workflow/runtime.ts";
-import { HerdrRuns, type HerdrRunsPort, type PaneRequest } from "./backends/herdr-runs.ts";
+import { HerdrRuns, type HerdrCapturedSummary, type HerdrRunsPort, type PaneRequest } from "./backends/herdr-runs.ts";
 import { FORK_DIRECTIVE } from "./definitions/builtins.ts";
 import { runInterruptedStopHooks, runStartHooks, type HookEnvironment } from "./hook-integration.ts";
 import { cleanupWorktree, createWorktree, restoreWorktree, translationNote } from "./worktree.ts";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { forkContextSkills, loadSkills, preloadSkills, skillAgentType, type SkillInfo } from "./skills.ts";
-import { InboxStore } from "./store/inbox.ts";
+import { InboxStore, nextRunInput } from "./store/inbox.ts";
 import { TaskStore, type TaskHooks } from "./tasks/store.ts";
 import { listMetas, writeMeta } from "./store/meta.ts";
 import { Outbox } from "./store/outbox.ts";
@@ -273,6 +273,16 @@ export class Engine {
 				if (meta.stoppedByUser && restored.active) restored.active.cancelRequested = "user";
 				try {
 					this.paneRuns.restore(meta, paneRun.runId);
+					// The pane accepted this input before the process ended; mark it delivered so completion does not run it again.
+					const accepted = (paneRun as HerdrCapturedSummary).herdr?.envelopeIds ?? [];
+					if (restored.active) restored.active.envelopeIds = accepted;
+					// A reconciliation failure must not undo the reattachment: the live pane stays reachable for stops.
+					if (accepted.length) try {
+						const inbox = this.inbox(meta.agentId);
+						for (const envelope of inbox.undelivered()) if (accepted.includes(envelope.id)) inbox.setState(envelope.id, "included", { runId: paneRun.runId });
+					} catch (inboxError) {
+						this.reportDiagnostics(meta.agentId, [`Could not mark the reattached pane's input delivered: ${(inboxError as Error).message}`]);
+					}
 					if (restored.active?.cancelRequested) this.cancelRun(meta.agentId, restored.active.cancelRequested);
 					continue;
 				} catch (restoreError) {
@@ -309,6 +319,7 @@ export class Engine {
 				...[...this.runs.values()].map((run) => run.handle.execution),
 				// Teardown after settlement (stop hooks, worktree cleanup) is part of shutting down.
 				...[...this.control.conversations.values()].flatMap((conversation) => conversation.exiting ? [conversation.exiting] : []),
+				...this.idleCleanups,
 			]),
 			new Promise((resolve) => { timer = setTimeout(resolve, 5000); }),
 		]);
@@ -370,6 +381,19 @@ export class Engine {
 	}
 
 	// ---- Agent ----
+
+	/**
+	 * Why a foreground caller's tool call was aborted. Only the user interrupting it is a user stop, which ends the child for good;
+	 * a session end or a stop of the calling agent cancels the child the same way it cancelled the caller.
+	 */
+	private callerAbortSource(caller: Caller, invocation: { internal?: InternalSpawn }): KilledBy {
+		if (invocation.internal) return "parent";
+		if (!this.root) return "session-end";
+		const callerStop = caller.agentId ? this.control.get(caller.agentId)?.active?.cancelRequested : undefined;
+		// A subagent caller is only ever user-stopped through a recorded stop; any other abort (say, it ended with needs_answer) is not the user.
+		if (!callerStop) return caller.agentId ? "parent" : "user";
+		return callerStop === "user" || callerStop === "session-end" ? callerStop : "parent";
+	}
 
 	async spawn(params: AgentParams, caller: Caller, invocation: { toolCallId: string; signal?: AbortSignal; ctx: ExtensionContext; origin?: "user" | "model"; internal?: InternalSpawn }): Promise<ToolText> {
 		const root = this.requireRoot();
@@ -507,9 +531,8 @@ export class Engine {
 		if (pane) return this.spawnHerdr(meta, reserved.runId, params, definition, background, invocation);
 
 		let handle: RunHandle;
-		const startAbortSource: KilledBy = invocation.internal ? "parent" : "user";
 		// An abort while the child session initializes is recorded on the reservation and forwarded once a handle exists.
-		const earlyAbort = () => { for (const id of this.control.requestStop(agentId, startAbortSource)) this.cancelRun(id, startAbortSource); };
+		const earlyAbort = () => { const source = this.callerAbortSource(caller, invocation); for (const id of this.control.requestStop(agentId, source)) this.cancelRun(id, source); };
 		try {
 			const notes: string[] = [];
 			if (isolate) {
@@ -546,7 +569,7 @@ export class Engine {
 			// A stop that arrived during setup (start hooks, worktree) must not be lost before a handle exists.
 			const pendingStop = this.control.get(agentId)?.active?.cancelRequested;
 			if (pendingStop || invocation.signal?.aborted) {
-				this.settle(agentId, reserved.runId, killedOutcome(pendingStop ?? "user"));
+				this.settle(agentId, reserved.runId, killedOutcome(pendingStop ?? this.callerAbortSource(caller, invocation)));
 				return error("The agent was stopped before it started.");
 			}
 			handle = this.launch(meta.agentId, reserved.runId, sessionSpec, prompt, background, definition.maxTurns);
@@ -566,8 +589,7 @@ export class Engine {
 		}
 		// Foreground: the caller waits; its abort cancels the child.
 		const record = this.runs.get(reserved.runId)!;
-		const abortSource: KilledBy = invocation.internal ? "parent" : "user";
-		const onAbort = () => { for (const id of this.control.requestStop(agentId, abortSource)) this.cancelRun(id, abortSource); };
+		const onAbort = () => { const source = this.callerAbortSource(caller, invocation); for (const id of this.control.requestStop(agentId, source)) this.cancelRun(id, source); };
 		invocation.signal?.addEventListener("abort", onAbort, { once: true });
 		if (invocation.signal?.aborted) onAbort();
 		try {
@@ -607,7 +629,7 @@ export class Engine {
 
 	// ---- SendMessage ----
 
-	async sendMessage(params: { to: string; message: string; summary?: string }, caller: Caller, toolCallId: string): Promise<SendReceipt> {
+	async sendMessage(params: { to: string; message: string; summary?: string; queue?: boolean }, caller: Caller, toolCallId: string): Promise<SendReceipt> {
 		const to = params.to?.trim() ?? "";
 		const text = params.message ?? "";
 		if (!to || /[\r\n]/.test(to) || to.length > 128) return { success: false, message: "`to` must be a single agent name or id." };
@@ -618,6 +640,7 @@ export class Engine {
 		if (callerConversation?.active?.cancelRequested || callerConversation?.meta.stoppedByUser) return { success: false, message: "You are being stopped; messages cannot be sent." };
 		const summary = params.summary?.trim().slice(0, 200) || undefined;
 		if (to === "main") {
+			if (params.queue) return { success: false, message: "Only agents have a task queue; send to main without queue." };
 			if (!caller.agentId) return { success: false, message: "You are the main conversation; there is no one to send to as main." };
 			// Durable, deduplicated acceptance; delivery goes through the guarded root drain like notices (review R08).
 			const accepted = this.mainInbox().accept({ acceptanceKey: `main:${caller.agentId}:${toolCallId}`, from: caller.agentId, to: "main", text, summary });
@@ -629,11 +652,39 @@ export class Engine {
 		if ("error" in resolved) return { success: false, message: resolved.error };
 		const agentId = resolved.agentId;
 		if (agentId === caller.agentId) return { success: false, message: "An agent cannot message itself." };
-		const accepted = this.inbox(agentId).accept({ acceptanceKey: `send:${toolCallId}`, from: caller.agentId ?? "main", to: agentId, text, summary });
+		const accepted = this.inbox(agentId).accept({ acceptanceKey: `send:${toolCallId}`, from: caller.agentId ?? "main", to: agentId, text, summary, ...(params.queue ? { queued: true } : {}) });
 		if ("conflict" in accepted) return { success: false, message: "This tool call was already used for a different message." };
 		const envelope = accepted.envelope;
 		if (accepted.duplicate && envelope.state !== "pending") return { success: true, delivery: "queued", envelopeId: envelope.id, agentId, message: "Already accepted." };
 		return this.dispatchEnvelope(agentId, envelope);
+	}
+
+	/** List, replace or withdraw the caller's queued tasks for one agent while they have not started. */
+	editQueue(params: { to: string; action: string; id?: string; message?: string; summary?: string }, caller: Caller): ToolText {
+		const resolved = this.control.resolveTarget(caller.agentId ?? "main", params.to?.trim() ?? "");
+		if ("error" in resolved) return error(resolved.error);
+		const agentId = resolved.agentId;
+		const inbox = this.inbox(agentId);
+		const from = caller.agentId ?? "main";
+		const started = new Set(this.control.get(agentId)?.active?.envelopeIds ?? []);
+		const queue = inbox.undelivered().filter((envelope) => envelope.queued && envelope.from === from);
+		if (params.action === "list") {
+			if (queue.length === 0) return { text: `No queued tasks from you for ${agentId}.` };
+			return { text: queue.map((envelope, index) => `${index + 1}. ${envelope.id}${envelope.state !== "pending" || started.has(envelope.id) ? " (started)" : ""}: ${envelope.summary ?? envelope.text.slice(0, 120)}`).join("\n"), details: { agentId, queue: queue.map((envelope) => envelope.id) } };
+		}
+		const envelope = queue.find((candidate) => candidate.id === params.id?.trim());
+		if (!envelope) return error(`No queued task ${JSON.stringify(params.id ?? "")} from you for ${agentId}. List the queue first.`);
+		if (envelope.state !== "pending" || started.has(envelope.id)) return error("That task has already started; send a SendMessage steer instead.");
+		if (params.action === "withdraw") {
+			inbox.setState(envelope.id, "refused", { refusedReason: "Withdrawn by the sender." });
+			return { text: `Withdrew ${envelope.id}.` };
+		}
+		if (params.action !== "replace") return error("`action` must be list, replace or withdraw.");
+		const text = params.message ?? "";
+		if (!text.trim()) return error("The replacement message is empty.");
+		if (looksLikeProtocolFrame(text)) return error("Structured protocol messages are not supported. Send plain text.");
+		inbox.revise(envelope.id, text, params.summary?.trim().slice(0, 200) || undefined);
+		return { text: `Replaced ${envelope.id}.` };
 	}
 
 	// ---- TaskStop ----
@@ -653,12 +704,16 @@ export class Engine {
 				record?.handle.cancel(source);
 				return { text: `Re-sent the stop signal to ${resolved.agentId}; it is still shutting down.` };
 			}
-			return error(`Agent ${resolved.agentId} is not running.`);
+			return error(`Agent ${resolved.agentId} is not running.${this.heldQueueNote(resolved.agentId)}`);
 		}
+		const affected = [...this.control.descendants(resolved.agentId), resolved.agentId];
+		const parked = source === "user" ? affected.filter((id) => this.control.get(id)?.disposition === "parked") : [];
 		const cancelled = this.control.requestStop(resolved.agentId, source);
+		if (source === "user") for (const id of affected) this.dropQueue(id);
+		for (const id of parked) this.releaseIdleWorktree(id);
 		for (const agentId of cancelled) this.cancelRun(agentId, agentId === resolved.agentId ? source : source === "user" ? "user" : "parent");
 		this.resendFailedStops(resolved.agentId, cancelled);
-		return { text: `Stopping ${resolved.agentId}${cancelled.length > 1 ? ` and ${cancelled.length - 1} of its subagents` : ""}.`, details: { agentId: resolved.agentId, stopped: cancelled } };
+		return { text: `Stopping ${resolved.agentId}${cancelled.length > 1 ? ` and ${cancelled.length - 1} of its subagents` : ""}.${source === "user" ? "" : this.heldQueueNote(resolved.agentId)}`, details: { agentId: resolved.agentId, stopped: cancelled } };
 	}
 
 	/** Compatibility read of a run's outcome (get_subagent_result). Earlier runs stay readable from their persisted summaries. */
@@ -790,9 +845,42 @@ export class Engine {
 		return Boolean(result && !result.isError);
 	}
 
+	/** Queued tasks waiting outside any active run. Stops and reports must work with an unreadable inbox, so this never throws. */
+	private queuedCount(agentId: AgentId): number {
+		try {
+			const owned = this.control.get(agentId)?.active?.envelopeIds ?? [];
+			return this.inbox(agentId).undelivered().filter((envelope) => envelope.queued && !owned.includes(envelope.id)).length;
+		} catch {
+			return 0;
+		}
+	}
+
+	private heldQueueNote(agentId: AgentId): string {
+		const count = this.queuedCount(agentId);
+		return count ? ` It still has ${count} queued task(s); withdraw unwanted ones with MessageQueue.` : "";
+	}
+
+	/** Refuse queued tasks, except one an active run owns; that run's settlement drops it. */
+	private dropQueue(agentId: AgentId): void {
+		try {
+			const inbox = this.inbox(agentId);
+			const owned = new Set(this.control.get(agentId)?.active?.envelopeIds ?? []);
+			for (const envelope of inbox.undelivered()) {
+				if (envelope.queued && !owned.has(envelope.id)) inbox.setState(envelope.id, "refused", { refusedReason: "The agent was stopped; its queued tasks were dropped." });
+			}
+		} catch (inboxError) {
+			this.reportDiagnostics(agentId, [`Could not drop the stopped agent's queued tasks: ${(inboxError as Error).message}`]);
+		}
+	}
+
 	/** User-source stop (activity panel, commands). */
 	async userStop(agentId: AgentId): Promise<void> {
+		const affected = [...this.control.descendants(agentId), agentId];
+		const parked = affected.filter((id) => this.control.get(id)?.disposition === "parked");
 		const fresh = this.control.requestStop(agentId, "user");
+		// Idle agents never settle again, so their queues are dropped and parked checkouts released here.
+		for (const id of affected) this.dropQueue(id);
+		for (const id of parked) this.releaseIdleWorktree(id);
 		for (const id of fresh) this.cancelRun(id, "user");
 		this.resendFailedStops(agentId, fresh);
 		this.emit({ type: "stopped", agentId });
@@ -972,7 +1060,7 @@ export class Engine {
 
 	private async continueHerdr(conversation: Conversation, runId: RunId): Promise<void> {
 		const ids = new Set(conversation.active!.envelopeIds);
-		const envelopes = this.inbox(conversation.meta.agentId).undelivered().filter((envelope) => ids.has(envelope.id) || ids.size === 0);
+		const envelopes = this.inbox(conversation.meta.agentId).undelivered().filter((envelope) => ids.has(envelope.id) || (ids.size === 0 && !envelope.queued));
 		const prompt = envelopes.map((envelope) => envelope.text).join("\n\n---\n\n") || "Continue.";
 		if (!this.paneRuns.available()) {
 			this.settle(conversation.meta.agentId, runId, failedOutcome("Herdr panes are not available in this session."));
@@ -1183,6 +1271,7 @@ export class Engine {
 		const record = this.runs.get(runId);
 		const conversation = this.control.get(agentId);
 		if (!conversation) return;
+		const queuedTask = conversation.active?.runId === runId && conversation.active.queuedTask;
 		if (this.prevented.delete(runId) && outcome.status === "completed") outcome.classification = "prevented";
 		this.noteRootOutputTokens(outcome.usage.billable.output);
 		this.runAborts.delete(runId);
@@ -1190,10 +1279,12 @@ export class Engine {
 		const finalized = this.control.finalize(agentId, runId, outcome, result);
 		this.runs.delete(runId);
 		if (!finalized) return;
-		this.emit({ type: "settled", agentId, runId, outcome });
+		// A user stop ends the agent for good, so its queue goes too; after any other kill the queue waits for a steer.
+		if (conversation.meta.stoppedByUser) this.dropQueue(agentId);
+		this.emit({ type: "settled", agentId, runId, outcome, ...(queuedTask ? { queuedTask: true } : {}) });
 		const attempted = this.stopHookAttempted.delete(runId);
 		// While a foreground caller is still waiting for this conversation, its reports stay passive (the caller receives them).
-		const passive = Boolean(record?.deliveredSynchronously) || this.foregroundWaiters.has(agentId);
+		const passive = Boolean(record?.deliveredSynchronously) || (this.foregroundWaiters.has(agentId) && !queuedTask);
 		const exiting = this.afterSettle(conversation, runId, outcome, result, finalized, passive, attempted).catch(() => undefined);
 		if (!finalized.continuation) {
 			// reserveContinuation defers while this is set, so a new run never starts against a checkout being cleaned up.
@@ -1214,16 +1305,15 @@ export class Engine {
 		const final = finalized.disposition === "evictable" || finalized.disposition === "stopped";
 		if (meta.worktree && final && outcome.status !== "needs-answer" && !meta.worktreeCleanlyRemoved) {
 			// Never while parked or continuing: the conversation may still need its checkout (plan §12).
-			const cleaned = await cleanupWorktree({ ...meta.worktree, repoRoot: meta.originCwd ?? meta.cwd }).catch((cleanupError) => ({ removed: false, kept: true, reason: String(cleanupError), commits: [] as string[] }));
-			if (cleaned.removed) meta.worktreeCleanlyRemoved = true;
-			this.persistMeta(meta);
-			worktree = { ...meta.worktree, kept: cleaned.kept };
+			worktree = { ...meta.worktree, kept: await this.releaseWorktree(meta) };
 		}
 		if (finalized.report) {
 			const payload: NoticePayload = {
 				agentId: meta.agentId, description: meta.description, status: outcome.status, classification: outcome.classification,
 				resultText: result.text, resultTruncated: result.truncated, transcriptPath: meta.sessionFile, usage: outcome.usage,
 				killedBy: outcome.killedBy, resumable: !meta.stoppedByUser, resumePending: Boolean(finalized.continuation),
+				queueWaitsForSlot: finalized.disposition === "parked" && conversation.queueParked || undefined,
+				queuedRemaining: this.queuedCount(meta.agentId) || undefined,
 				failure: outcome.error,
 			};
 			if (meta.name) payload.name = meta.name;
@@ -1232,6 +1322,44 @@ export class Engine {
 		}
 		if (finalized.continuation) void this.startContinuation(meta.agentId, finalized.continuation);
 		for (const waiting of finalized.wakes) this.wake(waiting);
+	}
+
+	/**
+	 * A park skips the final worktree cleanup. When a parked agent becomes finished without settling again (its wake dropped, or a
+	 * user stop), clean up once its descendants, which may work inside its checkout, have settled. The wait holds no fence, so
+	 * steers are not deferred meanwhile; only the removal itself is fenced, and it is skipped if the agent has moved on.
+	 */
+	private releaseIdleWorktree(agentId: AgentId): void {
+		const conversation = this.control.get(agentId);
+		const meta = conversation?.meta;
+		const finished = () => Boolean(conversation && !conversation.active && !conversation.exiting && !conversation.wakePending
+			&& ["evictable", "stopped"].includes(conversation.disposition) && meta?.worktree && !meta.worktreeCleanlyRemoved);
+		if (!conversation || !meta?.worktree || meta.worktreeCleanlyRemoved) return;
+		const descendants = this.control.descendants(agentId);
+		const pending: Promise<void> = (async () => {
+			await Promise.allSettled([...this.runs.values()].filter((run) => descendants.includes(run.agentId)).map((run) => run.handle.execution));
+			await Promise.allSettled(descendants.map((id) => this.control.get(id)?.exiting).filter((exiting) => exiting !== undefined));
+			await conversation.exiting?.catch(() => undefined);
+			if (!finished()) return;
+			const fence: Promise<void> = this.releaseWorktree(meta).catch(() => undefined).then(() => {
+				if (conversation.exiting !== fence) return;
+				if (this.control.exited(agentId)) this.wake(agentId);
+			});
+			conversation.exiting = fence;
+			await fence;
+		})().finally(() => this.idleCleanups.delete(pending));
+		// Shutdown waits on these too: the fence above does not exist yet when it takes its snapshot.
+		this.idleCleanups.add(pending);
+	}
+
+	private readonly idleCleanups = new Set<Promise<void>>();
+
+	/** Remove a finished agent's worktree if it is unchanged; returns whether it was kept. */
+	private async releaseWorktree(meta: AgentMeta): Promise<boolean> {
+		const cleaned = await cleanupWorktree({ ...meta.worktree!, repoRoot: meta.originCwd ?? meta.cwd }).catch((cleanupError) => ({ removed: false, kept: true, reason: String(cleanupError), commits: [] as string[] }));
+		if (cleaned.removed) meta.worktreeCleanlyRemoved = true;
+		this.persistMeta(meta);
+		return cleaned.kept;
 	}
 
 	/** Route a run's report to its owner agent when one is eligible, else to the root (plan §4.3, §16.2). */
@@ -1273,6 +1401,23 @@ export class Engine {
 				this.inbox(agentId).setState(envelope.id, "refused", { refusedReason: refusal });
 				return { success: false, agentId, message: refusal };
 			}
+		}
+		// Checked after the await above: a steer may have started a run meanwhile, and a queued task never enters a live one.
+		const stored = envelope.queued ? this.inbox(agentId).all().find((current) => current.id === envelope.id) : undefined;
+		if (stored && stored.state !== "pending") {
+			// Another dispatch already ran or refused it while this one waited; never reserve it twice.
+			if (stored.state === "refused") return { success: false, envelopeId: envelope.id, agentId, message: `The queued task did not run: ${stored.refusedReason ?? "refused"}` };
+			return { success: true, delivery: "task-queued", envelopeId: envelope.id, agentId, message: "The queued task has already started in its own run. You will be notified when it finishes." };
+		}
+		if (envelope.queued && conversation?.meta.stoppedByUser) {
+			const refusal = "This agent was stopped by the user, so it takes no queued tasks.";
+			this.inbox(agentId).setState(envelope.id, "refused", { refusedReason: refusal });
+			return { success: false, agentId, message: refusal };
+		}
+		if (envelope.queued && conversation && !this.control.queueOpen(conversation)) {
+			const position = this.inbox(agentId).undelivered().filter((queued) => queued.queued).findIndex((queued) => queued.id === envelope.id) + 1;
+			const when = conversation.active || conversation.meta.runs.at(-1)?.status === "completed" ? "after the agent's current work completes" : "once a SendMessage steer resumes the agent and that run completes (its last run did not complete)";
+			return { success: true, delivery: "task-queued", envelopeId: envelope.id, agentId, message: `Queued as task ${position} (id ${envelope.id}); it starts ${when}. Edit or withdraw it with MessageQueue until then.` };
 		}
 		const reservation = this.control.reserveContinuation(agentId, envelope.noticeKey ? "wake" : "continue", [envelope.id]);
 		switch (reservation.kind) {
@@ -1329,7 +1474,7 @@ export class Engine {
 			return;
 		}
 		const ids = new Set(conversation.active!.envelopeIds);
-		const envelopes = this.inbox(agentId).undelivered().filter((envelope) => ids.has(envelope.id) || ids.size === 0);
+		const envelopes = this.inbox(agentId).undelivered().filter((envelope) => ids.has(envelope.id) || (ids.size === 0 && !envelope.queued));
 		const prompt = envelopes.map((envelope) => envelope.text).join("\n\n---\n\n") || "Continue.";
 		// The stored definition is provenance, not authority: the current definition can only narrow it (review R03).
 		const definition = await this.currentDefinition(conversation.meta);
@@ -1384,7 +1529,8 @@ export class Engine {
 	private async awaitConversationReport(agentId: AgentId, first: RunOutcome, onRun: (outcome: RunOutcome) => void): Promise<RunOutcome> {
 		const pending = () => {
 			const conversation = this.control.get(agentId);
-			return Boolean(conversation && (conversation.active || conversation.disposition === "parked"));
+			// Queued tasks are separate assignments that report through notices, so the caller does not wait for them.
+			return Boolean(conversation && ((conversation.active && !conversation.active.queuedTask) || (conversation.disposition === "parked" && !conversation.queueParked)));
 		};
 		if (!pending()) return first;
 		this.foregroundWaiters.add(agentId);
@@ -1406,8 +1552,11 @@ export class Engine {
 				};
 				const unsubscribe = this.subscribe((event) => {
 					if (event.type === "settled" && event.agentId === agentId) {
+						// A queued task's run belongs to no foreground caller; once one starts, the wait ends before it can settle.
+						if (event.queuedTask) return;
 						last = event.outcome;
 						onRun(event.outcome);
+						if (this.control.get(agentId)?.active?.queuedTask) return check();
 					}
 					if ((event.type === "settled" || event.type === "stopped") && (event.agentId === agentId || event.type === "settled")) setImmediate(check);
 				});
@@ -1484,7 +1633,15 @@ export class Engine {
 	}
 
 	private wake(agentId: AgentId): void {
-		const pending = this.inbox(agentId).undelivered();
+		const conversation = this.control.get(agentId);
+		const undelivered = this.inbox(agentId).undelivered();
+		if (conversation && nextRunInput(undelivered, this.control.queueOpen(conversation)).length === 0) {
+			const parked = conversation.disposition === "parked";
+			this.control.dropWake(agentId);
+			if (parked) this.releaseIdleWorktree(agentId);
+			return;
+		}
+		const pending = undelivered.filter((envelope) => !envelope.queued);
 		const reservation = this.control.reserveContinuation(agentId, "wake", pending.map((envelope) => envelope.id));
 		if (reservation.kind === "reserved") this.startContinuation(agentId, reservation.runId);
 	}
@@ -1655,7 +1812,7 @@ export interface AgentSnapshot {
 export type EngineEvent =
 	| { type: "spawned"; agentId: AgentId; runId: RunId; meta: AgentMeta }
 	| { type: "run-event"; agentId: AgentId; runId: RunId; event: import("./types.ts").BackendEvent }
-	| { type: "settled"; agentId: AgentId; runId: RunId; outcome: RunOutcome }
+	| { type: "settled"; agentId: AgentId; runId: RunId; outcome: RunOutcome; queuedTask?: boolean }
 	| { type: "diagnostics"; agentId: AgentId; messages: string[] }
 	| { type: "stopped"; agentId: AgentId }
 	| { type: "stop-failed"; agentId: AgentId; runId: RunId }

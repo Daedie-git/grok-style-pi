@@ -17,7 +17,8 @@ Grok users get the engine through `integrations/subagents.ts` instead. Load exac
 | Tool | Purpose |
 |---|---|
 | `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model` (an unavailable model refuses the launch; Claude models are limited to the host's `claudeModels`, by default `claude-opus-5-5` and `claude-sonnet-5-5`, where `opus` or `sonnet` names the first listed one and Claude Code defaults to the first), `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` keeps a pane agent's pane open after it finishes; it does not select the pane backend or affect in-process agents. |
-| `SendMessage` | `{to, message, summary?}`. A running agent gets the message after its current tool round. A finished agent resumes the same conversation in a new run. `to: "main"` reaches the root conversation. |
+| `SendMessage` | `{to, message, summary?, queue?}`. A running agent gets the message after its current tool round. A finished agent resumes the same conversation in a new run. `to: "main"` reaches the root conversation. With `queue: true` the message is the agent's next task instead (see below). |
+| `MessageQueue` | `{to, action, id?, message?, summary?}`: `list`, `replace` or `withdraw` the tasks you queued for an agent, until each starts. |
 | `needs_answer` | Child-only, except forks and workflow agents: `{question}` ends the run as `needs-answer`. Include one concrete question and the current work state. The parent replies with `SendMessage` to resume the same child with the answer. |
 | `TaskStop` | Stop an agent. The main conversation can stop any agent; an agent can stop only itself. A stop by the user (Grok activity panel) also stops the agent's descendants, and none of them resume automatically. |
 | `TaskCreate` / `TaskGet` / `TaskList` / `TaskUpdate` | A shared task list. Every agent of the root session sees the same list. `owner` is a plain assignment; completed blockers are hidden in `TaskList`. |
@@ -25,6 +26,8 @@ Grok users get the engine through `integrations/subagents.ts` instead. Load exac
 | `get_subagent_result`, `steer_subagent` | Compatibility aliases for earlier runners. Set `PI_SUBAGENT_ALIASES=0` to disable them. |
 
 Runs end as completed, failed, killed, or `needs-answer`. A `needs-answer` result is not completion or failure: its notice or foreground result leads with the question and directs the caller to reply with `SendMessage`. The activity view shows “needs answer”. Forks and unattended workflow agents cannot ask follow-up questions and lack this tool. A workflow agent reports any out-of-scope decision as a blocker in its final handback.
+
+A queued task never enters a live run. Each starts its own run, in order, once the previous run completes, so every task gets its own report; the notice counts the tasks still queued. Waiting steers go first. After any run that did not complete (failed, `needs-answer`, `TaskStop`, session end) the queue waits until a steer resumes the agent and that run completes; withdraw tasks you no longer want. A user stop drops the queues of the agent and its descendants. A foreground `Agent` call returns when its own work is done; queued tasks report through notices. To combine tasks, replace one and withdraw the rest.
 
 Background agents report through a `subagent-notification` message. If the main conversation is idle, the notification starts a new turn; if it's busy, the notification arrives at the next safe point. A foreground `Agent` call returns the report directly, and the child's token usage counts toward the parent's session totals.
 
@@ -106,6 +109,7 @@ How runs behave:
 - No legacy teammates or cross-session messaging, and no `ListAgents` tool.
 - Pi has no permission modes, so `permissionMode` is ignored with a diagnostic.
 - Only command hooks are supported.
+- `SendMessage` `queue` and `MessageQueue` have no Claude Code equivalent.
 - Background usage is shown in notices but isn't added to Pi's own session totals.
 - Parent tools that exist only at runtime can't be copied into a fork; the missing names are recorded.
 - The explore model cap is opt-in.

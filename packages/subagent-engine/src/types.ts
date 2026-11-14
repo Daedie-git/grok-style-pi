@@ -202,11 +202,13 @@ export interface Envelope {
 	refusedReason?: string;
 	/** Set when the envelope carries a child's completion notice to an owner agent. */
 	noticeKey?: string;
+	/** A queued task: never steered into a live run; it starts its own run after a completed one. */
+	queued?: boolean;
 }
 
 export interface SendReceipt {
 	success: boolean;
-	delivery?: "queued" | "resumed" | "pending-continuation" | "main";
+	delivery?: "queued" | "resumed" | "pending-continuation" | "main" | "task-queued";
 	envelopeId?: string;
 	agentId?: AgentId;
 	message: string;
@@ -230,6 +232,10 @@ export interface NoticePayload {
 	worktree?: WorktreeInfo & { kept: boolean };
 	interim?: boolean;
 	resumePending?: boolean;
+	/** Queued tasks still waiting after this run. */
+	queuedRemaining?: number;
+	/** The next queued task starts by itself once a run slot frees. */
+	queueWaitsForSlot?: boolean;
 	killedBy?: KilledBy;
 	resumable: boolean;
 	failure?: string;

@@ -2,9 +2,9 @@
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentParams, Caller, Engine, ToolText } from "./engine.ts";
-import { agentToolDescription, SEND_MESSAGE_DESCRIPTION, TASK_STOP_DESCRIPTION, type PolicyInput } from "./policy/text.ts";
+import { agentToolDescription, MESSAGE_QUEUE_DESCRIPTION, SEND_MESSAGE_DESCRIPTION, TASK_STOP_DESCRIPTION, type PolicyInput } from "./policy/text.ts";
 
-export const ENGINE_TOOL_NAMES = ["Agent", "SendMessage", "TaskStop"] as const;
+export const ENGINE_TOOL_NAMES = ["Agent", "SendMessage", "MessageQueue", "TaskStop"] as const;
 
 export interface ToolOptions {
 	policy: () => PolicyInput;
@@ -63,11 +63,26 @@ export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => En
 			to: Type.String({ description: "The agent's name or id, or \"main\" for the main conversation." }),
 			message: Type.String({ description: "The message text." }),
 			summary: Type.Optional(Type.String({ description: "A 5-10 word summary for display." })),
+			queue: Type.Optional(Type.Boolean({ description: "Queue this as the agent's next task instead of steering its current work. It starts in its own run after the current run completes and stays editable with MessageQueue until then." })),
 		}),
 		execute: async (toolCallId, params) => {
 			const receipt = await current().sendMessage(params, caller, toolCallId);
 			return toolResult({ text: receipt.message, isError: !receipt.success, details: { ...receipt } });
 		},
+	}));
+
+	pi.registerTool(defineTool({
+		name: "MessageQueue",
+		label: "Message Queue",
+		description: MESSAGE_QUEUE_DESCRIPTION,
+		parameters: Type.Object({
+			to: Type.String({ description: "The agent's name or id." }),
+			action: Type.Union([Type.Literal("list"), Type.Literal("replace"), Type.Literal("withdraw")]),
+			id: Type.Optional(Type.String({ description: "The queued task's id, for replace and withdraw." })),
+			message: Type.Optional(Type.String({ description: "The replacement text, for replace." })),
+			summary: Type.Optional(Type.String({ description: "A 5-10 word summary for display, for replace." })),
+		}),
+		execute: async (_toolCallId, params) => toolResult(current().editQueue(params, caller)),
 	}));
 
 	pi.registerTool(defineTool({

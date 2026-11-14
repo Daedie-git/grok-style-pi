@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -10,8 +10,9 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { InProcessBackend } from "../src/backends/in-process.ts";
 import { Control } from "../src/control.ts";
+import { agentFiles } from "../src/store/paths.ts";
 import { builtInDefinitions } from "../src/definitions/builtins.ts";
-import { ROOT_CALLER } from "../src/engine.ts";
+import { Engine, ROOT_CALLER } from "../src/engine.ts";
 import type { AgentMeta, NoticeRecord, RunOutcome, SendReceipt } from "../src/types.ts";
 import { createHarness, scripted, until, type Harness } from "./fixtures/harness.ts";
 
@@ -661,4 +662,294 @@ test("interactive /skill:name without arguments launches the fresh skill agent i
 	hold.resolve();
 	await until(() => !conversation.active);
 	assert.equal(conversation.meta.runs[0].status, "completed");
+});
+
+for (const stop of ["session end", "parent TaskStop"] as const) test(`a ${stop} cancels a foreground grandchild without user-stopping it`, { timeout: 20_000 }, async t => {
+	noNetwork(t);
+	const never = deferred();
+	let owner = "";
+	let child = "";
+	const harness = await createHarness({
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "owner", prompt: "start" } }] } : { text: "ok" },
+		child: id => {
+			if (!owner) owner = id;
+			else child = id;
+			return ({ index }) => id === owner
+				? (index === 0 ? { tools: [{ name: "Agent", args: { description: "fg", prompt: "work", run_in_background: false } }] } : { text: "owner done" })
+				: { wait: never.promise, then: { text: "late" } };
+		},
+	});
+	t.after(async () => { never.resolve(); await harness.close(); });
+	await harness.parent.prompt("go", { source: "extension" });
+	await until(() => Boolean(child) && Boolean(harness.engine.control.get(child)?.active));
+	if (stop === "session end") await harness.engine.shutdownRoot("quit");
+	else await harness.engine.stop(owner, ROOT_CALLER);
+	const conversation = harness.engine.control.get(child)!;
+	await until(() => !conversation.active);
+	assert.equal(conversation.meta.stoppedByUser, undefined, "the child stays resumable");
+	assert.equal(conversation.meta.runs.at(-1)?.killedBy, stop === "session end" ? "session-end" : "parent");
+});
+
+/** A pane transport whose resumed runs complete only when told to. */
+class CrashPort {
+	phase: "running" | "completed" = "completed";
+	private sequence = 0;
+	readonly prompts: string[] = [];
+	private readonly listeners = new Set<(notice: never) => void>();
+	proxy(meta: AgentMeta, ref: { agentId: string; runId: string }): AgentMeta { return { ...structuredClone(meta), backend: "herdr", herdr: ref } as AgentMeta; }
+	async spawn(_request: unknown, _ctx: unknown, meta: AgentMeta) { const runId = `p${++this.sequence}`; return { agentId: "pane", runId, text: "ok", meta: this.proxy(meta, { agentId: "pane", runId }) }; }
+	async resume(meta: AgentMeta, prompt: string) { this.prompts.push(prompt); const runId = `p${++this.sequence}`; return { runId, text: "ok", meta: this.proxy(meta, { agentId: "pane", runId }) }; }
+	async read(meta: AgentMeta) { return { phase: this.phase, status: this.phase, resultText: "done", text: "done", runId: meta.herdr!.runId! }; }
+	async deliver() { return { ok: true as const, state: "submitted" as const }; }
+	async cancel() { return { acknowledged: false, message: "ok" }; }
+	onNotice(listener: (notice: never) => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+	async acknowledge() {}
+	complete(meta: AgentMeta) {
+		this.phase = "completed";
+		for (const listener of this.listeners) listener({ noticeId: `n${this.sequence}`, agentId: meta.agentId, herdrAgentId: "pane", runId: meta.herdr!.runId!, phase: "completed", text: "done" } as never);
+	}
+}
+
+test("a restart after a pane accepted a continuation does not run its input again", { timeout: 30_000 }, async t => {
+	noNetwork(t);
+	const harness = await createHarness({
+		panes: true,
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "pane", prompt: "start", backend: "pane", run_in_background: false } }] } : { text: "ok" },
+		child: () => () => ({ text: "unused" }),
+	});
+	const port = new CrashPort();
+	type Internals = { deps: ConstructorParameters<typeof Engine>[0]; root: { pi: never; ctx: never }; paneRuns: { host: { includeEnvelopes(...args: unknown[]): void } } };
+	const internals = harness.engine as unknown as Internals;
+	const detach = harness.engine.attachHerdr(port as never);
+	let recovered: Engine | undefined;
+	t.after(async () => { await recovered?.shutdownRoot("quit"); await harness.close(); });
+	await harness.parent.prompt("go", { source: "extension" });
+	const id = [...harness.engine.control.conversations.keys()][0];
+	await until(() => !harness.engine.control.get(id)?.exiting);
+	// The crash point: durable state copied just before the inclusion write.
+	const snapshot = join(harness.root, "crash-snapshot");
+	const include = internals.paneRuns.host.includeEnvelopes.bind(internals.paneRuns.host);
+	t.mock.method(internals.paneRuns.host, "includeEnvelopes", (...args: unknown[]) => { cpSync(join(harness.root, "agent"), snapshot, { recursive: true }); include(...args); });
+	port.phase = "running";
+	await harness.engine.sendMessage({ to: id, message: "execute exactly once" }, ROOT_CALLER, "steer");
+	await until(() => port.prompts.length === 1 && existsSync(snapshot));
+	const root = internals.root;
+	detach();
+	harness.engine.detachRoot();
+	recovered = new Engine({ ...internals.deps, agentDir: snapshot });
+	await recovered.bindRoot(root.pi, root.ctx);
+	recovered.attachHerdr(port as never);
+	assert.equal(recovered.inbox(id).undelivered().length, 0);
+	port.complete(recovered.control.get(id)!.meta);
+	const conversation = recovered.control.get(id)!;
+	await until(() => !conversation.active);
+	await new Promise(resolve => setTimeout(resolve, 200));
+	assert.deepEqual(port.prompts, ["execute exactly once"]);
+});
+
+test("withdrawing the task a finished worktree agent was parked for still removes its unchanged worktree", { timeout: 20_000 }, async t => {
+	noNetwork(t);
+	const finish = deferred();
+	const harness = await createHarness({
+		env: { PI_MAX_CONCURRENT_SUBAGENTS: "1" },
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Isolated", prompt: "Answer", isolation: "worktree", name: "w" } }] } : { text: "done" },
+		child: () => () => ({ wait: finish.promise, then: { text: "report" } }),
+	});
+	seedRepository(harness.root);
+	t.after(async () => { finish.resolve(); await harness.close(); });
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	await until(() => harness.children.size === 1);
+	const id = [...harness.children.keys()][0];
+	const conversation = harness.engine.control.get(id)!;
+	const receipt = await harness.engine.sendMessage({ to: id, message: "queued", queue: true }, ROOT_CALLER, "q");
+	// Another agent holds the only slot when this run completes, so the queued task parks for admission.
+	const control = harness.engine.control as unknown as { running: number };
+	control.running++;
+	finish.resolve();
+	await until(() => conversation.disposition === "parked" && Boolean(conversation.queueParked));
+	harness.engine.editQueue({ to: id, action: "withdraw", id: receipt.envelopeId }, ROOT_CALLER);
+	control.running--;
+	(harness.engine as unknown as { wake(agentId: string): void }).wake(id);
+	await until(() => conversation.meta.worktreeCleanlyRemoved === true && !conversation.exiting);
+	assert.equal(conversation.disposition, "evictable");
+	assert.equal(conversation.meta.worktreeCleanlyRemoved, true);
+	assert.equal(existsSync(conversation.meta.worktree!.path), false);
+	assert.equal(conversation.meta.runs.length, 1);
+});
+
+test("a reattached pane stays stoppable when its inbox is unreadable", { timeout: 30_000 }, async t => {
+	noNetwork(t);
+	const harness = await createHarness({
+		panes: true,
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "pane", prompt: "start", backend: "pane" } }] } : { text: "ok" },
+		child: () => () => ({ text: "unused" }),
+	});
+	const port = new CrashPort();
+	port.phase = "running";
+	const internals = harness.engine as unknown as { deps: ConstructorParameters<typeof Engine>[0]; root: { pi: never; ctx: never } };
+	const detach = harness.engine.attachHerdr(port as never);
+	let recovered: Engine | undefined;
+	t.after(async () => { await recovered?.shutdownRoot("quit"); await harness.close(); });
+	await harness.parent.prompt("go", { source: "extension" });
+	const id = [...harness.engine.control.conversations.keys()][0];
+	await until(() => harness.engine.control.get(id)?.active?.phase === "running");
+	const root = internals.root;
+	detach();
+	harness.engine.detachRoot();
+	const dir = join(harness.root, "recovered");
+	cpSync(join(harness.root, "agent"), dir, { recursive: true });
+	writeFileSync(agentFiles(dir, harness.engine.sessionId!, id).inboxFile, "invalid committed journal record\n");
+	recovered = new Engine({ ...internals.deps, agentDir: dir });
+	await recovered.bindRoot(root.pi, root.ctx);
+	recovered.attachHerdr(port as never);
+	assert.ok(recovered.control.get(id)?.active);
+	assert.match((await recovered.stop(id, ROOT_CALLER)).text, /^Stopping/);
+});
+
+test("an owner ending its run with needs_answer does not user-stop its foreground child", { timeout: 20_000 }, async t => {
+	noNetwork(t);
+	const never = deferred();
+	let owner = "";
+	const harness = await createHarness({
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "owner", prompt: "start" } }] } : { text: "ok" },
+		child: id => {
+			if (!owner) owner = id;
+			return ({ index }) => id === owner
+				? (index === 0 ? { tools: [{ name: "Agent", args: { description: "fg", prompt: "work", run_in_background: false } }] } : { text: "owner done" })
+				: { wait: never.promise, then: { text: "late" } };
+		},
+	});
+	t.after(async () => { never.resolve(); await harness.close(); });
+	await harness.parent.prompt("go", { source: "extension" });
+	const grandchild = () => [...harness.engine.control.conversations.values()].find(conversation => conversation.meta.parentAgentId === owner);
+	await until(() => grandchild()?.active?.phase === "running");
+	harness.engine.needsAnswer(owner, "which option?");
+	await until(() => !grandchild()!.active);
+	assert.equal(grandchild()!.meta.stoppedByUser, undefined);
+	assert.equal(grandchild()!.meta.runs.at(-1)?.killedBy, "parent");
+});
+
+test("a user stop of a worktree agent parked for a queued-task slot removes its unchanged worktree", { timeout: 20_000 }, async t => {
+	noNetwork(t);
+	const finish = deferred();
+	const harness = await createHarness({
+		env: { PI_MAX_CONCURRENT_SUBAGENTS: "1" },
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Isolated", prompt: "Answer", isolation: "worktree", name: "w" } }] } : { text: "done" },
+		child: () => () => ({ wait: finish.promise, then: { text: "report" } }),
+	});
+	seedRepository(harness.root);
+	t.after(async () => { finish.resolve(); await harness.close(); });
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	await until(() => harness.children.size === 1);
+	const id = [...harness.children.keys()][0];
+	const conversation = harness.engine.control.get(id)!;
+	await harness.engine.sendMessage({ to: id, message: "queued", queue: true }, ROOT_CALLER, "q");
+	const control = harness.engine.control as unknown as { running: number };
+	control.running++;
+	finish.resolve();
+	await until(() => conversation.disposition === "parked" && Boolean(conversation.queueParked));
+	await harness.engine.userStop(id);
+	control.running--;
+	await until(() => conversation.meta.worktreeCleanlyRemoved === true && !conversation.exiting);
+	assert.equal(conversation.disposition, "stopped");
+	assert.equal(conversation.meta.worktreeCleanlyRemoved, true);
+	assert.equal(existsSync(conversation.meta.worktree!.path), false);
+});
+
+test("a user stop of an owner parked on its running child removes the owner's worktree only after the child settles", { timeout: 20_000 }, async t => {
+	noNetwork(t);
+	let owner = "";
+	const harness = await createHarness({
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Isolated", prompt: "Answer", isolation: "worktree", name: "w" } }] } : { text: "done" },
+		child: id => {
+			if (!owner) owner = id;
+			return ({ index }) => id === owner
+				? (index === 0 ? { tools: [{ name: "Agent", args: { description: "bg", prompt: "work", run_in_background: true } }] } : { text: "owner done" })
+				: { tools: [{ name: "bash", args: { command: "sleep 1; echo wrote" } }] };
+		},
+	});
+	seedRepository(harness.root);
+	t.after(() => harness.close());
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	await until(() => Boolean(owner) && harness.engine.control.get(owner)?.disposition === "parked", 8000);
+	const ownerConversation = harness.engine.control.get(owner)!;
+	const child = [...harness.engine.control.conversations.values()].find(conversation => conversation.meta.parentAgentId === owner)!;
+	const engine = harness.engine as unknown as { releaseWorktree(meta: unknown): Promise<boolean> };
+	const original = engine.releaseWorktree.bind(engine);
+	let childActiveAtRelease: boolean | undefined;
+	engine.releaseWorktree = async (meta: unknown) => { if (meta === ownerConversation.meta) childActiveAtRelease = Boolean(child.active); return original(meta); };
+	await harness.engine.userStop(owner);
+	await until(() => ownerConversation.meta.worktreeCleanlyRemoved === true && !ownerConversation.exiting && !child.active, 8000);
+	assert.equal(childActiveAtRelease, false);
+	assert.equal(ownerConversation.meta.worktreeCleanlyRemoved, true);
+});
+
+test("an idle owner still takes a steer while its worktree cleanup waits on a running grandchild", { timeout: 30_000 }, async t => {
+	noNetwork(t);
+	const never = deferred();
+	const gate = deferred();
+	const ids: string[] = [];
+	const harness = await createHarness({
+		env: { PI_MAX_CONCURRENT_SUBAGENTS: "3" },
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Isolated", prompt: "Answer", isolation: "worktree", name: "w" } }] } : { text: "done" },
+		child: id => {
+			ids.push(id);
+			const role = ids.length;
+			return ({ index }) => {
+				if (role === 1) return index === 0 ? { tools: [{ name: "Agent", args: { description: "c", prompt: "c", run_in_background: true } }] } : index === 1 ? { wait: gate.promise, then: { text: "owner done" } } : { text: "steered" };
+				if (role === 2) return index === 0 ? { tools: [{ name: "Agent", args: { description: "g", prompt: "g", run_in_background: true } }] } : { error: "invalid request: permanent" };
+				return { wait: never.promise, then: { text: "late" } };
+			};
+		},
+	});
+	seedRepository(harness.root);
+	t.after(async () => { never.resolve(); gate.resolve(); await harness.close(); });
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	await until(() => ids.length === 3, 8000);
+	const [owner, child, grandchild] = ids.map(id => harness.engine.control.get(id)!);
+	// The child fails, so the owner holds no edge on the grandchild, which keeps running.
+	await until(() => child.meta.runs.at(-1)?.status === "failed" && Boolean(owner.active), 8000);
+	const receipt = await harness.engine.sendMessage({ to: owner.meta.agentId, message: "queued", queue: true }, ROOT_CALLER, "q");
+	const control = harness.engine.control as unknown as { running: number };
+	control.running += 3;
+	gate.resolve();
+	await until(() => owner.disposition === "parked" && Boolean(owner.queueParked), 8000);
+	harness.engine.editQueue({ to: owner.meta.agentId, action: "withdraw", id: receipt.envelopeId }, ROOT_CALLER);
+	control.running -= 3;
+	(harness.engine as unknown as { wake(agentId: string): void }).wake(owner.meta.agentId);
+	assert.equal((await harness.engine.sendMessage({ to: owner.meta.agentId, message: "follow-up" }, ROOT_CALLER, "s")).delivery, "resumed");
+	await until(() => owner.meta.runs.length === 2 && !owner.active, 8000);
+	assert.ok(grandchild.active, "the grandchild is still running");
+});
+
+test("shutdown waits for a parked owner's worktree cleanup that was waiting on a cancelling child", { timeout: 20_000 }, async t => {
+	noNetwork(t);
+	const childGate = deferred();
+	let owner = "";
+	let child = "";
+	const harness = await createHarness({
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Owner", prompt: "start", isolation: "worktree" } }] } : { text: "ok" },
+		child: id => {
+			if (!owner) owner = id;
+			else child = id;
+			return ({ index }) => id === owner
+				? (index === 0 ? { tools: [{ name: "Agent", args: { description: "Child", prompt: "work" } }] } : { text: "owner parked" })
+				: { wait: childGate.promise, then: { text: "child done" } };
+		},
+	});
+	seedRepository(harness.root);
+	t.after(async () => { childGate.resolve(); await harness.close(); });
+	await harness.parent.prompt("go", { source: "extension" });
+	await until(() => Boolean(child) && harness.engine.control.get(owner)?.disposition === "parked");
+	const ownerConversation = harness.engine.control.get(owner)!;
+	await ownerConversation.exiting;
+	await until(() => harness.children.get(child)!.isStreaming);
+	// The child's cancellation has not landed when the user quits.
+	t.mock.method(harness.children.get(child)!, "abort", async () => {});
+	await harness.engine.userStop(owner);
+	const stopping = harness.engine.shutdownRoot("quit");
+	await new Promise(resolve => setImmediate(resolve));
+	childGate.resolve();
+	await stopping;
+	assert.equal(ownerConversation.meta.worktreeCleanlyRemoved, true);
 });

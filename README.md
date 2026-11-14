@@ -236,7 +236,7 @@ The extension refreshes that handler when a session starts. Its `Exec` line is u
 
 ## Activity controls
 
-Load `integrations/subagents.ts` instead of the default Grok entrypoint to use the bundled [subagent engine](packages/subagent-engine/README.md). It always installs the engine, inside or outside Herdr, with in-process Pi sessions as the default backend. Disable the former Pi Subagents extension to avoid duplicate tools; no globally installed subagent package is required. The engine owns `Agent`, `SendMessage`, `TaskStop`, the four shared-task tools, `Workflow` (`RunWorkflow` alias), and the `get_subagent_result` / `steer_subagent` compatibility aliases.
+Load `integrations/subagents.ts` instead of the default Grok entrypoint to use the bundled [subagent engine](packages/subagent-engine/README.md). It always installs the engine, inside or outside Herdr, with in-process Pi sessions as the default backend. Disable the former Pi Subagents extension to avoid duplicate tools; no globally installed subagent package is required. The engine owns `Agent`, `SendMessage`, `MessageQueue`, `TaskStop`, the four shared-task tools, `Workflow` (`RunWorkflow` alias), and the `get_subagent_result` / `steer_subagent` compatibility aliases.
 
 When switching an existing package installation, disable this package's default extension: use `{"source":"/path/to/grok-style-pi","extensions":[]}` in `packages` and add `/path/to/grok-style-pi/integrations/subagents.ts` to `extensions`. Themes remain installed. Load only one Grok entrypoint and only one subagent extension, then run `/reload`. The combined entrypoint includes the same core chrome and codemode styling as the default entrypoint.
 

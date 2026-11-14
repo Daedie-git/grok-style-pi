@@ -1,3 +1,4 @@
+import { forkEnabledByEnv } from "../src/engine.ts";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, writeFile, rm, link } from "node:fs/promises";
 import { join } from "node:path";
@@ -337,4 +338,9 @@ test("malformed files and flags produce diagnostics without blocking valid defin
 	assert.match(set.diagnostics.join("\n"), /Invalid --agents JSON/);
 	const array = await discoverDefinitions({ ...options, flagJson: '[{"name":"array","description":"ok","model":"INHERIT"}]' });
 	assert.equal(array.active.get("array")?.model, "inherit");
+});
+
+test("forks are on by default and PI_SUBAGENT_FORK=0, false, no or off disables them", () => {
+	for (const value of [undefined, "", "1", "true"]) assert.equal(forkEnabledByEnv({ PI_SUBAGENT_FORK: value }), true, String(value));
+	for (const value of ["0", "false", "No", " off "]) assert.equal(forkEnabledByEnv({ PI_SUBAGENT_FORK: value }), false, value);
 });

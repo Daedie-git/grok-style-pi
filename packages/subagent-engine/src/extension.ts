@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { getAgentDir, ModelRuntime, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { inChildContext } from "./child-context.ts";
 import { childInstaller } from "./child-installer.ts";
-import { Engine, ROOT_CALLER, type EngineDeps } from "./engine.ts";
+import { Engine, forkEnabledByEnv, ROOT_CALLER, type EngineDeps } from "./engine.ts";
 import { builtInDefinitions } from "./definitions/builtins.ts";
 import { sessionGuidance, type PolicyInput } from "./policy/text.ts";
 import { installListingBridge } from "./listing.ts";
@@ -80,7 +80,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		const offer = (definitions: AgentDefinition[]): PolicyInput["offered"] =>
 			definitions.map((definition) => ({ agentType: definition.agentType, description: definition.description, tools: definition.tools }));
 		// Built-ins always exist, so the description registered before session start already reflects real routing.
-		let offered = offer(builtInDefinitions({ forkEnabled: env.PI_SUBAGENT_FORK === "1" || env.PI_SUBAGENT_FORK === "true" }));
+		let offered = offer(builtInDefinitions({ forkEnabled: forkEnabledByEnv(env) }));
 		const policy = (): PolicyInput => ({
 			autonomy: options.autonomy ?? (env.PI_SUBAGENT_AUTONOMY === "explicit" ? "explicit" : "positive"),
 			forkEnabled: engine.forkEnabled(),

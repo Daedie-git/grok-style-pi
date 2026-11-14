@@ -153,6 +153,11 @@ interface RunRecord {
 	background: boolean;
 }
 
+/** Forks are on unless `PI_SUBAGENT_FORK` is 0, false, no or off. */
+export function forkEnabledByEnv(env: Record<string, string | undefined>): boolean {
+	return !/^(?:0|false|no|off)$/i.test(env.PI_SUBAGENT_FORK?.trim() ?? "");
+}
+
 export class Engine {
 	readonly control: Control;
 	private backend?: InProcessBackend;
@@ -358,8 +363,7 @@ export class Engine {
 	}
 
 	forkEnabled(): boolean {
-		const value = this.deps.env.PI_SUBAGENT_FORK;
-		return value === "1" || value === "true";
+		return forkEnabledByEnv(this.deps.env);
 	}
 
 	// ---- Agent ----

@@ -67,7 +67,7 @@ export function fixture(t: test.TestContext, reply: (prompt: string, n: number) 
 	t.after(async () => { stopped = true; await children; await store?.close(); });
 	const env = {
 		HERDR_ENV: "1", HERDR_PANE_ID: OWNER.paneId, HERDR_WORKSPACE_ID: "w1", CLAUDE_CODE_SESSION_ID: OWNER.session,
-		CLAUDE_CONFIG_DIR: join(root, "claude"), SIDECAR_STATE_DIR: join(root, "state"), PATH: process.env.PATH,
+		CLAUDE_CONFIG_DIR: join(root, "claude"), SIDECAR_STATE_DIR: join(root, "state"), SIDECAR_CONFIG_FILE: join(root, "no-config.json"), PATH: process.env.PATH,
 	};
 	const runWith = async (options: { cwd?: string; stdin?: string; env?: Record<string, string | undefined> }, ...argv: string[]) => {
 		let stdout = "", stderr = "";

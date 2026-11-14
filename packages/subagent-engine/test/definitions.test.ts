@@ -160,7 +160,7 @@ test("built-ins expose immutable-by-call contracts and gated fork", () => {
 	const adversarial = builtInDefinitions({ forkEnabled: false, claudeCode: true }).find((d) => d.agentType === "adversarial-reviewer")!;
 	for (const key of ["prompt", "tools", "disallowedTools", "isolated", "omitClaudeMd", "effort"] as const) assert.deepEqual(adversarial[key], definitions[4][key]);
 	assert.equal(adversarial.runtime, "claude-code");
-	assert.equal(adversarial.model, "claude-opus-5-5");
+	assert.equal(adversarial.model, "opus");
 	assert.equal(definitions[5].maxTurns, 200);
 	assert.equal(definitions[5].model, "inherit");
 	assert.equal(builtInDefinitions({ forkEnabled: false }).some((d) => d.agentType === "fork"), false);

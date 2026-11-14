@@ -95,9 +95,9 @@ function firstProxy(harness: Harness) {
 	assert(proxy, "Agent must create an engine proxy");
 	return proxy;
 }
-async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean; agentFiles?: Record<string, string>; agentDefaults?: AgentDefaults } = {}) {
+async function setup(t: TestContext, parent: Script, options: { attach?: boolean; env?: Record<string, string>; paneDefault?: boolean; paneChild?: boolean; agentFiles?: Record<string, string>; agentDefaults?: AgentDefaults; claudeModels?: string[] } = {}) {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
-	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, agentFiles: options.agentFiles, env: options.env, agentDefaults: options.agentDefaults, child: () => () => ({ text: "Unexpected in-process child" }) });
+	const harness = await createHarness({ parent, panes: true, paneDefault: options.paneDefault, agentFiles: options.agentFiles, env: options.env, agentDefaults: options.agentDefaults, claudeModels: options.claudeModels, child: () => () => ({ text: "Unexpected in-process child" }) });
 	const fake = new FakeHerdr();
 	fake.child = options.paneChild === true;
 	fake.rootHasNotice = () => rootNotices(harness).length > 0;
@@ -264,6 +264,110 @@ test("adversarial-reviewer refuses in-process and workflow launches instead of m
 	assert.equal(fake.spawns.length, 0);
 });
 
+test("Claude Code panes take opus and sonnet as aliases for the 5.5 models", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [
+			{ name: "Agent", args: { ...assignment, backend: undefined, name: "opus", runtime: "claude-code", model: "opus" } },
+			{ name: "Agent", args: { ...assignment, backend: undefined, name: "sonnet", runtime: "claude-code", model: "sonnet" } },
+		] } : { text: "Parent useful work" });
+	await harness.parent.prompt("Run Claude", { source: "extension" });
+	assert.deepEqual(fake.spawns.map((spawn) => spawn.model).sort(), ["claude-opus-5-5", "claude-sonnet-5-5"]);
+});
+
+test("Claude Code panes refuse other Claude models and default to Opus 5.5", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [
+			{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", model: "haiku" } },
+			{ name: "Agent", args: { ...assignment, backend: undefined, name: "plain", runtime: "claude-code" } },
+		] } : { text: "Parent useful work" });
+	await harness.parent.prompt("Run Claude", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /Model haiku is not allowed; Claude subagents run claude-opus-5-5 or claude-sonnet-5-5/);
+	assert.deepEqual(fake.spawns.map((spawn) => spawn.model), ["claude-opus-5-5"]);
+});
+
+test("configured claudeModels replace the allowlist, and the first is Claude Code's default", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [
+			{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", model: "claude-opus-5-5" } },
+			{ name: "Agent", args: { ...assignment, backend: undefined, name: "plain", runtime: "claude-code" } },
+			{ name: "Agent", args: { ...assignment, backend: undefined, name: "adversary", subagent_type: "adversarial-reviewer" } },
+		] } : { text: "Parent useful work" }, { claudeModels: ["claude-sonnet-6", "claude-opus-6"] });
+	await harness.parent.prompt("Run Claude", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /Model claude-opus-5-5 is not allowed; Claude subagents run claude-sonnet-6 or claude-opus-6/);
+	assert.deepEqual(fake.spawns.map((spawn) => spawn.model).sort(), ["claude-opus-6", "claude-sonnet-6"]);
+});
+
+test("an empty claudeModels refuses Claude Code panes instead of running Claude Code's default", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code" } }] } : { text: "Parent useful work" }, { claudeModels: [] });
+	await harness.parent.prompt("Run Claude", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /no Claude model/);
+	assert.equal(fake.spawns.length, 0);
+});
+
+test("Claude Code's own default model is refused like any unlisted name", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", model: "default" } }] } : { text: "Parent useful work" });
+	await harness.parent.prompt("Run Claude", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /Model default is not allowed/);
+	assert.equal(fake.spawns.length, 0);
+});
+
+test("a deferred pane continuation refuses a model removed from claudeModels before it resumes", { timeout: 20_000 }, async (t) => {
+	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
+	const listeners = new Set<(notice: HerdrBackendNotice) => void>();
+	const resumes: string[] = [];
+	const phases = new Map([["r1", "running"]]);
+	const notice = (phase: string, runId: string) => {
+		phases.set(runId, phase);
+		for (const listener of listeners) listener({ noticeId: `notice-${runId}`, agentId: "p1", runId, phase, content: "finished" } as unknown as HerdrBackendNotice);
+	};
+	const fake = {
+		spawn: async () => ({ agentId: "p1", runId: "r1", text: "launched" }),
+		read: async (_id: string, options: { runId: string }) => ({ status: phases.get(options.runId), phase: phases.get(options.runId), resultText: "report", text: "report", runId: options.runId }),
+		onNotice(listener: (notice: HerdrBackendNotice) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+		paneChild: () => false,
+		capabilities: () => ({ liveDelivery: true, maxTurns: true, fork: false, sharedTasks: true }),
+		steer: async () => ({ ok: false, message: "Captured run is finishing" }),
+		resume: async (_id: string, prompt: string) => { resumes.push(prompt); phases.set("r2", "running"); return { runId: "r2", text: "resumed" }; },
+		cancel: async () => ({ acknowledged: true, message: "stopped" }),
+		acknowledge: async () => {},
+	};
+	const harness = await createHarness({ panes: true, parent: ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { backend: "pane", model: "anthropic/claude-sonnet-5-5", description: "Review", prompt: "Review", run_in_background: true } }] }
+		: { text: "Parent continues" }, child: () => () => ({ text: "unused" }) });
+	const detach = harness.engine.attachHerdr(new HerdrBackendAdapter(fake as unknown as HerdrBackendHandle));
+	t.after(async () => { await harness.close(); detach(); });
+	await harness.parent.prompt("Launch", { source: "extension" });
+	const conversation = [...harness.engine.control.conversations.values()][0];
+	const receipt = await harness.engine.sendMessage({ to: conversation.meta.agentId, message: "Follow up" }, ROOT_CALLER, "followup");
+	assert.equal(receipt.delivery, "pending-continuation");
+	(harness.engine as unknown as { deps: { claudeModels?: string[] } }).deps.claudeModels = [];
+	notice("completed", "r1");
+	await until(() => conversation.meta.runs.length > 1 && conversation.meta.runs.at(-1)!.status !== "running" && !conversation.active);
+	assert.equal(resumes.length, 0);
+	assert.equal(conversation.meta.runs.at(-1)!.status, "failed");
+	assert.match(JSON.stringify(harness.engine.inbox(conversation.meta.agentId).all()), /claude-sonnet-5-5 is not allowed/);
+});
+
+test("pre-allowlist Claude Code panes with no model or Claude Code's own default or an alias refuse to resume", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0
+		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", run_in_background: false } }] } : { text: "Parent useful work" });
+	await harness.parent.prompt("Run Claude", { source: "extension" });
+	const proxy = firstProxy(harness);
+	await until(() => !proxy.active);
+	delete proxy.meta.model;
+	const receipt = await harness.engine.sendMessage({ to: proxy.meta.agentId, message: "Continue" }, ROOT_CALLER, "legacy");
+	assert.match(JSON.stringify(receipt), /model was not recorded/);
+	proxy.meta.model = { requested: "default", effective: "default" };
+	const named = await harness.engine.sendMessage({ to: proxy.meta.agentId, message: "Continue" }, ROOT_CALLER, "legacy-default");
+	assert.match(JSON.stringify(named), /Model default is not allowed/);
+	proxy.meta.model = { requested: "opus", effective: "opus" };
+	const alias = await harness.engine.sendMessage({ to: proxy.meta.agentId, message: "Continue" }, ROOT_CALLER, "legacy-alias");
+	assert.match(JSON.stringify(alias), /Model opus is not allowed/);
+	assert.deepEqual(fake.resumes, []);
+});
+
 test("SendMessage resumes a finished pane with the same identity and a fresh Herdr/engine run", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => {
 		if (index === 0) return { tools: [{ name: "Agent", args: { ...assignment, run_in_background: false } }] };
@@ -374,7 +478,7 @@ test("a Claude Code pane falls back to the definition's native model and effort"
 		? { tools: [{ name: "Agent", args: { ...assignment, backend: undefined, runtime: "claude-code", subagent_type: "native" } }] } : { text: "Parent useful work" },
 	{ agentFiles: { "native.md": "---\nname: native\ndescription: native\nmodel: opus\neffort: high\n---\nReview." } });
 	await harness.parent.prompt("Claude pane", { source: "extension" });
-	assert.equal(fake.spawns[0].model, "opus");
+	assert.equal(fake.spawns[0].model, "claude-opus-5-5");
 	assert.equal(fake.spawns[0].thinking, "high");
 });
 
@@ -384,11 +488,11 @@ test("configured review defaults reach both local and machine pane requests", { 
 			{ name: "Agent", args: { ...assignment, name: "local", subagent_type: "review" } },
 			{ name: "Agent", args: { ...assignment, name: "remote", machine: "laptop", subagent_type: "adversarial-review" } },
 		] } : { text: "Parent useful work" },
-	{ agentDefaults: { review: { model: "anthropic/claude-sonnet-4-5", effort: "low" } } });
+	{ agentDefaults: { review: { model: "anthropic/claude-sonnet-5-5", effort: "low" } } });
 	await harness.parent.prompt("Review in local and remote panes", { source: "extension" });
 	assert.equal(fake.spawns.length, 2);
 	for (const request of fake.spawns) {
-		assert.equal(request.model, "anthropic/claude-sonnet-4-5");
+		assert.equal(request.model, "anthropic/claude-sonnet-5-5");
 		assert.equal(request.thinking, "low");
 		assert.equal(request.subagentType, "review");
 		assert.deepEqual(request.resolved?.allowedTools, ["read", "grep", "find", "ls", "bash"]);

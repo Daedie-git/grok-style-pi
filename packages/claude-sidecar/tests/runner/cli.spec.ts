@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,6 +57,37 @@ test("reviewers run Claude Code and adversarial reviewers run pi; a conflicting 
 	assert.match((await f.run("--slot", "2", "--role", "adversarial-reviewer", "--agent", "claude", "ask", "x")).stderr, /--role adversarial-reviewer runs pi; --role reviewer runs claude/);
 	assert.match((await f.run("--slot", "3", "--role", "reviewer", "--agent", "pi", "ask", "x")).stderr, /--role reviewer runs claude; --role adversarial-reviewer runs pi/);
 	assert.equal(f.starts.length, 0);
+});
+
+test("only Opus 5.5 and Sonnet 5.5 run as Claude sidecars", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	assert.match((await f.runWith({ env: { SIDECAR_CLAUDE_MODEL: "claude-haiku-4-5" } }, "--slot", "2", "--role", "reviewer", "ask", "x")).stderr, /model claude-haiku-4-5 is not allowed/);
+	assert.match((await f.runWith({ env: { SIDECAR_CLAUDE_MODEL: "default" } }, "--slot", "4", "--role", "reviewer", "ask", "x")).stderr, /model default is not allowed/);
+	assert.match((await f.runWith({ env: { SIDECAR_MODEL: "anthropic/claude-opus-4-1" } }, "--slot", "3", "ask", "x")).stderr, /not allowed/);
+	assert.equal(f.starts.length, 0);
+});
+
+test("claudeModels in the sidecar config replaces the allowlist", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const config = join(f.root, "config.json");
+	writeFileSync(config, JSON.stringify({ claudeModels: ["claude-opus-6", "claude-sonnet-6"] }));
+	const env = { SIDECAR_CONFIG_FILE: config };
+	assert.match((await f.runWith({ env: { ...env, SIDECAR_CLAUDE_MODEL: "claude-opus-5-5" } }, "--slot", "2", "--role", "reviewer", "ask", "x")).stderr, /claude-opus-5-5 is not allowed; Claude sidecars run claude-opus-6 or claude-sonnet-6/);
+	const run = await f.runWith({ env: { ...env, SIDECAR_MODEL: "anthropic/claude-sonnet-6" } }, "--slot", "3", "ask", "x");
+	assert.equal(run.code, 0, run.stderr);
+	assert.deepEqual(f.starts.at(-1)!.slice(2, 4), ["--model", "anthropic/claude-sonnet-6"]);
+});
+
+test("sidecar Claude aliases follow claudeModels, and follow-ups refuse a model since removed", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const config = join(f.root, "config.json");
+	writeFileSync(config, JSON.stringify({ claudeModels: ["claude-opus-6", "claude-sonnet-6"] }));
+	const env = { SIDECAR_CONFIG_FILE: config, SIDECAR_MODEL: "anthropic/sonnet" };
+	assert.equal((await f.runWith({ env }, "--slot", "2", "ask", "x")).code, 0);
+	assert.deepEqual(f.starts.at(-1)!.slice(2, 4), ["--model", "anthropic/claude-sonnet-6"]);
+	writeFileSync(config, JSON.stringify({ claudeModels: ["claude-opus-6"] }));
+	assert.match((await f.runWith({ env }, "--slot", "2", "ask", "again")).stderr, /claude-sonnet-6 is not allowed/);
+	assert.equal(f.prompts.length, 1);
 });
 
 test("a slot recorded as a pi reviewer is the adversarial reviewer", async (t) => {

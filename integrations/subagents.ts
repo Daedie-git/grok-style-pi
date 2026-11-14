@@ -11,7 +11,7 @@ import { createSubagentEngine, inChildContext, type SubagentEngineOptions } from
 import { selectSubagentRuntime, withoutTerminalHost } from "../src/subagents/runtime.ts";
 import { registerStyledSubagents } from "../src/subagents/result-style.ts";
 import { createHerdrNotificationRenderer } from "../src/subagents/notification-style.ts";
-import { loadSubagentSettings } from "../src/subagents/settings.ts";
+import { loadClaudeModels, loadSubagentSettings } from "../src/subagents/settings.ts";
 
 export async function loadSubagentExtension(
 	pi: ExtensionAPI,
@@ -62,9 +62,11 @@ export function createGrokSubagents(options: {
 			await createHerdrSubagents({ ...options.herdr, env: herdrIntegrationEnvironment(env), mode: "backend", onBackend(created) { handle = created; connect(); } })(pi);
 		}
 		const engineMemory = options.engine?.memoryEnabled;
+		const settingsPath = options.engine?.agentDir ? join(options.engine.agentDir, "grok-style.json") : undefined;
 		const engine = createSubagentEngine({
 			...options.engine,
-			agentDefaults: options.engine?.agentDefaults ?? loadSubagentSettings(options.engine?.agentDir ? join(options.engine.agentDir, "grok-style.json") : undefined),
+			agentDefaults: options.engine?.agentDefaults ?? loadSubagentSettings(settingsPath),
+			claudeModels: options.engine?.claudeModels ?? loadClaudeModels(settingsPath),
 			memoryEnabled: () => features.memory && !/^(?:1|true|yes|on)$/i.test(process.env.PI_DISABLE_AUTO_MEMORY ?? "")
 				&& (typeof engineMemory === "function" ? engineMemory() : engineMemory ?? true),
 			panes: inHerdr || options.engine?.panes,

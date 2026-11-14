@@ -10,6 +10,7 @@ import { Control, limitsFromEnv, type Conversation } from "./control.ts";
 import { compileToolSurface, type ToolLite } from "./context/capabilities.ts";
 import { resolveEffort, resolveModel, roleDefaultEffort, type ModelLite } from "./context/model.ts";
 import { childSystemPrompt, contextFilePolicy, taskMessage } from "./context/prompt.ts";
+import { allowedListing, allowedModel, DEFAULT_CLAUDE_MODELS, notAllowed } from "./context/claude-models.ts";
 import { canonicalAgentType, discoverDefinitions, selectDefinition, type DefinitionSet } from "./definitions/discovery.ts";
 import { launchResultText, noticeText } from "./policy/text.ts";
 import { memoryDir, memoryIndex, memoryPathGuard, memoryRootContained } from "./memory.ts";
@@ -103,6 +104,8 @@ export interface EngineDeps {
 	modelRuntime: () => Promise<ModelRuntime>;
 	/** Overrides definition model/effort defaults, but not explicit launch settings or forced environment settings. */
 	agentDefaults?: AgentDefaults;
+	/** The Claude models subagents may run, first as Claude Code's default; defaults to DEFAULT_CLAUDE_MODELS. */
+	claudeModels?: string[];
 	/** Host master switch for definition-scoped memory; standalone engines default to enabled. */
 	memoryEnabled?: boolean | (() => boolean);
 	now?: () => number;
@@ -177,7 +180,7 @@ export class Engine {
 	 * Rebind runtime-scoped dependencies after a reload handover: children created from now on must use the new runtime's
 	 * policy (autonomy) and installers, not closures captured by the runtime that created this engine.
 	 */
-	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault" | "memoryEnabled" | "agentDefaults">>): void {
+	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault" | "memoryEnabled" | "agentDefaults" | "claudeModels">>): void {
 		this.deps = { ...this.deps, ...deps };
 		this.tasks = undefined;
 	}
@@ -393,6 +396,30 @@ export class Engine {
 			if (invocation.internal) return error(`${definition.agentType} runs in a Claude Code pane, and workflow agents run in-process; use review.`);
 			params = { ...params, runtime: definition.runtime };
 		}
+		const claudeModels = this.deps.claudeModels ?? DEFAULT_CLAUDE_MODELS;
+		// Only the model that wins precedence is checked and alias-normalized. Remote and Claude Code panes take no local
+		// environment overrides; Claude Code runs the first allowed model unless one is named, never its own default.
+		let modelEnv = this.deps.env;
+		if (definition.builtIn !== "fork") {
+			const claudeCode = params.runtime === "claude-code";
+			const remote = claudeCode || Boolean(params.machine?.trim());
+			const slots = [
+				...(remote ? [] : [["force", modelEnv.PI_SUBAGENT_MODEL_FORCE] as const]),
+				["invocation", params.model] as const, ["definition", definition.model] as const,
+				...(remote ? [] : [["env", modelEnv.PI_SUBAGENT_MODEL] as const]),
+			];
+			const winner = slots.find(([, value]) => value?.trim());
+			const checked = allowedModel(winner?.[1], claudeModels, claudeCode);
+			if (checked.error) return error(checked.error);
+			if (winner?.[0] === "force") modelEnv = { ...modelEnv, PI_SUBAGENT_MODEL_FORCE: checked.model };
+			if (winner?.[0] === "env") modelEnv = { ...modelEnv, PI_SUBAGENT_MODEL: checked.model };
+			if (winner?.[0] === "invocation") params = { ...params, model: checked.model };
+			if (winner?.[0] === "definition") definition.model = checked.model;
+			if (claudeCode && (!winner || checked.model?.toLowerCase() === "inherit")) {
+				if (!claudeModels[0]) return error("claudeModels is empty, so no Claude model is allowed for Claude Code.");
+				params = { ...params, model: claudeModels[0] };
+			}
+		}
 		if (skill) params = { ...params, prompt: [skill.skill.content, params.prompt ?? ""].filter((part) => part.trim()).join("\n\n") };
 		if (!params.prompt?.trim()) return error("Agent needs a prompt.");
 		if (caller.allowedAgentTypes && !caller.allowedAgentTypes.some((type) => canonicalAgentType(type) === canonicalAgentType(definition.agentType))) {
@@ -429,9 +456,23 @@ export class Engine {
 		if (!parentModel) return error("No model is selected for this session.");
 		const available = invocation.ctx.modelRegistry.getAvailable();
 		const modelChoice = resolveModel({
-			invocation: params.model, definition: definition.model, env: this.deps.env, isFork,
+			invocation: params.model, definition: definition.model, env: modelEnv, isFork,
 			parent: liteModel(parentModel), available: available.map(liteModel),
 		});
+		// A machine's Pi or Claude Code resolves its own model; locally, an explicit request runs that model or nothing.
+		if (!(pane && (params.machine?.trim() || params.runtime === "claude-code"))) {
+			if (modelChoice.note && (modelChoice.source === "invocation" || modelChoice.source === "force")) {
+				const asked = modelChoice.requested ?? "";
+				const claude = /claude|opus|sonnet|haiku|fable/i.test(asked);
+				const hint = !claude ? "" : set.active.has("adversarial-reviewer") ? " For a Claude review, use adversarial-reviewer." : " Claude Code reviews run in Herdr panes; outside Herdr, none is available.";
+				return error(`Model ${asked} is not available here. Available: ${available.map((item) => `${item.provider}/${item.id}`).filter((id) => allowedListing(id, claudeModels)).join(", ") || "none"}.${hint}`);
+			}
+			// The session's own model is the user's choice; any other Claude model must be on the allowlist.
+			const resolved = `${modelChoice.model.provider}/${modelChoice.model.id}`;
+			if (resolved !== `${parentModel.provider}/${parentModel.id}` && !allowedListing(resolved, claudeModels)) {
+				return error(notAllowed(resolved, claudeModels));
+			}
+		}
 		const model = invocation.ctx.modelRegistry.find(modelChoice.model.provider, modelChoice.model.id) ?? parentModel;
 		const parentThinking = (caller.agentId ? this.backend?.session(caller.agentId)?.thinkingLevel : undefined) ?? root.pi.getThinkingLevel();
 		const effortChoice = resolveEffort({
@@ -761,12 +802,35 @@ export class Engine {
 	 * Fail closed when a stopped conversation's definition is no longer offered or trusted (plan §17.7, §16.5).
 	 * Built-ins and forks always remain available; a stored snapshot is a record of what ran, not a grant.
 	 */
+	/** A model removed from claudeModels stops its conversations; the session's own model stays the user's choice. */
+	private modelRefusal(conversation: Conversation): string | undefined {
+		const effective = conversation.meta.model?.effective;
+		if (conversation.meta.isFork || !this.root) return undefined;
+		const claudeModels = this.deps.claudeModels ?? DEFAULT_CLAUDE_MODELS;
+		// Only machine and Claude Code panes launch without a recorded model; a local one is Claude Code on its own default.
+		if (!effective && conversation.meta.backend === "herdr" && !conversation.meta.herdr?.machine) {
+			return `This Claude Code agent's model was not recorded, so it cannot be checked against ${claudeModels.join(", ") || "an empty claudeModels"}. Start a new agent instead.`;
+		}
+		if (!effective) return undefined;
+		// A local Pi pane records provider/id; a local Claude Code pane records the name it ran, which must be listed as is:
+		// an alias such as `opus` may have meant another model when it launched.
+		if (conversation.meta.backend === "herdr" && !conversation.meta.herdr?.machine && !effective.includes("/")) {
+			return claudeModels.some((model) => model.toLowerCase() === effective.toLowerCase()) ? undefined : `${notAllowed(effective, claudeModels)} Start a new agent instead.`;
+		}
+		const sessionModel = this.root.ctx.model;
+		if (allowedListing(effective, claudeModels)) return undefined;
+		if (effective === (sessionModel && `${sessionModel.provider}/${sessionModel.id}`)) return undefined;
+		return `${notAllowed(effective, claudeModels)} Start a new agent instead.`;
+	}
+
 	private async continuationRefusal(conversation: Conversation, reserved = false): Promise<string | undefined> {
 		// Durable, so it holds after the live session is evicted too (co-op review).
 		if (conversation.meta.hostEnded) return "The agent ended its work and cannot take more messages.";
 		const definition = conversation.meta.definition;
 		if (conversation.meta.isFork) return undefined;
 		if (!this.root) return undefined;
+		const modelRefusal = this.modelRefusal(conversation);
+		if (modelRefusal) return modelRefusal;
 		if (conversation.meta.skill) {
 			const skill = forkContextSkills(loadSkills({ agentDir: this.deps.agentDir, cwd: this.root.ctx.cwd, projectTrusted: this.projectTrusted }), "user").find((candidate) => candidate.name === conversation.meta.skill!.name);
 			if (!skill) return `The skill "${conversation.meta.skill.name}" is no longer available, so this agent cannot continue.`;
@@ -1245,6 +1309,13 @@ export class Engine {
 		// A stop that arrived while waiting for the root fences every backend before anything launches (re-review RR01).
 		if (this.stopFenced(agentId, runId)) return;
 		if (conversation.meta.backend === "herdr") {
+			const refusal = this.modelRefusal(conversation);
+			if (refusal) {
+				const inbox = this.inbox(agentId);
+				for (const envelope of inbox.undelivered()) inbox.setState(envelope.id, "refused", { refusedReason: refusal });
+				this.settle(agentId, runId, failedOutcome(refusal));
+				return;
+			}
 			await this.continueHerdr(conversation, runId);
 			return;
 		}

@@ -244,3 +244,85 @@ test("agent listing reaches each request once, persists, and later definitions a
 	const persisted = harness.parent.sessionManager.getEntries().filter((entry) => (entry as { customType?: string }).customType === "agent-listing");
 	assert.equal(persisted.length, 2);
 });
+
+test("an explicitly requested model that is unavailable refuses the launch instead of running another model", { timeout: 20_000 }, async (t) => {
+	const harness = await createHarness({
+		parent: ({ index }) => index === 0
+			? { tools: [{ name: "Agent", args: { description: "Review", prompt: "Review X", subagent_type: "review", model: "openai/gpt-9-9", run_in_background: false } }] }
+			: { text: "Parent done" },
+		child: () => () => ({ text: "should not run" }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	const [result] = toolResultText(harness.parent, "Agent");
+	assert.match(result, /Model openai\/gpt-9-9 is not available here\. Available: .*anthropic\/claude-(opus|sonnet)-5-5/);
+	assert.doesNotMatch(result, /claude-sonnet-4-5/);
+	assert.equal(harness.children.size, 0);
+});
+
+test("in-process agents refuse Claude models other than Opus and Sonnet 5.5", { timeout: 20_000 }, async (t) => {
+	const harness = await createHarness({
+		parent: ({ index }) => index === 0
+			? { tools: [{ name: "Agent", args: { description: "Review", prompt: "Review X", model: "anthropic/claude-sonnet-4-5", run_in_background: false } }] }
+			: { text: "Parent done" },
+		child: () => () => ({ text: "should not run" }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /not allowed; Claude subagents run claude-opus-5-5 or claude-sonnet-5-5/);
+	assert.equal(harness.children.size, 0);
+});
+
+test("model policy checks the winning source: an allowed override beats a refused default, and forced aliases follow claudeModels", { timeout: 20_000 }, async (t) => {
+	const harness = await createHarness({
+		agentDefaults: { review: { model: "anthropic/claude-opus-4-5" } },
+		parent: ({ index }) => index === 0
+			? { tools: [{ name: "Agent", args: { description: "Review", prompt: "Review X", subagent_type: "review", model: "anthropic/claude-sonnet-5-5", run_in_background: false } }] }
+			: { text: "Parent done" },
+		child: () => () => ({ text: "reviewed" }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	assert.equal([...harness.children.values()][0].model?.id, "claude-sonnet-5-5");
+
+	const forced = await createHarness({
+		env: { PI_SUBAGENT_MODEL_FORCE: "opus" }, claudeModels: ["claude-opus-4-5"],
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Work", prompt: "Do X", run_in_background: false } }] } : { text: "Parent done" },
+		child: () => () => ({ text: "done" }),
+	});
+	t.after(() => forced.close());
+	await forced.parent.prompt("Delegate", { source: "extension" });
+	assert.equal([...forced.children.values()][0].model?.id, "claude-opus-4-5");
+});
+
+test("an unavailable forced model refuses the launch", { timeout: 20_000 }, async (t) => {
+	const harness = await createHarness({
+		env: { PI_SUBAGENT_MODEL_FORCE: "openai/gpt-9-9" },
+		parent: ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "Work", prompt: "Do X", run_in_background: false } }] } : { text: "Parent done" },
+		child: () => () => ({ text: "should not run" }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Delegate", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /Model openai\/gpt-9-9 is not available here/);
+	assert.equal(harness.children.size, 0);
+});
+
+test("SendMessage refuses to resume an agent whose model was removed from claudeModels", { timeout: 20_000 }, async (t) => {
+	let agentId = "";
+	const harness = await createHarness({
+		parent: ({ index, messages }) => {
+			if (index === 0) return { tools: [{ name: "Agent", args: { description: "Worker", prompt: "Count files", model: "anthropic/claude-sonnet-5-5", run_in_background: false } }] };
+			if (index === 1) {
+				agentId = /agentId: (a[a-f0-9]+)/.exec(JSON.stringify(messages))?.[1] ?? "";
+				(harness.engine as unknown as { deps: { claudeModels?: string[] } }).deps.claudeModels = ["claude-opus-5-5"];
+				return { tools: [{ name: "SendMessage", args: { to: agentId, message: "Now count directories" } }] };
+			}
+			return { text: `parent ${index}` };
+		},
+		child: () => () => ({ text: "3 files" }),
+	});
+	t.after(() => harness.close());
+	await harness.parent.prompt("Go", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "SendMessage")[0], /claude-sonnet-5-5 is not allowed.*Start a new agent/);
+	assert.equal(harness.engine.control.get(agentId)!.meta.runs.length, 1);
+});

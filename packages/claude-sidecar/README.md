@@ -4,7 +4,7 @@ A Claude Code plugin that runs persistent [pi](https://github.com/badlogic/pi-mo
 
 Sidecars run on [herdr-runner](../herdr-runner/README.md), the core that Grok's Pi subagents use: one coordination database, pane placement, close-on-completion, owner-gone cleanup, cold resume and saved machines. A sidecar is a runner agent owned by the Claude conversation in its pane.
 
-Roles pick the backend: `reviewer` runs Claude Code and `adversarial-reviewer` (the default) runs pi; other roles default to pi. Pi uses `openai-codex/gpt-6.1-sol` (`SIDECAR_MODEL`), Claude Code `claude-opus-5-5` (`SIDECAR_CLAUDE_MODEL`). Reviewers think at `high`, other roles at `medium` (`SIDECAR_THINKING`).
+Roles pick the backend: `reviewer` runs Claude Code and `adversarial-reviewer` (the default) runs pi; other roles default to pi. Pi uses `openai-codex/gpt-6.1-sol` (`SIDECAR_MODEL`), Claude Code `claude-opus-5-5` (`SIDECAR_CLAUDE_MODEL`). Claude models are limited to `claudeModels` in `~/.config/claude-sidecar/config.json`, default `["claude-opus-5-5", "claude-sonnet-5-5"]`; the first is Claude Code's default. Reviewers think at `high`, other roles at `medium` (`SIDECAR_THINKING`).
 
 ## Requirements
 

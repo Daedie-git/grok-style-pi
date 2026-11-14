@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSubagentSettings } from "../src/subagents/settings.ts";
+import { loadClaudeModels, loadSubagentSettings } from "../src/subagents/settings.ts";
 import { defaultFeatures, saveFeatures } from "../src/extension/features.ts";
 import { saveStyleColor } from "../src/chrome/style-colors.ts";
 
@@ -62,4 +62,14 @@ test("invalid subagent settings report the affected key rather than silently ign
 	}
 	writeFileSync(path, "{broken json");
 	assert.throws(() => loadSubagentSettings(path), SyntaxError);
+});
+
+test("claudeModels is an optional list of model ids that other settings writers preserve", (t) => {
+	const { path, save } = fixture(t);
+	assert.equal(loadClaudeModels(path), undefined);
+	save({ claudeModels: [" claude-opus-6 ", "claude-sonnet-6"] });
+	saveFeatures({ ...defaultFeatures, footer: false }, path);
+	assert.deepEqual(loadClaudeModels(path), ["claude-opus-6", "claude-sonnet-6"]);
+	save({ claudeModels: "claude-opus-6" });
+	assert.throws(() => loadClaudeModels(path), /claudeModels must be a list of model ids/);
 });

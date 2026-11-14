@@ -58,7 +58,7 @@ export function scripted(script: Script, counter: (count: number) => void) {
 	};
 }
 
-export async function createHarness(input: { parent: Script; child: (agentId: string, session: AgentSession) => Script; env?: Record<string, string>; agentFiles?: Record<string, string>; now?: () => number; panes?: boolean; paneDefault?: boolean; memoryEnabled?: boolean | (() => boolean); agentDefaults?: AgentDefaults }): Promise<Harness> {
+export async function createHarness(input: { parent: Script; child: (agentId: string, session: AgentSession) => Script; env?: Record<string, string>; agentFiles?: Record<string, string>; now?: () => number; panes?: boolean; paneDefault?: boolean; memoryEnabled?: boolean | (() => boolean); agentDefaults?: AgentDefaults; claudeModels?: string[] }): Promise<Harness> {
 	const root = mkdtempSync(join(tmpdir(), "subagent-engine-"));
 	const agentDir = join(root, "agent");
 	if (input.agentFiles) {
@@ -74,7 +74,7 @@ export async function createHarness(input: { parent: Script; child: (agentId: st
 	const loader = new DefaultResourceLoader({
 		cwd: root, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 		extensionFactories: [createSubagentEngine({
-			env: input.env ?? {}, agentDir, homeDir: root, now: input.now, panes: input.panes, paneDefault: input.paneDefault, memoryEnabled: input.memoryEnabled, agentDefaults: input.agentDefaults, modelRuntime: async () => runtime,
+			env: input.env ?? {}, agentDir, homeDir: root, now: input.now, panes: input.panes, paneDefault: input.paneDefault, memoryEnabled: input.memoryEnabled, agentDefaults: input.agentDefaults, claudeModels: input.claudeModels, modelRuntime: async () => runtime,
 			onEngine: (created) => { engine = created; },
 			onSessionCreated: (session, agentId) => {
 				children.set(agentId, session);

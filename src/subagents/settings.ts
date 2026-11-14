@@ -25,3 +25,11 @@ export function loadSubagentSettings(path = featureSettingsPath()): AgentDefault
 		}];
 	}));
 }
+
+/** The Claude models subagents may run (`claudeModels`), first as Claude Code's default; undefined keeps the engine's list. */
+export function loadClaudeModels(path = featureSettingsPath()): string[] | undefined {
+	const values = readSettingsObject(path).claudeModels;
+	if (values === undefined) return undefined;
+	if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !value.trim())) throw new Error("Grok claudeModels must be a list of model ids");
+	return values.map((value: string) => value.trim());
+}

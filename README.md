@@ -224,6 +224,8 @@ With `integrations/subagents.ts`, configure each agent's defaults under `subagen
 
 Run `/reload` after editing. New launches use the changed defaults; existing agent conversations retain their model and effort. These preferences override agent-definition defaults, while explicit launch parameters still win. `PI_SUBAGENT_MODEL_FORCE` and `PI_SUBAGENT_EFFORT` retain their forced-override behavior for in-process agents and local Pi panes. Conversation forks always inherit the parent's model and effort. Remote Pi panes receive an explicitly launched or configured model name; without one, they use the remote Pi default. The standalone Herdr extension does not read these Grok settings.
 
+`claudeModels` in the same file lists the Claude models subagents may run, default `["claude-opus-5-5", "claude-sonnet-5-5"]`. `opus` or `sonnet` names the first listed model of that family; Claude Code panes without a model run the first entry. Other Claude models are refused. Update the list when new models land, then `/reload`.
+
 The canonical type names are `explore`, `plan`, and `review` (formerly `Explore`, `Plan`, and `adversarial-review`); old names remain accepted for compatibility.
 
 ### Communication Style

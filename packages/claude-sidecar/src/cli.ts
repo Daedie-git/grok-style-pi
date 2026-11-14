@@ -113,6 +113,28 @@ function repoSkills(cwd: string): string[] {
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
+/** The Claude models a sidecar may run: `claudeModels` in `~/.config/claude-sidecar/config.json`, first as the default. */
+function claudeModels(env: NodeJS.ProcessEnv): string[] {
+	const file = env.SIDECAR_CONFIG_FILE || join(env.HOME || homedir(), ".config", "claude-sidecar", "config.json");
+	if (!existsSync(file)) return ["claude-opus-5-5", "claude-sonnet-5-5"];
+	let models: unknown;
+	try { models = (JSON.parse(readFileSync(file, "utf8")) as { claudeModels?: unknown }).claudeModels; }
+	catch { throw new Error(`invalid sidecar configuration: ${file}`); }
+	if (models === undefined) return ["claude-opus-5-5", "claude-sonnet-5-5"];
+	if (!Array.isArray(models) || models.some((model) => typeof model !== "string" || !model.trim())) throw new Error(`claudeModels in ${file} must be a list of model ids`);
+	return models.map((model: string) => model.trim());
+}
+
+/** A Claude model normalized against the allowlist (`opus` names the first listed Opus); for Claude Code every name must be listed. */
+function allowedClaudeModel(model: string, allowed: string[], claudeCode = false): string {
+	if (!claudeCode && !/claude|opus|sonnet|haiku|fable|^anthropic\//i.test(model)) return model;
+	const prefix = /^anthropic\//i.test(model) ? "anthropic/" : "";
+	const id = model.slice(prefix.length).toLowerCase();
+	const found = ["opus", "sonnet", "haiku", "fable"].includes(id) ? allowed.find((item) => item.toLowerCase().includes(id)) : allowed.find((item) => item.toLowerCase() === id);
+	if (!found) throw new Error(`model ${model} is not allowed; Claude sidecars run ${allowed.join(" or ") || "no Claude model"}`);
+	return prefix + found;
+}
+
 export class SidecarCli {
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly cwd: string;
@@ -282,6 +304,12 @@ export class SidecarCli {
 				const routed = await this.parent.routeLive(record.agentId);
 				runner = routed.runner;
 				const agent = await runner.resolve(routed.id);
+				// A model removed from claudeModels ends its slot's conversation. The recorded name must be listed as is: an alias
+				// such as `opus` may have meant another model when the slot started.
+				const allowed = claudeModels(this.env);
+				if (agent.model && allowedClaudeModel(agent.model, allowed, agent.runtime === "claude-code") !== agent.model) {
+					throw new Error(`model ${agent.model} is not allowed; Claude sidecars run ${allowed.join(" or ") || "no Claude model"}`);
+				}
 				// A run left by a killed launcher finishes before this one starts.
 				const previous = await this.settle(local, runner, { agentId: routed.id, runId: agent.currentRunId });
 				if (previous.phase === "blocked") return this.blocked(agent.herdrName);
@@ -344,16 +372,19 @@ export class SidecarCli {
 		const profile = this.profile;
 		// Pi finds .pi/skills itself; Claude Code repositories keep theirs in .claude/skills. A profile names its own.
 		const skills = profile ? profileSkills(profile, this.env.HOME || homedir()) : !machine && agent === "pi" ? repoSkills(this.cwd) : [];
+		const allowed = claudeModels(this.env);
 		const model = agent === "claude"
-			? this.env.SIDECAR_CLAUDE_MODEL || "claude-opus-5-5"
+			? this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
 			: this.env.SIDECAR_MODEL || "openai-codex/gpt-6.1-sol";
+		if (!model) throw new Error("claudeModels is empty; no Claude model is allowed");
+		const checked = allowedClaudeModel(model, allowed, agent === "claude");
 		return {
 			runtime: agent === "claude" ? "claude-code" : "pi",
 			prompt,
 			description: `${role} sidecar, slot ${globals.slot}`,
 			name: `sidecar-${globals.slot}-${role}`,
 			subagentType: role,
-			model,
+			model: checked,
 			thinking: this.env.SIDECAR_THINKING || (reviewer ? "high" : "medium"),
 			runInBackground: true,
 			keep,

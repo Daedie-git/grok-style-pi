@@ -79,10 +79,10 @@ test("real Grok integration dispatches Agent in a Pi tool loop and records compl
 
 test("grok-style.json configures each canonical agent type without changing explicit launch overrides", { timeout: 15000 }, async (t) => {
 	const types = ["explore", "plan", "review", "general-purpose", "researcher"];
-	const subagents = Object.fromEntries(types.map((type) => [type, { model: "anthropic/claude-opus-4-5", effort: "low" as const }]));
+	const subagents = Object.fromEntries(types.map((type) => [type, { model: "anthropic/claude-opus-5-5", effort: "low" as const }]));
 	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [
 		...types.map((type) => ({ name: "Agent", args: { subagent_type: type, description: type, prompt: "Complete the assignment", run_in_background: false } })),
-		{ name: "Agent", args: { subagent_type: "explore", description: "explicit override", prompt: "Find code", model: "anthropic/claude-sonnet-4-5", effort: "high", run_in_background: false } },
+		{ name: "Agent", args: { subagent_type: "explore", description: "explicit override", prompt: "Find code", model: "anthropic/claude-sonnet-5-5", effort: "high", run_in_background: false } },
 	] } : { text: "Done" }, () => ({ text: "Agent report" }), true, { subagents });
 	await h.session.prompt("Launch the configured agents");
 	assert.deepEqual(h.extensionErrors, []);
@@ -91,25 +91,25 @@ test("grok-style.json configures each canonical agent type without changing expl
 	for (const type of types) {
 		const snapshot = snapshots.find((agent) => agent.description === type)!;
 		assert.equal(snapshot.agentType, type);
-		assert.equal(snapshot.model, "anthropic/claude-opus-4-5");
+		assert.equal(snapshot.model, "anthropic/claude-opus-5-5");
 		assert.equal(snapshot.effort, "low");
 	}
 	const explicit = snapshots.find((agent) => agent.description === "explicit override")!;
-	assert.equal(explicit.model, "anthropic/claude-sonnet-4-5");
+	assert.equal(explicit.model, "anthropic/claude-sonnet-5-5");
 	assert.equal(explicit.effort, "high");
-	assert.equal(h.children.filter((child) => child.model?.id === "claude-opus-4-5" && child.thinkingLevel === "low").length, 5);
+	assert.equal(h.children.filter((child) => child.model?.id === "claude-opus-5-5" && child.thinkingLevel === "low").length, 5);
 });
 
 test("forced environment settings still override Grok agent defaults", { timeout: 15000 }, async (t) => {
 	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: {
 		subagent_type: "explore", description: "forced settings", prompt: "Find code", run_in_background: false,
 	} }] } : { text: "Done" }, () => ({ text: "Report" }), true, {
-		subagents: { explore: { model: "anthropic/claude-opus-4-5", effort: "low" } },
-		env: { PI_SUBAGENT_MODEL_FORCE: "anthropic/claude-sonnet-4-5", PI_SUBAGENT_EFFORT: "high" },
+		subagents: { explore: { model: "anthropic/claude-opus-5-5", effort: "low" } },
+		env: { PI_SUBAGENT_MODEL_FORCE: "anthropic/claude-sonnet-5-5", PI_SUBAGENT_EFFORT: "high" },
 	});
 	await h.session.prompt("Launch the agent");
 	assert.equal(h.children.length, 1);
-	assert.equal(h.children[0].model?.id, "claude-sonnet-4-5");
+	assert.equal(h.children[0].model?.id, "claude-sonnet-5-5");
 	assert.equal(h.children[0].thinkingLevel, "high");
 });
 
@@ -120,12 +120,12 @@ test("reload applies edited agent defaults to new children and removing them res
 	await h.session.prompt("Launch before reload");
 	const engine = h.engine;
 	assert.equal(h.children[0].thinkingLevel, "low");
-	writeFileSync(h.settingsPath, JSON.stringify({ subagents: { explore: { model: "anthropic/claude-opus-4-5", effort: "high" } } }));
+	writeFileSync(h.settingsPath, JSON.stringify({ subagents: { explore: { model: "anthropic/claude-opus-5-5", effort: "high" } } }));
 	await h.session.reload();
 	await h.session.prompt("Launch after reload");
 	assert.equal(h.engine, engine);
 	assert.equal(h.children[0].thinkingLevel, "low", "existing conversations keep their launch preferences");
-	assert.equal(h.children[1].model?.id, "claude-opus-4-5");
+	assert.equal(h.children[1].model?.id, "claude-opus-5-5");
 	assert.equal(h.children[1].thinkingLevel, "high");
 	writeFileSync(h.settingsPath, "{}");
 	await h.session.reload();

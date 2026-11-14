@@ -31,8 +31,8 @@ export function builtInDefinitions(options: { forkEnabled: boolean; claudeCode?:
 		make("review", "Read-only review of a change or plan on your own model. Attacks assumptions, missing tests, and incorrect claims. Does not implement.",
 			reviewPrompt, reviewOptions),
 	];
-	if (options.claudeCode) definitions.push(make("adversarial-reviewer", "Read-only review of a change or plan by Claude Code (Opus 5.5), a model family other than yours. Same scope as review.",
-		reviewPrompt, { ...reviewOptions, runtime: "claude-code", model: "claude-opus-5-5" }));
+	if (options.claudeCode) definitions.push(make("adversarial-reviewer", "Read-only review of a change or plan by Claude Code on Opus, a model family other than yours. Same scope as review.",
+		reviewPrompt, { ...reviewOptions, runtime: "claude-code", model: "opus" }));
 	if (options.forkEnabled) definitions.push(make("fork", "Perform one explicit assignment using a snapshot of the parent's conversation; never the default agent choice.",
 		"The runtime supplies the parent's system prompt, model, effort and exact tools. Follow the separate single-assignment fork directive.", { maxTurns: 200 }));
 	return definitions;

@@ -16,7 +16,7 @@ Grok users get the engine through `integrations/subagents.ts` instead. Load exac
 
 | Tool | Purpose |
 |---|---|
-| `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model`, `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` keeps a pane agent's pane open after it finishes; it does not select the pane backend or affect in-process agents. |
+| `Agent` | Launch an agent. Parameters: `description`, `prompt`, `subagent_type` (default `general-purpose`), `model` (an unavailable model refuses the launch; Claude models are limited to the host's `claudeModels`, by default `claude-opus-5-5` and `claude-sonnet-5-5`, where `opus` or `sonnet` names the first listed one and Claude Code defaults to the first), `effort`, `run_in_background` (default `true`), `name`, `isolation: "worktree"`. Inside Herdr, `keep` keeps a pane agent's pane open after it finishes; it does not select the pane backend or affect in-process agents. |
 | `SendMessage` | `{to, message, summary?}`. A running agent gets the message after its current tool round. A finished agent resumes the same conversation in a new run. `to: "main"` reaches the root conversation. |
 | `needs_answer` | Child-only, except forks and workflow agents: `{question}` ends the run as `needs-answer`. Include one concrete question and the current work state. The parent replies with `SendMessage` to resume the same child with the answer. |
 | `TaskStop` | Stop an agent. The main conversation can stop any agent; an agent can stop only itself. A stop by the user (Grok activity panel) also stops the agent's descendants, and none of them resume automatically. |
@@ -36,7 +36,7 @@ Built-in types:
 - **`explore`** locates code and is read-only.
 - **`plan`** produces an implementation plan and is read-only.
 - **`review`** provides read-only adversarial review of a change or plan on the parent's model: assumptions, missing tests and incorrect claims. It does not implement changes.
-- **`adversarial-reviewer`** is `review` run by Claude Code (`claude-opus-5-5`, `high` effort) in a Herdr pane, for a model family other than the parent's. It is offered only inside Herdr.
+- **`adversarial-reviewer`** is `review` run by Claude Code (`opus`, `high` effort) in a Herdr pane, for a model family other than the parent's. It is offered only inside Herdr.
 - **`researcher`** answers questions from high-trust primary sources and is read-only. It inherits an available `web_search` tool even in the background; the engine does not bundle a web lookup provider. Research findings include source URLs or absolute paths and verification limits.
 - **`fork`** inherits the conversation, system prompt, model and tools. Disable it with `PI_SUBAGENT_FORK=0`.
 

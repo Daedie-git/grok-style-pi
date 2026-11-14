@@ -37,7 +37,7 @@ export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => En
 			description: Type.String({ description: "A short (3-5 word) description of the task." }),
 			prompt: Type.String({ description: "The task for the agent to perform." }),
 			subagent_type: Type.Optional(Type.String({ description: "The type of specialized agent to use. Omit for general-purpose." })),
-			model: Type.Optional(Type.String({ description: "Optional model override, such as sonnet or provider/model-id." })),
+			model: Type.Optional(Type.String({ description: "Optional model override, such as sonnet or provider/model-id. An unavailable model refuses the launch; only allowed Claude models run." })),
 			effort: Type.Optional(Type.Union(["low", "medium", "high", "xhigh", "max"].map((level) => Type.Literal(level)), { description: "Reasoning effort. Set only when explicitly asked." })),
 			run_in_background: Type.Optional(Type.Boolean({ description: "Defaults to true. Set false only when your next step depends on the result." })),
 			name: Type.Optional(Type.String({ description: "Optional name, so SendMessage can address this agent by name." })),

@@ -21,7 +21,7 @@ function golden(text: string, required: string[], forbidden: string[]): void {
 const fixtures: { name: string; input: PolicyInput; required: string[]; forbidden: string[]; listingRequired: string[]; listingForbidden: string[] }[] = [
 	{
 		name: "positive", input: positive,
-		required: ["Delegation heuristics", "costs more than it looks", "independent work that can run in parallel", "a fitting description alone is no reason", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "The explore agent locates code"],
+		required: ["Delegation heuristics", "small, bounded tasks directly", "expected benefit exceeds briefing, waiting, and checking costs", "before choosing an agent type", "opportunities, not sufficient reasons", "independent work that can run in parallel", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "The explore agent locates code"],
 		forbidden: ["Delegate only when the user explicitly requests", "prefer an offered fork", "A fork inherits", "without a separate user request", "proactive use"],
 		listingRequired: ["Available agent types", "explore: Locate implementation paths", "Read, Grep", "general-purpose", "inherited tools"],
 		listingForbidden: ["fork:", "Removed;", "without a separate user request", "more than 3 queries"],

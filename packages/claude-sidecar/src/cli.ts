@@ -375,7 +375,7 @@ export class SidecarCli {
 		const allowed = claudeModels(this.env);
 		const model = agent === "claude"
 			? this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
-			: this.env.SIDECAR_MODEL || "openai-codex/gpt-6.1-sol";
+			: this.env.SIDECAR_MODEL || "openai-codex/gpt-6.2-sol";
 		if (!model) throw new Error("claudeModels is empty; no Claude model is allowed");
 		const checked = allowedClaudeModel(model, allowed, agent === "claude");
 		return {

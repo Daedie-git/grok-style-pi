@@ -17,7 +17,7 @@ test("ask starts a Pi sidecar owned by the Claude session and prints its report"
 	assert.equal(body.join("\n"), "## Verdict\nship");
 	assert.match(f.prompts[0], /Review the parser\./);
 	assert.match(f.prompts[0], /your final reply is the report/);
-	assert.deepEqual(f.starts[0].slice(2), ["--model", "openai-codex/gpt-6.1-sol", "--thinking", "high"]);
+	assert.deepEqual(f.starts[0].slice(2), ["--model", "openai-codex/gpt-6.2-sol", "--thinking", "high"]);
 	const status = await f.run("--slot", "2", "status");
 	assert.match(status.stdout, /^slot 2: adversarial-reviewer · pi · sidecar-2-adversarial-reviewer · completed/m);
 	const report = await f.run("--slot", "2", "report");

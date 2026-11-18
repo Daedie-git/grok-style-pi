@@ -90,7 +90,12 @@ export class SubagentAdapter {
 			if (run?.identity.runId === event.runId && run.activity.status === "stopping") { run.activity.status = "running"; this.publish(run.activity, false); }
 			return;
 		}
-		if (event.type === "run-event" && event.event.type === "started") run = this.begin(event.agentId, event.runId);
+		if (event.type === "run-event" && event.event.type === "started") {
+			// A resumed run may have no cached row after reattachment or history eviction.
+			const snapshot = run ? undefined : this.engine.agentSnapshots().find((agent) =>
+				agent.agentId === event.agentId && agent.runId === event.runId && agent.running && !agent.workflow);
+			run = this.begin(event.agentId, event.runId, snapshot);
+		}
 		if (!run || run.identity.runId !== event.runId) return;
 		if (event.type === "settled") {
 			if (event.outcome.resultText && !run.activity.output.includes(event.outcome.resultText)) this.append(run, `\n${event.outcome.resultText}`);

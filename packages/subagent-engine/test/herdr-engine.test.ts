@@ -645,6 +645,14 @@ test("a resumed pane emits the new run start and the real activity adapter follo
 	await harness.engine.teardown(proxy.meta.agentId);
 	assert.match(changes.at(-1)!.output, /First pane report/);
 	const beforeResume = changes.length;
+	// A reattached activity bar has no row for a pane that was idle when it attached.
+	const reattachedRows: { title: string; status: string; output: string; startedAt: number; newRun: boolean }[] = [];
+	const reattached = new SubagentAdapter(harness.engine, (entry, newRun) => {
+		const { title, status, output, startedAt } = entry;
+		reattachedRows.push({ title, status, output, startedAt, newRun });
+	});
+	t.after(() => reattached.dispose());
+	assert.equal(reattached.identity(proxy.meta.agentId), undefined);
 	const receipt = await harness.engine.sendMessage({ to: proxy.meta.agentId, message: "Continue in the same pane" }, ROOT_CALLER, "activity-pane-resume");
 	assert.equal(receipt.success, true);
 	await until(() => fake.resumes.length === 1 && proxy.meta.herdr?.runId === "herdr-run-2" && adapter.identity(proxy.meta.agentId)?.runId === proxy.active?.runId);
@@ -654,8 +662,14 @@ test("a resumed pane emits the new run start and the real activity adapter follo
 	assert.ok(changes.slice(beforeResume).some(entry => entry.newRun && entry.status === "running"));
 	assert.equal(changes.at(-1)!.status, "running");
 	assert.equal(changes.at(-1)!.output, "", "the old run's output is reset on new-run start");
+	assert.equal(reattached.identity(proxy.meta.agentId)?.runId, secondRun, "a resumed pane reappears even without its previous activity row");
+	assert.deepEqual(reattachedRows, [{
+		title: `${proxy.meta.agentType}: ${proxy.meta.description}`,
+		status: "running", output: "", startedAt: proxy.active!.startedAt, newRun: true,
+	}]);
 	fake.notice("pane-1", "completed", "Second pane report");
-	await until(() => !proxy.active && changes.at(-1)?.status === "completed");
+	await until(() => !proxy.active && changes.at(-1)?.status === "completed" && reattachedRows.at(-1)?.status === "completed");
+	assert.match(reattachedRows.at(-1)!.output, /Second pane report/);
 	await harness.engine.teardown(proxy.meta.agentId);
 	assert.equal(adapter.identity(proxy.meta.agentId)?.runId, secondRun);
 	assert.match(changes.at(-1)!.output, /Second pane report/);

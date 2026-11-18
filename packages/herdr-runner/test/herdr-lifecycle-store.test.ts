@@ -94,6 +94,23 @@ test("Claude readiness requires an intact transcript containing its own saved co
 	assert.equal(await store.coldResumeReady(claude.id), false);
 });
 
+for (const action of ["ABORT", "ROLLBACK"]) test(`execution reports the original SQLite error after ${action}`, async (t) => {
+	const { root, store, ref, binding, task } = await fixture(t);
+	await store.claimNextCommand(task.id, binding.token, false);
+	await store.recordExecutionEvent(ref, binding.token, { type: "live" }, 3);
+	const db = new DatabaseSync(join(root, "control.sqlite"));
+	t.after(() => db.close());
+	// ROLLBACK ends the transaction in SQLite before the exception reaches the worker (also true of SQLITE_FULL).
+	// ABORT rolls back only the statement; the worker still needs to roll back its transaction.
+	db.exec(`CREATE TRIGGER fail_run_update BEFORE UPDATE ON runs BEGIN SELECT RAISE(${action}, 'test write failure'); END;`);
+	const finish = () => store.recordExecutionEvent(ref, binding.token, { type: "completed", result: "saved" }, 4);
+	await assert.rejects(finish, /operation=recordExecutionEvent .*test write failure/);
+	assert.equal((await store.read(ref)).phase, "running");
+	db.exec("DROP TRIGGER fail_run_update");
+	await finish();
+	assert.equal((await store.read(ref)).phase, "completed");
+});
+
 test("a busy database ends a maintenance pass quietly; the lease lapses and a later pass settles", { timeout: 30_000 }, async (t) => {
 	const { root, store, ref } = await fixture(t);
 	assert.equal(await store.claimMaintenance("first", 10, 1000), true);

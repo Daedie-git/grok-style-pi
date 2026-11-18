@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 import { createChildSession, type ChildSession, type ChildIdentity } from "herdr-runner/child.ts";
 import { createBackendController, type HerdrBackendHandle } from "herdr-runner/backend.ts";
 export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "herdr-runner/backend.ts";
-import type { ExecutionEvent, RunRef } from "herdr-runner/state.ts";
+import type { ActivePaneScope, ExecutionEvent, RunRef } from "herdr-runner/state.ts";
+import { pickHerdrMachine } from "herdr-runner/client.ts";
 import {
 	completionNotice,
 	qualifiedAgentId,
@@ -287,6 +288,33 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 						queuedNotices.add(notice.id);
 					}
 				};
+				const activePanes = new Map<string, ActivePaneScope[1]>();
+				const unsupported = new WeakSet<HerdrRunner>();
+				const nextProjection = new WeakMap<HerdrRunner, number>();
+				let publishedPanes: string | undefined;
+				const projectPanes = async (source: HerdrRunner) => {
+					if (!hc || !paneId || !deps.client.publishActivePanes || unsupported.has(source)) return;
+					if ((nextProjection.get(source) ?? -Infinity) > deps.now()) return;
+					nextProjection.set(source, deps.now() + 1000);
+					const rows = await source.activePanes(parent.parentKey(source.machine), identity.sessionFile || undefined, source.machine ? current.machineId : undefined).catch((error) => {
+						// Older remote workers still run commands and deliver notices; their list is unknown.
+						if (source.machine && /Unknown Herdr control operation/.test(String(error))) unsupported.add(source);
+						else reportError(error, source.machine ?? "");
+						return undefined;
+					});
+					if (!live() || !rows) return;
+					const machine = source.machine ? pickHerdrMachine(parent.profiles, source.machine)?.label ?? source.machine : "";
+					activePanes.set(machine, rows);
+					// Remote and local ticks can finish out of order; serialize writes and take the latest projection.
+					publication = publication.then(async () => {
+						if (!live()) return;
+						const snapshot = [...activePanes].sort(([left], [right]) => left.localeCompare(right));
+						const serialized = JSON.stringify(snapshot);
+						if (publishedPanes === serialized) return;
+						await deps.client.publishActivePanes!(paneId, snapshot);
+						publishedPanes = serialized;
+					}).catch((error) => reportError(error));
+				};
 				const poll = async () => {
 					if (!child && attachUntil > deps.now()) await attachChild();
 					await child?.poll();
@@ -304,6 +332,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 						async service(machine, source) {
 							await acknowledge(machine, source);
 							await deliver(source);
+							await projectPanes(source);
 						},
 						reportError,
 						recovered: (machine) => { lastErrors.delete(machine); },
@@ -336,7 +365,10 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 			if (timer) clearInterval(timer);
 			timer = undefined;
 			await tick;
-			if (hc && paneId) await publish(undefined);
+			if (hc && paneId) {
+				await publish(undefined);
+				await deps.client.publishActivePanes?.(paneId, undefined).catch(() => undefined);
+			}
 			if (event?.reason !== "reload") await child?.noteExit();
 			await child?.dispose();
 			child = undefined;

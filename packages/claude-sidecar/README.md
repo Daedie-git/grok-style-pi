@@ -53,6 +53,8 @@ Role prompts are `sidecar/<role>.md` after a shared protocol (`src/prompts.ts`).
 
 ## Pane lifecycle
 
+On the Herdr desktop app, the Agents pane follows Claude's sidecar list: a request that ends disappears from both lists, except when it is still waiting for an answer. This does not close the terminal.
+
 A pane closes once its run completes, unless pinned (`ask --keep`, `keep`) or focused; failed, blocked and questioning panes stay open. The next request resumes the same conversation in a new pane. When the owning Claude pane ends, its pi sidecars are stopped and their panes closed; a running Claude Code sidecar stays open, since stopping it would lose its conversation. Clearing Claude hands the slots to the new conversation (SessionStart transfers ownership).
 
 Closing needs a process that maintains coordination. Each request runs a detached `maintain` pass afterwards, at most one per Claude pane, for three minutes; `session-end` and the Bash hook's once-a-minute sweep start one too. In the Herdr app, requests label Claude's terminal with its process and session so a departed owner can be recognized.

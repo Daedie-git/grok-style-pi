@@ -1,5 +1,9 @@
 export const START_TIMEOUT_MS = 15_000;
 
+export type ActivePane = [paneId: string, blocked: boolean];
+/** An empty machine name means the coordinating Pi's own host. Empty rows are authoritative. */
+export type ActivePaneScope = [machine: string, rows: ActivePane[]];
+
 export interface RunRef {
 	agentId: string;
 	runId: string;

@@ -350,6 +350,7 @@ export class HerdrStore {
 	recordLaunch(ref: RunRef, owner: string, stage: LaunchStage, facts: LaunchFacts, now: number) { return this.call("recordLaunch", ref, owner, stage, facts, now); }
 	claimLaunchRecovery(ref: RunRef, previousOwner: string, owner: string, now: number) { return this.call("claimLaunchRecovery", ref, previousOwner, owner, now); }
 	failLaunch(ref: RunRef, owner: string, error: string, stopped: boolean, now: number) { return this.call("failLaunch", ref, owner, error, stopped, now); }
+	activePanes(herdrSession: string, parentPaneId: string, parentSessionFile?: string, parentMachine?: string) { return this.call("activePanes", herdrSession, parentPaneId, parentSessionFile, parentMachine); }
 	notices(parentPaneId: string, parentSessionFile?: string, parentMachine?: string) { return this.call("notices", parentPaneId, parentSessionFile, parentMachine); }
 	claudeHookCommand() { return this.call("claudeHookCommand"); }
 	setKeep(agentId: string, keep: boolean) { return this.call("setKeep", agentId, keep); }

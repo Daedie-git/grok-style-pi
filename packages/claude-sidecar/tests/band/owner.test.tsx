@@ -12,6 +12,39 @@ test('a Herdr app terminal owns the slots named after it', async ($, on) => {
   await ui.unmount()
 })
 
+test('Herdr receives the same live slot set as the Claude band, including an empty set', async ($, on) => {
+  on('session.start', (_, e) => ({ cwd:e.cwd }))
+  const env = { HOME:'/fake-home', HC_TERMINAL_ID:'t7', HC_BIN_PATH:'/fake/hc' }
+  on('env.get', (_, e) => ({ value:env[e.name] }))
+  let finished = false
+  let answered = false
+  on('fs.list', () => ({ value:['sc-hc-t7.request.json','sc-hc-t7-2.request.json','sc-hc-t7-2.pending','sc-hc-t7-3.request.json']
+    .map(name => ({ name, kind:'file', size:0, mtimeMs:0, isLink:false })) }))
+  on('fs.read', (_, e) => ({ value:
+    e.path.endsWith('/runner/sc-hc-t7.json') ? '{"agentId":"sidecar-1-reviewer"}' :
+    e.path.endsWith('/runner/sc-hc-t7-2.json') ? '{"agentId":"sidecar-2-reviewer@other"}' :
+    e.path.endsWith('/runner/sc-hc-t7-3.json') ? '{"agentId":"sidecar-3-reviewer"}' :
+    e.path.endsWith('-2.pending') ? JSON.stringify({ answered }) :
+    e.path.endsWith('-2.machine') ? 'other-core-id' :
+    e.path.endsWith('.machine') ? '' :
+    e.path.endsWith('-2.request.json') ? '{"started":1,"finished":2,"machine":"other"}' :
+    e.path.endsWith('-3.request.json') ? '{"started":1,"finished":2}' :
+    e.path.endsWith('request.json') ? JSON.stringify({ started:1, ...(finished ? { finished:2 } : {}) }) : 'reviewer' }))
+  const snapshots: string[][] = []
+  on('process.run', (_, e) => {
+    snapshots.push(e.argv)
+    return { value:{ exitCode:0, stdout:'', stderr:'', isStdoutTruncated:false, isStderrTruncated:false } }
+  })
+  const clock = mock.clock(on, { now:10000 })
+  await $.session.start({ cwd:'/', surface:'terminal', isInteractive:true })
+  expect(snapshots).toEqual([['/fake/hc','label','t7','claude-sidecar.active=[["","sidecar-1-reviewer",false],["other","sidecar-2-reviewer",true]]']])
+  await clock.advance(3000)
+  expect(snapshots.length).toBe(1)
+  finished = answered = true
+  await clock.advance(3000)
+  expect(snapshots[1]).toEqual(['/fake/hc','label','t7','claude-sidecar.active=[]'])
+})
+
 test('a stopped slot with an unanswered question leaves the band', async ($, on) => {
   on('session.start', (_, e) => ({ cwd:e.cwd }))
   on('env.get', (_, e) => ({ value:e.name === 'HOME' ? '/fake-home' : e.name === 'HERDR_PANE_ID' ? 'PANE:1' : undefined }))

@@ -9,7 +9,7 @@ import { claudeArgs, claudeTools, handleClaudeHook, localClaudeHook } from "../s
 import type { HerdrClient } from "../src/client.ts";
 import { HerdrRunner, type SpawnRequest } from "../src/runner.ts";
 
-function fixture(t: TestContext, extra: Partial<HerdrClient> = {}) {
+function fixture(t: TestContext, extra: Partial<HerdrClient> = {}, now = Date.now) {
 	const root = mkdtempSync(join(tmpdir(), "herdr-claude space-'$`&-é-"));
 	const live = new Map<string, string>();
 	const prompts: string[] = [];
@@ -29,7 +29,7 @@ function fixture(t: TestContext, extra: Partial<HerdrClient> = {}) {
 		showLabel: async () => {},
 		...extra,
 	};
-	const runner = new HerdrRunner({ root, client });
+	const runner = new HerdrRunner({ root, client, now });
 	t.after(async () => { await runner.close(); rmSync(root, { recursive: true, force: true }); });
 	const request: SpawnRequest = { runtime: "claude-code", prompt: "Review launch code", description: "Review launch code", subagentType: "reviewer", cwd: root, paneId: "w1:p1", runInBackground: true };
 	const hook = async (event: string, data: Record<string, unknown> = {}) => {
@@ -82,6 +82,24 @@ test("Claude hook rejects stale commands and other sessions", async (t) => {
 	await f.hook("UserPromptSubmit", { prompt: f.prompts[0] });
 	await f.hook("Stop", { last_assistant_message: "Done" });
 	assert.equal((await f.hook("UserPromptSubmit", { prompt: f.prompts[0] }))?.decision, "block");
+});
+
+test("Claude accepts prompt receipt after the Pi startup deadline on launch and resume", async (t) => {
+	let now = Date.now() - 44_000;
+	const f = fixture(t, {}, () => now);
+	let ref = await f.runner.spawn(f.request);
+	for (const index of [0, 1]) {
+		if (index === 1) ref = await f.runner.resume(ref.agentId, "Follow-up");
+		// Windows recorded the first UserPromptSubmit rejection about 22 seconds after launch.
+		now += 22_000;
+		await f.runner.reconcile(ref);
+		assert.equal(await f.hook("UserPromptSubmit", { prompt: f.prompts[index] }), undefined);
+		const received = await f.runner.read(ref);
+		assert.equal(received.inputReceived, true);
+		assert.equal(received.accepted, false, "receipt is not proof that Claude executed the task");
+		await f.hook("Stop", { last_assistant_message: "Reviewed" });
+		assert.equal((await f.runner.read(ref)).phase, "completed");
+	}
 });
 
 test("Claude prompts target the verified pane and refuse a name taken in another pane", async (t) => {

@@ -47,16 +47,22 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
-    const who = identity({
+    const env = {
       HOME: await $.env.get('HOME'),
       USERPROFILE: await $.env.get('USERPROFILE'),
       SIDECAR_MUX: await $.env.get('SIDECAR_MUX'),
       HERDR_PANE_ID: await $.env.get('HERDR_PANE_ID'),
       HC_TERMINAL_ID: await $.env.get('HC_TERMINAL_ID'),
       SIDECAR_AGENT: await $.env.get('SIDECAR_AGENT'),
-    })
+    }
+    const who = identity(env)
     if (!who) return result
     const { dir, owner } = who
+    const hcTerminal = env.SIDECAR_MUX === 'herdr' || (env.SIDECAR_MUX !== 'hc' && env.HERDR_PANE_ID) ? undefined : env.HC_TERMINAL_ID
+    const hc = hcTerminal ? (await $.env.get('HC_BIN_PATH')) || 'hc' : undefined
+    let published: string | undefined
+    let scanVersion = 0
+    let publishing = Promise.resolve()
 
     // Jobs: DIR/ID.json, then .out, .err and .done from scripts/sidecar-job, then .delivered once handed to the model.
     const jobDir = `${dir}/jobs/${owner}`
@@ -243,7 +249,9 @@ export const register: Register = on => {
       timer = $.clock.after(fast ? FAST_MS : SLOW_MS, () => void poll())
     }
     const scan = async () => {
-      const entries = await $.fs.list(dir).catch(() => [])
+      const version = ++scanVersion
+      const entries = await $.fs.list(dir).catch(() => undefined)
+      if (!entries) return
       const names = new Set(entries.map(entry => entry.name))
       const found: SlotRow[] = []
       for (const entry of entries) {
@@ -276,6 +284,25 @@ export const register: Register = on => {
       const before = await read($, rows)
       if (JSON.stringify(before) !== JSON.stringify(found)) await update($, rows, () => found)
       await tick()
+      if (hc && hcTerminal) {
+        // Export the exact same slot selection, not whether the sidecar process still exists.
+        const active = []
+        for (const row of found) {
+          const name = row.slot === '1' ? owner : `${owner}-${row.slot}`
+          try {
+            const { agentId } = JSON.parse(await raw(`${dir}/runner/${name}.json`))
+            if (typeof agentId === 'string' && agentId) active.push([row.machine, agentId.split('@', 1)[0], row.waiting])
+          } catch { /* The launcher may not have allocated a terminal for this slot yet. */ }
+        }
+        const snapshot = JSON.stringify(active)
+        // A refresh can overlap a timer scan. Never let its older snapshot finish last.
+        publishing = publishing.then(async () => {
+          if (version !== scanVersion || snapshot === published) return
+          const result = await $.process.run([hc, 'label', hcTerminal, `claude-sidecar.active=${snapshot}`], { timeoutMs: 2500 }).catch(() => undefined)
+          if (result?.exitCode === 0) published = snapshot
+        })
+        await publishing
+      }
     }
     // Elapsed times redraw every second, only while a running row is shown.
     const tick = async () => {

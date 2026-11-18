@@ -23,6 +23,8 @@ const MACHINE_MAINTENANCE_LEASE_MS = 60_000;
 const LEASE_RENEWAL_MS = 1000;
 /** Pi on a loaded laptop took 20s to pick up its task. A pi that exits is caught sooner, by its missing name. */
 const MACHINE_START_TIMEOUT_MS = 120_000;
+// An interactive Claude pane can take longer than a Pi child to reach UserPromptSubmit.
+const CLAUDE_PROMPT_TIMEOUT_MS = 60_000;
 const CLOSE_GRACE_MS = 2000;
 /** Status lag and a glance at a just-finished pane do not keep it open. */
 const DONE_SETTLE_MS = 120_000;
@@ -290,7 +292,7 @@ export class HerdrRunner {
 					parentTabId: caller.tabId, parentWorkspaceId: caller.workspaceId, parentMachine: this.machine ? MACHINE : undefined,
 				} : undefined;
 				// Adoption and the previous-run CAS must commit together, including against legacy callers.
-				return this.store.beginRun(record.id, previous, prompt, notify, this.now(), ownership, this.startTimeoutMs);
+				return this.store.beginRun(record.id, previous, prompt, notify, this.now(), ownership, this.startTimeoutMs(record.runtime));
 			}, combined);
 			const record = await this.resolve(ref.agentId);
 			try {
@@ -308,6 +310,10 @@ export class HerdrRunner {
 		const record = await this.store.findAgent(agentId);
 		if (!record) throw new Error(`Agent not found: "${agentId}". Legacy agents cannot be resumed with protocol 2.`);
 		return record;
+	}
+
+	activePanes(parentPaneId: string, parentSessionFile?: string, parentMachine?: string) {
+		return this.store.activePanes(this.herdrSession, parentPaneId, parentSessionFile, parentMachine);
 	}
 
 	read(ref: RunRef): Promise<RunSnapshot> { return this.store.read(ref); }
@@ -460,8 +466,9 @@ export class HerdrRunner {
 		return pane?.session !== undefined && sameSession(pane.session, agent);
 	}
 
-	private get startTimeoutMs(): number | undefined {
-		return this.machine ? MACHINE_START_TIMEOUT_MS : undefined;
+	private startTimeoutMs(runtime: SpawnRequest["runtime"]): number | undefined {
+		if (this.machine) return MACHINE_START_TIMEOUT_MS;
+		return runtime === "claude-code" ? CLAUDE_PROMPT_TIMEOUT_MS : undefined;
 	}
 
 	private get maintenanceLeaseMs(): number {
@@ -653,7 +660,7 @@ export class HerdrRunner {
 				if (!launch) await this.deps.client.startClaude!({ name: task.id, paneId: paneId!, args }, signal);
 			} else if (!launch) await this.deps.client.startPi({ name: task.id, paneId: paneId!, args }, signal);
 			check(signal);
-			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now(), this.startTimeoutMs);
+			await this.store.publish(ref, taskMessage(task), request.runInBackground, this.now(), this.startTimeoutMs(request.runtime));
 			published = true;
 			if (claude && !signal.aborted) await this.serviceClaude(task.id, signal);
 			if (signal.aborted) { await this.cancel(ref); return ref; }

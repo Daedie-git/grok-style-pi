@@ -7,7 +7,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HerdrCliError, type HerdrAgentRef, type HerdrClient } from "herdr-runner/client.ts";
 import { createHerdrSubagents } from "../src/herdr/extension.ts";
-import { createHcCli, HC_AGENT_LABEL, HC_SESSION_LABEL, HcError, hcConnect, hcCoreId, hcRef, hcSession, hcSessionTag, hcTerminalName, listHcMachines, type HcCall, type HcFocus } from "herdr-runner/hc.ts";
+import { createHcCli, HC_ACTIVE_PANES_LABEL, HC_AGENT_LABEL, HC_SESSION_LABEL, HcError, hcConnect, hcCoreId, hcRef, hcSession, hcSessionTag, hcTerminalName, listHcMachines, type HcCall, type HcFocus } from "herdr-runner/hc.ts";
 import { hostPaneId, terminalHost } from "herdr-runner/host.ts";
 import { HerdrRunner } from "herdr-runner/runner.ts";
 import type { ChildBinding } from "herdr-runner/store.ts";
@@ -356,7 +356,7 @@ async function fixture(t: test.TestContext, tag = hcSessionTag("core-a"), window
 		await runner.store.recordExecutionEvent(ref, binding.token, { type: "completed", result: "remembered" }, now);
 		await runner.store.acknowledgeNotice(ref.runId);
 	};
-	return { root, runner, hc, ref, parent, complete, advance: (ms = 901_000) => { now += ms; } };
+	return { root, runner, hc, ref, parent, binding, complete, advance: (ms = 901_000) => { now += ms; } };
 }
 
 test("an hc subagent runs in a child terminal, closes when done and reopens cold", async (t) => {
@@ -497,6 +497,50 @@ test("an app child attaches once its runner records the terminal, and publishes 
 	await handlers.get("session_shutdown")!({ reason: "quit" });
 	handlers.delete("session_shutdown");
 	assert.equal(hc.terminals.get("t2")!.labels[HC_SESSION_LABEL], undefined);
+});
+
+test("a coordinating Pi publishes current runs and questions, not surviving terminals", { timeout: 12_000 }, async (t) => {
+	const f = await fixture(t);
+	assert.ok(f.binding);
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = {
+		on(event: string, handler: (...args: any[]) => any) { handlers.set(event, handler); },
+		registerTool() {}, appendEntry() {}, sendMessage() {}, sendUserMessage() {},
+	} as unknown as ExtensionAPI;
+	const client = createHcCli({ HC_TERMINAL_ID: "t1" }, { call: f.hc.call, focus: async () => "t2" });
+	const file = "/sessions/owner.jsonl";
+	let now = 1_001_000;
+	const start = async (sessionFile: string) => {
+		const ctx = {
+			isIdle: () => true, abort() {}, ui: { notify() {} },
+			sessionManager: { getEntries: () => [], getBranch: () => [], getSessionFile: () => sessionFile, getSessionId: () => sessionFile },
+		} as unknown as ExtensionContext;
+		await handlers.get("session_start")!({}, ctx);
+	};
+	const waitFor = async (expected: string) => {
+		now += 1000;
+		for (let i = 0; i < 100 && f.parent.labels[HC_ACTIVE_PANES_LABEL] !== expected; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(f.parent.labels[HC_ACTIVE_PANES_LABEL], expected);
+	};
+	await createHerdrSubagents({ root: f.root, agentDir: f.root, client, env: { HC_TERMINAL_ID: "t1" }, now: () => now, listMachines: async () => [] })(pi);
+	t.after(() => handlers.get("session_shutdown")?.({ reason: "quit" }));
+	await start(file);
+	await waitFor('[["",[["t2",false]]]]');
+	await f.runner.store.claimNextCommand(f.ref.agentId, f.binding.token, false);
+	await f.runner.store.recordExecutionEvent(f.ref, f.binding.token, { type: "live" }, now);
+	await f.runner.store.recordExecutionEvent(f.ref, f.binding.token, { type: "needs-answer", result: "Which file?" }, now);
+	await waitFor('[["",[["t2",true]]]]');
+	const resumed = await f.runner.resume(f.ref.agentId, "Use the test file");
+	await waitFor('[["",[["t2",false]]]]');
+	await f.runner.store.claimNextCommand(resumed.agentId, f.binding.token, false);
+	await f.runner.store.recordExecutionEvent(resumed, f.binding.token, { type: "live" }, now);
+	await f.runner.store.recordExecutionEvent(resumed, f.binding.token, { type: "failed", error: "Run failed" }, now);
+	await waitFor('[["",[]]]');
+	assert.equal(f.hc.terminals.get("t2")?.state, "live");
+	await handlers.get("session_shutdown")!({ reason: "new" });
+	assert.equal(f.parent.labels[HC_ACTIVE_PANES_LABEL], undefined);
+	await start("/sessions/another.jsonl");
+	await waitFor('[["",[]]]');
 });
 
 test("each hc core session keeps its own records; another core's runner leaves them alone", async (t) => {

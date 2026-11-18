@@ -30,6 +30,7 @@ export async function hcCoreId(call: HcCall): Promise<string> {
 export const HC_AGENT_LABEL = "herdr-subagents.agent";
 /** `<pid>:<session file name>`, written by the Pi that runs in the terminal. */
 export const HC_SESSION_LABEL = "herdr-subagents.session";
+export const HC_ACTIVE_PANES_LABEL = "pi-subagents.active";
 
 const CALL_TIMEOUT_MS = 70_000;
 /** hc answers a listing only after every connected machine does, so even local calls can wait on SSH. */
@@ -325,6 +326,9 @@ export function createHcCli(env: NodeJS.ProcessEnv = process.env, options: HcOpt
 			const terminals = (await list({ all: true }, options.signal)).filter(tracked);
 			const focused = await focus();
 			return terminals.map((terminal) => hcRef(terminal, paneOf(terminal), focused));
+		},
+		async publishActivePanes(paneId, snapshot) {
+			await call("terminal.label", { terminal: address(paneId), labels: { [HC_ACTIVE_PANES_LABEL]: snapshot ? JSON.stringify(snapshot) : "" } }, { timeout: 5000 });
 		},
 		async publishSession(paneId, sessionFile, pid = process.pid) {
 			const value = sessionFile ? `${pid}:${sessionFile.split(/[\\/]/).pop()}` : "";

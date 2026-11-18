@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent } from "./state.ts";
+import { START_TIMEOUT_MS, expireUnaccepted, isTerminal, transition, type RunRef, type RunSnapshot, type ExecutionEvent, type ActivePane } from "./state.ts";
 import { HERDR_REMOTE_PROTOCOL, agentNamePrefix, agentNumbers, herdrSubagentRoot, type MaintenanceObservation } from "./store.ts";
 import { CLAUDE_MARKER, CLAUDE_START_TIMEOUT_MS, claudeActorPrefix, claudePermissionKey, localClaudeHook, type ClaudeHookCommand, type ClaudeHookInput } from "./claude.ts";
 import type { AgentRecord, AgentOwnership, HerdrTask, LaunchFacts, LaunchRecord, LaunchStage, Command, ChildBinding, CompletionNotice } from "./store.ts";
@@ -87,7 +87,9 @@ function transaction<T>(body: () => T): T {
 		db.exec("COMMIT");
 		return result;
 	} catch (error) {
-		db.exec("ROLLBACK");
+		// SQLite can end the transaction itself (for example on SQLITE_FULL).
+		// Cleanup is best-effort and must not replace the original error.
+		try { if (db.isTransaction) db.exec("ROLLBACK"); } catch {}
 		throw error;
 	}
 }
@@ -672,6 +674,18 @@ const operations = {
 			if (launch(ref).owner !== owner) throw new Error("Launch ownership changed");
 			return saveRun(transition(run(ref), { type: stopped ? "stopped" : "failed", error }, now));
 		});
+	},
+	activePanes(herdrSession: string, parentPaneId: string, parentSessionFile?: string, parentMachine?: string): ActivePane[] {
+		const rows = db.prepare(`SELECT a.pane, json_extract(r.data,'$.phase') AS phase FROM agents a
+			JOIN runs r ON r.id=json_extract(a.data,'$.currentRunId')
+			WHERE a.pane IS NOT NULL AND a.pane<>'' AND json_extract(a.data,'$.paneState') IS NULL
+			AND json_extract(a.data,'$.herdrSession') = ?
+			AND json_extract(a.data,'$.parentPaneId') = ?
+			AND (json_extract(a.data,'$.parentSessionFile') IS NULL OR json_extract(a.data,'$.parentSessionFile') IS ?)
+			AND (json_extract(a.data,'$.parentMachine') IS NULL OR json_extract(a.data,'$.parentMachine') IS ?)
+			AND json_extract(r.data,'$.phase') IN ('queued','starting','running','blocked','needs-answer')
+			ORDER BY a.pane`).all(herdrSession, parentPaneId, parentSessionFile ?? null, parentMachine ?? null);
+		return rows.map(({ pane, phase }) => [String(pane), phase === "blocked" || phase === "needs-answer"]);
 	},
 	notices(parentPaneId: string, parentSessionFile?: string, parentMachine?: string): CompletionNotice[] {
 		return db.prepare(`SELECT r.data,a.data AS agent_data FROM notices n JOIN runs r ON r.id=n.run JOIN agents a ON a.id=r.agent

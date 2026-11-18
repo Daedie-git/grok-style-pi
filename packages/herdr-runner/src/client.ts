@@ -75,6 +75,8 @@ export interface HerdrClient {
 	/** Records which conversation this process runs in its pane, for hosts that cannot see it; undefined withdraws it. */
 	/** `pid` is the process that runs the conversation, by default this one. */
 	publishSession?(paneId: string, sessionFile: string | undefined, pid?: number): Promise<void>;
+	/** Publish the owning Pi's active child terminals, independent of terminal lifetime. */
+	publishActivePanes?(paneId: string, snapshot: import("./state.ts").ActivePaneScope[] | undefined): Promise<void>;
 }
 
 export function paneIdFromSplit(payload: unknown): string {

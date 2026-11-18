@@ -1,7 +1,7 @@
 import { defineTool, getAgentDir, truncateHead, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { fileURLToPath } from "node:url";
-import { createChildSession, type ChildSession, type ChildIdentity } from "herdr-runner/child.ts";
+import { createChildSession, type ChildSession, type ChildIdentity, type ChildOutcome } from "herdr-runner/child.ts";
 import { createBackendController, type HerdrBackendHandle } from "herdr-runner/backend.ts";
 export type { HerdrBackendHandle, HerdrBackendNotice, HerdrBackendRequest } from "herdr-runner/backend.ts";
 import type { ActivePaneScope, ExecutionEvent, RunRef } from "herdr-runner/state.ts";
@@ -65,7 +65,7 @@ export function createHerdrSubagents(overrides: HerdrSubagentOptions = {}): Exte
 		let timer: ReturnType<typeof setInterval> | undefined;
 		let streaming = false;
 		let assistant = "";
-		let outcome: "completed" | "aborted" | "error" = "completed";
+		let outcome: ChildOutcome = "completed";
 		const messenger = {
 			sendUserMessage(text: string, options?: { deliverAs?: "steer" | "followUp" }) {
 				pi.sendUserMessage(text, options);
@@ -415,14 +415,21 @@ function toolResult(result: ToolText) {
 	return { content: [{ type: "text" as const, text }], details: result.details };
 }
 
-function runOutcome(messages: unknown): "completed" | "aborted" | "error" {
+function runOutcome(messages: unknown): ChildOutcome {
 	if (!Array.isArray(messages)) return "completed";
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") continue;
-		const reason = (message as { stopReason?: string }).stopReason;
-		if (reason === "error") return "error";
-		if (reason === "aborted") return "aborted";
+		const { stopReason, errorMessage } = message as { stopReason?: string; errorMessage?: unknown };
+		if (stopReason === "error") {
+			// Recognize the observed Codex diagnostic and Pi's normalized finish reason. Never forward the raw error.
+			if (typeof errorMessage === "string" && (
+				/\bflagged for possible cybersecurity risk\b/i.test(errorMessage) ||
+				/^Provider finish_reason: content_filter$/i.test(errorMessage.trim())
+			)) return "safety-blocked";
+			return "error";
+		}
+		if (stopReason === "aborted") return "aborted";
 		return "completed";
 	}
 	return "completed";

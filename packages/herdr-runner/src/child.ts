@@ -17,12 +17,14 @@ export interface ChildIdentity {
 	checkpoint?: { ref: RunRef; event: ExecutionEvent };
 }
 
+export type ChildOutcome = "completed" | "aborted" | "error" | "safety-blocked";
+
 export interface ChildSession {
 	poll(): Promise<void>;
 	input(text: string): Promise<{ action: "handled" } | { action: "transform"; text: string } | undefined>;
 	noteStatus(status: "running" | "blocked"): Promise<void>;
 	noteLive(): Promise<void>;
-	noteSettled(outcome: "completed" | "aborted" | "error"): Promise<void>;
+	noteSettled(outcome: ChildOutcome): Promise<void>;
 	needsAnswer(question: string): Promise<void>;
 	noteExit(): Promise<void>;
 	noteTurn(): Promise<void>;
@@ -158,9 +160,11 @@ export async function createChildSession(store: HerdrStore, paneId: string, iden
 			const result = messenger.assistantText() || undefined;
 			return enqueue(async () => {
 				if (!ref || (!armed && !cancelling)) return;
-				await finish(ref, {
-					type: outcome === "completed" ? "completed" : outcome === "aborted" ? "stopped" : "failed",
-					result, error: outcome === "aborted" ? "Stopped" : outcome === "error" ? "The agent failed." : undefined,
+				if (outcome === "completed") await finish(ref, { type: "completed", result });
+				else if (outcome === "aborted") await finish(ref, { type: "stopped", result, error: "Stopped" });
+				else await finish(ref, {
+					type: "failed", result,
+					error: outcome === "safety-blocked" ? "The run was blocked by the provider's safety policy." : "The agent failed.",
 				});
 			});
 		},

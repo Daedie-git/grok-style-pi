@@ -108,6 +108,16 @@ test("a failed run reports no report and exits 2", async (t) => {
 	assert.match(result.stderr, /no report .* failed: model unavailable/);
 });
 
+test("a provider safety block is reported to Claude as a failed request, without a report or retry", async (t) => {
+	const message = "The run was blocked by the provider's safety policy.";
+	const f = fixture(t, () => ({ type: "failed", error: message, result: "Unfinished sidecar output" }));
+	const result = await f.run("ask", "Review the parser.");
+	assert.equal(result.code, EXIT.noReport);
+	assert.match(result.stderr, /the run failed: The run was blocked by the provider's safety policy\./);
+	assert.ok(!result.stdout.includes("Unfinished sidecar output"));
+	assert.equal(f.prompts.length, 1);
+});
+
 test("role instructions keep the guidance and replace the launcher's delivery protocol", () => {
 	for (const backend of ["pi", "claude"] as const) {
 		const text = roleInstructions("reviewer", backend);

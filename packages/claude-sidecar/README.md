@@ -49,6 +49,8 @@ A request starts the slot's agent, or resumes its conversation, and waits for th
 | 5 | the sidecar is blocked on an approval in its pane |
 | 7 | `stop` refused while a request runs |
 
+When a Pi sidecar ends with a recognized provider safety block, the job exits 2 and tells Claude the run was blocked by the provider's safety policy. The notice does not include the raw provider error, and the launcher does not retry the request.
+
 Role prompts are `sidecar/<role>.md` after a shared protocol (`src/prompts.ts`). Local pi sidecars also load the repository's `.claude/skills`.
 
 ## Pane lifecycle

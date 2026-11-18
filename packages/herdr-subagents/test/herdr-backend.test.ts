@@ -171,6 +171,38 @@ test("backend mode retains child input authorization, tool filtering and settled
 	assert.deepEqual(child.tools.map((tool: any) => tool.name), ["needs_answer"]);
 });
 
+for (const [label, diagnostic, expected] of [
+	["cybersecurity flag", "Codex backend error: This content was flagged for possible cybersecurity risk. Private provider detail.", "The run was blocked by the provider's safety policy."],
+	["content filter", "Provider finish_reason: content_filter", "The run was blocked by the provider's safety policy."],
+	["unrelated error", "Could not load cybersecurity settings. Private provider detail.", "The agent failed."],
+] as const) {
+	test(`backend reports ${label} at settlement without forwarding the raw provider error`, { timeout: 15_000 }, async (t) => {
+		const f = fixture(t);
+		const parent = await install(f);
+		const notices: HerdrBackendNotice[] = [];
+		parent.backend.onNotice((notice) => notices.push(notice));
+		await parent.start();
+		const ref = await parent.backend.spawn(request(f.root), parent.ctx);
+		const record = await f.observer.resolve(ref.agentId);
+		const child = await install(f, record.paneId, record.sessionFile, record.sessionId);
+		await child.start();
+		await until(() => child.sent.length === 1);
+		assert.equal((await child.handlers.get("input")!({ text: child.sent[0] })).action, "transform");
+		await child.handlers.get("agent_start")!();
+		await child.handlers.get("agent_end")!({ messages: [{ role: "assistant", stopReason: "error", errorMessage: diagnostic }] });
+		assert.equal((await f.observer.read(ref)).phase, "running", "Pi can still continue before settlement");
+		await child.handlers.get("agent_settled")!({ aborted: false });
+		const settled = await f.observer.read(ref);
+		assert.equal(settled.phase, "failed");
+		assert.equal(settled.error, expected);
+		await until(() => notices.length === 1);
+		assert.equal(notices[0].phase, "failed");
+		assert.ok(notices[0].content.includes(expected));
+		assert.ok(!notices[0].content.includes(diagnostic));
+		assert.equal(child.sent.length, 1, "Herdr does not retry a failed run");
+	});
+}
+
 test("backend cancellation reports a request before child acknowledgement and Claude steering is unsupported", { timeout: 15_000 }, async (t) => {
 	const f = fixture(t);
 	const parent = await install(f);

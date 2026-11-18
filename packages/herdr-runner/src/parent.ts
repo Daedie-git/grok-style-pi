@@ -1,7 +1,7 @@
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHerdrCli, findHerdrMachine, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrExec, type HerdrMachine } from "./client.ts";
+import { createHerdrCli, findHerdrMachine, MachineSelectionError, herdrSessionName, listHerdrMachines, pickHerdrMachine, type HerdrAgentRef, type HerdrClient, type HerdrExec, type HerdrMachine } from "./client.ts";
 import { HerdrRunner, splitAgentId, type ResumeCaller } from "./runner.ts";
 import { machineDefaultCwd, machineWorkerEntry, readHerdrSettings, type HerdrSettings } from "./config.ts";
 import { HERDR_REMOTE_PROTOCOL, herdrSubagentRoot, sshChannel, type HerdrStore, type StoreChannelFactory } from "./store.ts";
@@ -159,7 +159,7 @@ export class HerdrParent {
 	async findMachine(selector: string): Promise<HerdrMachine> {
 		if (!this.hc) return findHerdrMachine(selector, this.deps.env);
 		const machine = pickHerdrMachine(await listHcMachines(this.hcCall), selector);
-		if (!machine) throw new Error(`Unknown hc machine '${selector}'. Add it with hc machine add, then check hc machine ls.`);
+		if (!machine) throw new MachineSelectionError(`Unknown hc machine '${selector}'. Add it with hc machine add, then check hc machine ls.`);
 		return machine;
 	}
 
@@ -362,14 +362,17 @@ export class HerdrParent {
 	}
 }
 
+/** The machine answered, but runs an incompatible runner; retrying cannot help. */
+export class RemoteProtocolError extends Error {}
+
 async function assertRemoteProtocol(store: HerdrStore, machine: string): Promise<void> {
 	const update = (side: string) => `Update herdr-subagents (or the Grok package that includes it) on ${side} so both match, then retry.`;
 	const remote = await store.remoteProtocol().catch((error: Error) => {
 		// Packages before the handshake lack the operation, so this is the one error text worth matching.
-		if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${machine} runs an older Herdr subagent runner. ${update(machine)}`);
+		if (/Unknown Herdr control operation/.test(error.message)) throw new RemoteProtocolError(`${machine} runs an older Herdr subagent runner. ${update(machine)}`);
 		throw error;
 	});
 	if (remote !== HERDR_REMOTE_PROTOCOL) {
-		throw new Error(`${machine} speaks remote protocol ${remote}; this machine speaks ${HERDR_REMOTE_PROTOCOL}. ${update(remote < HERDR_REMOTE_PROTOCOL ? machine : "this machine")}`);
+		throw new RemoteProtocolError(`${machine} speaks remote protocol ${remote}; this machine speaks ${HERDR_REMOTE_PROTOCOL}. ${update(remote < HERDR_REMOTE_PROTOCOL ? machine : "this machine")}`);
 	}
 }

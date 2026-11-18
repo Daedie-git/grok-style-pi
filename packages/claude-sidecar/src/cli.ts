@@ -6,7 +6,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { HerdrParent, type ParentOptions } from "../herdr-runner/src/parent.ts";
+import { HerdrParent, RemoteProtocolError, type ParentOptions } from "../herdr-runner/src/parent.ts";
+import { MachineSelectionError } from "../herdr-runner/src/client.ts";
 import { qualifiedAgentId, type HerdrRunner, type SpawnRequest } from "../herdr-runner/src/runner.ts";
 import { isTerminal, type RunRef, type RunSnapshot } from "../herdr-runner/src/state.ts";
 import { Checks } from "./checks.ts";
@@ -46,6 +47,8 @@ export interface CliOptions {
 	/** Interval of "still working" lines on stderr. */
 	progressMs?: number;
 	pollMs?: number;
+	/** Delay between attempts to reopen a dropped machine channel. */
+	reconnectMs?: number;
 	/** How long `maintain` keeps panes under supervision. */
 	maintainMs?: number;
 }
@@ -111,6 +114,25 @@ function repoSkills(cwd: string): string[] {
 	return path && existsSync(path) && statSync(path).isDirectory() ? [path] : [];
 }
 
+const RECONNECT_MS = 10_000;
+interface Outage { limit: number; deadline: number; retrying: boolean }
+class Stalled extends Error {}
+
+/** SIDECAR_RECONNECT_S in ms: how long a request on another machine waits for its dropped channel to reopen. */
+function reconnectLimit(env: NodeJS.ProcessEnv): number {
+	const seconds = Number(env.SIDECAR_RECONNECT_S ?? 3600);
+	if (!Number.isFinite(seconds) || seconds < 0 || seconds * 1000 > 2 ** 31 - 1) throw new Error("SIDECAR_RECONNECT_S must be a number of seconds from 0 to 2147483");
+	return seconds * 1000;
+}
+
+/** Rejects with Stalled when WORK takes longer than MS. */
+async function within<T>(work: Promise<T>, ms: number, machine: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Stalled(`no reply from ${machine}`)), Math.max(0, ms)); })]);
+	} finally { clearTimeout(timer); }
+}
+const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 /** The Claude models a sidecar may run: `claudeModels` in `~/.config/claude-sidecar/config.json`, first as the default. */
@@ -312,7 +334,8 @@ export class SidecarCli {
 				}
 				// A run left by a killed launcher finishes before this one starts.
 				const previous = await this.settle(local, runner, { agentId: routed.id, runId: agent.currentRunId });
-				if (previous.phase === "blocked") return this.blocked(agent.herdrName);
+				runner = previous.runner;
+				if (previous.snapshot.phase === "blocked") return this.blocked(agent.herdrName);
 				if (options.keep) await runner.store.setKeep(routed.id, true);
 				const caller = await this.parent.caller(runner, agent.cwd ?? this.cwd, this.ownerSession);
 				ref = await runner.resume(routed.id, prompt, undefined, true, caller);
@@ -333,8 +356,8 @@ export class SidecarCli {
 			slot.beginRequest(id, Math.floor(Date.now() / 1000), record.machine);
 			if (kind === "answer") slot.pending(slot.pendingId(), id);
 			try {
-				const snapshot = await this.settle(local, runner, ref, id);
-				return await this.deliver(slot, record, runner, ref, snapshot, id, kind, globals.slot);
+				const settled = await this.settle(local, runner, ref, id);
+				return await this.deliver(slot, record, settled.runner, ref, settled.snapshot, id, kind, globals.slot);
 			} finally {
 				// stop --fresh may have forgotten the slot meanwhile; its conversation must stay discarded.
 				if (slot.read()?.agentId === record.agentId) slot.write({ ...record, inflight: undefined });
@@ -406,16 +429,36 @@ export class SidecarCli {
 		await this.parent.deps.client.publishSession?.(this.parent.paneId, this.ownerSession, pid).catch(() => undefined);
 	}
 
-	/** Maintains coordination until RUN ends or blocks; prints a progress line while it works. */
-	private async settle(local: HerdrRunner, runner: HerdrRunner, ref: RunRef, label?: string): Promise<RunSnapshot> {
+	/**
+	 * Maintains coordination until RUN ends or blocks; prints a progress line while it works. A dropped machine channel
+	 * is reopened while the run continues there; returns the runner that read the final snapshot.
+	 */
+	private async settle(local: HerdrRunner, runner: HerdrRunner, ref: RunRef, label?: string): Promise<{ snapshot: RunSnapshot; runner: HerdrRunner }> {
 		const poll = this.options.pollMs ?? 200;
 		const progress = this.options.progressMs ?? Number(this.env.SIDECAR_PROGRESS_S ?? 60) * 1000;
 		const started = this.parent.deps.now();
 		let next = started + progress;
+		// Lasts until a replacement channel reads the run, so a flapping machine cannot reset the budget.
+		let outage: Outage | undefined;
 		for (;;) {
-			const snapshot = await runner.read(ref);
-			if (isTerminal(snapshot.phase) || snapshot.phase === "blocked") return snapshot;
-			await this.parent.tick(local, { service: async () => undefined, reportError: (error) => { if (error) this.io.stderr(`sidecar: ${error instanceof Error ? error.message : String(error)}\n`); } });
+			let snapshot: RunSnapshot;
+			try { snapshot = await (outage ? within(runner.read(ref), outage.deadline - this.parent.deps.now(), runner.machine!) : runner.read(ref)); }
+			catch (error) {
+				if (!runner.machine || !(runner.store.failed || error instanceof Stalled)) throw error;
+				if (!outage) {
+					const limit = reconnectLimit(this.env);
+					outage = { limit, deadline: this.parent.deps.now() + limit, retrying: false };
+					this.io.stderr(`sidecar: lost the connection to ${runner.machine}; the run continues there, reconnecting (${messageOf(error)})\n`);
+				}
+				runner = await this.reconnect(runner, outage, error);
+				continue;
+			}
+			if (outage) {
+				this.io.stderr(`sidecar: reconnected to ${runner.machine}\n`);
+				outage = undefined;
+			}
+			if (isTerminal(snapshot.phase) || snapshot.phase === "blocked") return { snapshot, runner };
+			await this.parent.tick(local, { service: async () => undefined, reportError: (error) => { if (error) this.io.stderr(`sidecar: ${messageOf(error)}\n`); } });
 			const now = this.parent.deps.now();
 			if (label && progress > 0 && now >= next) {
 				const seconds = Math.floor((now - started) / 1000);
@@ -423,6 +466,28 @@ export class SidecarCli {
 				next = now + progress;
 			}
 			await this.parent.deps.sleep(poll);
+		}
+	}
+
+	/** Reopens a failed machine channel every RECONNECT_MS, each attempt bounded by the outage's remaining budget. */
+	private async reconnect(failed: HerdrRunner, outage: Outage, last: unknown): Promise<HerdrRunner> {
+		const machine = failed.machine!;
+		const { now, sleep } = this.parent.deps;
+		// Dropping forgets the machine at once; closing a stalled channel or setup must not hold this request.
+		const drop = (expected?: HerdrRunner) => { this.parent.dropMachine(machine, expected).catch(() => undefined); };
+		drop(failed);
+		for (;;) {
+			if (outage.retrying) await sleep(Math.max(0, Math.min(this.options.reconnectMs ?? RECONNECT_MS, outage.deadline - now())));
+			outage.retrying = true;
+			const remaining = outage.deadline - now();
+			if (remaining <= 0) throw new Error(`${machine} unreachable for ${Math.round(outage.limit / 1000)}s; the run may still be working there: ${messageOf(last)}`);
+			try { return await within(this.parent.machine(machine), remaining, machine); }
+			catch (reason) {
+				// A mismatched runner, or a machine no longer saved or enabled, will not come back by retrying.
+				if (reason instanceof RemoteProtocolError || reason instanceof MachineSelectionError || (reason as { code?: string }).code === "machine_unknown") throw reason;
+				last = reason;
+				drop();
+			}
 		}
 	}
 
@@ -641,10 +706,10 @@ export class SidecarCli {
 		const { id, runner } = await this.parent.routeLive(record.agentId);
 		const agent = await runner.resolve(id);
 		const ref = { agentId: id, runId: agent.currentRunId };
-		const snapshot = await this.settle(local, runner, ref);
+		const settled = await this.settle(local, runner, ref);
 		const reqId = requestId("wait", slot.name);
 		this.io.stdout(`# Sidecar report (${slot.reportPath(reqId)})\n`);
-		return this.deliver(slot, record, runner, ref, snapshot, reqId, "wait", "");
+		return this.deliver(slot, record, settled.runner, ref, settled.snapshot, reqId, "wait", "");
 	}
 
 	private report(slot: SlotState): number {

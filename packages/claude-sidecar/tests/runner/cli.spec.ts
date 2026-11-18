@@ -6,6 +6,10 @@ import test from "node:test";
 import { EXIT } from "../../src/cli.ts";
 import { claudeQuestion, roleInstructions } from "../../src/prompts.ts";
 import { fixture } from "./fixture.ts";
+import { SlotState } from "../../src/state.ts";
+import { MachineSelectionError } from "../../herdr-runner/src/client.ts";
+import { HcError } from "../../herdr-runner/src/hc.ts";
+import { workerChannel, type StoreChannel, type StoreEvents } from "../../herdr-runner/src/store.ts";
 
 test("ask starts a Pi sidecar owned by the Claude session and prints its report", async (t) => {
 	const f = fixture(t, () => ({ type: "completed", result: "## Verdict\nship" }));
@@ -143,4 +147,124 @@ test("scripts/sidecar runs the front-end, and its hook entries return at once", 
 		assert.match(status.stderr, /run inside a herdr pane or a Herdr app terminal/);
 		for (const hook of ["session-end", "sweep", "done-close"]) assert.equal(spawnSync(launcher, [hook], { env }).status, 0);
 	} finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+/**
+ * Routes slot 2's agent through a "lappy" channel onto the fixture's store. `channel` sees each request on the Nth open
+ * and returns true to swallow it; for the pseudo-request "open" it may return "offline", "hang" or an error to throw instead.
+ */
+async function onMachine(t: test.TestContext, env: Record<string, string>, channel: (open: number, request: Parameters<StoreChannel["post"]>[0], events: StoreEvents) => boolean | "offline" | "hang" | Error) {
+	const f = fixture(t, (_prompt, n) => ({ type: "completed", result: `report ${n}` }));
+	assert.equal((await f.run("--slot", "2", "ask", "first")).code, EXIT.report);
+	const slot = new SlotState(join(f.root, "state"), "sc-w1-p1-2");
+	const record = slot.read()!;
+	slot.write({ ...record, agentId: `${record.agentId}@lappy`, machine: "lappy" });
+	let opens = 0;
+	const machineChannel = async () => {
+		const open = ++opens;
+		const setup = channel(open, { id: 0, operation: "open" } as never, undefined as never);
+		if (setup === "offline") throw new Error("ssh: connect to host lappy port 22: Connection timed out");
+		if (setup === "hang") await new Promise(() => undefined);
+		if (setup instanceof Error) throw setup;
+		const factory = workerChannel(join(f.root, "store"));
+		return (events: StoreEvents) => {
+			const inner = factory(events);
+			return { ...inner, post: (request: Parameters<StoreChannel["post"]>[0]) => { if (!channel(open, request, events)) inner.post(request); } };
+		};
+	};
+	const result = await f.runWith({ reconnectMs: 10, env, parent: {
+		listMachines: async () => [{ id: "m1", label: "lappy", target: "lappy", enabled: true }],
+		machineClient: () => f.client, machineChannel,
+	} }, "--slot", "2", "ask", "second");
+	return { ...result, opens };
+}
+
+test("a request on a machine reconnects a dropped control channel and the recovered channel delivers the report", async (t) => {
+	let begun = false, acknowledged = 0;
+	const result = await onMachine(t, {}, (open, request, events) => {
+		if (request.operation === "open") return open === 2 ? "offline" : false;
+		if (request.operation === "beginRun") begun = true;
+		if (open === 1 && begun && request.operation === "read") { events.fail(new Error("Timeout, server lappy not responding.")); return true; }
+		if (open === 3 && request.operation === "acknowledgeNotice") acknowledged++;
+		return false;
+	});
+	assert.equal(result.code, EXIT.report, result.stderr);
+	assert.match(result.stdout, /report 2/);
+	assert.match(result.stderr, /lost the connection to lappy; the run continues there, reconnecting \(Timeout, server lappy not responding\.\)/);
+	assert.match(result.stderr, /reconnected to lappy/);
+	assert.equal(result.opens, 3);
+	assert.equal(acknowledged, 1, "the recovered channel acknowledges the run's notice");
+});
+
+test("a machine that stays unreachable, or keeps dropping before it reads the run, fails at SIDECAR_RECONNECT_S", async (t) => {
+	for (const flap of [false, true]) {
+		let begun = false;
+		const result = await onMachine(t, { SIDECAR_RECONNECT_S: "0.2" }, (open, request, events) => {
+			if (request.operation === "open") return open > 1 && !flap ? "offline" : false;
+			if (request.operation === "beginRun") begun = true;
+			if (begun && request.operation === "read") { events.fail(new Error("closed")); return true; }
+			return false;
+		});
+		assert.equal(result.code, EXIT.failed, result.stderr);
+		assert.match(result.stderr, /lappy unreachable for 0s; the run may still be working there/);
+		assert.doesNotMatch(result.stderr, /reconnected/);
+		assert.ok(result.opens < 40, `retries keep their cadence (${result.opens} opens)`);
+	}
+});
+
+test("a stalled reconnect handshake ends at the deadline; a protocol mismatch or disabled machine fails at once", async (t) => {
+	let begun = false;
+	const stalled = await onMachine(t, { SIDECAR_RECONNECT_S: "0.2" }, (open, request, events) => {
+		if (request.operation === "beginRun") begun = true;
+		if (open === 1 && begun && request.operation === "read") { events.fail(new Error("closed")); return true; }
+		return open > 1 && request.operation === "remoteProtocol";
+	});
+	assert.equal(stalled.code, EXIT.failed);
+	assert.match(stalled.stderr, /lappy unreachable for 0s; the run may still be working there: no reply from lappy/);
+	begun = false;
+	const mismatch = await onMachine(t, {}, (open, request, events) => {
+		if (request.operation === "beginRun") begun = true;
+		if (open === 1 && begun && request.operation === "read") { events.fail(new Error("closed")); return true; }
+		if (open > 1 && request.operation === "remoteProtocol") { events.reply({ id: request.id, value: 999 }); return true; }
+		return false;
+	});
+	assert.equal(mismatch.code, EXIT.failed);
+	assert.match(mismatch.stderr, /lappy speaks remote protocol 999/);
+	assert.equal(mismatch.opens, 2);
+	for (const refusal of [new MachineSelectionError("Herdr machine 'lappy' is disabled."), new HcError("hc machine lappy is not listed", "machine_unknown")]) {
+		begun = false;
+		const gone = await onMachine(t, {}, (open, request, events) => {
+			if (request.operation === "open") return open > 1 ? refusal : false;
+			if (request.operation === "beginRun") begun = true;
+			if (begun && request.operation === "read") { events.fail(new Error("closed")); return true; }
+			return false;
+		});
+		assert.equal(gone.code, EXIT.failed);
+		assert.ok(gone.stderr.includes(refusal.message), gone.stderr);
+		assert.equal(gone.opens, 2);
+	}
+	// The replacement answers the handshake, then never answers the read.
+	begun = false;
+	const stalledRead = await onMachine(t, { SIDECAR_RECONNECT_S: "0.2" }, (open, request, events) => {
+		if (request.operation === "beginRun") begun = true;
+		if (open === 1 && begun && request.operation === "read") { events.fail(new Error("closed")); return true; }
+		return open > 1 && request.operation === "read";
+	});
+	assert.equal(stalledRead.code, EXIT.failed);
+	assert.match(stalledRead.stderr, /lappy unreachable for 0s; the run may still be working there: no reply from lappy/);
+});
+
+test("reconnect gives up on a setup that never opens a channel, and refuses an invalid budget", async (t) => {
+	for (const [env, expected] of [[{ SIDECAR_RECONNECT_S: "0.2" }, /lappy unreachable for 0s; the run may still be working there: no reply from lappy/], [{ SIDECAR_RECONNECT_S: "soon" }, /SIDECAR_RECONNECT_S must be a number of seconds/]] as const) {
+		let begun = false, dropped = 0;
+		const result = await onMachine(t, env, (open, request, events) => {
+			if (request.operation === "open") return open > 1 ? "hang" : false;
+			if (request.operation === "beginRun") begun = true;
+			if (begun && request.operation === "read") { dropped = Date.now(); events.fail(new Error("closed")); return true; }
+			return false;
+		});
+		assert.equal(result.code, EXIT.failed);
+		assert.match(result.stderr, expected);
+		assert.ok(Date.now() - dropped < 3000, "the request ends near its budget, not when the setup does");
+	}
 });

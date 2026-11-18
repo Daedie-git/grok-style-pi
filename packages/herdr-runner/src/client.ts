@@ -187,12 +187,15 @@ export function pickHerdrMachine(machines: HerdrMachine[], selector: string): He
 	return machines.find((machine) => machine.id === selector) ?? (byLabel.length === 1 ? byLabel[0] : undefined);
 }
 
+/** The saved machine cannot be used as named: unknown, ambiguous or disabled. Retrying cannot help. */
+export class MachineSelectionError extends Error {}
+
 export async function findHerdrMachine(selector: string, env: NodeJS.ProcessEnv = process.env): Promise<HerdrMachine> {
 	const machines = await listHerdrMachines(env);
 	const machine = pickHerdrMachine(machines, selector);
-	if (!machine && machines.some((item) => item.label === selector)) throw new Error(`Herdr machine label '${selector}' is ambiguous; use its profile ID.`);
-	if (!machine) throw new Error(`Unknown Herdr machine '${selector}'. Add it with herdr machine add, then check herdr machine list.`);
-	if (!machine.enabled) throw new Error(`Herdr machine '${selector}' is disabled.`);
+	if (!machine && machines.some((item) => item.label === selector)) throw new MachineSelectionError(`Herdr machine label '${selector}' is ambiguous; use its profile ID.`);
+	if (!machine) throw new MachineSelectionError(`Unknown Herdr machine '${selector}'. Add it with herdr machine add, then check herdr machine list.`);
+	if (!machine.enabled) throw new MachineSelectionError(`Herdr machine '${selector}' is disabled.`);
 	return machine;
 }
 

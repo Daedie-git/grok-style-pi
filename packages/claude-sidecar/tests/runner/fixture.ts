@@ -6,6 +6,7 @@ import type test from "node:test";
 import type { HerdrAgentRef, HerdrClient } from "../../herdr-runner/src/client.ts";
 import type { ChildBinding, HerdrStore } from "../../herdr-runner/src/store.ts";
 import type { ExecutionEvent } from "../../herdr-runner/src/state.ts";
+import type { ParentOptions } from "../../herdr-runner/src/parent.ts";
 import { SidecarCli } from "../../src/cli.ts";
 
 export const OWNER = { paneId: "w1:p1", session: "0b0c0d0e-0000-4000-8000-00000000000a" };
@@ -69,16 +70,16 @@ export function fixture(t: test.TestContext, reply: (prompt: string, n: number) 
 		HERDR_ENV: "1", HERDR_PANE_ID: OWNER.paneId, HERDR_WORKSPACE_ID: "w1", CLAUDE_CODE_SESSION_ID: OWNER.session,
 		CLAUDE_CONFIG_DIR: join(root, "claude"), SIDECAR_STATE_DIR: join(root, "state"), SIDECAR_CONFIG_FILE: join(root, "no-config.json"), PATH: process.env.PATH,
 	};
-	const runWith = async (options: { cwd?: string; stdin?: string; env?: Record<string, string | undefined> }, ...argv: string[]) => {
+	const runWith = async (options: { cwd?: string; stdin?: string; env?: Record<string, string | undefined>; parent?: Partial<ParentOptions>; reconnectMs?: number }, ...argv: string[]) => {
 		let stdout = "", stderr = "";
 		const cli = new SidecarCli({ stdout: (text) => { stdout += text; }, stderr: (text) => { stderr += text; }, stdin: async () => options.stdin ?? "from stdin" }, {
-			env: { ...env, ...options.env } as NodeJS.ProcessEnv, cwd: options.cwd ?? root, pollMs: 10, progressMs: 0,
-			parent: { client, root: join(root, "store"), agentDir: join(root, "agent"), listMachines: async () => [] },
+			env: { ...env, ...options.env } as NodeJS.ProcessEnv, cwd: options.cwd ?? root, pollMs: 10, progressMs: 0, reconnectMs: options.reconnectMs,
+			parent: { client, root: join(root, "store"), agentDir: join(root, "agent"), listMachines: async () => [], ...options.parent },
 		});
 		const code = await cli.run(argv);
 		return { code, stdout, stderr };
 	};
 	const run = (...argv: string[]) => runWith({}, ...argv);
-	return { run, runWith, prompts, starts, root, panes, env, store: () => store };
+	return { run, runWith, prompts, starts, root, panes, env, client, store: () => store };
 }
 

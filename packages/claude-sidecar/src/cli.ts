@@ -53,7 +53,7 @@ export interface CliOptions {
 	maintainMs?: number;
 }
 
-interface Globals { slot: string; role?: Role; agent?: Backend; machine?: string; remoteCwd?: string; profileFile?: string }
+interface Globals { slot: string; role?: Role; agent?: Backend; machine?: string; remoteCwd?: string; profileFile?: string; model?: string; thinking?: string }
 
 /** Hook entries and read-only checks that need no runner. */
 const LIGHT = new Set(["unreviewed", "push-gate", "session-start"]);
@@ -88,6 +88,8 @@ function parse(argv: string[]): { globals: Globals; command: string; rest: strin
 			case "--machine": globals.machine = value; break;
 			case "--remote-cwd": globals.remoteCwd = value; break;
 			case "--profile-file": globals.profileFile = value; break;
+			case "--model": globals.model = value; break;
+			case "--thinking": globals.thinking = value; break;
 			default: throw new UsageError(`${argv[i]} is not supported`);
 		}
 	}
@@ -326,6 +328,7 @@ export class SidecarCli {
 				const routed = await this.parent.routeLive(record.agentId);
 				runner = routed.runner;
 				const agent = await runner.resolve(routed.id);
+				if (globals.model && globals.model !== agent.model) throw new UsageError(`slot ${globals.slot} runs ${agent.model}; use stop --fresh or a new slot for ${globals.model}`);
 				// A model removed from claudeModels ends its slot's conversation. The recorded name must be listed as is: an alias
 				// such as `opus` may have meant another model when the slot started.
 				const allowed = claudeModels(this.env);
@@ -397,8 +400,8 @@ export class SidecarCli {
 		const skills = profile ? profileSkills(profile, this.env.HOME || homedir()) : !machine && agent === "pi" ? repoSkills(this.cwd) : [];
 		const allowed = claudeModels(this.env);
 		const model = agent === "claude"
-			? this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
-			: this.env.SIDECAR_MODEL || "openai-codex/gpt-6.2-sol";
+			? globals.model || this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
+			: globals.model || this.env.SIDECAR_MODEL || "openai-codex/gpt-6.2-sol";
 		if (!model) throw new Error("claudeModels is empty; no Claude model is allowed");
 		const checked = allowedClaudeModel(model, allowed, agent === "claude");
 		return {
@@ -408,7 +411,7 @@ export class SidecarCli {
 			name: `sidecar-${globals.slot}-${role}`,
 			subagentType: role,
 			model: checked,
-			thinking: this.env.SIDECAR_THINKING || (reviewer ? "high" : "medium"),
+			thinking: globals.thinking || this.env.SIDECAR_THINKING || (reviewer ? "high" : "medium"),
 			runInBackground: true,
 			keep,
 			cwd,

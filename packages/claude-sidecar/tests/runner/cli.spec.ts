@@ -82,6 +82,15 @@ test("claudeModels in the sidecar config replaces the allowlist", async (t) => {
 	assert.deepEqual(f.starts.at(-1)!.slice(2, 4), ["--model", "anthropic/claude-sonnet-6"]);
 });
 
+test("--model and --thinking choose a fresh slot's model; follow-ups refuse another model", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const run = await f.run("--slot", "4", "--role", "implementer", "--model", "openai-codex/gpt-6.2-astra", "--thinking", "high", "ask", "x");
+	assert.equal(run.code, 0, run.stderr);
+	assert.deepEqual(f.starts.at(-1)!.slice(2), ["--model", "openai-codex/gpt-6.2-astra", "--thinking", "high"]);
+	assert.match((await f.run("--slot", "4", "--model", "openai-codex/gpt-6.2-sol", "ask", "again")).stderr, /runs openai-codex\/gpt-6.2-astra; use stop --fresh/);
+	assert.equal(f.prompts.length, 1);
+});
+
 test("sidecar Claude aliases follow claudeModels, and follow-ups refuse a model since removed", async (t) => {
 	const f = fixture(t, () => ({ type: "completed", result: "done" }));
 	const config = join(f.root, "config.json");

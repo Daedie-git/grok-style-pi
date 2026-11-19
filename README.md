@@ -40,6 +40,10 @@ Restart Pi after changing `tuiMode`.
 
 Install either the local clone or the GitHub package, not both. When working from the local clone, `/reload` loads your latest changes.
 
+## Herdr App and Claude Code
+
+This repository also contains the [Herdr App mods and layout](packages/herdr-app-mods/README.md) and the [Claude Sidecar plugin](packages/claude-sidecar/README.md). Herdr App itself is a separate application.
+
 ## Standalone media
 
 To use only `show_image`, `show_video`, and `show_html`, load the media-only entrypoint instead of either Grok entrypoint:

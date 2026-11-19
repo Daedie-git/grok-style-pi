@@ -6,7 +6,8 @@ import type { ExtensionAPI, ExtensionContext, ModelRuntime, ToolInfo } from "@ea
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { InProcessBackend, type SessionSpec } from "./backends/in-process.ts";
-import { Control, limitsFromEnv, type Conversation } from "./control.ts";
+import { Control, type Conversation } from "./control.ts";
+import { delegationLimits, type DelegationLimits } from "./delegation-limits.ts";
 import { compileToolSurface, type ToolLite } from "./context/capabilities.ts";
 import { resolveEffort, resolveModel, roleDefaultEffort, type ModelLite } from "./context/model.ts";
 import { childSystemPrompt, contextFilePolicy, taskMessage } from "./context/prompt.ts";
@@ -100,6 +101,7 @@ export type AgentDefaults = Readonly<Record<string, { model?: string; effort?: T
 
 export interface EngineDeps {
 	env: Record<string, string | undefined>;
+	limits?: DelegationLimits;
 	agentDir: string;
 	modelRuntime: () => Promise<ModelRuntime>;
 	/** Overrides definition model/effort defaults, but not explicit launch settings or forced environment settings. */
@@ -180,7 +182,7 @@ export class Engine {
 	 * Rebind runtime-scoped dependencies after a reload handover: children created from now on must use the new runtime's
 	 * policy (autonomy) and installers, not closures captured by the runtime that created this engine.
 	 */
-	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "taskHooks" | "paneDefault" | "memoryEnabled" | "agentDefaults" | "claudeModels">>): void {
+	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "limits" | "taskHooks" | "paneDefault" | "memoryEnabled" | "agentDefaults" | "claudeModels">>): void {
 		this.deps = { ...this.deps, ...deps };
 		this.tasks = undefined;
 	}
@@ -189,7 +191,8 @@ export class Engine {
 		this.deps = deps;
 		this.now = deps.now ?? Date.now;
 		this.resetBound();
-		this.control = new Control(limitsFromEnv(deps.env), {
+		const { maxConcurrent, maxDepth } = deps.limits ?? delegationLimits(deps.env);
+		this.control = new Control({ maxConcurrent, maxDepth }, {
 			persist: (meta) => this.persistMeta(meta),
 			inboxOf: (agentId) => this.inbox(agentId),
 			newRunId,
@@ -465,6 +468,8 @@ export class Engine {
 		const parent = isFork ? this.parentContext(caller, invocation.ctx) : undefined;
 		if (isFork && !parent) return error("The calling conversation is not available to fork.");
 		const explicitPane = params.backend === "pane" || Boolean(params.machine?.trim()) || params.runtime === "claude-code";
+		const inPaneChild = this.paneRuns.available() && !this.paneRuns.defaultsHere();
+		if (explicitPane && (caller.agentId || inPaneChild)) return error("Nested agents run in-process; omit backend/machine/runtime.");
 		if (explicitPane && !this.paneRuns.available()) return error("Herdr panes are only available when running inside Herdr.");
 		if (explicitPane && (isFork || isolate || invocation.internal || skill)) return error("Forks, worktree isolation, workflow agents and skill agents run in-process; omit backend/machine/runtime.");
 		const unenforceable = paneUnenforceable(definition);
@@ -508,7 +513,7 @@ export class Engine {
 		const files = agentFiles(this.deps.agentDir, root.sessionId, agentId);
 		const meta: AgentMeta = {
 			agentId, agentType: definition.agentType, description: params.description.trim(), rootSessionId: root.sessionId,
-			spawnDepth: caller.depth + 1, cwd: invocation.ctx.cwd, sessionFile: files.sessionFile, taskListId: this.taskListId(),
+			spawnDepth: (inPaneChild && !caller.agentId ? 1 : caller.depth) + 1, cwd: invocation.ctx.cwd, sessionFile: files.sessionFile, taskListId: this.taskListId(),
 			backend: "in-process", definition, stopGeneration: 0, runs: [], toolUseId: invocation.toolCallId,
 			model: { requested: params.model, effective: `${model.provider}/${model.id}` },
 			effort: { requested: params.effort, effective: effortChoice.effort ?? parentThinking },
@@ -752,7 +757,10 @@ export class Engine {
 	private workflowTasks?: WorkflowTasks;
 	private outputTokens = 0;
 
+	private workflowsEnabled(): boolean { return this.deps.limits?.workflowsEnabled ?? this.deps.env.PI_SUBAGENT_WORKFLOW !== "0"; }
+
 	workflows(): WorkflowTasks {
+		if (!this.workflowsEnabled()) throw new Error("Workflows are disabled for this session.");
 		this.workflowTasks ??= new WorkflowTasks({ engine: this, agentDir: this.deps.agentDir, env: this.deps.env });
 		return this.workflowTasks;
 	}
@@ -1049,13 +1057,22 @@ export class Engine {
 	/** The definition as a pane applies it: its prompt and, when restricted, the tool surface compiled against the root's tools. */
 	private paneDefinition(definition: AgentDefinition, meta: AgentMeta): PaneRequest["resolved"] {
 		const instructions = definition.prompt || undefined;
-		if ((definition.tools === undefined || definition.tools.includes("*")) && definition.disallowedTools.length === 0 && !definition.isolated) return { instructions };
+		// A pane starts a separate runtime with its own profile; never let it regain delegation at the parent's ceiling.
+		const atLimit = meta.spawnDepth >= this.control.limits.maxDepth;
+		const denyWorkflows = atLimit || !this.workflowsEnabled();
+		const unrestricted = (definition.tools === undefined || definition.tools.includes("*")) && definition.disallowedTools.length === 0 && !definition.isolated;
+		if (!denyWorkflows && unrestricted) return { instructions };
 		const surface = compileToolSurface({
 			definition, available: this.requireRoot().pi.getAllTools().map(toolLite), depth: meta.spawnDepth,
 			maxDepth: this.control.limits.maxDepth, background: false, isFork: false,
 		});
 		// A pane cannot limit which agent types its Agent tool launches.
-		return { instructions, allowedTools: surface.allowedAgentTypes ? surface.active.filter((name) => name !== "Agent") : surface.active };
+		const allowedTools = surface.active.filter((name) => {
+			if (name === "Agent" && surface.allowedAgentTypes) return false;
+			if (denyWorkflows && (name === "Workflow" || name === "RunWorkflow")) return false;
+			return true;
+		});
+		return { instructions, allowedTools };
 	}
 
 	private async continueHerdr(conversation: Conversation, runId: RunId): Promise<void> {

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { getAgentDir, ModelRuntime, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { inChildContext } from "./child-context.ts";
 import { childInstaller } from "./child-installer.ts";
+import { delegationLimits } from "./delegation-limits.ts";
 import { Engine, forkEnabledByEnv, ROOT_CALLER, type EngineDeps } from "./engine.ts";
 import { builtInDefinitions } from "./definitions/builtins.ts";
 import { sessionGuidance, type PolicyInput } from "./policy/text.ts";
@@ -77,6 +78,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		if (inChildContext()) return;
 		const env = options.env ?? process.env;
 		const agentDir = options.agentDir ?? getAgentDir();
+		const limits = options.limits ?? delegationLimits(env, agentDir);
 		const offer = (definitions: AgentDefinition[]): PolicyInput["offered"] =>
 			definitions.map((definition) => ({ agentType: definition.agentType, description: definition.description, tools: definition.tools }));
 		// Built-ins always exist, so the description registered before session start already reflects real routing.
@@ -89,7 +91,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		});
 		const create = (): Engine => {
 			const created = new Engine({
-				env, agentDir, homeDir: options.homeDir ?? homedir(), now: options.now, onSessionCreated: options.onSessionCreated, paneDefault: options.paneDefault,
+				env, agentDir, limits, homeDir: options.homeDir ?? homedir(), now: options.now, onSessionCreated: options.onSessionCreated, paneDefault: options.paneDefault,
 				memoryEnabled: options.memoryEnabled, agentDefaults: options.agentDefaults, claudeModels: options.claudeModels,
 				modelRuntime: options.modelRuntime ?? (() => ModelRuntime.create({
 					authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), modelsStorePath: join(agentDir, "models-store.json"),
@@ -104,7 +106,11 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		registerEngineTools(pi, () => engine, ROOT_CALLER, { policy, panes: options.panes, paneDefault: options.paneDefault, paneGuidance: options.paneGuidance });
 		if (env.PI_SUBAGENT_ALIASES !== "0") registerCompatAliases(pi, () => engine, ROOT_CALLER);
 		if (env.PI_SUBAGENT_TASKS !== "0") registerTaskTools(pi, { store: () => engine.taskStore(), caller: {} });
-		if (env.PI_SUBAGENT_WORKFLOW !== "0") registerWorkflowTool(pi, () => engine.workflows());
+		if (limits.workflowsEnabled) registerWorkflowTool(pi, () => engine.workflows());
+		pi.events.on("grok:runtime-limits:query", (data) => {
+			const request = data as { reply?: unknown } | undefined;
+			if (typeof request?.reply === "function") request.reply({ ...engine.control.limits, workflowsEnabled: limits.workflowsEnabled });
+		});
 
 		const refreshOffered = async (): Promise<PolicyInput["offered"]> => {
 			try {
@@ -120,7 +126,10 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 			const adopted = adoptFromBroker(sessionId);
 			if (adopted) {
 				engine = adopted;
+				// Admission reads this object for every spawn, including in children preserved across /reload.
+				Object.assign(adopted.control.limits, { maxDepth: limits.maxDepth, maxConcurrent: limits.maxConcurrent });
 				adopted.rebindRuntime({
+					limits,
 					childInstaller: options.childInstaller ?? childInstaller(policy),
 					taskHooks: options.taskHooks ?? ((owner) => taskHooks(owner.hookEnvironment(), () => owner.rootHookContext())),
 					paneDefault: options.paneDefault,

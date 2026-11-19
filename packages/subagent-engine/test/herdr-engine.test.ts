@@ -454,6 +454,22 @@ test("paneDefault runs a general-purpose Agent in a pane with the resolved model
 	assert.equal(fake.spawns[0].resolved?.allowedTools, undefined, "an unrestricted definition keeps every pane tool");
 });
 
+test("a last-depth pane gets an allowlist without any delegation tool", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, launchScript, { env: { PI_MAX_SUBAGENT_SPAWN_DEPTH: "1" } });
+	await harness.parent.prompt("Launch a bounded pane", { source: "extension" });
+	const tools = fake.spawns[0].resolved?.allowedTools;
+	assert.ok(tools && tools.includes("read"));
+	for (const tool of ["Agent", "Workflow", "RunWorkflow"]) assert.ok(!tools.includes(tool));
+});
+
+test("pane-child sessions cannot reset their depth by starting an in-process agent", { timeout: 20_000 }, async (t) => {
+	const { harness, fake } = await setup(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "nested", prompt: "work" } }] } : { text: "done" }, { paneChild: true, env: { PI_MAX_SUBAGENT_SPAWN_DEPTH: "1" } });
+	await harness.parent.prompt("Try another launch", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /depth limit/);
+	assert.equal(harness.children.size, 0);
+	assert.equal(fake.spawns.length, 0);
+});
+
 test("paneDefault sends Explore's prompt and read-only tool surface to its pane", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => index === 0
 		? { tools: [{ name: "Agent", args: { description: "Find code", prompt: "Locate pane routing", subagent_type: "Explore" } }] } : { text: "Parent useful work" }, { paneDefault: true });

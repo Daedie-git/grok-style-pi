@@ -9,17 +9,17 @@ export interface ControlLimits {
 	maxDepth: number;
 }
 
-export function limitsFromEnv(env: Record<string, string | undefined>): ControlLimits {
+export function limitsFromEnv(env: Record<string, string | undefined>, defaultDepth = 3): ControlLimits {
 	return {
 		maxConcurrent: positiveInteger(env.PI_MAX_CONCURRENT_SUBAGENTS) ?? 20,
-		maxDepth: positiveInteger(env.PI_MAX_SUBAGENT_SPAWN_DEPTH) ?? 3,
+		maxDepth: positiveInteger(env.PI_MAX_SUBAGENT_SPAWN_DEPTH) ?? defaultDepth,
 	};
 }
 
 function positiveInteger(value: string | undefined): number | undefined {
 	if (!value || !/^\d+$/.test(value.trim())) return undefined;
 	const parsed = Number(value.trim());
-	return parsed > 0 ? parsed : undefined;
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 export type RunPhase = "reserved" | "running" | "finalizing";

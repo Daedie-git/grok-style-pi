@@ -16,12 +16,15 @@ import type { Activity } from "../src/activity/ui.ts";
 import { scripted, until, type Script } from "../packages/subagent-engine/test/fixtures/harness.ts";
 import { FakeEngine } from "./fixtures/engine-activity.ts";
 
-async function fixture(t: TestContext, parent: Script, child: Script, autonomy = true, options: { subagents?: AgentDefaults; env?: Record<string, string> } = {}) {
+async function fixture(t: TestContext, parent: Script, child: Script, autonomy = true, options: { subagents?: AgentDefaults; env?: Record<string, string>; delegation?: { maxSubagentDepth: number; workflowsEnabled: boolean } } = {}) {
 	t.mock.method(globalThis, "fetch", async () => { throw new Error("Network access forbidden"); });
 	mkdirSync(resolve("captures"), { recursive: true });
 	const root = mkdtempSync(join(resolve("captures"), "grok-engine-"));
 	const agentDir = join(root, "agent"); mkdirSync(agentDir);
 	const settingsPath = join(agentDir, "grok-style.json");
+	const delegationPath = join(agentDir, "subagents.json");
+	if (options.delegation) writeFileSync(delegationPath, JSON.stringify(options.delegation));
+	let events!: ExtensionAPI["events"];
 	if (options.subagents) writeFileSync(settingsPath, JSON.stringify({ subagents: options.subagents }));
 	// Real child discovery loads the actual file entrypoint; its child-context guard must make it inert.
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: [fileURLToPath(new URL("../integrations/subagents.ts", import.meta.url))] }));
@@ -39,7 +42,7 @@ async function fixture(t: TestContext, parent: Script, child: Script, autonomy =
 			env: options.env ?? {}, agentDir, homeDir: root, modelRuntime: async () => runtime,
 			onEngine(created) { engine = created; adapter?.dispose(); adapter = new SubagentAdapter(created, (entry) => { if (!activity.includes(entry)) activity.push(entry); }); },
 			onSessionCreated(session) { children.push(session); session.agent.streamFunction = scripted(child, () => {}) as never; },
-		} })],
+		} }), (pi) => { events = pi.events; }],
 	});
 	const oldSteer = process.env.GROK_STEER_DIR; process.env.GROK_STEER_DIR = join(root, "steer");
 	await loader.reload();
@@ -59,7 +62,8 @@ async function fixture(t: TestContext, parent: Script, child: Script, autonomy =
 		if (oldSteer === undefined) delete process.env.GROK_STEER_DIR; else process.env.GROK_STEER_DIR = oldSteer;
 		rmSync(root, { recursive: true, force: true });
 	});
-	return { session, get engine() { return engine; }, get adapter() { return adapter; }, activity, children, features, settingsPath, extensionErrors, modelInput: () => modelInput };
+	return { session, get engine() { return engine; }, get adapter() { return adapter; }, activity, children, features, settingsPath, delegationPath,
+		queryLimits() { let value: unknown; events.emit("grok:runtime-limits:query", { reply: (limits: unknown) => { value = limits; } }); return value; }, extensionErrors, modelInput: () => modelInput };
 }
 
 test("real Grok integration dispatches Agent in a Pi tool loop and records completion", { timeout: 15000 }, async (t) => {
@@ -98,6 +102,26 @@ test("grok-style.json configures each canonical agent type without changing expl
 	assert.equal(explicit.model, "anthropic/claude-sonnet-5-5");
 	assert.equal(explicit.effort, "high");
 	assert.equal(h.children.filter((child) => child.model?.id === "claude-opus-5-5" && child.thinkingLevel === "low").length, 5);
+});
+
+test("host delegation limits govern tools, child admission and diagnostics across reload", { timeout: 15000 }, async (t) => {
+	const h = await fixture(t, ({ index }) => index === 0 ? { tools: [{ name: "Agent", args: { description: "child", prompt: "work", run_in_background: false } }] } : { text: "done" }, () => ({ text: "child" }), true, { delegation: { maxSubagentDepth: 1, workflowsEnabled: false } });
+	const check = (depth: number, workflows: boolean) => {
+		assert.deepEqual(h.queryLimits(), { maxConcurrent: 20, maxDepth: depth, workflowsEnabled: workflows });
+		for (const name of ["Workflow", "RunWorkflow"]) assert.equal(h.session.getAllTools().some((tool) => tool.name === name), workflows);
+	};
+	check(1, false);
+	await h.session.prompt("Launch one child");
+	assert.equal(h.children.length, 1);
+	assert.ok(!h.children[0].getActiveToolNames().includes("Agent"));
+	assert.match(h.engine.control.admissionError({ spawnDepth: 2 })!, /depth limit/);
+	const initial = h.engine;
+	writeFileSync(h.delegationPath, JSON.stringify({ workflowsEnabled: true, maxSubagentDepth: 2 }));
+	await h.session.reload();
+	assert.equal(h.engine, initial);
+	check(2, true);
+	assert.equal(h.engine.control.admissionError({ spawnDepth: 2 }), undefined);
+	assert.deepEqual(h.extensionErrors, []);
 });
 
 test("forced environment settings still override Grok agent defaults", { timeout: 15000 }, async (t) => {

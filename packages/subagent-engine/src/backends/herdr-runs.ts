@@ -141,7 +141,7 @@ export class HerdrRuns {
 		return () => { if (this.generation === generation) { this.generation++; this.unsubscribe?.(); this.unsubscribe = undefined; this.port = undefined; } };
 	}
 	available(): boolean { return Boolean(this.port) && !this.disposed; }
-	/** A pane child's own launches are nested agents, which stay in-process unless a call asks for a pane. */
+	/** A pane child's own launches are nested agents, not top-level pane assignments. */
 	defaultsHere(): boolean { return this.available() && !this.port!.paneChild?.(); }
 	pendingAcknowledgements(): number { return this.acks.size; }
 	getHandle(runId: string): HerdrRunHandle | undefined { return this.runs.get(runId)?.handle; }

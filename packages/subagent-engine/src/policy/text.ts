@@ -10,6 +10,8 @@ export interface PolicyInput {
 const EXPLICIT = "Delegate only when the user explicitly requests agents or names an offered agent type. A request for thoroughness or several subtasks is not such a request. This restriction overrides proactive wording in type descriptions.";
 const POSITIVE = "Delegation heuristics: do small, bounded tasks directly. Delegate only when the expected benefit exceeds briefing, waiting, and checking costs; decide this before choosing an agent type. Independent work and a matching specialist are opportunities, not sufficient reasons. Delegation can help with substantial independent work that can run in parallel, a side task that should not block your main thread, or an investigation spanning many files whose conclusion is all you need. A fresh agent lacks your context; its report may omit details or confidently confirm your hypothesis. Delegate review only when you want a read not anchored on yours, and give the reviewer the code, not your conclusion. When in doubt, do not spawn.";
 const DIRECT = "Keep a known-file or known-symbol lookup, a single fact, a check you could run yourself, and other work of a handful of tool calls inline. Do not create workers just to run trivial commands.";
+// Heuristics steer only the agent's own initiative; they never overrule the person.
+const REQUESTED = "These limits govern only your own initiative. When the user asks you to delegate work, to use agents, or to give an agent a model or effort level, do so as asked, even for a small task.";
 const OPERATIONS = [
 	"Choose only currently offered types from the agent listing; removed types are no longer executable. The listing supplies routing descriptions, not permission to take otherwise unauthorized actions.",
 	"For permitted independent assignments, batch Agent calls in one message so they can run concurrently. Dependent assignments must wait for their inputs. Do not repeat research assigned to a worker; do different useful work instead. Avoid overlapping writers on the same files.",
@@ -35,7 +37,7 @@ function routing(input: PolicyInput): string | undefined {
 }
 
 function policy(input: PolicyInput): string {
-	return [input.autonomy === "explicit" ? EXPLICIT : POSITIVE, DIRECT, OPERATIONS, routing(input)].filter(Boolean).join("\n\n");
+	return [input.autonomy === "explicit" ? EXPLICIT : POSITIVE, DIRECT, REQUESTED, OPERATIONS, routing(input)].filter(Boolean).join("\n\n");
 }
 
 export function agentToolDescription(input: PolicyInput): string {

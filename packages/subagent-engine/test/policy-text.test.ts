@@ -21,14 +21,14 @@ function golden(text: string, required: string[], forbidden: string[]): void {
 const fixtures: { name: string; input: PolicyInput; required: string[]; forbidden: string[]; listingRequired: string[]; listingForbidden: string[] }[] = [
 	{
 		name: "positive", input: positive,
-		required: ["Delegation heuristics", "small, bounded tasks directly", "expected benefit exceeds briefing, waiting, and checking costs", "before choosing an agent type", "opportunities, not sufficient reasons", "independent work that can run in parallel", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "The explore agent locates code"],
+		required: ["Delegation heuristics", "small, bounded tasks directly", "expected benefit exceeds briefing, waiting, and checking costs", "before choosing an agent type", "opportunities, not sufficient reasons", "independent work that can run in parallel", "not anchored on yours", "When in doubt, do not spawn", "more than 3 queries", "The explore agent locates code", "govern only your own initiative", "even for a small task"],
 		forbidden: ["Delegate only when the user explicitly requests", "prefer an offered fork", "A fork inherits", "without a separate user request", "proactive use"],
 		listingRequired: ["Available agent types", "explore: Locate implementation paths", "Read, Grep", "general-purpose", "inherited tools"],
 		listingForbidden: ["fork:", "Removed;", "without a separate user request", "more than 3 queries"],
 	},
 	{
 		name: "explicit-only", input: { ...positive, autonomy: "explicit" },
-		required: ["Delegate only when the user explicitly requests agents or names an offered agent type", "overrides proactive wording", "thoroughness or several subtasks"],
+		required: ["Delegate only when the user explicitly requests agents or names an offered agent type", "overrides proactive wording", "thoroughness or several subtasks", "When the user asks you to delegate work"],
 		forbidden: ["without a separate user request", "Delegation heuristics", "prefer an offered fork", "more than 3 queries", "use a matching specialist"],
 		listingRequired: ["Available agent types", "explore", "current delegation policy", "descriptions do not override its restrictions"],
 		listingForbidden: ["without a separate user request", "more than 3 queries", "prefer an offered fork"],

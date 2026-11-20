@@ -1,6 +1,6 @@
 ---
 name: sidecar-review
-description: Second-opinion review by a persistent pi or Claude Code agent in Herdr. Use after your own implementation, before complex plans, at milestones to brief the reviewer, and when the user asks for a sidecar review. A plain user request to review code is not a sidecar request; do that review yourself. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
+description: Second-opinion review by a persistent pi or Claude Code agent in Herdr, and the way to run agents on GPT models (Sol, Astra) such as implementers, since the Agent tool runs only Claude models. Use after your own implementation, before complex plans, at milestones to brief the reviewer, when the user asks for a sidecar review, and when the user asks for agents or implementers on a GPT model (`--model gpt-6.2-sol --thinking medium`). A plain user request to review code is not a sidecar request; do that review yourself. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
 ---
 
 # Sidecar review

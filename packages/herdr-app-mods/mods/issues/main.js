@@ -1,9 +1,23 @@
 // Herdr Issues panel: a view over the coordinator. It keeps no authoritative state.
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView } from "gpui-base";
-import { spaces, panes, exec, hc, run, theme, shared, layout, home } from "herdr";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, Popover } from "gpui-base";
+import { spaces, panes, exec, hc, run, theme, shared, layout, home, machines, checking } from "herdr";
 
-const FILTERS = { open: ["draft", "planning", "awaiting_approval", "queued", "implementing", "review", "failed", "blocked"], done: ["done", "cancelled"], all: null };
+const FILTERS = { open: ["draft", "planning", "awaiting_approval", "queued", "implementing", "human_review", "finishing", "failed", "blocked"], done: ["done", "cancelled"], all: null };
+const ROLES = ["planner", "coordinator", "implement", "verify", "review"];
+const LIVE_ATTEMPT = ["dispatching", "accepted", "running"];
+
+/** A model starting with claude- runs in Claude Code and takes its effort levels; any other runs in Pi. */
+const harness = (model) => (model ?? "").startsWith("claude-") ? "claude" : "pi";
+const thinkingFor = (stages, model) => stages?.thinking?.[harness(model)] ?? [];
+const modelLabel = (model) => (model ?? "?").split("/").at(-1).replace(/^claude-/, "");
+/** Keep the thinking level when the new model's harness has it, else the role's default, else a middle level. */
+function snapThinking(stages, model, thinking, fallback) {
+  const levels = thinkingFor(stages, model);
+  if (!levels.length || levels.includes(thinking)) return thinking;
+  if (levels.includes(fallback)) return fallback;
+  return levels.includes("high") ? "high" : levels[Math.floor(levels.length / 2)];
+}
 
 /** The CLI that reaches the local coordinator; override with shared("herdr-issues.command"). */
 function command() {
@@ -126,15 +140,21 @@ export default class Issues extends View {
     this.reviseTitle = InputState.new({ placeholder: "Title" });
     this.reviseBody = TextareaState.new({ placeholder: "Revised specification", rows: 5 });
     this.revising = null; // { issueId, version }: the version the form's text was read from
+    this.sendBack = TextareaState.new({ placeholder: "What should the coordinator change?", rows: 3 });
+    this.stages = null; // status.stages: { models, thinking: { claude, pi }, defaults }
+    this.modelsOpen = false; this.stageEdit = null; this.picker = null;
+    // Session launches: `${attemptId}:${launch}` → acknowledged; this view never launches one twice.
+    this.launched = new Map(); this.sessionRun = false; this.sessionAgain = false; this.sessionsWaiting = 0;
+    this.createdSpaces = new Map(); this.deferredSpaces = new Set();
     this.reconcile(cx);
     this.startWatching(cx);
   }
 
   /** Drafts per checkout (machine and root), so a first issue typed before registration survives a workspace switch. */
-  draft() { return this.repoKey && this.repo?.root ? (this.drafts[this.repoKey] ??= { title: "", body: "", reply: "", selected: null }) : null; }
+  draft() { return this.repoKey && this.repo?.root ? (this.drafts[this.repoKey] ??= { title: "", body: "", reply: "", sendBack: "", stages: {}, selected: null }) : null; }
   saveDraft() {
     const d = this.draft();
-    if (d) { d.title = this.title.value(); d.body = this.body.value(); d.reply = this.reply.value(); }
+    if (d) { d.title = this.title.value(); d.body = this.body.value(); d.reply = this.reply.value(); d.sendBack = this.sendBack.value(); }
   }
 
   active() { return !this.closed && !this.paused; }
@@ -173,8 +193,10 @@ export default class Issues extends View {
     if (!this.active()) return false;
     if (status.ok) {
       this.seedRevision(status.result?.revision);
+      if (status.result?.stages) this.stages = status.result.stages;
       this.connected = true; this.offline = false; this.connectionState = null; this.connectionError = null; this.readinessFailures = 0;
       if (resuming) this.reconcile(cx, true);
+      this.requestSessions(cx);
       cx.notify();
       return true;
     }
@@ -245,6 +267,7 @@ export default class Issues extends View {
           }
           this.watchFailures = 0; this.watchError = null;
           this.revision = batch.next;
+          if (batch.events.some((e) => e?.type === "session.launch_requested")) this.requestSessions(cx);
           changed ||= batch.events.length > 0; resync ||= !!batch.resync;
           if (batch.more) continue;
           if (resync) this.reconcile(cx, true);
@@ -295,9 +318,9 @@ export default class Issues extends View {
   switchRepo(repo, key) {
     if (this.repoKey === key) { this.repo = { ...this.repo, ...repo }; return; }
     this.saveDraft();
-    this.repoKey = key; this.repo = repo; this.list = null; this.detail = null; this.confirm = null; this.generated = null; this.error = null; this.actionError = null; this.stale = false; this.busy = false;
+    this.repoKey = key; this.repo = repo; this.list = null; this.detail = null; this.confirm = null; this.generated = null; this.error = null; this.actionError = null; this.stale = false; this.busy = false; this.stageEdit = null; this.picker = null;
     const d = this.draft();
-    this.title.set_value(d?.title ?? ""); this.body.set_value(d?.body ?? ""); this.reply.set_value(d?.reply ?? "");
+    this.title.set_value(d?.title ?? ""); this.body.set_value(d?.body ?? ""); this.reply.set_value(d?.reply ?? ""); this.sendBack.set_value(d?.sendBack ?? "");
   }
 
   async loadIssues(key, generation, cx) {
@@ -354,6 +377,7 @@ export default class Issues extends View {
     const title = this.title.value().trim(), body = this.body.value();
     if (!title) { this.actionError = "Give the issue a title"; return cx.notify(); }
     const key = this.repoKey, generation = this.generation, target = { ...this.repo };
+    const stages = this.stageOverrides();
     this.busy = true; this.actionError = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -365,11 +389,12 @@ export default class Issues extends View {
           if (this.current(key, generation)) this.repo = { ...this.repo, ...r.result };
           repoId = r.result.repoId;
         }
-        const r = await request({ type: "issue.create", repoId, title, body, idempotencyKey: `create-${repoId}-${Date.now()}` });
+        const r = await request({ type: "issue.create", repoId, title, body, ...(stages ? { stages } : {}), idempotencyKey: `create-${repoId}-${Date.now()}` });
         if (!r.ok) throw r.error;
         if (this.current(key, generation)) {
-          this.title.set_value(""); this.body.set_value(""); this.creating = false;
-          const d = this.draft(); if (d) { d.title = ""; d.body = ""; d.selected = r.result.issueId; }
+          // Stage overrides belong to the issue just made, never to the next one.
+          this.title.set_value(""); this.body.set_value(""); this.creating = false; this.modelsOpen = false;
+          const d = this.draft(); if (d) { d.title = ""; d.body = ""; d.stages = {}; d.selected = r.result.issueId; }
           await this.loadIssues(key, generation, cx);
         }
       } catch (e) {
@@ -377,6 +402,109 @@ export default class Issues extends View {
         if (e?.code === "coordinator_offline" && this.active()) { this.connected = false; await this.ready(cx); }
       } finally { if (this.current(key, generation)) this.busy = false; if (this.active()) cx.notify(); }
     });
+  }
+
+  /** The new-issue form's stage for a role: the configured default with this checkout's picks over it. */
+  newStage(role) { return { ...this.stages?.defaults?.[role], ...this.draft()?.stages?.[role] }; }
+  /** Only the roles the person changed from the defaults, each as a complete {model, thinking}; null when none. */
+  stageOverrides() {
+    const picks = this.draft()?.stages ?? {}, out = {};
+    for (const role of ROLES) if (picks[role]) out[role] = this.newStage(role);
+    return Object.keys(out).length ? out : null;
+  }
+  pickNewStage(role, stage) {
+    const d = this.draft(), base = this.stages?.defaults?.[role];
+    if (!d) return;
+    if (base && base.model === stage.model && base.thinking === stage.thinking) delete d.stages[role];
+    else d.stages[role] = { model: stage.model, thinking: stage.thinking };
+  }
+
+  /** One session.requests pass at a time; a request made meanwhile runs once more afterwards. */
+  requestSessions(cx) {
+    if (!this.active() || checking()) return; // herdr-app check runs init for real: never open sessions there
+    if (this.sessionRun) { this.sessionAgain = true; return; }
+    this.sessionRun = true;
+    cx.spawn(async (cx) => {
+      try {
+        do { this.sessionAgain = false; await this.fulfilSessions(cx); } while (this.sessionAgain && this.active());
+      } finally { this.sessionRun = false; }
+    });
+  }
+
+  /** The service cannot open tabs: open each requested planner or coordinator session in the person's Spaces. */
+  async fulfilSessions(cx) {
+    const r = await this.read({ type: "session.requests" }, cx);
+    if (!r?.ok || !this.active()) return;
+    let waiting = 0;
+    for (const q of r.result?.requests ?? []) {
+      if (!this.active()) return;
+      const key = `${q.attemptId}:${q.launch}`;
+      if (!this.launched.has(key)) {
+        const opened = this.launchSession(q);
+        if (opened === "waiting") waiting++;
+        if (opened !== "opened") continue;
+        this.launched.set(key, false);
+      }
+      if (this.launched.get(key)) continue;
+      const ack = await request({ type: "session.launched", attemptId: q.attemptId, launch: q.launch, space: q.spaceName });
+      // stale or conflict: another copy of the panel (or an earlier pass) already reported it.
+      if (ack.ok || ["stale", "conflict"].includes(ack.error?.code)) this.launched.set(key, true);
+    }
+    if (this.sessionsWaiting !== waiting) { this.sessionsWaiting = waiting; cx.notify(); }
+  }
+
+  /** "opened", "waiting" (its machine is unavailable), or "deferred" (a space this view just made has not appeared yet). */
+  launchSession(q) {
+    const machine = q.machine ?? null, spaceKey = `${machine ?? ""}|${q.spaceName}`;
+    if (machine && machines().find((m) => m.name === machine)?.layout !== "ready") return "waiting";
+    const space = spaces().find((s) => s.name === q.spaceName && (s.machine ?? null) === machine);
+    const made = this.createdSpaces.get(spaceKey);
+    if (!space && made !== undefined && Date.now() - made < 15000) { this.deferredSpaces.add(spaceKey); return "deferred"; }
+    const name = q.role === "coordinator" ? "Coordinator" : "Planner";
+    try {
+      if (space) run("tab.new", { space: space.id, name, folder: q.folder, argv: q.argv, focus: false });
+      else {
+        run("space.new", { name: q.spaceName, tab: name, folder: q.folder, machine: machine ?? "", argv: q.argv, focus: false });
+        this.createdSpaces.set(spaceKey, Date.now());
+      }
+    } catch (e) {
+      console.warn(`Issues: could not open ${q.spaceName}: ${e}`);
+      return "waiting";
+    }
+    return "opened";
+  }
+
+  /** Focus a session's agent by terminal, else show its space. */
+  openSession(cx, terminal, spaceName) {
+    if (terminal) return run("agent.focus", { terminal });
+    const space = spaces().find((s) => s.name === spaceName);
+    if (space) run("space.select", { id: space.id });
+    else { this.actionError = `Space ${spaceName} is not open`; cx.notify(); }
+  }
+
+  dropdown(t, id, value, options, label, onPick) {
+    return Popover.new(id).anchor("top_left").open(this.picker === id)
+      .on_open_change((open, cx) => { this.picker = open ? id : this.picker === id ? null : this.picker; cx.notify(); })
+      .trigger(div().px(6).py(1).rounded(5).text_size(12).border_1().border_color(t.border).bg(t.raised).child(`${label(value)} ▾`))
+      .content(v_flex().p(4).gap(1).rounded(6).border_1().border_color(t.border).bg(t.popover).children(options.map((o) =>
+        div().id(`${id}:${o}`).px(8).py(2).rounded(4).text_size(12).bg(o === value ? t.selected : t.popover).hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => { this.picker = null; if (!this.busy && o !== value) onPick(o, cx); cx.notify(); }).child(label(o)))));
+  }
+
+  /** One row per role: a model and a thinking dropdown. A model of the other harness snaps thinking to one it has. */
+  stageRows(t, prefix, stageOf, onPick) {
+    const st = this.stages;
+    return v_flex().gap(4).children(ROLES.map((role) => {
+      const value = stageOf(role), fallback = st?.defaults?.[role]?.thinking;
+      const models = st?.models?.includes(value.model) ? st.models : [value.model, ...(st?.models ?? [])];
+      const levels = thinkingFor(st, value.model), thinking = levels.includes(value.thinking) ? levels : [value.thinking, ...levels];
+      return h_flex().gap(6).items_center()
+        .child(div().w(84).text_size(12).text_color(t.muted).child(role))
+        .child(this.dropdown(t, `${prefix}-${role}-model`, value.model, models, modelLabel,
+          (model, cx) => onPick(cx, role, { model, thinking: snapThinking(st, model, value.thinking, fallback) })))
+        .child(this.dropdown(t, `${prefix}-${role}-thinking`, value.thinking, thinking, String,
+          (level, cx) => onPick(cx, role, { model: value.model, thinking: level })));
+    }));
   }
 
   startPlanning(cx, s) {
@@ -393,9 +521,14 @@ export default class Issues extends View {
   }
 
   render(cx) {
-    if (this.paused && !this.closed && panelVisible()) { this.paused = false; this.locationKey = undefined; this.connectionState = null; }
+    const resumed = this.paused && !this.closed && panelVisible();
+    if (resumed) { this.paused = false; this.locationKey = undefined; this.connectionState = null; }
     this.reconcile(cx);
     this.startWatching(cx);
+    // Requests wait while the panel is hidden; a deferred one goes on once the space this view made appears.
+    const appeared = [...this.deferredSpaces].some((k) => spaces().some((s) => `${s.machine ?? ""}|${s.name}` === k));
+    if (appeared) this.deferredSpaces.clear();
+    if ((resumed && this.connected) || appeared) this.requestSessions(cx);
     const t = theme();
     const chip = (text, color) => div().px(6).py(1).rounded(5).text_size(11).text_color(color ?? t.muted).border_1().border_color(t.border).child(text);
     const button = (id, label, onClick, primary) => div().id(id).px(10).py(4).rounded(6).text_size(12)
@@ -423,6 +556,7 @@ export default class Issues extends View {
     if (this.connectionError) body.child(div().py(6).text_color(t.blocked).child(this.connectionError));
     if (this.actionError) body.child(div().py(6).text_color(t.blocked).child(this.actionError));
     if (this.error) body.child(div().py(6).text_color(t.blocked).child(this.error));
+    if (this.sessionsWaiting) body.child(div().py(4).text_size(12).text_color(t.muted).child(`${this.sessionsWaiting} session${this.sessionsWaiting === 1 ? "" : "s"} waiting to open (machine unavailable)`));
     body.child(this.detail ? this.renderDetail(cx, t, chip, button, section) : this.renderList(t, chip, button, section));
     return root.child(body);
   }
@@ -439,6 +573,13 @@ export default class Issues extends View {
       v.child(v_flex().gap(6).py(8)
         .child(div().h(30).px(8).flex().items_center().rounded(6).border_1().border_color(t.input).bg(t.background).child(Input.new(this.title).h_full()))
         .child(div().px(8).py(4).rounded(6).border_1().border_color(t.input).bg(t.background).child(Textarea.new(this.body).h(80)))
+        .when(!!this.stages?.defaults, (el) => {
+          const changed = Object.keys(this.draft()?.stages ?? {}).length;
+          el.child(div().id("models").text_size(12).text_color(t.muted).hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => { this.modelsOpen = !this.modelsOpen; cx.notify(); })
+            .child(`${this.modelsOpen ? "▾" : "▸"} Models${changed ? ` (${changed} changed)` : ": defaults"}`));
+          return this.modelsOpen ? el.child(this.stageRows(t, "new", (role) => this.newStage(role), (cx, role, stage) => { this.pickNewStage(role, stage); cx.notify(); })) : el;
+        })
         .child(h_flex().child(button("create", "Create draft", (cx) => this.create(cx), true))));
     }
     if (!this.list) return v.child(div().pt(8).text_color(t.muted).child("Loading…"));
@@ -460,7 +601,16 @@ export default class Issues extends View {
       .child(button("back", "←", (cx) => { this.draft().selected = null; this.detail = null; cx.notify(); }))
       .child(div().flex_1().font_semibold().truncate().child(i.title))
       .child(chip(i.state.replace("_", " "), stateColor(t, i.state))));
-    out.child(div().text_size(11).text_color(t.dim).child(`spec ${i.spec_revision} · ${i.workflow_id}@${i.workflow_version} · ${i.model} (${i.thinking}) · v${v}`));
+    const approved = !!(i.approval_id || s.approval), policy = i.policy ?? {};
+    const stagesEditable = i.stages && this.stages && (i.state === "draft" || (["planning", "awaiting_approval", "blocked"].includes(i.state) && !approved));
+    out.child(div().text_size(11).text_color(t.dim).child(`spec ${i.spec_revision} · ${i.workflow_id}@${i.workflow_version} · v${v}`));
+    if (i.stages) out.child(h_flex().gap(6).items_center()
+      .child(div().flex_1().text_size(11).text_color(t.dim).child(ROLES.filter((r) => i.stages[r]).map((r) => `${r} ${modelLabel(i.stages[r].model)} ${i.stages[r].thinking}`).join(" · ")))
+      .when(!!stagesEditable, (el) => el.child(button("edit-stages", this.stageEdit === issueId ? "Done" : "Models…", (cx) => { this.stageEdit = this.stageEdit === issueId ? null : issueId; cx.notify(); }))));
+    else out.child(div().text_size(11).text_color(t.dim).child(`${i.model} (${i.thinking})`));
+    if (stagesEditable && this.stageEdit === issueId)
+      out.child(this.stageRows(t, `issue-${issueId}`, (role) => i.stages[role], (cx, role, stage) =>
+        this.act(cx, { type: "issue.set_stages", repoId, issueId, expectedVersion: v, stages: { [role]: stage } })));
     if (i.queue_reason) out.child(div().text_size(12).text_color(t.blocked).child(i.queue_reason));
     if (i.body) out.child(TextView.markdown(`body-${issueId}`, i.body));
 
@@ -469,13 +619,28 @@ export default class Issues extends View {
     if (i.state === "awaiting_approval" && plan && !plan.unauthorizedChanges.length)
       actions.child(button("approve", `Approve ${short(plan.hash, 8)} @ ${short(plan.base_commit, 8)}`, (cx) =>
         this.act(cx, { type: "plan.approve", repoId, issueId, expectedVersion: v, planRevisionId: plan.id, planHash: plan.hash }), true));
-    if (i.state === "review") actions.child(button("accept", "Accept", (cx) => this.act(cx, { type: "issue.accept", repoId, issueId, expectedVersion: v }), true));
     if (i.state === "failed" && i.approvalValid) actions.child(button("retry", "Retry", (cx) => this.act(cx, { type: "issue.retry", repoId, issueId, expectedVersion: v })));
-    if (["awaiting_approval", "blocked"].includes(i.state)) actions.child(button("restart", "New planning session", (cx) => this.act(cx, { type: "plan.restart", repoId, issueId, expectedVersion: v })));
+    if (["awaiting_approval", "blocked"].includes(i.state) && !approved) actions.child(button("restart", "New planning session", (cx) => this.act(cx, { type: "plan.restart", repoId, issueId, expectedVersion: v })));
     if (!["done", "cancelled", "draft"].includes(i.state) && this.revising?.issueId !== issueId)
       actions.child(button("revise", "Revise…", (cx) => { this.revising = { issueId, version: v }; this.reviseTitle.set_value(i.title); this.reviseBody.set_value(i.body); cx.notify(); }));
     if (!["done", "cancelled"].includes(i.state)) actions.child(button("cancel", "Cancel issue", (cx) => this.act(cx, { type: "issue.cancel", repoId, issueId, expectedVersion: v })));
     out.child(actions);
+    const coordinator = [...s.attempts].reverse().find((a) => a.role === "coordinator" && LIVE_ATTEMPT.includes(a.state));
+    if (i.state === "implementing") out.child(h_flex().gap(6).items_center().pt(6)
+      .child(div().flex_1().text_color(t.working).child(`Coordinator running${i.coordination?.branch ? ` on ${i.coordination.branch}` : ""}${i.coordination?.machine ? ` (${i.coordination.machine})` : ""}`))
+      .when(!!(coordinator?.terminal || coordinator?.space), (el) => el.child(button("open-coordinator", "Open", (cx) => this.openSession(cx, coordinator.terminal, coordinator.space)))));
+    if (i.state === "finishing") out.child(div().pt(6).text_color(t.working).child(`Delivering: ${policy.done ?? "the repository's done action"}`));
+    if (i.state === "human_review") this.renderReview(out, t, section, button, s, policy);
+    // Send back continues the coordinator's conversation; it needs an implemented approved plan.
+    if (i.state === "human_review" || (["failed", "blocked"].includes(i.state) && approved && i.coordination)) {
+      out.child(section("Send back"))
+        .child(div().px(8).py(4).rounded(6).border_1().border_color(t.input).bg(t.background).child(Textarea.new(this.sendBack).h(60)))
+        .child(h_flex().child(button("send-back", "Send back", (cx) => {
+          const instructions = this.sendBack.value().trim();
+          if (!instructions) { this.actionError = "Say what should change"; return cx.notify(); }
+          this.act(cx, { type: "issue.send_back", repoId, issueId, expectedVersion: v, instructions }, () => { this.sendBack.set_value(""); });
+        })));
+    }
     if (this.revising?.issueId === issueId) {
       // Saving creates a new specification revision: approval is invalidated and running work is asked to stop.
       out.child(v_flex().gap(6).py(6)
@@ -502,7 +667,7 @@ export default class Issues extends View {
       out.child(section("Discussion"));
       for (const m of s.messages) out.child(v_flex().py(4).child(div().text_size(11).text_color(t.dim).child(`${m.author} · ${m.ts.slice(0, 16).replace("T", " ")}`)).child(TextView.markdown(`m-${m.id}`, m.content)));
     }
-    if (["awaiting_approval", "blocked"].includes(i.state)) {
+    if (["planning", "awaiting_approval", "blocked"].includes(i.state) && !approved) {
       out.child(div().px(8).py(4).rounded(6).border_1().border_color(t.input).bg(t.background).child(Textarea.new(this.reply).h(60)))
         .child(h_flex().child(button("send", "Send reply", (cx) => {
           const content = this.reply.value().trim();
@@ -514,13 +679,15 @@ export default class Issues extends View {
     for (const a of [...s.attempts].reverse()) {
       const wt = a.worktree;
       const row = v_flex().py(4).border_t_1().border_color(t.border)
-        .child(h_flex().gap(6).items_center().child(div().flex_1().child(`${a.kind} on ${a.machine}`)).child(chip(a.state.replace("_", " "), stateColor(t, a.state)))
+        .child(h_flex().gap(6).items_center().child(div().flex_1().child(`${a.role ?? a.kind} on ${a.machine}${a.space ? ` · ${a.space}` : ""}`)).child(chip(a.state.replace("_", " "), stateColor(t, a.state)))
           .when(!!a.superseded, (el) => el.child(chip("superseded")))
           .when(!!a.reservation, (el) => el.child(chip(`reservation ${a.reservation.state}`))))
         .when(!!a.reconcile_reason, (el) => el.child(div().text_size(12).text_color(t.blocked).child(a.reconcile_reason)))
         .when(!!a.receipt?.reason, (el) => el.child(div().text_size(12).text_color(t.muted).child(a.receipt.reason)))
         .when(!!a.terminal, (el) => el.child(div().text_size(11).text_color(t.dim).child(`terminal ${a.terminal}`)));
       const btns = h_flex().gap(6).pt(4).flex_wrap();
+      if (LIVE_ATTEMPT.includes(a.state) && (a.terminal || a.space))
+        btns.child(button(`open-${a.id}`, "Open", (cx) => this.openSession(cx, a.terminal, a.space)));
       if (["dispatching", "accepted", "running", "needs_reconcile"].includes(a.state) && !a.cancel_requested)
         btns.child(button(`stop-${a.id}`, "Cancel attempt", (cx) => this.act(cx, { type: "attempt.cancel", repoId, issueId, attemptId: a.id })));
       if (a.state === "needs_reconcile")
@@ -549,9 +716,32 @@ export default class Issues extends View {
     }
     return out;
   }
+
+  /** The coordinator's review: what it produced, how each phase went, and what the repository asks of the person. */
+  renderReview(out, t, section, button, s, policy) {
+    const r = s.issue.review;
+    out.child(section("Review"));
+    if (policy.humanReview) out.child(div().text_size(12).text_color(t.muted).child(`Review: ${policy.humanReview}`));
+    if (!r) out.child(div().text_color(t.muted).child("No review reported yet"));
+    if (r?.summary) out.child(TextView.markdown(`review-${s.issue.id}`, r.summary));
+    if (r?.url) {
+      const web = /^https?:\/\/[^/\s]+/.test(r.url);
+      out.child(h_flex().gap(6).items_center()
+        .child(TextView.markdown(`review-url-${s.issue.id}`, `\`${r.url.replace(/`/g, "")}\``).selectable(true).flex_1())
+        .when(web, (el) => el.child(button("open-review", "Open", (cx) => cx.open_url(r.url)))));
+    }
+    if (r?.head) out.child(div().text_size(11).text_color(t.dim).child(`head ${short(r.head)}`));
+    for (const p of r?.phases ?? [])
+      out.child(h_flex().gap(6).text_size(12).child(div().text_color(p.passed ? t.done : t.blocked).child(`${p.passed ? "✓" : "✗"} ${p.name}`))
+        .when(!!p.detail, (el) => el.child(div().flex_1().text_color(t.muted).child(p.detail))));
+    const i = s.issue;
+    out.child(div().pt(4).text_size(12).text_color(t.muted).child(`Accept will: ${policy.done ?? "archive the branch and remove the worktree"}`))
+      .child(h_flex().pt(4).child(button("accept", "Accept", (cx) => this.act(cx, { type: "issue.accept", repoId: i.repo_id, issueId: i.id, expectedVersion: i.version }), true)));
+    return out;
+  }
 }
 
 function stateColor(t, state) {
-  return ({ review: t.done, done: t.done, succeeded: t.done, implementing: t.working, planning: t.working, running: t.working, queued: t.working,
+  return ({ human_review: t.accent, finishing: t.working, done: t.done, succeeded: t.done, implementing: t.working, planning: t.working, running: t.working, queued: t.working,
     awaiting_approval: t.accent, failed: t.blocked, blocked: t.blocked, needs_reconcile: t.blocked, cancelled: t.dim })[state] ?? t.muted;
 }

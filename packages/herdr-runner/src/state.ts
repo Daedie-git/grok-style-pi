@@ -16,12 +16,16 @@ export interface RunSnapshot extends RunRef {
 	result?: string;
 	error?: string;
 	accepted: boolean;
+	/** The prompt was claimed for dispatch, not necessarily delivered. */
+	dispatched?: true;
 	/** Claude input-hook receipt is durable dispatch evidence, not execution acceptance. */
 	inputReceived?: boolean;
 	cancelRequested: boolean;
 	deadline: number;
 	/** Set when this run's start window differs from START_TIMEOUT_MS. */
 	startTimeoutMs?: number;
+	/** A pane seen running another session while this run's prompt waited; the prompt is not claimed while it is set. */
+	paneConflict?: string;
 	turns: number;
 	updatedAt: number;
 }
@@ -42,7 +46,9 @@ export function expireUnaccepted(run: RunSnapshot, now: number): RunSnapshot {
 		...run, phase: "failed", updatedAt: now,
 		error: run.cancelRequested
 			? "The child did not acknowledge cancellation. The pane may still be live."
-			: "The agent started, but the pane did not confirm task execution.",
+			: run.paneConflict
+				? `Herdr reported another session in pane ${run.paneConflict}${run.dispatched ? "" : ", so nothing was sent"}; resume to continue in a fresh run.`
+				: "The agent started, but the pane did not confirm task execution.",
 	};
 }
 

@@ -623,8 +623,30 @@ const operations = {
 			const { value, command } = next;
 			command.state = "dispatching";
 			db.prepare("UPDATE commands SET data=? WHERE id=?").run(JSON.stringify(command), command.id);
-			if (command.type === "prompt") saveRun({ ...value, phase: "starting", updatedAt: Date.now() });
+			if (command.type === "prompt") saveRun({ ...value, phase: "starting", dispatched: true, updatedAt: Date.now() });
 			return command;
+		});
+	},
+	/** Claim the queued prompt of exactly this run, only while it is current, queued and not cancelled. */
+	claimPrompt(agentId: string, runId: string, token: string): Command | undefined {
+		return transaction(() => {
+			if (!owns(agentId, token) || agent(agentId)?.currentRunId !== runId) return undefined;
+			const value = run({ agentId, runId });
+			if (value.phase !== "queued" || value.cancelRequested || value.paneConflict) return undefined;
+			const command = commands(value).find((item) => item.state === "queued" && item.type === "prompt");
+			if (!command) return undefined;
+			command.state = "dispatching";
+			db.prepare("UPDATE commands SET data=? WHERE id=?").run(JSON.stringify(command), command.id);
+			saveRun({ ...value, phase: "starting", dispatched: true, updatedAt: Date.now() });
+			return command;
+		});
+	},
+	/** Every runner honors the first ownership conflict for the rest of this run. */
+	notePaneConflict(ref: RunRef, paneId: string): void {
+		transaction(() => {
+			if (!current(ref)) return;
+			const value = run(ref);
+			if (!isTerminal(value.phase) && !value.paneConflict) saveRun({ ...value, paneConflict: paneId });
 		});
 	},
 	commandDelivered(command: Command, token: string): void {

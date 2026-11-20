@@ -25,6 +25,12 @@ const LEASE_RENEWAL_MS = 1000;
 const MACHINE_START_TIMEOUT_MS = 120_000;
 // An interactive Claude pane can take longer than a Pi child to reach UserPromptSubmit.
 const CLAUDE_PROMPT_TIMEOUT_MS = 60_000;
+/** How long a dispatch waits for a Claude pane to become ready, inside its start window. */
+const CLAUDE_READY_MS = 45_000;
+/** How long an unclassified ("unknown") pane is waited on; Herdr reports it briefly while a fresh Claude loads. */
+const CLAUDE_UNKNOWN_GRACE_MS = 15_000;
+/** Start-window time kept for the send itself and Claude's receipt. */
+const CLAUDE_SEND_MARGIN_MS = 10_000;
 const CLOSE_GRACE_MS = 2000;
 /** Status lag and a glance at a just-finished pane do not keep it open. */
 const DONE_SETTLE_MS = 120_000;
@@ -164,6 +170,41 @@ function sameSession(reported: string, record: Pick<AgentRecord, "sessionFile" |
 	return file(reported) === file(record.sessionFile) || (!!record.sessionId && reported.includes(record.sessionId));
 }
 
+/** The exact session, for destructive effects: the transcript or session file's own name, or the bare session ID. */
+function exactSession(reported: string, record: Pick<AgentRecord, "sessionFile" | "sessionId">): boolean {
+	const name = reported.split(/[\\/]/).pop()?.replace(/\.jsonl$/, "");
+	const own = record.sessionFile.split(/[\\/]/).pop()?.replace(/\.jsonl$/, "");
+	return !!name && (name === own || (!!record.sessionId && name === record.sessionId));
+}
+
+/**
+ * Fresh evidence about a pane before a destructive close, shared by maintenance and resume. `identity`: both the name
+ * and the pane lookup name this agent's exact session (`ours`), the name does but the pane positively names another
+ * (`pane-disagrees`), or the evidence is missing or points elsewhere (`unknown`). `activity`: both lookups idle or done,
+ * either working or blocked, or anything else. `unfocused`: the pane lookup reports no focus, and the name lookup no
+ * positive focus (Herdr's app reports focus on panes only).
+ */
+/**
+ * Ownership for destructive effects: like `agentPresence`, but a reported session must be this agent's exact session,
+ * never a substring of another transcript's name. Without a session report, the recorded pane decides, as before.
+ */
+export function ownedPresence(record: Pick<AgentRecord, "herdrName" | "paneId" | "sessionFile" | "sessionId">, named: HerdrAgentRef | undefined): Presence {
+	if (named?.session !== undefined) return exactSession(named.session, record) ? "alive" : "dead";
+	return agentPresence(record, named);
+}
+
+export type PaneVerdict = { identity: "ours" | "pane-disagrees" | "unknown"; activity: "idle" | "busy" | "unknown"; unfocused: boolean };
+
+export function paneVerdict(record: Pick<AgentRecord, "sessionFile" | "sessionId">, paneId: string, named: HerdrAgentRef | undefined, pane: HerdrAgentRef | undefined): PaneVerdict {
+	const namedOurs = named?.paneId === paneId && named.session !== undefined && exactSession(named.session, record);
+	const paneOurs = pane?.paneId === paneId && pane.session !== undefined && exactSession(pane.session, record);
+	const identity = namedOurs && paneOurs ? "ours" : namedOurs && pane?.session !== undefined ? "pane-disagrees" : "unknown";
+	const state = (item?: HerdrAgentRef) => ["idle", "done"].includes(item?.status ?? "") ? "idle" : ["working", "blocked"].includes(item?.status ?? "") ? "busy" : "unknown";
+	const states = [state(named), state(pane)];
+	const activity = states.includes("busy") ? "busy" : states.every((value) => value === "idle") ? "idle" : "unknown";
+	return { identity, activity, unfocused: pane?.focused === false && named?.focused !== true };
+}
+
 /** Tags arrived with session tracking. Older records came from a default session, the only kind most machines run. */
 function sessionOf(item: { herdrSession?: string }): string {
 	return item.herdrSession ?? "default";
@@ -279,7 +320,14 @@ export class HerdrRunner {
 					throw new Error(`Cannot resume ${record.id}: an earlier pane launch is unresolved. Inspect Herdr before retrying.`);
 				}
 				const named = await this.deps.client.getAgent(record.herdrName, combined);
-				const presence = agentPresence(record, named);
+				let presence = agentPresence(record, named);
+				// Before any pane is closed or run published: an old machine runner refuses with everything left as it was.
+				if (record.runtime === "claude-code") await this.assertClaudePrompts();
+				if (await this.replaceStalePane(record, value, named, combined)) {
+					record = await this.resolve(agentId);
+					// Recompute after every intent: a pane taken over by another session is never treated as this agent's.
+					presence = agentPresence(record, await this.deps.client.getAgent(record.herdrName, combined));
+				}
 				if (presence === "unknown") await this.locate(record, combined);
 				if (presence === "dead") {
 					await this.assertColdResumeAllowed(record.id);
@@ -391,11 +439,33 @@ export class HerdrRunner {
 				}
 				if (candidates.length) await this.reap(token, renew, listings);
 				await this.store.finishMaintenance(token, observations, this.now());
-				for (const { agent } of runs) if (agent.runtime === "claude-code" && !this.sessionsDown.has(sessionOf(agent))) await this.serviceClaude(agent.id, this.stopping.signal);
-				if (await this.store.tryPlacementLock(token)) {
-					try { await this.recoverLaunches(); }
-					finally { await this.store.releasePlacementLock(token); }
+				// One agent's failure must not stall the others or launch recovery; every failure is still reported after the pass.
+				const failures: unknown[] = [];
+				for (const { agent } of runs) {
+					if (agent.runtime !== "claude-code" || this.sessionsDown.has(sessionOf(agent))) continue;
+					try { await this.serviceClaude(agent.id, this.stopping.signal); }
+					catch (error) {
+						if (this.stopping.signal.aborted) throw error;
+						// Backend errors need not name the agent; the report must.
+						failures.push(message(error).includes(agent.id) ? error : new Error(`${agent.id}: ${message(error)}`, { cause: error }));
+					}
 				}
+				let locked = false;
+				try {
+					locked = await this.store.tryPlacementLock(token);
+					if (locked) await this.recoverLaunches();
+				} catch (error) {
+					if (this.stopping.signal.aborted) throw error;
+					failures.push(error);
+				} finally {
+					if (locked) {
+						try { await this.store.releasePlacementLock(token); }
+						catch (error) { failures.push(error); }
+					}
+				}
+				if (failures.length === 1) throw failures[0];
+				// Reporters show only the message, so it names every failure (each names its agent), bounded.
+				if (failures.length) throw new AggregateError(failures, `${failures.length} maintenance failures: ${failures.map(message).join("; ")}`.slice(0, 1_000));
 			} catch (error) {
 				// Liveness observed before a failed reap still settles, so one bad candidate cannot hold every run open.
 				await this.store.finishMaintenance(token, observations, this.now());
@@ -543,10 +613,17 @@ export class HerdrRunner {
 	/** A machine's worker names its own Node, hook entry and store; an older worker cannot host Claude children. */
 	private async claudeHook(): Promise<ClaudeHookCommand> {
 		if (!this.machine) return localClaudeHook(this.deps.root);
-		return this.store.claudeHookCommand().catch((error: Error) => {
+		const hook = await this.store.claudeHookCommand().catch((error: Error) => {
 			if (/Unknown Herdr control operation/.test(error.message)) throw new Error(`${this.machine} runs a Herdr runner too old for Claude Code children. Update it there, then retry.`);
 			throw error;
 		});
+		await this.assertClaudePrompts();
+		return hook;
+	}
+
+	/** Checked before a pane opens or a run is published: a refused request must leave nothing that could run later. */
+	private async assertClaudePrompts(): Promise<void> {
+		if (this.machine && !(await this.store.claimPromptSupported())) throw new Error(`${this.machine} runs a Herdr runner too old to send Claude Code prompts safely. Update it there (sidecar sync-machine), then retry.`);
 	}
 
 	private async launch(request: SpawnRequest, signal: AbortSignal): Promise<RunRef> {
@@ -556,6 +633,8 @@ export class HerdrRunner {
 		if (claude && (!this.deps.client.startClaude || !this.deps.client.promptAgent)) throw new Error("The Herdr client does not support Claude Code launches.");
 		if (!request.paneId) throw new Error("Not inside a Herdr pane, so no subagent pane can be opened.");
 		await this.store.assertProtocolReady();
+		// Before anything is reserved: a refused launch leaves no record, pane or run behind.
+		if (claude) await this.assertClaudePrompts();
 		check(signal);
 		const parent = await this.managedCaller(request);
 		check(signal);
@@ -858,9 +937,9 @@ export class HerdrRunner {
 					// This is newer than ownerDeparted's inventory: never ignore a returned or uncertain owner here.
 					const ownerMayBePresent = ownerGone && (!ownerSession || freshPanes.some((item) => uncertainSession(item)
 						|| (item.session !== undefined && sameSession(item.session, { sessionFile: ownerSession }))));
-					if (ownerMayBePresent || !live?.paneId || live.paneId !== named.paneId || live.session === undefined || agentPresence(agent, live) !== "alive"
-						|| !fresh || fresh.session === undefined || !sameSession(fresh.session, agent)
-						|| (!ownerGone && (fresh.focused !== false || !["idle", "done"].includes(live.status ?? "") || !["idle", "done"].includes(fresh.status ?? "")))) {
+					const verdict = paneVerdict(agent, named.paneId, live, fresh);
+					// A departed owner's pane closes whatever its activity; otherwise only an idle, unfocused pane does.
+					if (ownerMayBePresent || !live?.paneId || verdict.identity !== "ours" || (!ownerGone && (verdict.activity !== "idle" || !verdict.unfocused))) {
 						if (!(await this.store.lifecycleAllowed())) return;
 						await this.store.abortPaneClose(ref, agent.paneId);
 						if (!ownerGone) await this.store.notePaneActivity(ref, this.now());
@@ -953,6 +1032,59 @@ export class HerdrRunner {
 		return inventory.some(uncertainSession) ? "unknown" : "dead";
 	}
 
+	/**
+	 * A Claude prompt that never reached Claude (no input receipt) may still sit unsubmitted in the composer. The next Enter
+	 * would submit it with the follow-up, the input hook would block both as stale, and Claude would restore them to the
+	 * composer, failing every later run. Such a pane is closed through the maintenance protocol so the conversation continues
+	 * cold in a clean pane. Returns whether a close intent was taken; throws a retryable error when the pane is in use, Herdr
+	 * disagrees about its occupant, or its departure is not yet proven. Anything short of a proven idle, unfocused pane of this
+	 * agent's own session keeps the pane, and resume continues as before.
+	 */
+	private async replaceStalePane(record: AgentRecord, last: RunSnapshot, named: HerdrAgentRef | undefined, signal: AbortSignal): Promise<boolean> {
+		if (record.runtime !== "claude-code" || last.phase !== "failed" || !last.dispatched || last.accepted || last.inputReceived || !this.deps.client.getPane) return false;
+		if (!named?.paneId || named.session === undefined || !exactSession(named.session, record) || agentPresence(record, named) !== "alive") return false;
+		const ref = { agentId: record.id, runId: last.runId };
+		// The intent needs lifecycle permission, this terminal run and a resumable conversation, and blocks a concurrent run.
+		if (!(await this.store.preparePaneClose(ref, record.paneId, false, this.now()))) return false;
+		let verdict: PaneVerdict | undefined;
+		let closed = false;
+		let failure: unknown;
+		try {
+			verdict = paneVerdict(record, named.paneId, await this.deps.client.getAgent(record.herdrName, signal), await this.deps.client.getPane(named.paneId, signal));
+			// Quarantine may begin after the intent: permission is checked again at the close itself.
+			if (verdict.identity === "ours" && verdict.activity === "idle" && verdict.unfocused && await this.store.lifecycleAllowed()) {
+				check(signal);
+				closed = true;
+				await this.deps.client.closePane(named.paneId);
+			}
+		} catch (error) {
+			failure = error;
+		}
+		// The maintenance rules: no close issued, the intent is withdrawn (abortPaneClose; a quarantined database keeps it for
+		// explicit upgrade recovery, like every quarantined intent). A close issued: park on proven departure, roll back on a
+		// surviving session, keep the intent while the outcome is unknown. A failing cleanup is kept as a cause too.
+		try {
+			if (!closed) await this.store.abortPaneClose(ref, record.paneId);
+			else await this.recoverPaneClose(await this.resolve(record.id), undefined, signal);
+		} catch (error) {
+			failure = failure === undefined ? error : new AggregateError([failure, error], "The stale pane close and its recovery both failed");
+		}
+		// A kept intent is reported first, on every exit: under quarantine only explicit recovery unblocks it, whatever the pane
+		// evidence or a failed lookup or close said; otherwise its outcome is merely unconfirmed and a retry recovers it.
+		const current = await this.resolve(record.id);
+		if (current.paneClose) {
+			const cause = failure === undefined ? undefined : { cause: failure };
+			if (!(await this.store.lifecycleAllowed())) throw new Error(`Agent ${record.id} has a pending pane close while lifecycle is quarantined. After old workers drain, use lifecycle-upgrade.mjs before resuming.`, cause);
+			throw new Error(`Agent ${record.id}'s stale Claude pane is closing, but Herdr cannot yet confirm its session's departure. Retry the resume shortly.`, cause);
+		}
+		if (failure !== undefined) throw failure;
+		if (verdict?.identity === "pane-disagrees") throw new Error(`Herdr reports agent ${record.id}'s pane ${named.paneId} running another session. Retry the resume once Herdr settles.`);
+		if (verdict?.identity === "ours" && verdict.activity === "busy") throw new Error(`Agent ${record.id}'s Claude pane ${named.paneId} is busy with another turn. Retry the resume when it is idle.`);
+		// A closed pane may still be shutting down; the follow-up never goes into it.
+		if (closed && current.paneState !== "parked") throw new Error(`Agent ${record.id}'s stale Claude pane is still shutting down. Retry the resume shortly.`);
+		return true;
+	}
+
 	/** Returns true only when an interrupted close was rolled back with positive live-session evidence. */
 	private async recoverPaneClose(agent: AgentRecord, token?: string, signal = this.stopping.signal): Promise<boolean> {
 		const intent = agent.paneClose;
@@ -988,18 +1120,51 @@ export class HerdrRunner {
 				if (isTerminal((await this.read(binding.run)).phase)) return;
 				// Close the agent where it is now. An exited agent has nothing to stop, and its old pane may host another process.
 				const named = await client.getAgent(binding.agent.herdrName, signal);
-				const presence = agentPresence(binding.agent, named);
+				const presence = ownedPresence(binding.agent, named);
+				// Cancellation needs no idleness, but the pane itself must not positively name another session.
+				if (presence === "alive" && client.getPane) {
+					const pane = await client.getPane(named!.paneId!, signal);
+					if (pane?.session !== undefined && !exactSession(pane.session, binding.agent)) {
+						throw new Error(`Cannot cancel ${agentId}: Herdr reports pane ${named!.paneId} running another session. Retry once Herdr settles.`);
+					}
+				}
 				if (presence === "unknown") throw new Error(`Cannot cancel ${agentId}: Herdr agent ${binding.agent.herdrName} is in pane ${named!.paneId}, not ${binding.agent.paneId}, and reports no session to confirm it.`);
 				if (presence === "alive") await client.closePane(named!.paneId!);
 				await this.store.recordPaneClosed(binding.run, this.now());
 			}, signal ?? this.stopping.signal);
 			return;
 		}
-		const command = await this.store.claimNextCommand(agentId, binding.token, false);
+		// A Claude conversation receives only prompts here; cancellation closes the pane above.
+		if (binding.run.phase !== "queued") return;
+		// Wait for readiness before claiming, so the claimed-but-unsent window stays the send itself: a stop, an expiry or a
+		// restart during the wait leaves the prompt unclaimed, and a failed lookup here is not an uncertain dispatch. An ownership
+		// conflict prevents dispatch for the rest of this run.
+		const readyPane = await this.awaitClaudeReady(client, binding.agent, binding.run, signal);
+		if (!readyPane || await this.locateClaude(client, binding.agent, binding.run, signal) !== readyPane) return;
+		// Past the start window nothing is sent; maintenance expires the run.
+		if (this.now() >= (await this.read(binding.run)).deadline) return;
+		// Only this run's own prompt, while it is still current, queued and not cancelled.
+		const command = await this.store.claimPrompt(agentId, binding.run.runId, binding.token);
 		if (!command) return;
 		try {
 			// Target the verified pane: the name alone could reach another process that took it.
-			const paneId = await this.locate(binding.agent, signal);
+			const paneId = await this.locateClaude(client, binding.agent, binding.run, signal);
+			if (paneId !== readyPane) {
+				await this.store.recordExecutionEvent(command, binding.token, { type: "failed", error: "The Claude pane changed before the prompt could be sent; nothing was typed." }, this.now());
+				return;
+			}
+			// The lookup itself may outlast the start window, or the run be stopped meanwhile: then nothing is typed. The state is
+			// read first and the clock after it, so neither can change unseen between the check and the send.
+			const latest = await this.read(command);
+			if (isTerminal(latest.phase) || latest.cancelRequested) return;
+			if (latest.paneConflict !== undefined) {
+				await this.store.recordExecutionEvent(command, binding.token, { type: "failed", error: "Herdr reported another session before the Claude prompt could be sent; nothing was typed." }, this.now());
+				return;
+			}
+			if (this.now() >= latest.deadline) {
+				await this.store.recordExecutionEvent(command, binding.token, { type: "failed", error: "The Claude prompt's start window ended before it could be sent; nothing was typed." }, this.now());
+				return;
+			}
 			await client.promptAgent!(paneId, claudePrompt(command), signal);
 			await this.store.commandDelivered(command, binding.token);
 		} catch (error) {
@@ -1018,6 +1183,54 @@ export class HerdrRunner {
 			}, this.now());
 			throw error;
 		}
+	}
+
+	/**
+	 * Claude takes typed input before it is ready: while a resumed conversation still loads, the text lands in the composer
+	 * but the Enter is lost, and the run expires unsubmitted. Wait until the agent's own pane reports idle or done, following
+	 * the agent if its pane changes hands. Bounded by the run's start deadline less a send margin; an unclassified pane gets
+	 * a short grace, and a client reporting no activity is not waited on. A failed status lookup is retried, not fatal.
+	 * A different session reported by name or pane blocks this run permanently, even if the original session returns.
+	 */
+	private async awaitClaudeReady(client: HerdrClient, record: AgentRecord, run: RunSnapshot, signal?: AbortSignal): Promise<string | undefined> {
+		const started = this.now();
+		const deadline = Math.min(started + CLAUDE_READY_MS, run.deadline - CLAUDE_SEND_MARGIN_MS);
+		if (run.paneConflict) return undefined;
+		let paneId = await this.locateClaude(client, record, run, signal);
+		if (!paneId) return undefined;
+		let observed: string | undefined;
+		for (let first = true; ; first = false) {
+			if (!first && this.now() >= deadline) return observed;
+			// Another servicer may have claimed the prompt, or the run been stopped or finished: there is nothing left to wait for.
+			const current = await this.read(run);
+			if (current.phase !== "queued" || current.cancelRequested || current.paneConflict) return undefined;
+			let pane: HerdrAgentRef | undefined;
+			try {
+				pane = await client.getPane?.(paneId, signal) ?? await client.getAgent(record.herdrName, signal);
+			} catch (error) { if (signal?.aborted) throw error; }
+			if (pane?.session !== undefined && !exactSession(pane.session, record)) {
+				await this.store.notePaneConflict(run, pane.paneId ?? paneId);
+				return undefined;
+			}
+			if (pane?.paneId && pane.paneId !== paneId) {
+				if (ownedPresence(record, pane) !== "alive") return undefined;
+				paneId = pane.paneId;
+				observed = undefined;
+			} else if (pane?.paneId === paneId) {
+				observed = paneId;
+				if (pane.status === undefined || ["idle", "done"].includes(pane.status)) return observed;
+				if (pane.status === "unknown" && this.now() - started >= CLAUDE_UNKNOWN_GRACE_MS) return observed;
+			}
+			if (this.now() >= deadline) return observed;
+			await this.sleep(POLL_MS);
+			if (signal) check(signal);
+		}
+	}
+
+	private async locateClaude(client: HerdrClient, record: AgentRecord, run: RunRef, signal?: AbortSignal): Promise<string | undefined> {
+		const named = await client.getAgent(record.herdrName, signal);
+		if (named?.session !== undefined && !exactSession(named.session, record)) await this.store.notePaneConflict(run, named.paneId ?? record.paneId);
+		return ownedPresence(record, named) === "alive" ? named?.paneId : undefined;
 	}
 
 	/** The pane currently hosting this agent. Throws unless Herdr proves it is the launched process. */

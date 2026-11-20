@@ -12,6 +12,10 @@ Stay on documented Pi extension APIs: `setFooter`, `setEditorComponent` wrapping
 
 Match the existing TypeScript style: tabs, and `.ts` import specifiers.
 
+## Boundaries
+
+Code that talks to Pi tools, Herdr clients, the runner store or Claude Code follows the real interface on the other side. Read that interface before changing such code, and reuse the existing procedure for the same kind of action: Pi's `resolveToCwd` resolves tool paths, and the runner's maintenance close (`reap`, `preparePaneClose`, `recoverPaneClose`) closes panes. Each boundary gets at least one test through the real adapter or CLI (`createHcCli` with a fake transport, a fake `claude` executable that prints the CLI's own messages); a fixture you write yourself only checks your own assumptions.
+
 ## Adding a diamond
 
 Route every header and body `handleMouse` through `handleDiamondClick` in `src/tools/interaction.ts`; it owns the gesture table (README, "Diamond interaction"). Do not re-implement toggle, close, or open-target gestures. Give the content a file target with `fileTarget`, and finish with `assertDiamondGestures` from `test/fixtures/diamond-gestures.ts`. `test/interaction.test.ts` fails any tool or subagent module that handles mouse input without importing `interaction.ts`.

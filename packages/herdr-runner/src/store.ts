@@ -342,6 +342,28 @@ export class HerdrStore {
 	claudeBinding(agentId: string) { return this.call("claudeBinding", agentId); }
 	claudeHook(agentId: string, input: import("./claude.ts").ClaudeHookInput, now: number) { return this.call("claudeHook", agentId, input, now); }
 	claimNextCommand(agentId: string, token: string, streaming: boolean) { return this.call("claimNextCommand", agentId, token, streaming); }
+	/**
+	 * The queued prompt of exactly this run. An older worker lacks the operation, and its agent-scoped claim could take
+	 * another run's prompt, so nothing is claimed there: the machine's runner must be updated.
+	 */
+	notePaneConflict(ref: RunRef, paneId: string) { return this.call("notePaneConflict", ref, paneId); }
+	/** Whether this worker can claim a run's own prompt; a call for no agent claims nothing on a current worker. */
+	async claimPromptSupported(): Promise<boolean> {
+		try { await this.call("claimPrompt", "", "", ""); return true; }
+		catch (error) {
+			if (error instanceof Error && error.message === "Unknown Herdr control operation") return false;
+			throw error;
+		}
+	}
+	async claimPrompt(agentId: string, runId: string, token: string): Promise<Command | undefined> {
+		try { return await this.call("claimPrompt", agentId, runId, token); }
+		catch (error) {
+			if (error instanceof Error && error.message === "Unknown Herdr control operation") {
+				throw new Error("This machine runs a Herdr runner too old to send Claude Code prompts safely. Update it there (sidecar sync-machine), then retry.", { cause: error });
+			}
+			throw error;
+		}
+	}
 	commandDelivered(command: Command, token: string) { return this.call("commandDelivered", command, token); }
 	authorizeInput(ref: RunRef, commandId: string, token: string) { return this.call("authorizeInput", ref, commandId, token); }
 	recordExecutionEvent(ref: RunRef, token: string, event: ExecutionEvent, now: number) { return this.call("recordExecutionEvent", ref, token, event, now); }

@@ -21,7 +21,7 @@ test("ask starts a Pi sidecar owned by the Claude session and prints its report"
 	assert.equal(body.join("\n"), "## Verdict\nship");
 	assert.match(f.prompts[0], /Review the parser\./);
 	assert.match(f.prompts[0], /your final reply is the report/);
-	assert.deepEqual(f.starts[0].slice(2), ["--model", "openai-codex/gpt-6.2-sol", "--thinking", "high"]);
+	assert.deepEqual(f.starts[0].slice(2), ["--model", "openai-codex/gpt-6.2-astra", "--thinking", "high"]);
 	const status = await f.run("--slot", "2", "status");
 	assert.match(status.stdout, /^slot 2: adversarial-reviewer · pi · sidecar-2-adversarial-reviewer · completed/m);
 	const report = await f.run("--slot", "2", "report");
@@ -84,11 +84,20 @@ test("claudeModels in the sidecar config replaces the allowlist", async (t) => {
 
 test("--model and --thinking choose a fresh slot's model; follow-ups refuse another model", async (t) => {
 	const f = fixture(t, () => ({ type: "completed", result: "done" }));
-	const run = await f.run("--slot", "4", "--role", "implementer", "--model", "openai-codex/gpt-6.2-astra", "--thinking", "high", "ask", "x");
+	const run = await f.run("--slot", "4", "--role", "implementer", "--model", "openai-codex/gpt-6.2-sol", "--thinking", "high", "ask", "x");
 	assert.equal(run.code, 0, run.stderr);
-	assert.deepEqual(f.starts.at(-1)!.slice(2), ["--model", "openai-codex/gpt-6.2-astra", "--thinking", "high"]);
-	assert.match((await f.run("--slot", "4", "--model", "openai-codex/gpt-6.2-sol", "ask", "again")).stderr, /runs openai-codex\/gpt-6.2-astra; use stop --fresh/);
+	assert.deepEqual(f.starts.at(-1)!.slice(2), ["--model", "openai-codex/gpt-6.2-sol", "--thinking", "high"]);
+	assert.match((await f.run("--slot", "4", "--model", "openai-codex/gpt-6.2-astra", "ask", "again")).stderr, /runs openai-codex\/gpt-6.2-sol; use stop --fresh/);
 	assert.equal(f.prompts.length, 1);
+});
+
+test("pi roles default to astra; reviewers and researchers think at high, others at medium", async (t) => {
+	for (const [role, thinking] of [["implementer", "medium"], ["explorer", "medium"], ["researcher", "high"]]) {
+		const f = fixture(t, () => ({ type: "completed", result: "done" }));
+		const run = await f.run("--slot", "5", "--role", role, "ask", "x");
+		assert.equal(run.code, 0, run.stderr);
+		assert.deepEqual(f.starts.at(-1)!.slice(2), ["--model", "openai-codex/gpt-6.2-astra", "--thinking", thinking]);
+	}
 });
 
 test("sidecar Claude aliases follow claudeModels, and follow-ups refuse a model since removed", async (t) => {

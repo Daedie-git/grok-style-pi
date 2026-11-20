@@ -401,7 +401,7 @@ export class SidecarCli {
 		const allowed = claudeModels(this.env);
 		const model = agent === "claude"
 			? globals.model || this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
-			: globals.model || this.env.SIDECAR_MODEL || "openai-codex/gpt-6.2-sol";
+			: globals.model || this.env.SIDECAR_MODEL || "openai-codex/gpt-6.2-astra";
 		if (!model) throw new Error("claudeModels is empty; no Claude model is allowed");
 		const checked = allowedClaudeModel(model, allowed, agent === "claude");
 		return {
@@ -411,7 +411,7 @@ export class SidecarCli {
 			name: `sidecar-${globals.slot}-${role}`,
 			subagentType: role,
 			model: checked,
-			thinking: globals.thinking || this.env.SIDECAR_THINKING || (reviewer ? "high" : "medium"),
+			thinking: globals.thinking || this.env.SIDECAR_THINKING || (reviewer || role === "researcher" ? "high" : "medium"),
 			runInBackground: true,
 			keep,
 			cwd,

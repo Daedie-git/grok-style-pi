@@ -12,7 +12,7 @@ import { sanitizeToolText } from "../tools/diamond.ts";
 import type { MemoryFooterStatus } from "../chrome/footer.ts";
 
 export type MemoryOptions = { provider: string; model: string; reasoning: ThinkingLevel; recall: boolean; extraction: boolean; consolidation: boolean; everyTurns: number; idleMs: number; minHours: number; minSessions: number };
-export const defaultMemoryOptions: MemoryOptions = { provider: "openai-codex", model: "gpt-6.1-terra", reasoning: "medium", recall: true, extraction: true, consolidation: true, everyTurns: 5, idleMs: 120_000, minHours: 24, minSessions: 5 };
+export const defaultMemoryOptions: MemoryOptions = { provider: "openai-codex", model: "gpt-6.2-sol", reasoning: "medium", recall: true, extraction: true, consolidation: true, everyTurns: 5, idleMs: 120_000, minHours: 24, minSessions: 5 };
 export type RecentMemorySession = { id: string; modified: number; text: string };
 import { readMemoryProgress, writeMemoryProgress } from "./memory-progress.ts";
 import { consolidationChunks, memoryChunk, type MemoryCursor } from "./memory-context.ts";

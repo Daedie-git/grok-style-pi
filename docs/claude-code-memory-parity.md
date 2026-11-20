@@ -6,7 +6,7 @@ The installed Claude Code does have a separate model-based topic selector. The i
 
 Our pre-fix `before_agent_start` awaited the selector. That was a real behavior difference and a direct message-submission gate. The regression test held the selector response pending, observed the submission hook remain blocked, and failed before the fix. The implementation now returns immediately, retains already-recalled notes in conversation history without duplicating them, and queues new escaped notes through Pi's public hidden-message API with `triggerTurn: false`. This does not steer the current response or force another turn. Pending recall is canceled when the foreground run settles.
 
-This fixes the scheduling difference; **it does not make every other part of our system identical to Claude Code**. The remaining differences are listed explicitly below. The requested Grok default of GPT-6.1 Terra with medium reasoning remains an intentional user override, not a claim about Claude's model choice.
+This fixes the scheduling difference; **it does not make every other part of our system identical to Claude Code**. The remaining differences are listed explicitly below. The requested Grok default of GPT-6.2 Sol with medium reasoning remains an intentional user override, not a claim about Claude's model choice.
 
 ## Evidence, method and limits
 
@@ -196,7 +196,7 @@ Sources: `chunk-x22hm4b2.js` `Oh` 61517, `Cae` 61596, `gy` 62073, `hy` 63655, re
 | Worktrees | Shared validated repository memory | Ours separates worktrees. |
 | Enablement | Normal local default on, richer policy/session gates | Ours default off plus a separate explicit directory grant for automatic access. |
 | Directory configuration | Configurable memory root and explicit project-key override | Ours resolves a fixed private per-project store. |
-| Models/effort | Sonnet selector; extraction/dream inherit parent options | Ours intentionally uses configurable GPT-6.1 Terra/medium per user request. |
+| Models/effort | Sonnet selector; extraction/dream inherit parent options | Ours intentionally uses configurable GPT-6.2 Sol/medium per user request. |
 | Account/team stores | Additional transports, scopes, gates and snapshot waits | Not implemented by our local project-memory feature. |
 | Safety/concurrency | Validated paths/ordinary permissions; local dream write/recheck lock | Ours uses stricter private Markdown tools, mutation queue, compare-and-swap and exclusive lock. Keep safety differences explicit rather than weaken them blindly. |
 

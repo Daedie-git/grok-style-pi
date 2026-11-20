@@ -162,13 +162,13 @@ Replace `off` with `on` to re-enable a mode. Manual passes respect their mode's 
 
 Dream consolidation checks after settled runs, requiring 24 hours since the last successful consolidation and at least five other modified sessions. `/memory consolidate` bypasses those timing/count thresholds, not the dream toggle. It reads bounded transcript tails (at most ten sessions, 100,000 bytes each) from Pi's public session listing for the current launch directory, using human/assistant prose only, then merges notes, removes stale/duplicate entries and repairs links. Each session has an identifier/modification timestamp; all supplied prose is processed in bounded newest-first chunks, not a tail slice that drops newer sessions. Per-session snapshot progress excludes already-reviewed revisions before selecting the next capped batch, while the time watermark records scan start, not completion. Corrections written during a pass therefore remain eligible later. It neither changes Pi's transcripts/compaction nor writes instruction files. Consolidation covers sessions launched in that directory, not an automatic scan of every repository or subdirectory on the machine.
 
-Both background modes coordinate through `.consolidate-lock` and record successful consolidation time separately. A crash can leave a conservative lock; if `/memory status` reports one, remove it only after verifying no memory worker is running. New prompts, compaction, tree changes, session replacement and shutdown abort pending work. Already-completed file writes remain. All automatic recall, extraction and consolidation requests default to `openai-codex/gpt-6.1-terra` with `medium` reasoning, independent of the conversation's model and thinking level. Override `automaticMemory.provider`, `automaticMemory.model`, and `automaticMemory.reasoning` in `~/.pi/agent/grok-style.json` (or your configured agent directory), then `/reload`. Supported reasoning levels are `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, subject to the selected model's capabilities. For example:
+Both background modes coordinate through `.consolidate-lock` and record successful consolidation time separately. A crash can leave a conservative lock; if `/memory status` reports one, remove it only after verifying no memory worker is running. New prompts, compaction, tree changes, session replacement and shutdown abort pending work. Already-completed file writes remain. All automatic recall, extraction and consolidation requests default to `openai-codex/gpt-6.2-sol` with `medium` reasoning, independent of the conversation's model and thinking level. Override `automaticMemory.provider`, `automaticMemory.model`, and `automaticMemory.reasoning` in `~/.pi/agent/grok-style.json` (or your configured agent directory), then `/reload`. Supported reasoning levels are `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, subject to the selected model's capabilities. For example:
 
 ```json
 {
   "automaticMemory": {
     "provider": "openai-codex",
-    "model": "gpt-6.1-terra",
+    "model": "gpt-6.2-sol",
     "reasoning": "medium"
   }
 }

@@ -45,7 +45,7 @@ async function setup(t: TestContext, overrides: Record<string, unknown> = {}) {
 test("memory requests use their configured model and reasoning, not the conversation model", async t => {
 	const h = await setup(t, { complete: undefined });
 	const requests: any[] = [];
-	const model = { id: "gpt-6.1-terra", provider: "openai-codex" };
+	const model = { id: "gpt-6.2-sol", provider: "openai-codex" };
 	Object.assign(h.ctx, {
 		model: { id: "other-conversation-model" },
 		modelRegistry: {

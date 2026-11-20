@@ -86,10 +86,6 @@ export function parseDefinitionData(data: unknown, prompt: string, origin: Defin
 		if (data.isolation === "worktree") definition.isolation = "worktree";
 		else diagnostics.push(`Unsupported isolation: ${String(data.isolation)}; only worktree is supported`);
 	}
-	if (data.memory !== undefined) {
-		if (data.memory === "user" || data.memory === "project" || data.memory === "local") definition.memory = data.memory;
-		else diagnostics.push("memory must be user, project or local");
-	}
 	if (definition.permissionMode !== undefined) diagnostics.push("permissionMode is unsupported by Pi and has no effect");
 	for (const key of ["hooks", "mcpServers"] as const) {
 		if (data[key] === undefined) continue;

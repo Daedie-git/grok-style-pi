@@ -45,7 +45,7 @@ export function registerEngineTools(pi: ExtensionAPI, engine: Engine | (() => En
 			...(options.panes ? {
 				keep: Type.Optional(Type.Boolean({ description: "Keep a Herdr pane open after the agent finishes. Overrides agent-file keep and persists across resumes. Does not select the pane backend or prevent owner-gone cleanup." })),
 				backend: Type.Optional(Type.Union([Type.Literal("in-process"), Type.Literal("pane")], { description: options.paneDefault
-					? "In a top-level Herdr session, agents default to a pane; forks, worktree, nested agents and definitions with skills, memory, hooks or MCP servers run in-process. Use in-process only when the user asks to keep the agent out of a pane."
+					? "In a top-level Herdr session, agents default to a pane; forks, worktree, nested agents and definitions with skills, hooks or MCP servers run in-process. Use in-process only when the user asks to keep the agent out of a pane."
 					: "Default in-process. Use pane only when the user asks for a visible Herdr pane." })),
 				runtime: Type.Optional(Type.Union([Type.Literal("pi"), Type.Literal("claude-code")], { description: "Use claude-code only when the user asks for Claude Code; runs in a pane." })),
 				machine: Type.Optional(Type.String({ description: "A saved Herdr SSH machine to run on, only when the user asks; runs in a pane there." })),

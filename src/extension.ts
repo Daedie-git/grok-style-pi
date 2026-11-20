@@ -3,7 +3,6 @@ import { VisualPreparation } from "./rendering/visual-preparation.ts";
 import type { ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { defaultFeatures } from "./extension/features.ts";
 import { COMMUNICATION, installCommunication } from "./extension/communication.ts";
-import { createProjectMemorySession } from "./extension/project-memory-session.ts";
 import { BUILTIN_TOOL_NAMES, createDiamondTools, wrapWithDiamondRenderer, type BuiltinToolName, type OriginalTool } from "./tools/renderer.ts";
 import { installMediaTools } from "./media/tools.ts";
 import { createFileNavigation } from "./extension/file-navigation.ts";
@@ -19,16 +18,14 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	const preparation = new VisualPreparation();
 	let started = false;
 	let activeContext: SessionContext | undefined;
-	const projectMemory = createProjectMemorySession({ enabled: features.memory, storageRoot: deps.projectMemoryRoot });
 	const navigation = createFileNavigation(pi, { ...deps, communication: features.communication });
 	const chrome = createSessionChrome(pi, { CustomEditor: deps.CustomEditor, features });
 
 	pi.on("before_agent_start", (event, ctx) => {
 		const sections = (event.systemPromptOptions as { sections?: Record<string, string> } | undefined)?.sections;
 		installCommunication(sections, features.communication);
-		const prompt = !sections && features.communication ?
-			`${event.systemPrompt}\n\n<communication>\n${COMMUNICATION}\n</communication>` : event.systemPrompt;
-		return projectMemory.beforeAgentStart(event, ctx, prompt);
+		if (sections || !features.communication) return undefined;
+		return { systemPrompt: `${event.systemPrompt}\n\n<communication>\n${COMMUNICATION}\n</communication>` };
 	});
 	const diamondHooks = {
 		preparation,
@@ -59,7 +56,6 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		projectMemory.startSession();
 		activeContext = ctx;
 		if (started) preparation.reset();
 		started = true;
@@ -69,7 +65,6 @@ export function createGrokStyleExtension(pi: ExtensionApiLike, deps: GrokStyleDe
 		registerTools(ctx.cwd, deps.getToolOptions?.(ctx));
 	});
 	pi.on("session_shutdown", () => {
-		projectMemory.dispose();
 		activeContext = undefined;
 		preparation.reset();
 		navigation.dispose();

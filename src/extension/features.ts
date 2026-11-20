@@ -12,10 +12,10 @@ export const featureLabels = {
 	communication: "Communication style and clickable file references",
 	autonomy: "Autonomous in-process subagent delegation",
 	panes: "Subagents in Herdr panes",
-	memory: "Persistent project memory (opt-in)",
+	claudeMemory: "Recall from Claude Code memory (read-only)",
 } as const;
 export type Features = Record<keyof typeof featureLabels, boolean>;
-export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true, panes: true, memory: false };
+export const defaultFeatures: Features = { footer: true, composer: true, toolStyling: true, activity: true, terminalColors: true, communication: true, autonomy: true, panes: true, claudeMemory: true };
 
 export function loadFeatures(path = featureSettingsPath()): Features {
 	const values = readSettingsObject(path);
@@ -29,8 +29,12 @@ export function loadFeatures(path = featureSettingsPath()): Features {
 	return result;
 }
 
+/** Keys of the removed Pi memory system: `memory` was its opt-in switch, `automaticMemory` its model and grants. */
+const OBSOLETE_KEYS = ["memory", "automaticMemory"];
+
 export function saveFeatures(features: Features, path = featureSettingsPath()) {
-	writeSettingsObject({ ...readSettingsObject(path), ...features }, path);
+	const saved = Object.fromEntries(Object.entries(readSettingsObject(path)).filter(([key]) => !OBSOLETE_KEYS.includes(key)));
+	writeSettingsObject({ ...saved, ...features }, path);
 }
 
 export function installFeatureSettings(pi: ExtensionAPI, path = featureSettingsPath()) {

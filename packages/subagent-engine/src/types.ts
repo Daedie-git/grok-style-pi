@@ -7,7 +7,6 @@ export type RunId = string;
 
 export type DefinitionSource = "built-in" | "package" | "user" | "project" | "flag" | "policy";
 export type BuiltInKind = "general-purpose" | "explore" | "plan" | "review" | "adversarial-reviewer" | "researcher" | "fork";
-export type MemoryScope = "user" | "project" | "local";
 
 export interface HookCommand {
 	type: "command";
@@ -47,7 +46,6 @@ export interface AgentDefinition {
 	/** Default idle-cleanup exemption for Herdr panes; ignored in-process. */
 	keep?: boolean;
 	isolation?: "worktree";
-	memory?: MemoryScope;
 	hooks?: HookConfig;
 	mcpServers?: McpServerSpec[];
 	omitClaudeMd?: boolean;

@@ -1,5 +1,4 @@
-import { join } from "node:path";
-import { getAgentDir, SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { inChildContext } from "../packages/subagent-engine/src/child-context.ts";
 import { defaultFeatures, loadFeatures, installFeatureSettings, type Features } from "../src/extension/features.ts";
 import { loadStyleColors, useStyleColors } from "../src/chrome/style-colors.ts";
@@ -10,11 +9,9 @@ import { registerStyledCodemode } from "../src/tools/codemode.ts";
 import { installSteeringInbox } from "../src/steering/inbox.ts";
 import { installFastMode } from "../src/extension/fast-mode.ts";
 import { installToolGuard } from "../src/extension/tool-guard.ts";
-import { installAutomaticMemory } from "../src/extension/automatic-memory.ts";
-import { recentMemorySessions } from "../src/extension/memory-history.ts";
 
 type PiObjects = Pick<typeof import("@earendil-works/pi-coding-agent"), "CustomEditor" | "createReadToolDefinition" | "createBashToolDefinition" | "createPowerShellToolDefinition" | "createEditToolDefinition" | "createWriteToolDefinition" | "createGrepToolDefinition" | "createFindToolDefinition" | "createLsToolDefinition"> & { createCodemodeExtension?: () => ExtensionFactory };
-export type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features; projectMemoryRoot?: string };
+export type InstallDeps = { loadAgent?: () => Promise<PiObjects>; features?: Features };
 
 /** Each alternative entrypoint installs one core runtime and shares its rendering hooks. */
 export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {}) {
@@ -27,11 +24,8 @@ export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {})
 	installToolGuard(pi);
 	installSteeringInbox(pi);
 	const activity = features.activity ? installActivityPanel(pi) : undefined;
-	const projectMemoryRoot = deps.projectMemoryRoot ?? join(getAgentDir(), "grok-memory", "projects");
-	const memoryEnabled = features.memory && !/^(?:1|true|yes|on)$/i.test(process.env.PI_DISABLE_AUTO_MEMORY ?? "");
 	const runtime = createGrokStyleExtension(pi, {
-		features: { ...features, memory: memoryEnabled },
-		projectMemoryRoot,
+		features,
 		wrapTool: activity?.wrapTool,
 		CustomEditor: agent.CustomEditor,
 		getToolOptions: loadToolOptions,
@@ -45,11 +39,6 @@ export async function installGrokStyle(pi: ExtensionAPI, deps: InstallDeps = {})
 			find: agent.createFindToolDefinition,
 			ls: agent.createLsToolDefinition,
 		},
-	});
-	installAutomaticMemory(pi, {
-		enabled: memoryEnabled, storageRoot: projectMemoryRoot, queue: withFileMutationQueue,
-		recentSessions: async (ctx, since, signal, processed) => recentMemorySessions(
-			await SessionManager.list(ctx.cwd, undefined, undefined, signal), since, ctx.sessionManager.getSessionId(), signal, processed),
 	});
 	// Older Pi releases have no codemode factory. Do not construct it when styling is off.
 	const codemode = (agent as PiObjects).createCodemodeExtension;

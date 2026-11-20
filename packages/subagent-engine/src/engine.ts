@@ -12,9 +12,9 @@ import { compileToolSurface, type ToolLite } from "./context/capabilities.ts";
 import { resolveEffort, resolveModel, roleDefaultEffort, type ModelLite } from "./context/model.ts";
 import { childSystemPrompt, contextFilePolicy, taskMessage } from "./context/prompt.ts";
 import { allowedListing, allowedModel, DEFAULT_CLAUDE_MODELS, notAllowed } from "./context/claude-models.ts";
+import { claudeMemoryGuard } from "./claude-memory/recall.ts";
 import { canonicalAgentType, discoverDefinitions, selectDefinition, type DefinitionSet } from "./definitions/discovery.ts";
 import { launchResultText, noticeText } from "./policy/text.ts";
-import { memoryDir, memoryIndex, memoryPathGuard, memoryRootContained } from "./memory.ts";
 import { truncateResult } from "./results.ts";
 import { buildForkEntries, writeForkSession } from "./context/fork.ts";
 import { WorkflowTasks, type WorkflowSnapshot } from "./workflow-tool.ts";
@@ -45,9 +45,6 @@ export interface Caller {
 	isFork: boolean;
 	/** Agent(a,b) restriction from the caller's definition. */
 	allowedAgentTypes?: string[];
-	/** Tools granted only for agent memory, and the guard confining them to the memory directory (plan §11, §17.8). */
-	memoryScoped?: string[];
-	memoryGuard?: (toolName: string, args: Record<string, unknown>) => string | undefined;
 	/** The compiled tool policy for this child; every call is checked against it, not the mutable active loadout. */
 	allowedTools?: ReadonlySet<string>;
 }
@@ -108,8 +105,6 @@ export interface EngineDeps {
 	agentDefaults?: AgentDefaults;
 	/** The Claude models subagents may run, first as Claude Code's default; defaults to DEFAULT_CLAUDE_MODELS. */
 	claudeModels?: string[];
-	/** Host master switch for definition-scoped memory; standalone engines default to enabled. */
-	memoryEnabled?: boolean | (() => boolean);
 	now?: () => number;
 	/** Installs the child-side tools and policy handlers into a child session. Supplied by the extension wiring. */
 	childInstaller: (engine: Engine, caller: Caller) => (pi: ExtensionAPI) => void;
@@ -182,7 +177,7 @@ export class Engine {
 	 * Rebind runtime-scoped dependencies after a reload handover: children created from now on must use the new runtime's
 	 * policy (autonomy) and installers, not closures captured by the runtime that created this engine.
 	 */
-	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "limits" | "taskHooks" | "paneDefault" | "memoryEnabled" | "agentDefaults" | "claudeModels">>): void {
+	rebindRuntime(deps: Pick<EngineDeps, "childInstaller"> & Partial<Pick<EngineDeps, "limits" | "taskHooks" | "paneDefault" | "agentDefaults" | "claudeModels">>): void {
 		this.deps = { ...this.deps, ...deps };
 		this.tasks = undefined;
 	}
@@ -371,12 +366,6 @@ export class Engine {
 		});
 		this.definitionCache = { at: this.now(), set };
 		return set;
-	}
-
-	memoryEnabled(): boolean {
-		if (/^(?:1|true|yes|on)$/i.test(this.deps.env.PI_DISABLE_AUTO_MEMORY ?? "")) return false;
-		const enabled = this.deps.memoryEnabled;
-		return typeof enabled === "function" ? enabled() : enabled ?? true;
 	}
 
 	forkEnabled(): boolean {
@@ -1215,27 +1204,21 @@ export class Engine {
 		if (parent) { meta.forkSystemPrompt = parent.systemPrompt; meta.forkParentTools = parent.tools; }
 		const forkPrompt = meta.isFork ? meta.forkSystemPrompt : undefined;
 		const caller: Caller = { agentId: meta.agentId, depth: meta.spawnDepth, background, isFork: Boolean(meta.isFork) };
-		const configuredMemory = definition.memory && this.memoryEnabled() ? memoryDir(definition.memory, { agentDir: this.deps.agentDir, cwd: meta.cwd, agentType: definition.agentType }) : undefined;
-		const memoryWorkingCopy = definition.memory === "project" || definition.memory === "local" ? meta.cwd : undefined;
-		const memoryUnavailable = configuredMemory !== undefined && memoryWorkingCopy !== undefined && !memoryRootContained(configuredMemory, memoryWorkingCopy);
-		const memory = memoryUnavailable ? undefined : configuredMemory;
-		if (memory) caller.memoryGuard = memoryPathGuard(memory, memoryWorkingCopy);
 		const policy = contextFilePolicy(definition);
 		return {
 			agentId: meta.agentId, cwd: meta.cwd, agentDir: this.deps.agentDir, sessionFile: meta.sessionFile, model, thinkingLevel: thinking,
 			projectTrusted: this.projectTrusted, depth: meta.spawnDepth,
 			systemPrompt: forkPrompt !== undefined
 				? { mode: "exact", text: forkPrompt }
-				: { mode: "preamble", text: childSystemPrompt({ definition, cwd: meta.cwd, isBackground: background, isWorkflow: Boolean(meta.workflow), memoryDirectory: memory, memoryUnavailable, memoryIndex: memory ? memoryIndex(memory, 25_000, memoryWorkingCopy) : undefined }) },
+				: { mode: "preamble", text: childSystemPrompt({ definition, cwd: meta.cwd, isBackground: background, isWorkflow: Boolean(meta.workflow) }) },
 			noContextFiles: policy === "none",
 			installers: [this.deps.childInstaller(this, caller)],
 			selectTools: (tools: ToolInfo[]) => {
 				const surface = compileToolSurface({
 					definition, available: tools.map(toolLite), depth: meta.spawnDepth, maxDepth: this.control.limits.maxDepth,
-					background, isFork: Boolean(meta.isFork), parentTools: meta.forkParentTools, memoryTools: memory ? ["read", "write", "edit"] : undefined,
+					background, isFork: Boolean(meta.isFork), parentTools: meta.forkParentTools,
 				});
 				caller.allowedAgentTypes = surface.allowedAgentTypes;
-				caller.memoryScoped = surface.memoryScoped;
 				// Host-installed handback tools (StructuredOutput) are always part of an internal child's policy.
 				for (const name of extraTools) if (tools.some((tool) => tool.name === name) && !surface.active.includes(name)) surface.active.push(name);
 				caller.allowedTools = new Set(surface.active);
@@ -1614,6 +1597,13 @@ export class Engine {
 	 * Live authorization (plan §16.4, review R03): a tool call is checked against the agent's *current* definition, so
 	 * narrowing a definition revokes the grant even for a retained session. Fails closed when the definition disappeared.
 	 */
+	/** Pi agents never change Claude Code memory; children are held to the same guard as the root session. */
+	memoryWriteBlock(agentId: AgentId, toolName: string, input: unknown): Promise<string | undefined> {
+		this.memoryGuard ??= claudeMemoryGuard(this.deps.env, this.deps.homeDir);
+		return this.memoryGuard.check(toolName, input, this.control.get(agentId)?.meta.cwd ?? process.cwd());
+	}
+	private memoryGuard?: ReturnType<typeof claudeMemoryGuard>;
+
 	async toolRevocation(agentId: AgentId, toolName: string): Promise<string | undefined> {
 		if (toolName === "StructuredOutput") return undefined;
 		const decision = await this.currentCapability(agentId, toolName);
@@ -1623,8 +1613,7 @@ export class Engine {
 	}
 
 	/**
-	 * The current capability decision for one tool of a user-defined agent, compiled from the same inputs as its launch
-	 * (scoped memory included), so live admission and spawn-time grants agree (re-review RR02, RR08). Undefined when the
+	 * The current capability decision for one tool of a user-defined agent, compiled from the same inputs as its launch, so live admission and spawn-time grants agree (re-review RR02, RR08). Undefined when the
 	 * agent's capabilities are fixed for its lifetime (built-in, fork, skill, pane).
 	 */
 	private async currentCapability(agentId: AgentId, toolName: string): Promise<{ surface: ReturnType<typeof compileToolSurface>; agentType: string } | { error: string } | undefined> {
@@ -1644,7 +1633,6 @@ export class Engine {
 		const mcp = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName)?.[1];
 		const surface = compileToolSurface({
 			definition: current, available: [{ name: toolName, mcpServer: mcp }], depth: meta.spawnDepth, maxDepth: this.control.limits.maxDepth, background: false, isFork: false,
-			memoryTools: current.memory && this.memoryEnabled() ? ["read", "write", "edit"] : undefined,
 		});
 		return { surface, agentType: historical.agentType };
 	}
@@ -1847,7 +1835,6 @@ function liteModel(model: Model<any>): ModelLite {
 /** Definition features that only an in-process child applies. */
 function paneUnenforceable(definition: AgentDefinition): string | undefined {
 	if (definition.skills.length > 0) return "preloaded skills";
-	if (definition.memory) return "agent memory";
 	if (definition.hooks && Object.keys(definition.hooks).length > 0) return "hooks";
 	if (definition.mcpServers?.length) return "MCP servers";
 	return undefined;

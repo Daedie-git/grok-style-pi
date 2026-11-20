@@ -10,7 +10,6 @@ export interface SurfaceInput {
 	background: boolean;
 	isFork: boolean;
 	parentTools?: string[];
-	memoryTools?: string[];
 }
 export interface ToolSurface {
 	active: string[];
@@ -18,7 +17,6 @@ export interface ToolSurface {
 	allowedAgentTypes?: string[];
 	invalid: string[];
 	unavailable: string[];
-	memoryScoped: string[];
 }
 
 // An empty target is a recognized Claude tool with no Pi equivalent.
@@ -45,7 +43,7 @@ const isMcp = (tool: ToolLite): boolean => tool.mcpServer !== undefined || tool.
 export function compileToolSurface(input: SurfaceInput): ToolSurface {
 	const { available, definition } = input;
 	const names = new Set(available.map((tool) => tool.name));
-	const result: ToolSurface = { active: [], excluded: [], invalid: [], unavailable: [], memoryScoped: [] };
+	const result: ToolSurface = { active: [], excluded: [], invalid: [], unavailable: [] };
 	if (input.isFork) {
 		result.active = [...(input.parentTools ?? [])].filter((name) => name !== "needs_answer");
 		result.unavailable = unique(result.active.filter((name) => !names.has(name)));
@@ -97,14 +95,6 @@ export function compileToolSurface(input: SurfaceInput): ToolSurface {
 		if (!unrestrictedAgent && selected.has("Agent")) result.allowedAgentTypes = unique(types);
 	}
 	for (const name of selected) if (poolNames.has(name) && !denied.has(name)) result.active.push(name);
-	for (const raw of input.memoryTools ?? []) {
-		for (const name of expand(raw).names) {
-			if (poolNames.has(name) && !denied.has(name) && !result.active.includes(name)) {
-				result.active.push(name);
-				result.memoryScoped.push(name);
-			}
-		}
-	}
 	// Lifecycle handback is available to every non-fork child, even read-only or isolated definitions.
 	if (names.has("needs_answer") && !result.active.includes("needs_answer")) result.active.push("needs_answer");
 	if (!result.active.includes("Agent")) delete result.allowedAgentTypes;

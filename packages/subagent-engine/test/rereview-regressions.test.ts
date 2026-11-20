@@ -403,54 +403,25 @@ test("RR07: both public stop paths retry failed pane cancellation and emit stop-
 	});
 });
 
-test("RR08: memory-only grants allow owned MEMORY.md but refuse outside writes", { timeout: 20_000 }, async t => {
+test("RR08: a child with write granted still cannot change Claude Code memory", { timeout: 20_000 }, async t => {
 	offline(t);
-	let memory = "", outside = "";
-	const h = await createHarness({ parent: customParent, agentFiles: { "custom.md": definition("[]", "memory: user\n") },
+	let memory = "", ordinary = "";
+	const h = await createHarness({ parent: customParent, agentFiles: { "custom.md": definition("[write]", "memory: user\n") },
 		child: () => ({ index }) => index === 0 ? { tools: [
-			{ name: "write", args: { path: memory, content: "owned memory" } },
-			{ name: "write", args: { path: outside, content: "must not write" } },
+			{ name: "write", args: { path: memory, content: "must not write" } },
+			{ name: "write", args: { path: ordinary, content: "ordinary file" } },
 		] } : { text: "done" },
 	});
-	memory = join(h.root, "agent", "agent-memory", "custom", "MEMORY.md");
-	outside = join(h.root, "OUTSIDE.txt");
+	memory = join(h.root, ".claude", "projects", "-repo", "memory", "topic.md");
+	ordinary = join(h.root, "ORDINARY.txt");
 	t.after(() => h.close());
 	await h.parent.prompt("go", { source: "extension" });
 	const child = [...h.children.values()][0];
-	const results = child.messages.filter(message => message.role === "toolResult" && message.toolName === "write");
-	assert.equal(results.length, 2);
-	assert.equal((results[0] as { isError?: boolean }).isError, false);
-	assert.equal(readFileSync(memory, "utf8"), "owned memory");
-	assert.equal((results[1] as { isError?: boolean }).isError, true);
-	assert.equal(existsSync(outside), false);
-	assert.match(toolResultText(child, "write")[1], /memory|allowed|scope/i);
-});
-
-test("disabled memory omits scoped indexes and memory-only grants at child creation", { timeout: 20_000 }, async t => {
-	offline(t);
-	for (const [name, options] of [
-		["master switch", { memoryEnabled: false }],
-		["process override", { memoryEnabled: true, env: { PI_DISABLE_AUTO_MEMORY: "1" } }],
-	] as const) await t.test(name, async t => {
-		let note = "", request = "";
-		const h = await createHarness({ ...options, parent: customParent, agentFiles: { "custom.md": definition("[]", "memory: user\n") },
-			child: () => ({ index, system, messages }) => {
-				request = JSON.stringify({ system, messages });
-				return index === 0 ? { tools: [{ name: "write", args: { path: note, content: "must not write" } }] } : { text: "done" };
-			},
-		});
-		t.after(() => h.close());
-		const directory = join(h.root, "agent", "agent-memory", "custom");
-		mkdirSync(directory, { recursive: true });
-		writeFileSync(join(directory, "MEMORY.md"), "SCOPED_INDEX_MUST_NOT_LOAD");
-		note = join(directory, "new.md");
-		assert.equal(h.engine.memoryEnabled(), false);
-		await h.parent.prompt("go", { source: "extension" });
-		const child = [...h.children.values()][0];
-		assert.doesNotMatch(request, /SCOPED_INDEX_MUST_NOT_LOAD|Persistent agent memory/);
-		assert.equal(existsSync(note), false);
-		assert.equal((child.messages.find(message => message.role === "toolResult" && message.toolName === "write") as { isError?: boolean })?.isError, true);
-	});
+	const results = child.messages.filter(message => message.role === "toolResult" && message.toolName === "write") as Array<{ isError?: boolean }>;
+	assert.deepEqual(results.map(result => result.isError), [true, false]);
+	assert.equal(existsSync(memory), false);
+	assert.equal(readFileSync(ordinary, "utf8"), "ordinary file");
+	assert.match(toolResultText(child, "write")[0], /Claude Code memory is read-only/);
 });
 
 test("RR09: branched root ignores inherited main receipts and includes later owned receipts", { timeout: 20_000 }, async t => {

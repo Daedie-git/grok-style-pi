@@ -75,13 +75,12 @@ test("aliases select Pi tools, while empty and wildcard selections stay distinct
 		["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
 });
 
-test("denies win over inherited, explicit and memory grants", () => {
+test("denies win over inherited and explicit grants", () => {
 	for (const tools of [undefined, ["*"], ["Read", "Write", "Agent(a)", "mcp__repo"]]) {
-		const result = surface({ memoryTools: ["read", "Write", "mcp__repo__search", "Agent"] }, {
+		const result = surface({}, {
 			tools, disallowedTools: ["Read", "write", "Agent(blocked)", "mcp__repo"],
 		});
 		for (const name of ["read", "write", "Agent", "mcp__repo__search", "mcp__repo__fetch"]) assert(!result.active.includes(name));
-		assert.deepEqual(result.memoryScoped, []);
 		assert.equal(result.allowedAgentTypes, undefined);
 	}
 	assert.deepEqual(surface({}, { tools: ["Read"], disallowedTools: ["*"] }).active, []);
@@ -117,22 +116,13 @@ test("diagnostics distinguish invalid, recognized absent, and currently filtered
 	assert.deepEqual(surface({ available: [] }, { tools: ["Read", "read", "Agent", "TaskList"] }).unavailable, ["Read", "read", "Agent", "TaskList"]);
 });
 
-test("memory grants are additive and only newly granted tools become scoped", () => {
-	const result = surface({ memoryTools: ["Read", "Write", "Write", "Edit"] }, { tools: ["Read"], disallowedTools: ["Edit"] });
-	assert.deepEqual(result.active, ["read", "write"]);
-	assert.deepEqual(result.memoryScoped, ["write"]);
-	assert(!result.excluded.includes("write"));
-	assert.deepEqual(surface({ depth: 3, background: true, memoryTools: ["Agent", "TaskCreate"] }, { tools: [] }).active, []);
-});
-
 test("fork preserves exact parent order and unknown names despite depth, background and denies", () => {
 	const parentTools = ["custom", "Agent", "TaskCreate", "runtimeOnly", "/skill:run", "custom"];
-	const result = surface({ isFork: true, parentTools, depth: 9, background: true, memoryTools: ["write"] },
+	const result = surface({ isFork: true, parentTools, depth: 9, background: true },
 		{ tools: [], disallowedTools: ["*"] });
 	assert.deepEqual(result.active, parentTools);
 	assert.notEqual(result.active, parentTools);
 	assert.deepEqual(result.unavailable, ["runtimeOnly"]);
-	assert.deepEqual(result.memoryScoped, []);
 	assert.equal(result.allowedAgentTypes, undefined);
 	assert.deepEqual(surface({ isFork: true }).active, []);
 });

@@ -540,19 +540,19 @@ test("a definition's turn limit reaches a Claude Code pane request, for the runn
 	assert.equal(fake.spawns[0].maxTurns, 2);
 });
 
-const keeper = { "keeper.md": "---\nname: keeper\ndescription: remembers\nmemory: project\n---\nKeep notes." };
+const keeper = { "keeper.md": "---\nname: keeper\ndescription: hooked\nhooks:\n  SubagentStop:\n    - hooks:\n        - type: command\n          command: \"true\"\n---\nKeep notes." };
 
 test("an explicit pane is refused for a definition only an in-process child can apply", { timeout: 20_000 }, async (t) => {
 	const { harness, fake } = await setup(t, ({ index }) => index === 0
 		? { tools: [{ name: "Agent", args: { ...assignment, subagent_type: "keeper" } }] } : { text: "Refused" }, { agentFiles: keeper });
-	await harness.parent.prompt("Pane with memory", { source: "extension" });
-	assert.match(toolResultText(harness.parent, "Agent")[0], /cannot apply keeper's agent memory/);
+	await harness.parent.prompt("Pane with hooks", { source: "extension" });
+	assert.match(toolResultText(harness.parent, "Agent")[0], /cannot apply keeper's hooks/);
 	assert.equal(fake.spawns.length, 0);
 	assert.equal(harness.engine.control.conversations.size, 0);
 });
 
 for (const [label, args, options] of [
-	["agent memory", { subagent_type: "keeper" }, { agentFiles: keeper }],
+	["hooks", { subagent_type: "keeper" }, { agentFiles: keeper }],
 	["backend: in-process", { backend: "in-process" }, {}],
 	["no attached backend", {}, { attach: false }],
 	["paneDefault off", {}, { paneDefault: false }],

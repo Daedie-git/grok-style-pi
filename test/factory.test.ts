@@ -179,14 +179,14 @@ test("createGrokStyleExtension registers diamond built-ins, footer, and composer
 	assert.ok(footerLine.includes("Context 36,000/200,000 used"));
 	assert.ok(footerLine.includes("│"));
 	assert.ok(footerLine.includes("Grok 4.6 high"));
-	assert.ok(footerLine.includes("<muted>Memory: off"));
-	for (const status of ["on", "recalling", "extracting", "consolidating", "needs authorization", "error"]) {
-		statuses.set("grok-memory", status);
+	assert.ok(!footerLine.includes("Memory:"), "no memory item until the engine's recall publishes one");
+	for (const status of ["off", "on", "recalling", "error"]) {
+		statuses.set("claude-memory", status);
 		assert.ok(footer.render(200).join("").includes(`Memory: ${status}`));
 	}
-	statuses.set("grok-memory", "error: /private/memory/path");
+	statuses.set("claude-memory", "error: /private/memory/path");
 	assert.ok(!footer.render(200).join("").includes("/private/memory/path"));
-	statuses.delete("grok-memory");
+	statuses.set("claude-memory", "off");
 	thinkingLevel = "low";
 	assert.ok(footer.render(160).join("").includes("Grok 4.6 low"));
 	assert.ok(footer.render(12).every((line: string) => visibleWidth(line) <= 12));

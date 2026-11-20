@@ -14,10 +14,10 @@ function settingsFile(t: any) {
 	return join(dir, "grok-style.json");
 }
 
-test("visual preferences default on, project memory is opt-in, and settings persist", (t) => {
+test("features default on, including Claude memory recall, and settings persist", (t) => {
 	const path = settingsFile(t);
 	assert.deepEqual(loadFeatures(path), defaultFeatures);
-	assert.equal(loadFeatures(path).memory, false);
+	assert.equal(loadFeatures(path).claudeMemory, true);
 	saveFeatures({ ...defaultFeatures, activity: false, footer: false }, path);
 	assert.equal(loadFeatures(path).activity, false);
 	assert.equal(loadFeatures(path).composer, true);
@@ -25,8 +25,13 @@ test("visual preferences default on, project memory is opt-in, and settings pers
 	assert.deepEqual(loadFeatures(path), { ...defaultFeatures, composer: false });
 	writeFileSync(path, '{"activity":"false"}');
 	assert.throws(() => loadFeatures(path), /must be true or false/);
-	writeFileSync(path, '{"memory":"true"}');
+	writeFileSync(path, '{"claudeMemory":"true"}');
 	assert.throws(() => loadFeatures(path), /must be true or false/);
+	// An old `memory: false` was the removed Pi memory's opt-in default, not a choice about Claude memory recall.
+	writeFileSync(path, '{"memory":false,"automaticMemory":{"authorizedDirectories":["/x"]}}');
+	assert.equal(loadFeatures(path).claudeMemory, true);
+	saveFeatures(loadFeatures(path), path);
+	assert.deepEqual(Object.keys(JSON.parse(readFileSync(path, "utf8"))).filter((key) => key === "memory" || key === "automaticMemory"), []);
 	writeFileSync(path, '{"footer":true,"colors":{"diffInsert":"#112233"}}');
 	saveFeatures({ ...defaultFeatures, composer: false }, path);
 	assert.equal(loadStyleColors(path).diffInsert, "#112233");
@@ -61,14 +66,14 @@ test("settings command supports menu toggles, all-off, validation and cancellati
 	await command.handler("", ctx);
 	assert.deepEqual(loadFeatures(path), before);
 	assert.ok(notices.some((message) => message.includes("/reload")));
-	await command.handler("memory on", ctx);
-	assert.equal(loadFeatures(path).memory, true);
-	await command.handler("memory off", ctx);
-	assert.equal(loadFeatures(path).memory, false);
+	await command.handler("claudeMemory on", ctx);
+	assert.equal(loadFeatures(path).claudeMemory, true);
+	await command.handler("claudeMemory off", ctx);
+	assert.equal(loadFeatures(path).claudeMemory, false);
 	await command.handler("all on", ctx);
 	assert.ok(Object.values(loadFeatures(path)).every((value) => value === true));
 	await command.handler("all off", ctx);
-	assert.equal(loadFeatures(path).memory, false);
+	assert.equal(loadFeatures(path).claudeMemory, false);
 	await command.handler("activity on", ctx);
 	await command.handler("color comment #a0a8b8", ctx);
 	assert.equal(loadStyleColors(path).comment, "#a0a8b8");

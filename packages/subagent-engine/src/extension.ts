@@ -16,6 +16,7 @@ import type { AgentDefinition } from "./types.ts";
 import { registerCompatAliases, registerEngineTools } from "./tools.ts";
 import { registerTaskTools } from "./tasks/tools.ts";
 import { taskHooks } from "./hook-integration.ts";
+import { installClaudeMemory, type ClaudeMemoryOptions } from "./claude-memory/recall.ts";
 
 export interface SubagentEngineOptions extends Partial<EngineDeps> {
 	autonomy?: "positive" | "explicit";
@@ -25,6 +26,8 @@ export interface SubagentEngineOptions extends Partial<EngineDeps> {
 	paneGuidance?: string;
 	/** Called with the engine once created (integrations, tests). */
 	onEngine?: (engine: Engine) => void;
+	/** Recall from Claude Code's memory (read-only); `false` turns recall off. The write guard is always installed. */
+	claudeMemory?: ClaudeMemoryOptions | false;
 }
 
 export { inChildContext } from "./child-context.ts";
@@ -92,7 +95,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		const create = (): Engine => {
 			const created = new Engine({
 				env, agentDir, limits, homeDir: options.homeDir ?? homedir(), now: options.now, onSessionCreated: options.onSessionCreated, paneDefault: options.paneDefault,
-				memoryEnabled: options.memoryEnabled, agentDefaults: options.agentDefaults, claudeModels: options.claudeModels,
+				agentDefaults: options.agentDefaults, claudeModels: options.claudeModels,
 				modelRuntime: options.modelRuntime ?? (() => ModelRuntime.create({
 					authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), modelsStorePath: join(agentDir, "models-store.json"),
 				})),
@@ -107,6 +110,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 		if (env.PI_SUBAGENT_ALIASES !== "0") registerCompatAliases(pi, () => engine, ROOT_CALLER);
 		if (env.PI_SUBAGENT_TASKS !== "0") registerTaskTools(pi, { store: () => engine.taskStore(), caller: {} });
 		if (limits.workflowsEnabled) registerWorkflowTool(pi, () => engine.workflows());
+		installClaudeMemory(pi, { env, home: options.homeDir ?? homedir(), ...(options.claudeMemory === false ? { guardOnly: true } : options.claudeMemory) });
 		pi.events.on("grok:runtime-limits:query", (data) => {
 			const request = data as { reply?: unknown } | undefined;
 			if (typeof request?.reply === "function") request.reply({ ...engine.control.limits, workflowsEnabled: limits.workflowsEnabled });
@@ -133,7 +137,7 @@ export function createSubagentEngine(options: SubagentEngineOptions = {}) {
 					childInstaller: options.childInstaller ?? childInstaller(policy),
 					taskHooks: options.taskHooks ?? ((owner) => taskHooks(owner.hookEnvironment(), () => owner.rootHookContext())),
 					paneDefault: options.paneDefault,
-					memoryEnabled: options.memoryEnabled, agentDefaults: options.agentDefaults, claudeModels: options.claudeModels,
+					agentDefaults: options.agentDefaults, claudeModels: options.claudeModels,
 				});
 				// Integrations (activity panel) must follow the adopted engine, not the fresh one this runtime created.
 				options.onEngine?.(adopted);

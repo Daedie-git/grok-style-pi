@@ -46,22 +46,22 @@ test("footer shows bounded memory status beside Fast on every provider", () => {
 	assert.match(line(input), /Fast: on │ Memory: on │ Context 12\/100 used/);
 	assert.match(line({ ...input, provider: "anthropic" }), /Memory: on │ Context/);
 	assert.doesNotMatch(line({ ...input, memoryStatus: undefined }), /Memory:/);
-	for (const [status, tone] of [["off", "muted"], ["on", "accent"], ["recalling", "accent"], ["extracting", "accent"], ["consolidating", "accent"], ["needs authorization", "warning"], ["deferred", "warning"], ["error", "error"]] as const) {
+	for (const [status, tone] of [["off", "muted"], ["on", "accent"], ["recalling", "accent"], ["error", "error"]] as const) {
 		const painted = renderFooter({ ...input, memoryStatus: status }, { width: 200, paint: (token, text) => `<${token}>${text}</${token}>` })[0];
 		assert.ok(painted.includes(`<${tone}>Memory: ${status}</${tone}>`));
 		for (let width = 0; width <= 160; width++) {
 			assert.ok(visibleWidth(line({ ...input, memoryStatus: status }, width)) <= width, `${status}, width ${width}`);
 		}
-		assert.equal(memoryFooterStatus(status, false), status);
+		assert.equal(memoryFooterStatus(status), status);
 	}
-	assert.equal(memoryFooterStatus(undefined, true), "on");
-	assert.equal(memoryFooterStatus(undefined, false), "off");
-	assert.equal(memoryFooterStatus("error: /private/memory/path", true), "on");
-	const status: MemoryFooterStatus = "needs authorization";
+	// Without the engine's recall publishing a status, the footer shows no memory item at all.
+	assert.equal(memoryFooterStatus(undefined), undefined);
+	assert.equal(memoryFooterStatus("error: /private/memory/path"), undefined);
+	const status: MemoryFooterStatus = "recalling";
 	const account = { ...input, memoryStatus: status, account: "person@example.com" };
 	assert.match(line(account), /Account person@example.com$/);
-	assert.doesNotMatch(line(account, 90), /Account/);
-	assert.match(line(account, 90), /Fast: on │ Memory: needs authorization │ Context 12\/100 used/);
+	assert.doesNotMatch(line(account, 80), /Account/);
+	assert.match(line(account, 80), /Fast: on │ Memory: recalling │ Context 12\/100 used/);
 });
 
 test("footer marks unknown model, thinking level, and context", () => {

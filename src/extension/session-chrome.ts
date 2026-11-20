@@ -16,7 +16,7 @@ import type { CustomEditorCtor, ExtensionApiLike, SessionContext, SessionUi } fr
 
 type SessionChromeDeps = {
 	CustomEditor: CustomEditorCtor;
-	features: Pick<Features, "footer" | "composer" | "terminalColors" | "toolStyling"> & Partial<Pick<Features, "memory">>;
+	features: Pick<Features, "footer" | "composer" | "terminalColors" | "toolStyling">;
 	warningEvents?: {
 		on(event: "warning", listener: (warning: Error) => void): unknown;
 		off(event: "warning", listener: (warning: Error) => void): unknown;
@@ -153,7 +153,7 @@ export function createSessionChrome(pi: ExtensionApiLike, deps: SessionChromeDep
 							branch: branch === undefined ? ctx.branch : branch,
 							provider: ctx.model?.provider,
 							fastMode: /^gpt-/i.test(ctx.model?.id ?? "") ? Boolean(statuses?.get("openai-fast")) : undefined,
-							memoryStatus: memoryFooterStatus(statuses?.get("grok-memory"), features.memory ?? false),
+							memoryStatus: memoryFooterStatus(statuses?.get("claude-memory")),
 							subscription,
 							account,
 							grokWeekly,

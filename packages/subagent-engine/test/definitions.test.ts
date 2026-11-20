@@ -85,7 +85,8 @@ test("supported metadata and unsupported values produce diagnostics", () => {
 	assert.equal(definition.background, true);
 	assert.equal(definition.omitClaudeMd, false);
 	assert.equal(definition.maxTurns, 4);
-	assert.equal(definition.memory, "local");
+	// Claude Code's `memory:` configures memory Claude writes; Pi agents never write memory, so it is ignored silently.
+	assert.equal("memory" in definition, false);
 	assert.equal(definition.isolation, "worktree");
 	assert.equal(definition.permissionMode, "bypassPermissions");
 	assert.match(definition.diagnostics.join("\n"), /permissionMode.*unsupported/);
@@ -93,8 +94,7 @@ test("supported metadata and unsupported values produce diagnostics", () => {
 	assert.equal(bad.maxTurns, undefined);
 	assert.equal(bad.background, undefined);
 	assert.equal(bad.isolation, undefined);
-	assert.equal(bad.memory, undefined);
-	assert.equal(bad.diagnostics.length, 5);
+	assert.equal(bad.diagnostics.length, 4);
 	assert.equal(parse("maxTurns: 1.5\n").maxTurns, undefined);
 	assert.equal(parse("effort: low\nthinking: high\n").effort, "low");
 });

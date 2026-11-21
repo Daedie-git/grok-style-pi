@@ -370,8 +370,17 @@ export default class Issues extends View {
       if (d.ok) detail = d.result; else this.draft().selected = null;
     }
     this.seedRevision(list.result.revision);
-    this.list = list.result; this.detail = detail; this.stale = false; this.error = null;
+    this.list = list.result; this.setDetail(detail); this.stale = false; this.error = null;
     this.publishAttention(list.result.issues ?? []);
+  }
+
+  /** Shows an issue, creating the answer box for each open attention item now: text state can't be created during render. */
+  setDetail(detail) {
+    this.detail = detail;
+    for (const a of detail?.attention ?? []) {
+      const id = `${detail.issue.id}:${a.key}`;
+      if (a.state === "open" && !this.answers.has(id)) this.answers.set(id, TextareaState.new({ placeholder: a.kind === "notice" ? "Reply (optional)" : "Your answer", rows: 2 }));
+    }
   }
 
   /**
@@ -401,7 +410,7 @@ export default class Issues extends View {
         this.busy = false;
         if (!r.ok) this.actionError = `${r.error.code}: ${r.error.message}`;
         else {
-          if (r.result?.issue && r.result.issue.repo_id === this.repo?.repoId) this.detail = r.result;
+          if (r.result?.issue && r.result.issue.repo_id === this.repo?.repoId) this.setDetail(r.result);
           after?.(r.result);
           await this.loadIssues(key, generation, cx);
         }
@@ -779,8 +788,8 @@ export default class Issues extends View {
     if (open.length) out.child(section(`Needs you (${open.length})`));
     for (const a of open) {
       const id = `${i.id}:${a.key}`;
-      if (!this.answers.has(id)) this.answers.set(id, TextareaState.new({ placeholder: a.kind === "notice" ? "Reply (optional)" : "Your answer", rows: 2 }));
       const answer = this.answers.get(id);
+      if (!answer) continue; // its box is made when the issue loads
       const item = v_flex().gap(4).p(6).mb(4).rounded(6).border_1().border_color(a.waiting ? t.blocked : t.border)
         .child(h_flex().gap(6).items_center()
           .child(chip(a.kind, a.kind === "notice" ? t.muted : t.accent))

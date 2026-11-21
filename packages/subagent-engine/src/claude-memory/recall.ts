@@ -1,6 +1,8 @@
-// Pi reads Claude Code's auto memory and never writes it. Recall mirrors Claude Code: per user prompt, a Sonnet selector
-// picks at most five notes concurrently with the main request; ready results join the conversation as hidden reference.
+// Pi reads Claude Code's project memory: the startup index or selected topic files, never both for a prompt.
 import { homedir } from "node:os";
+import { join } from "node:path";
+import { readMemoryIndex } from "./index-content.ts";
+import { usesMemorySelector } from "./mode.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { claudeConfig, claudeMemoryDirectory, isClaudeMemoryPath, memoryDirectory, mentionsClaudeMemory, projectBase, projectMemoryDirectories, protectedRoots, settingsRoots, toolPath, type ClaudeConfig, type ProtectedRoots } from "./location.ts";
 import { claudeCodeRunner, memoryPreview, recalledMemoryText, scanClaudeMemories, selectMemories, selectorModels, type SelectorRunner } from "./selector.ts";
@@ -74,6 +76,7 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 	let state = fresh();
 	let job: AbortController | undefined;
 	let context: ExtensionContext | undefined;
+	let index: { path: string; override?: string; content?: string } | undefined;
 	let status: ClaudeMemoryStatus | undefined;
 	let lastError: string | undefined;
 	let last: { model?: string; files: string[]; costUsd?: number } | undefined;
@@ -84,6 +87,7 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 		context?.ui.setStatus?.(MEMORY_STATUS, next);
 	};
 	const on = (config?: ClaudeConfig) => live && enabled(config);
+	const stillSelecting = () => { const config = claudeConfig(env, home); return on(config) && usesMemorySelector(config); };
 	const idle = () => publish(!on() ? "off" : lastError ? "error" : "on");
 	const cancel = () => { job?.abort(); job = undefined; };
 	const save = () => pi.appendEntry(STATE_ENTRY, structuredClone(state));
@@ -101,13 +105,11 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 		}
 	}
 
-	async function recall(ctx: ExtensionContext, query: string, controller: AbortController) {
+	async function recall(ctx: ExtensionContext, query: string, controller: AbortController, config: ClaudeConfig) {
 		const { signal } = controller;
 		const current = () => job === controller && !signal.aborted && live;
 		try {
 			// One configuration snapshot for this selection; opt-outs are checked again before anything is delivered.
-			const config = claudeConfig(env, home);
-			if (!enabled(config)) return;
 			const directory = await claudeMemoryDirectory(ctx.cwd, config);
 			if (!current()) return;
 			if (state.directory !== directory) { state = { ...fresh(), directory }; save(); }
@@ -122,7 +124,7 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 			// Sending the query and note list is its own decision: Claude Code's opt-outs are checked right before each request,
 			// fallbacks included, and an opt-out ends this selection.
 			const send: SelectorRunner = (request) => {
-				if (!on()) { controller.abort(); return Promise.resolve({ ok: false, refused: false, message: "Claude Code memory was turned off" }); }
+				if (!stillSelecting()) { controller.abort(); return Promise.resolve({ ok: false, refused: false, message: "Claude Code memory was turned off" }); }
 				return run(request);
 			};
 			const selection = await selectMemories({ query, files, models, run: send, signal });
@@ -142,13 +144,13 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 				memories.push(memory);
 			}
 			// Claude Code's opt-outs may change while the selector runs; a change takes effect before delivery.
-			if (!memories.length || !current() || !on()) return;
+			if (!memories.length || !current() || !stillSelecting()) return;
 			const content = recalledMemoryText(memories);
 			state.used += content.length;
 			state.surfaced.push(...memories.map((memory) => memory.path));
 			save();
 			// A hidden reference queued for the next model request: never steer, interrupt, or start a turn for recall.
-			pi.sendMessage({ customType: RECALL_MESSAGE, content, display: false, details: { paths: memories.map((memory) => memory.path) } }, { triggerTurn: false });
+			pi.sendMessage({ customType: RECALL_MESSAGE, content, display: false, details: { paths: memories.map((memory) => memory.path), model: selection.model } }, { triggerTurn: false });
 		} catch (error) {
 			if (current()) lastError = String(error).slice(0, 400);
 		} finally {
@@ -159,6 +161,7 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 	pi.on("session_start", (_event, ctx) => {
 		cancel();
 		context = ctx;
+		index = undefined;
 		status = undefined;
 		lastError = undefined;
 		last = undefined;
@@ -170,14 +173,33 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 	// Compaction drops recalled notes from context, so they may be selected again.
 	pi.on("session_compact", () => { cancel(); state = { ...fresh(), directory: state.directory }; if (live) save(); idle(); });
 	pi.on("session_shutdown", () => { live = false; cancel(); context?.ui.setStatus?.(MEMORY_STATUS, undefined); context = undefined; status = undefined; });
-	pi.on("before_agent_start", (event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		cancel();
+		const config = claudeConfig(env, home);
+		if (!on(config)) { index = undefined; idle(); return; }
+		if (!usesMemorySelector(config)) {
+			if (/^(?:1|true|yes|on)$/i.test(config.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS?.trim() ?? "")) {
+				index = undefined;
+			} else {
+				const path = join(await claudeMemoryDirectory(ctx.cwd, config), "MEMORY.md");
+				const override = config.env.CLAUDE_COWORK_MEMORY_INDEX_CONTENT;
+				if (index?.path !== path || index.override !== override) index = { path, override, content: await readMemoryIndex(path, config.env) };
+			}
+			lastError = undefined;
+			idle();
+			return;
+		}
+		index = undefined;
 		if (typeof event.prompt !== "string" || !event.prompt.trim()) return;
-		if (!on()) { idle(); return; }
 		const controller = new AbortController();
 		job = controller;
 		// Submission never waits for the scan or the selector.
-		void recall(ctx, event.prompt, controller);
+		void recall(ctx, event.prompt, controller, config);
+	});
+	// A user-role startup reminder, not system policy or an extra entry each time Pi submits a prompt.
+	pi.on("context_with_system", (event) => {
+		if (!index?.content || !on()) return;
+		return { messages: [event.messages[0], { role: "user", content: index.content, timestamp: 0 }, ...event.messages.slice(1)] };
 	});
 	// Claude Code discards a selection that is not ready when the turn ends.
 	pi.on("agent_settled", () => { if (job) { cancel(); idle(); } });
@@ -202,15 +224,17 @@ export function installClaudeMemory(pi: ExtensionAPI, options: ClaudeMemoryOptio
 			const config = claudeConfig(env, home);
 			const directory = await claudeMemoryDirectory(ctx.cwd, config).catch((error) => `unavailable (${String(error)})`);
 			const enabledNow = on(config);
-			const files = enabledNow && !directory.startsWith("unavailable") ? (await scanClaudeMemories(directory).catch(() => [])).length : 0;
+			const selecting = enabledNow && usesMemorySelector(config);
+			const files = selecting && !directory.startsWith("unavailable") ? (await scanClaudeMemories(directory).catch(() => [])).length : 0;
 			const selector = selectorModels(config.sonnet, ctx.modelRegistry.getAll().filter((model) => model.provider === "anthropic")
 				.map((model) => ({ id: model.id, price: model.cost ? model.cost.input + model.cost.output : undefined })), config.noModelFallback);
 			ctx.ui.notify([
 				`Claude memory recall ${enabledNow ? "on" : "off"}. Pi never writes memory; Claude Code does.`,
-				`Directory: ${directory}${enabledNow ? ` (${files} notes)` : ""}`,
-				`Selector: headless Claude Code, models ${selector.join(" → ")}`,
+				`Directory: ${directory}${selecting ? ` (${files} notes)` : ""}`,
+				...(enabledNow && !selecting ? [`Mode: startup index (${join(directory, "MEMORY.md")}); no retrieval model.`] : []),
+				...(selecting ? [`Mode: topic selector (headless Claude Code), models ${selector.join(" → ")}`,
 				last ? `Last recall: ${last.files.length ? last.files.join(", ") : "nothing relevant"}${last.model ? ` via ${last.model}` : ""}${last.costUsd !== undefined ? ` ($${last.costUsd.toFixed(4)})` : ""}` : "No recall yet this session.",
-				`Recalled this conversation: ${state.surfaced.length} notes, ${state.used} of ${RECALL_BUDGET} units.`,
+				`Recalled this conversation: ${state.surfaced.length} notes, ${state.used} of ${RECALL_BUDGET} units.`] : []),
 				...(lastError ? [`Last issue: ${lastError}`] : []),
 			].join("\n"), lastError ? "warning" : "info");
 		},

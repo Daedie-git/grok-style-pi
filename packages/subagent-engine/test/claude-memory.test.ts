@@ -11,6 +11,7 @@ import {
 	claudeCodeRunner, memoryHeader, memoryManifest, memoryPreview, recalledMemoryText, scanClaudeMemories, selectMemories, selectorModels,
 	SELECTOR_SCHEMA, SELECTOR_SETTINGS, SELECTOR_SYSTEM_PROMPT, type SelectorReply, type SelectorRequest,
 } from "../src/claude-memory/selector.ts";
+import { createHarness, until } from "./fixtures/harness.ts";
 
 // Views of one configuration snapshot, read the way recall and the guard read it.
 const claudeMemoryDirectory = (cwd: string, env: NodeJS.ProcessEnv, home: string) => directoryFor(cwd, claudeConfig(env, home));
@@ -321,7 +322,7 @@ test("recall runs beside the main request, delivers once as hidden reference, an
 	const pending: Array<{ request: SelectorRequest; resolve(reply: SelectorReply): void }> = [];
 	const run = (request: SelectorRequest) => new Promise<SelectorReply>((resolve) => pending.push({ request, resolve }));
 	const { pi, emit, sent, entries, statuses } = fakePi();
-	installClaudeMemory(pi, { env: {}, home, run });
+	installClaudeMemory(pi, { env: { CLAUDE_MEMORY_STORES: "1" }, home, run });
 	const ctx = {
 		cwd, ui: { setStatus: (_key: string, value?: string) => statuses.push(value) },
 		sessionManager: { getBranch: () => entries },
@@ -392,6 +393,61 @@ test("recall runs beside the main request, delivers once as hidden reference, an
 	await new Promise((r) => setTimeout(r, 30));
 	assert.equal(pending.length, 3);
 });
+
+for (const { name, gate, stores, disabled, mode } of [
+	{ name: "default", mode: "index" },
+	{ name: "cached gate off", gate: false, mode: "index" },
+	{ name: "cached gate on", gate: true, mode: "selector" },
+	{ name: "stores overrides cached gate off", gate: false, stores: true, mode: "selector" },
+	{ name: "disabled with default configuration", disabled: true, mode: "off" },
+	{ name: "disabled with both selector switches on", gate: true, stores: true, disabled: true, mode: "off" },
+]) {
+	test(`real Pi model requests use ${mode} mode (${name})`, async (t) => {
+		const home = temp(t);
+		const directory = join(home, "notes");
+		const indexMarker = "INDEX-ONLY-9f188";
+		note(join(directory, "topic.md"), "description: Useful topic", "TOPIC-BODY-33cf5");
+		writeFileSync(join(directory, "MEMORY.md"), `${indexMarker}\n- [Topic](topic.md)`);
+		if (gate !== undefined) writeFileSync(join(home, ".claude.json"), JSON.stringify({ cachedGrowthBookFeatures: { tengu_moth_copse: gate } }));
+		const selector: SelectorRequest[] = [];
+		const requests: Array<{ messages: unknown[]; system?: string }> = [];
+		let release!: () => void;
+		const first = new Promise<void>(resolve => { release = resolve; });
+		const h = await createHarness({
+			claudeMemory: {
+				home, env: { CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: directory, ...(stores && { CLAUDE_MEMORY_STORES: "1" }), ...(disabled && { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" }) },
+				run: async request => { selector.push(request); return { ok: true, value: { selected_memories: [] } }; },
+			},
+			parent: ({ index, messages, system }) => {
+				requests.push({ messages, system });
+				return index === 0 ? { wait: first, then: { tools: [{ name: "read", args: { path: "ordinary.txt" } }] } } : { text: "OK" };
+			},
+			child: () => () => ({ text: "unused" }),
+		});
+		t.after(() => h.close());
+		writeFileSync(join(h.root, "ordinary.txt"), "ordinary tool result");
+		const turn = h.parent.prompt("Find the topic");
+		try {
+			await until(() => requests.length === 1);
+			if (mode === "selector") await until(() => selector.length > 0);
+		} finally { release(); await turn; }
+		await h.parent.prompt("Continue");
+		assert.equal(requests.length, 3, "first request, tool continuation, next user prompt");
+		assert.match(JSON.stringify(requests[1].messages), /ordinary tool result/, "tool output reaches the continuation");
+		for (const { messages, system } of requests) {
+			assert.ok(!system?.includes(indexMarker), "index is not a system instruction");
+			const text = JSON.stringify(messages);
+			assert.equal(text.split(indexMarker).length - 1, mode === "index" ? 1 : 0);
+			if (mode === "index") assert.equal((messages.find(message => JSON.stringify(message).includes(indexMarker)) as { role: string }).role, "user");
+			assert.ok(!text.includes("TOPIC-BODY-33cf5"), "no unselected topic is loaded");
+		}
+		assert.ok(!JSON.stringify(h.parent.sessionManager.getBranch()).includes(indexMarker), "the index is transient, not session history");
+		if (mode === "selector") {
+			assert.match(selector[0].prompt, /topic\.md/);
+			assert.doesNotMatch(selector[0].prompt, /MEMORY\.md|INDEX-ONLY-9f188/);
+		} else assert.equal(selector.length, 0);
+	});
+}
 
 test("recall stays off when disabled by the host, Pi, or Claude Code, but the write guard still applies", async (t) => {
 	const root = temp(t);

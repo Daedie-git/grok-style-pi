@@ -1,6 +1,6 @@
-# Claude Code memory parity: installed 2.1.329
+# Claude Code memory parity: selector (2.1.329), retrieval mode (2.1.330)
 
-Pi no longer has a memory system of its own. Claude Code writes memory. Pi's subagent engine reads Claude Code's auto memory and recalls from it with Claude Code's own selector logic (`packages/subagent-engine/src/claude-memory/`). Every Pi agent is blocked from changing Claude Code memory.
+Pi no longer has a memory system of its own. Claude Code writes memory. Pi's subagent engine reads Claude Code's personal project memory in index or selector mode (`packages/subagent-engine/src/claude-memory/`). Every Pi agent is blocked from changing Claude Code memory.
 
 ## Evidence
 
@@ -8,6 +8,7 @@ Read from the installed bundle `~/.local/npm/lib/node_modules/@anthropic-ai/clau
 
 | Behavior | Claude Code site | Pi |
 | --- | --- | --- |
+| Personal memory mode: a nonblank `CLAUDE_MEMORY_STORES` or `tengu_moth_copse` selects topics; otherwise load `MEMORY.md` before the first request | 2.1.330 embedded JS byte 313867873 (gate), 314504859 (flag resolution), 323493987 (index intake); confirmed against the Fury `memories` request | `mode.ts`, `index-content.ts`, `recall.ts` |
 | Selector request: system prompt `XAi`, `Available memories:` first message, `Select memories relevant to:\n\n<query>`, `selected_memories` JSON schema | `RMo`, `exi`, `OSt` | `selector.ts`: `SELECTOR_SYSTEM_PROMPT`, `selectMemories` |
 | Default Sonnet: `ANTHROPIC_DEFAULT_SONNET_MODEL`, else the resolved `sonnet` alias | `HS` | `configuredSonnet`, else `--model sonnet` (Claude Code resolves it) |
 | Fallback: up to 2 other Sonnet models, newest first, priced (1M in + 1M out) no higher than the first; none when `CLAUDE_CODE_NO_MODEL_FALLBACK` is set or the first price is unknown | `nxi`, `vMo`, `txi` | `selectorModels` with Pi's model catalog prices |
@@ -27,5 +28,5 @@ Read from the installed bundle `~/.local/npm/lib/node_modules/@anthropic-ai/clau
 - **Selector history.** Claude Code keeps one selector conversation per memory folder and appends each query and reply. Each Pi request is stateless. Instead of relying on the history line "Do not re-select …", Pi leaves already recalled and already read notes out of the manifest.
 - **Delivery point.** Claude Code attaches a ready selection at the next tool boundary of the same run. Pi queues it as a hidden message (`triggerTurn: false`); Pi flushes queued custom messages at the end of each turn, so it reaches the next model request in the same run.
 - **Settings scope.** Recall follows managed (per platform, with `managed-settings.d`) and user settings for `autoMemoryDirectory`, `autoMemoryEnabled` and settings `env`. It ignores project and local `.claude/settings*.json`, which Claude Code applies only for trusted folders, and `CLAUDE_CODE_PROJECT_DIR_NAME`; the write guard still protects a folder those files name.
-- **Index mode, account and team stores.** Claude Code's legacy mode injects `MEMORY.md` instead of running the selector; Pi always uses the selector. Account, team and mounted memory stores are not read; the `team/` subtree is skipped, where Claude Code shows it only while mounted (`EFe`).
+- **Rollout and stores.** Pi uses the startup disk cache (`cachedGrowthBookFeatures ?? cachedFeatureFlags`, default false); it cannot see a running Claude process's live rollout payload or its internal feature-evaluation eligibility. It never fetches remote assignments. In index mode it adds the bounded `MEMORY.md` text as user-role request context instead of merging it with Claude Code's other startup instructions. Account, team and mounted memory stores are not read; the `team/` subtree is skipped, where Claude Code shows it only while mounted (`EFe`).
 - **Writes.** Claude Code's extraction and dream passes write memory. Pi has none, and blocks `write`, `edit` and shell commands that target `projects/*/memory`, the configured folder, or `agent-memory` folders. File paths resolve as Pi's tools resolve them; the shell check is best-effort text matching.

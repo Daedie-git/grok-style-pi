@@ -275,7 +275,7 @@ export default class Issues extends View {
           if (resync) this.reconcile(cx, true);
           else if (changed) {
             if (this.repo?.state === "registered") await this.loadIssues(this.repoKey, this.generation, cx);
-            else if (this.repo?.state === "unregistered") await this.load({ cwd: this.repo.root, machine: this.repo.machineName }, this.generation, cx);
+            else if (this.repo?.state === "unregistered") await this.load({ cwd: this.repo.toplevel ?? this.repo.root, machine: this.repo.machineName }, this.generation, cx);
             else this.reconcile(cx, true);
           }
           if (this.active() && (resync || changed)) cx.notify();
@@ -301,18 +301,48 @@ export default class Issues extends View {
 
   async load(loc, generation, cx) {
     if (!loc?.cwd) return;
-    const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: loc.cwd, on: loc.machine }).catch(() => null);
+    // A linked worktree (such as a task's) shares its repository's issues, which belong to the
+    // main worktree. Only a linked worktree's git dir is <common dir>/worktrees/<name>; there,
+    // `git worktree list` names the main worktree first. All four are asked at once.
+    const git = (args, cwd = loc.cwd) => exec("git", args, { cwd, on: loc.machine }).catch(() => null);
+    const [top, gitDir, common, list] = await Promise.all([
+      git(["rev-parse", "--show-toplevel"]), git(["rev-parse", "--git-dir"]),
+      git(["rev-parse", "--git-common-dir"]), git(["worktree", "list", "--porcelain"]),
+    ]);
     if (!this.active() || this.generation !== generation) return;
     if (!top || top.code !== 0) return this.switchRepo({ state: "none", reason: "not a git checkout" }, `none:${loc.cwd}`);
-    const root = top.stdout.trim(), key = `${loc.machine ?? ""}|${root}`;
-    const res = await this.read({ type: "repo.resolve", machine: loc.machine, path: root }, cx);
+    const toplevel = line(top.stdout);
+    const linked = gitDir?.code === 0 && /[\\/]worktrees[\\/][^\\/]+$/.test(line(gitDir.stdout));
+    let main = linked && list?.code === 0 ? mainWorktree(list.stdout) : "";
+    if (main && main !== toplevel) {
+      // Only a candidate git confirms: a checkout whose toplevel is itself and that shares our
+      // common git dir. A metadata dir, a misparsed path or another repository fails this.
+      const [mainTop, mainCommon] = await Promise.all([git(["rev-parse", "--show-toplevel"], main), git(["rev-parse", "--git-common-dir"], main)]);
+      if (!this.active() || this.generation !== generation) return;
+      const same = mainTop?.code === 0 && line(mainTop.stdout) === main && mainCommon?.code === 0 && common?.code === 0
+        && absolute(line(mainCommon.stdout), main) === absolute(line(common.stdout), toplevel);
+      if (!same) main = "";
+    }
+    let root = toplevel;
+    let res = await this.read({ type: "repo.resolve", machine: loc.machine, path: toplevel }, cx);
     if (!res || !this.active() || this.generation !== generation) return;
+    // A worktree registered on its own (before worktrees shared issues) keeps its board.
+    // Otherwise, when its own lookup succeeded without a board (unregistered, or a worktree
+    // nested inside the main checkout), it shows the main worktree's, but only a board that
+    // already exists: a candidate is never registered on the strength of this guess.
+    if (main && main !== toplevel && res.ok && ["unregistered", "ambiguous"].includes(res.result.state)) {
+      const shared = await this.read({ type: "repo.resolve", machine: loc.machine, path: main }, cx);
+      if (!shared || !this.active() || this.generation !== generation) return;
+      // A failed lookup is an error, not "no board": creating here would split the board.
+      if (!shared.ok || shared.result.state === "registered") { root = main; res = shared; }
+    }
+    const key = `${loc.machine ?? ""}|${root}`;
     if (!res.ok) {
       this.switchRepo({ state: "error", root }, key);
       this.stale = true; this.error = res.error.message;
       return;
     }
-    this.switchRepo({ ...res.result, root, machineName: loc.machine }, key);
+    this.switchRepo({ ...res.result, root, toplevel, machineName: loc.machine }, key);
     if (res.result.state !== "registered") { this.list = { issues: [] }; return; }
     await this.loadIssues(key, generation, cx);
   }
@@ -344,9 +374,15 @@ export default class Issues extends View {
     this.publishAttention(list.result.issues ?? []);
   }
 
-  /** Open attention counts per checkout, under shared "herdr-issues.attention", for the Issues button's badge. */
+  /**
+   * For the Issues button's badge: open attention counts per board under shared
+   * "herdr-issues.attention" (keyed `machine|board root`), and under "herdr-issues.boards" which
+   * board each checkout shows (`machine|toplevel` → that key), so a tab never has to guess.
+   */
   publishAttention(issues) {
-    const key = `${this.repo.machineName ?? ""}|${this.repo.root}`;
+    const machine = this.repo.machineName ?? "", key = `${machine}|${this.repo.root}`;
+    const boards = { ...(shared("herdr-issues.boards") ?? {}) }, checkout = `${machine}|${this.repo.toplevel ?? this.repo.root}`;
+    if (boards[checkout] !== key) { boards[checkout] = key; setShared("herdr-issues.boards", boards); }
     const sum = (field) => issues.reduce((n, i) => n + (i.attention?.[field] ?? 0), 0);
     const counts = { open: sum("open"), waiting: sum("waiting") };
     const all = { ...(shared("herdr-issues.attention") ?? {}) };
@@ -798,6 +834,26 @@ export default class Issues extends View {
       .child(h_flex().pt(4).child(button("accept", acceptLabel(s.attention), (cx) => this.act(cx, { type: "issue.accept", repoId: i.repo_id, issueId: i.id, expectedVersion: i.version }), true)));
     return out;
   }
+}
+
+/** One path printed by git: only its trailing newline is not part of it. */
+const line = (stdout) => stdout.replace(/\r?\n$/, "");
+
+/** A path git printed relative to `base` (as `--git-common-dir` can), made absolute. */
+function absolute(path, base) {
+  if (/^(\/|[A-Za-z]:[\\/])/.test(path)) return path.replace(/[\\/]+$/, "");
+  return `${base.replace(/[\\/]+$/, "")}/${path}`.replace(/[\\/]\.\/?$/, "").replace(/[\\/]+$/, "");
+}
+
+/**
+ * The main worktree from `git worktree list --porcelain`, whose first record it always is; ""
+ * when there is none to use: a bare repository, or a path that is not plainly absolute.
+ */
+function mainWorktree(stdout) {
+  const record = stdout.split(/\r?\n\r?\n/)[0].split(/\r?\n/);
+  const path = record[0]?.startsWith("worktree ") ? record[0].slice("worktree ".length) : "";
+  if (record.includes("bare") || !/^(\/|[A-Za-z]:[\\/])/.test(path)) return "";
+  return path;
 }
 
 /** Accept stays possible with open items, but says so. */

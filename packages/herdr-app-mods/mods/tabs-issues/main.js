@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings, exec } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -16,6 +16,45 @@ export default class Tabs extends View {
     this.pressed = null;
     this.scroll = ScrollHandle.new();
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    // `${machine}|${folder}` → { root, at }: the repository's main checkout ("" outside git, or
+    // if the check failed), with `pending` while it is being checked again.
+    this.checkouts = new Map();
+  }
+
+  /**
+   * The main checkout of the repository a space's first terminal is in (shared by all of the
+   * repository's worktrees): the folder the Issues panel follows. Every answer is checked again
+   * after 30 s, on a later render: a folder can become a repository, or a failed check succeed.
+   * Meanwhile a found checkout stays in use; otherwise the answer is undefined (not known yet).
+   */
+  checkout(space, cx) {
+    if (!space) return "";
+    const first = space.tabs?.[0] && panes().find((p) => p.tab === space.tabs[0].id && p.terminal);
+    const folder = first?.cwd || space.folder;
+    if (!folder) return "";
+    const key = `${space.machine ?? ""}|${folder}`;
+    const known = this.checkouts.get(key);
+    const fresh = known && (known.pending || Date.now() - known.at < 30000);
+    if (!fresh) {
+      this.checkouts.set(key, { root: known?.root, at: known?.at ?? 0, pending: true });
+      cx.spawn(async (cx) => {
+        // Which board a checkout shows (a worktree may share its main checkout's) is the Issues
+        // panel's to decide; it publishes that. This only needs the checkout itself.
+        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: folder, on: space.machine }).catch(() => null);
+        // Only git itself saying so (its fatal exit status, 128, in any language) means "not in
+        // git". A check that failed otherwise (say, the machine is unreachable) keeps the last
+        // answer, or leaves it unknown.
+        const last = this.checkouts.get(key);
+        let root = last?.root;
+        if (top?.code === 0) root = top.stdout.replace(/\r?\n$/, "");
+        else if (top?.code === 128) root = "";
+        this.checkouts.set(key, { root, at: Date.now() });
+        cx.notify();
+      });
+    }
+    const root = known?.root;
+    if (root) return root; // found, perhaps being checked again
+    return root === "" && fresh && !known.pending ? "" : undefined;
   }
 
   // The side panel is remembered per space: switching shows that space's choice
@@ -41,12 +80,18 @@ export default class Tabs extends View {
       if (this.pending.want !== now && Date.now() < this.pending.until) return;
       this.pending = null;
     }
+    // A panel this space can no longer have (Issues, once confirmed outside git) closes; the
+    // closed panel is recorded on the next render.
+    if (now && !enabled.includes(now)) {
+      run("layout.hide", { id: "panel" });
+      return;
+    }
     if (this.panels[space.id] === now) return;
     this.panels[space.id] = now;
     localStorage.setItem("panels", JSON.stringify(this.panels));
   }
 
-  render() {
+  render(cx) {
     const t = theme();
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];
@@ -87,15 +132,18 @@ export default class Tabs extends View {
       ? Math.max(10, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
-    // Issues: shown only for a space in a git checkout (its terminal reports a branch).
-    const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), ...(space?.branch ? ["issues"] : [])];
+    // Issues: for a space in any checkout of a git repository, worktrees included. While that is
+    // not known yet, a branch or a remembered Issues panel counts, so restoring it never waits.
+    const checkout = this.checkout(space, cx);
+    const git = checkout === undefined ? !!space?.branch || this.panels[space?.id] === "issues" : !!checkout;
+    const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), ...(git ? ["issues"] : [])];
     this.syncPanel(space, panel, body, enabled);
-    // Open attention items the Issues panel published for this space's checkout.
-    const attention = Object.entries(shared("herdr-issues.attention") ?? {}).reduce((n, [key, c]) => {
-      const [machine, ...rest] = key.split("|"), root = rest.join("|"), folder = space?.folder ?? "";
-      const inside = folder === root || folder.startsWith(root.endsWith("/") || root.endsWith("\\") ? root : `${root}/`) || folder.startsWith(`${root}\\`);
-      return machine === (space?.machine ?? "") && root && inside ? { open: n.open + c.open, waiting: n.waiting + c.waiting } : n;
-    }, { open: 0, waiting: 0 });
+    // Open attention items for the board this checkout shows, which the Issues panel publishes
+    // (a task worktree shows its main checkout's). Before the panel has shown this checkout, its
+    // own board is assumed.
+    const machine = space?.machine ?? "";
+    const board = checkout && (shared("herdr-issues.boards")?.[`${machine}|${checkout}`] || `${machine}|${checkout}`);
+    const attention = (board && shared("herdr-issues.attention")?.[board]) || { open: 0, waiting: 0 };
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)

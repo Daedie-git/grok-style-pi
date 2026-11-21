@@ -90,6 +90,12 @@ export default class Tabs extends View {
     // Issues: shown only for a space in a git checkout (its terminal reports a branch).
     const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), ...(space?.branch ? ["issues"] : [])];
     this.syncPanel(space, panel, body, enabled);
+    // Open attention items the Issues panel published for this space's checkout.
+    const attention = Object.entries(shared("herdr-issues.attention") ?? {}).reduce((n, [key, c]) => {
+      const [machine, ...rest] = key.split("|"), root = rest.join("|"), folder = space?.folder ?? "";
+      const inside = folder === root || folder.startsWith(root.endsWith("/") || root.endsWith("\\") ? root : `${root}/`) || folder.startsWith(`${root}\\`);
+      return machine === (space?.machine ?? "") && root && inside ? { open: n.open + c.open, waiting: n.waiting + c.waiting } : n;
+    }, { open: 0, waiting: 0 });
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
@@ -98,7 +104,9 @@ export default class Tabs extends View {
         .on_click(() => {
           if (on) run("layout.hide", { id: "panel" });
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
-        }).child(svg(icon).size(14)).child(label);
+        }).child(svg(icon).size(14)).child(label)
+        .when(id === "issues" && attention.open > 0, el => el.child(div().px(5).rounded(7).text_size(10)
+          .bg(attention.waiting > 0 ? t.blocked : t.accent).text_color(t.background).child(String(attention.open))));
     };
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })

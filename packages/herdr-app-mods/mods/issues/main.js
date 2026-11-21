@@ -1,7 +1,7 @@
 // Herdr Issues panel: a view over the coordinator. It keeps no authoritative state.
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, Popover } from "gpui-base";
-import { spaces, panes, exec, hc, run, theme, shared, layout, home, machines, checking } from "herdr";
+import { spaces, panes, exec, hc, run, theme, shared, setShared, layout, home, machines, checking } from "herdr";
 
 const FILTERS = { open: ["draft", "planning", "awaiting_approval", "queued", "implementing", "human_review", "finishing", "failed", "blocked"], done: ["done", "cancelled"], all: null };
 const ROLES = ["planner", "coordinator", "implement", "verify", "review"];
@@ -141,6 +141,8 @@ export default class Issues extends View {
     this.reviseBody = TextareaState.new({ placeholder: "Revised specification", rows: 5 });
     this.revising = null; // { issueId, version }: the version the form's text was read from
     this.sendBack = TextareaState.new({ placeholder: "What should the coordinator change?", rows: 3 });
+    this.answers = new Map(); // `${issueId}:${key}` → TextareaState for an open attention item
+    this.resolvedOpen = false;
     this.stages = null; // status.stages: { models, thinking: { claude, pi }, defaults }
     this.modelsOpen = false; this.stageEdit = null; this.picker = null;
     // Session launches: `${attemptId}:${launch}` → acknowledged; this view never launches one twice.
@@ -339,6 +341,18 @@ export default class Issues extends View {
     }
     this.seedRevision(list.result.revision);
     this.list = list.result; this.detail = detail; this.stale = false; this.error = null;
+    this.publishAttention(list.result.issues ?? []);
+  }
+
+  /** Open attention counts per checkout, under shared "herdr-issues.attention", for the Issues button's badge. */
+  publishAttention(issues) {
+    const key = `${this.repo.machineName ?? ""}|${this.repo.root}`;
+    const sum = (field) => issues.reduce((n, i) => n + (i.attention?.[field] ?? 0), 0);
+    const counts = { open: sum("open"), waiting: sum("waiting") };
+    const all = { ...(shared("herdr-issues.attention") ?? {}) };
+    if (JSON.stringify(all[key] ?? { open: 0, waiting: 0 }) === JSON.stringify(counts)) return;
+    if (counts.open) all[key] = counts; else delete all[key];
+    setShared("herdr-issues.attention", all);
   }
 
   /** Every mutation carries the repository and issue it was made from, never the current focus. */
@@ -586,7 +600,9 @@ export default class Issues extends View {
     if (!issues.length) v.child(div().pt(8).text_color(t.muted).child("No issues"));
     for (const i of issues) {
       v.child(v_flex().id(`i-${i.id}`).px(6).py(6).rounded(6).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.select(cx, i.id))
-        .child(h_flex().gap(6).items_center().child(div().flex_1().truncate().child(i.title)).child(chip(i.state.replace("_", " "), stateColor(t, i.state))))
+        .child(h_flex().gap(6).items_center().child(div().flex_1().truncate().child(i.title))
+          .when(i.attention?.open > 0, (el) => el.child(chip(`${i.attention.open} need${i.attention.open === 1 ? "s" : ""} you`, i.attention.waiting > 0 ? t.blocked : t.accent)))
+          .child(chip(i.state.replace("_", " "), stateColor(t, i.state))))
         .when(!!i.queue_reason, (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(i.queue_reason)))
         .when(i.cleanup.length > 0, (el) => el.child(h_flex().gap(4).pt(2).children(i.cleanup.map((c) => chip(c.replace("_", " ")))))));
     }
@@ -625,6 +641,7 @@ export default class Issues extends View {
       actions.child(button("revise", "Revise…", (cx) => { this.revising = { issueId, version: v }; this.reviseTitle.set_value(i.title); this.reviseBody.set_value(i.body); cx.notify(); }));
     if (!["done", "cancelled"].includes(i.state)) actions.child(button("cancel", "Cancel issue", (cx) => this.act(cx, { type: "issue.cancel", repoId, issueId, expectedVersion: v })));
     out.child(actions);
+    this.renderAttention(out, t, chip, button, section, s);
     const coordinator = [...s.attempts].reverse().find((a) => a.role === "coordinator" && LIVE_ATTEMPT.includes(a.state));
     if (i.state === "implementing") out.child(h_flex().gap(6).items_center().pt(6)
       .child(div().flex_1().text_color(t.working).child(`Coordinator running${i.coordination?.branch ? ` on ${i.coordination.branch}` : ""}${i.coordination?.machine ? ` (${i.coordination.machine})` : ""}`))
@@ -717,6 +734,48 @@ export default class Issues extends View {
     return out;
   }
 
+  /** What the issue needs from the person: open attention items first, with their controls, then the closed ones. */
+  renderAttention(out, t, chip, button, section, s) {
+    const items = s.attention ?? [], i = s.issue;
+    const open = items.filter((a) => a.state === "open"), closed = items.filter((a) => a.state !== "open");
+    if (!items.length) return;
+    const send = (cx, type, a, extra = {}) => this.act(cx, { type, repoId: i.repo_id, issueId: i.id, key: a.key, ...extra }, () => this.answers.get(`${i.id}:${a.key}`)?.set_value(""));
+    if (open.length) out.child(section(`Needs you (${open.length})`));
+    for (const a of open) {
+      const id = `${i.id}:${a.key}`;
+      if (!this.answers.has(id)) this.answers.set(id, TextareaState.new({ placeholder: a.kind === "notice" ? "Reply (optional)" : "Your answer", rows: 2 }));
+      const answer = this.answers.get(id);
+      const item = v_flex().gap(4).p(6).mb(4).rounded(6).border_1().border_color(a.waiting ? t.blocked : t.border)
+        .child(h_flex().gap(6).items_center()
+          .child(chip(a.kind, a.kind === "notice" ? t.muted : t.accent))
+          .child(div().flex_1().font_semibold().child(a.title))
+          .when(!!a.waiting, (el) => el.child(chip("waiting", t.blocked))))
+        .when(!!a.detail, (el) => el.child(TextView.markdown(`att-${id}`, a.detail)))
+        .when(a.role === "planner", (el) => el.child(div().text_size(11).text_color(t.dim).child("from the planner: answering asks for a revised plan")));
+      if (a.kind === "decision")
+        item.child(h_flex().gap(6).flex_wrap().children((a.options ?? []).map((o, n) =>
+          button(`att-opt-${id}-${n}`, o === a.recommendation ? `${o} (recommended)` : o, (cx) => send(cx, "attention.answer", a, { option: o, answer: answer.value().trim() }), o === a.recommendation))));
+      item.child(div().px(8).py(4).rounded(6).border_1().border_color(t.input).bg(t.background).child(Textarea.new(answer).h(44)));
+      const controls = h_flex().gap(6);
+      if (a.kind === "notice") controls.child(button(`att-ack-${id}`, "Acknowledge", (cx) => send(cx, "attention.acknowledge", a), true));
+      controls.child(button(`att-answer-${id}`, a.kind === "notice" ? "Reply" : "Answer", (cx) => {
+        const text = answer.value().trim();
+        if (!text) { this.actionError = "Write an answer"; return cx.notify(); }
+        send(cx, "attention.answer", a, { answer: text });
+      }, a.kind === "question"));
+      out.child(item.child(controls));
+    }
+    if (closed.length) {
+      out.child(div().id("att-resolved").pt(4).text_size(12).text_color(t.muted).hover((st) => st.text_color(t.foreground))
+        .on_click((_e, cx) => { this.resolvedOpen = !this.resolvedOpen; cx.notify(); })
+        .child(`${this.resolvedOpen ? "▾" : "▸"} Resolved (${closed.length})`));
+      if (this.resolvedOpen) for (const a of closed)
+        out.child(v_flex().py(2).text_size(12)
+          .child(h_flex().gap(6).child(chip(a.state, a.state === "superseded" ? t.dim : t.done)).child(div().flex_1().child(a.title)))
+          .when(!!a.answer || !!a.answered_by, (el) => el.child(div().pl(8).text_color(t.muted).child(`${a.answered_by ? `${a.answered_by}: ` : ""}${a.answer ?? "acknowledged"}`))));
+    }
+  }
+
   /** The coordinator's review: what it produced, how each phase went, and what the repository asks of the person. */
   renderReview(out, t, section, button, s, policy) {
     const r = s.issue.review;
@@ -736,9 +795,15 @@ export default class Issues extends View {
         .when(!!p.detail, (el) => el.child(div().flex_1().text_color(t.muted).child(p.detail))));
     const i = s.issue;
     out.child(div().pt(4).text_size(12).text_color(t.muted).child(`Accept will: ${policy.done ?? "archive the branch and remove the worktree"}`))
-      .child(h_flex().pt(4).child(button("accept", "Accept", (cx) => this.act(cx, { type: "issue.accept", repoId: i.repo_id, issueId: i.id, expectedVersion: i.version }), true)));
+      .child(h_flex().pt(4).child(button("accept", acceptLabel(s.attention), (cx) => this.act(cx, { type: "issue.accept", repoId: i.repo_id, issueId: i.id, expectedVersion: i.version }), true)));
     return out;
   }
+}
+
+/** Accept stays possible with open items, but says so. */
+function acceptLabel(items) {
+  const open = (items ?? []).filter((a) => a.state === "open").length;
+  return open ? `Accept (${open} open item${open === 1 ? "" : "s"})` : "Accept";
 }
 
 function stateColor(t, state) {

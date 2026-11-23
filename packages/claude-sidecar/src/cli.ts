@@ -137,16 +137,16 @@ async function within<T>(work: Promise<T>, ms: number, machine: string): Promise
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-/** The Claude models a sidecar may run: `claudeModels` in `~/.config/claude-sidecar/config.json`, first as the default. */
-function claudeModels(env: NodeJS.ProcessEnv): string[] {
+function modelConfig(env: NodeJS.ProcessEnv) {
 	const file = env.SIDECAR_CONFIG_FILE || join(env.HOME || homedir(), ".config", "claude-sidecar", "config.json");
-	if (!existsSync(file)) return ["claude-opus-5-5", "claude-sonnet-5-5"];
-	let models: unknown;
-	try { models = (JSON.parse(readFileSync(file, "utf8")) as { claudeModels?: unknown }).claudeModels; }
+	let config: { claudeModels?: unknown; piModel?: unknown } = {};
+	try { if (existsSync(file)) config = JSON.parse(readFileSync(file, "utf8")); }
 	catch { throw new Error(`invalid sidecar configuration: ${file}`); }
-	if (models === undefined) return ["claude-opus-5-5", "claude-sonnet-5-5"];
-	if (!Array.isArray(models) || models.some((model) => typeof model !== "string" || !model.trim())) throw new Error(`claudeModels in ${file} must be a list of model ids`);
-	return models.map((model: string) => model.trim());
+	if (!config) throw new Error(`invalid sidecar configuration: ${file}`);
+	const { claudeModels = ["claude-opus-5-5", "claude-sonnet-5-5"], piModel = "openai-codex/gpt-6.2-astra" } = config;
+	if (!Array.isArray(claudeModels) || claudeModels.some((model) => typeof model !== "string" || !model.trim())) throw new Error(`claudeModels in ${file} must be a list of model ids`);
+	if (typeof piModel !== "string" || !piModel.trim()) throw new Error(`piModel in ${file} must be a model id`);
+	return { claudeModels: claudeModels.map((model: string) => model.trim()), piModel: piModel.trim() };
 }
 
 /** A Claude model normalized against the allowlist (`opus` names the first listed Opus); for Claude Code every name must be listed. */
@@ -331,7 +331,7 @@ export class SidecarCli {
 				if (globals.model && globals.model !== agent.model) throw new UsageError(`slot ${globals.slot} runs ${agent.model}; use stop --fresh or a new slot for ${globals.model}`);
 				// A model removed from claudeModels ends its slot's conversation. The recorded name must be listed as is: an alias
 				// such as `opus` may have meant another model when the slot started.
-				const allowed = claudeModels(this.env);
+				const { claudeModels: allowed } = modelConfig(this.env);
 				if (agent.model && allowedClaudeModel(agent.model, allowed, agent.runtime === "claude-code") !== agent.model) {
 					throw new Error(`model ${agent.model} is not allowed; Claude sidecars run ${allowed.join(" or ") || "no Claude model"}`);
 				}
@@ -398,10 +398,10 @@ export class SidecarCli {
 		const profile = this.profile;
 		// Pi finds .pi/skills itself; Claude Code repositories keep theirs in .claude/skills. A profile names its own.
 		const skills = profile ? profileSkills(profile, this.env.HOME || homedir()) : !machine && agent === "pi" ? repoSkills(this.cwd) : [];
-		const allowed = claudeModels(this.env);
+		const { claudeModels: allowed, piModel } = modelConfig(this.env);
 		const model = agent === "claude"
 			? globals.model || this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
-			: globals.model || this.env.SIDECAR_MODEL || "openai-codex/gpt-6.2-astra";
+			: globals.model || this.env.SIDECAR_MODEL || piModel;
 		if (!model) throw new Error("claudeModels is empty; no Claude model is allowed");
 		const checked = allowedClaudeModel(model, allowed, agent === "claude");
 		return {

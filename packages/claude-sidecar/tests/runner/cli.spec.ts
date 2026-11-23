@@ -71,6 +71,27 @@ test("only Opus 5.5 and Sonnet 5.5 run as Claude sidecars", async (t) => {
 	assert.equal(f.starts.length, 0);
 });
 
+test("piModel selects the pi model unless overridden by SIDECAR_MODEL or --model", async (t) => {
+	for (const [slot, expected, env, flags] of [
+		["1", "openai-codex/gpt-6.2-sol", {}, []],
+		["2", "env-model", { SIDECAR_MODEL: "env-model" }, []],
+		["3", "flag-model", { SIDECAR_MODEL: "env-model" }, ["--model", "flag-model"]],
+	] as const) {
+		const f = fixture(t, () => ({ type: "completed", result: "done" }));
+		const config = join(f.root, "config.json");
+		writeFileSync(config, JSON.stringify({ piModel: "openai-codex/gpt-6.2-sol" }));
+		const run = await f.runWith({ env: { SIDECAR_CONFIG_FILE: config, ...env } }, "--slot", slot, ...flags, "ask", "x");
+		assert.equal(run.code, 0, run.stderr);
+		assert.deepEqual(f.starts.at(-1)!.slice(2, 4), ["--model", expected]);
+	}
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const config = join(f.root, "config.json");
+	for (const piModel of [42, "  "]) {
+		writeFileSync(config, JSON.stringify({ piModel }));
+		assert.match((await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "--slot", "4", "ask", "x")).stderr, /piModel .* must be a model id/);
+	}
+});
+
 test("claudeModels in the sidecar config replaces the allowlist", async (t) => {
 	const f = fixture(t, () => ({ type: "completed", result: "done" }));
 	const config = join(f.root, "config.json");

@@ -72,24 +72,33 @@ test("only Opus 5.5 and Sonnet 5.5 run as Claude sidecars", async (t) => {
 });
 
 test("piModel selects the pi model unless overridden by SIDECAR_MODEL or --model", async (t) => {
-	for (const [slot, expected, env, flags] of [
-		["1", "openai-codex/gpt-6.2-sol", {}, []],
-		["2", "env-model", { SIDECAR_MODEL: "env-model" }, []],
-		["3", "flag-model", { SIDECAR_MODEL: "env-model" }, ["--model", "flag-model"]],
+	const sol = "openai-codex/gpt-6.2-sol", astra = "openai-codex/gpt-6.2-astra";
+	const roles = { default: sol, "adversarial-reviewer": astra };
+	for (const [piModel, expected, env, flags] of [
+		[sol, sol, {}, []],
+		[roles, astra, {}, []],
+		[roles, sol, {}, ["--role", "implementer"]],
+		[{ implementer: sol }, astra, {}, []],
+		[roles, "env-model", { SIDECAR_MODEL: "env-model" }, []],
+		[roles, "flag-model", { SIDECAR_MODEL: "env-model" }, ["--model", "flag-model"]],
 	] as const) {
 		const f = fixture(t, () => ({ type: "completed", result: "done" }));
 		const config = join(f.root, "config.json");
-		writeFileSync(config, JSON.stringify({ piModel: "openai-codex/gpt-6.2-sol" }));
-		const run = await f.runWith({ env: { SIDECAR_CONFIG_FILE: config, ...env } }, "--slot", slot, ...flags, "ask", "x");
+		writeFileSync(config, JSON.stringify({ piModel }));
+		const run = await f.runWith({ env: { SIDECAR_CONFIG_FILE: config, ...env } }, ...flags, "ask", "x");
 		assert.equal(run.code, 0, run.stderr);
 		assert.deepEqual(f.starts.at(-1)!.slice(2, 4), ["--model", expected]);
 	}
 	const f = fixture(t, () => ({ type: "completed", result: "done" }));
 	const config = join(f.root, "config.json");
-	for (const piModel of [42, "  "]) {
+	for (const piModel of [42, "  ", null, [], { default: 0 }, { explorer: "  " }]) {
 		writeFileSync(config, JSON.stringify({ piModel }));
 		assert.match((await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "--slot", "4", "ask", "x")).stderr, /piModel .* must be a model id/);
 	}
+	writeFileSync(config, JSON.stringify({ piModel: { typo: sol } }));
+	assert.match((await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "ask", "x")).stderr, /unknown piModel role typo/);
+	writeFileSync(config, JSON.stringify({ piModel: { reviewer: sol } }));
+	assert.match((await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "ask", "x")).stderr, /runs Claude Code; use adversarial-reviewer/);
 });
 
 test("claudeModels in the sidecar config replaces the allowlist", async (t) => {

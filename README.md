@@ -44,6 +44,10 @@ Install either the local clone or the GitHub package, not both. When working fro
 
 This repository also contains the [Herdr App mods and layout](packages/herdr-app-mods/README.md) and the [Claude Sidecar plugin](packages/claude-sidecar/README.md). Herdr App itself is a separate application.
 
+## Codex native compaction
+
+The [standalone Codex compaction extension](packages/codex-compaction/README.md) uses OpenAI's native checkpoints for `openai-codex`. Install it separately and remove the upstream extension before loading this fork; neither Grok entrypoint loads it automatically.
+
 ## Standalone media
 
 To use only `show_image`, `show_video`, and `show_html`, load the media-only entrypoint instead of either Grok entrypoint:

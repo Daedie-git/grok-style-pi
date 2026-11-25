@@ -20,6 +20,7 @@
     "packages/subagent-engine"
   ],
   "files": [
+    "packages/codex-compaction",
     "packages/herdr-runner/src",
     "packages/herdr-runner/package.json",
     "packages/herdr-runner/README.md",

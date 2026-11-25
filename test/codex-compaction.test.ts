@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
-import { buildCompactionRequestBody, spliceCheckpointHistory } from "../packages/codex-compaction/native-compaction.ts";
+import { buildCodexHeaders, buildCompactionRequestBody, spliceCheckpointHistory } from "../packages/codex-compaction/native-compaction.ts";
 
 const model: Model<"openai-codex-responses"> = {
 	id: "gpt-test", name: "GPT Test", api: "openai-codex-responses", provider: "openai-codex",
@@ -38,7 +38,19 @@ test("replays a unique standalone checkpoint marker with or without the optional
 test("rejects missing, duplicate, and mixed-content checkpoint markers", () => {
 	const mixed = { ...placeholder, content: [...placeholder.content, ...prompt.content] };
 	const repeated = { ...placeholder, content: [...placeholder.content, ...placeholder.content] };
-	for (const input of [[prompt], [placeholder, typedPlaceholder], [mixed], [placeholder, mixed], [repeated]]) {
+	const stringMarker = { role: "user", content: marker };
+	for (const input of [[prompt], [placeholder, typedPlaceholder], [mixed], [placeholder, mixed], [repeated], [placeholder, stringMarker], [stringMarker]]) {
 		assert.throws(() => spliceCheckpointHistory(input, marker, [checkpoint]), /Could not place the OpenAI Codex native compaction checkpoint/);
 	}
+});
+
+test("preserves both case variants of the beta-features header and omits null headers", () => {
+	const claims = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64url");
+	const headers = buildCodexHeaders({
+		apiKey: `test.${claims}.test`,
+		sessionId: "test-session",
+		headers: { "x-codex-beta-features": "first", "X-Codex-Beta-Features": "second", "x-omitted": null },
+	});
+	assert.equal(headers.get("x-codex-beta-features"), "first,second,remote_compaction_v2");
+	assert.equal(headers.has("x-omitted"), false);
 });

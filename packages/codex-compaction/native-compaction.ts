@@ -356,7 +356,9 @@ export function replaceCheckpointedMessages<T extends { role: string }>(
 export function spliceCheckpointHistory(input: unknown, marker: string, history: ResponseItem[]): ResponseItem[] {
 	const items = Array.isArray(input) ? input as ResponseItem[] : [];
 	const matches = items.flatMap((item, index) => {
-		if (!isJsonObject(item) || item.role !== "user" || !Array.isArray(item.content)) return [];
+		if (!isJsonObject(item) || item.role !== "user") return [];
+		if (item.content === marker) return [index];
+		if (!Array.isArray(item.content)) return [];
 		return item.content.flatMap((part: unknown) =>
 			isJsonObject(part) && part.type === "input_text" && part.text === marker ? [index] : [],
 		);
@@ -579,7 +581,7 @@ export function buildCodexHeaders(params: {
 }): Headers {
 	const headers = new Headers();
 	for (const [name, value] of Object.entries(params.headers ?? {})) {
-		if (value !== null) headers.set(name, value);
+		if (value !== null) headers.append(name, value);
 	}
 	headers.set("authorization", `Bearer ${params.apiKey}`);
 	headers.set("chatgpt-account-id", extractCodexAccountId(params.apiKey));

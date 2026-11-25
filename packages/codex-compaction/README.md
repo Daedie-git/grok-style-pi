@@ -66,6 +66,8 @@ On older Pi releases only, the fallback defaults to `autoCompact: true` and `thr
 
 The current conversation is sent to the ChatGPT Codex Responses endpoint. OpenAI returns an opaque `encrypted_content` value, which is stored in the local Pi session JSONL and replayed to OpenAI on compatible subsequent requests.
 
+For compatibility with Pi's provider header overrides, the compaction request omits headers whose value is `null`. Non-null values are appended so differently cased names retain both values, as in the upstream extension.
+
 ## Limitations
 
 Native checkpoints are model-specific. Switch back to the model that created the checkpoint before continuing. Provider switching is not a portability path because no textual summary is generated.

@@ -79,8 +79,9 @@ test("piModel selects the pi model unless overridden by SIDECAR_MODEL or --model
 		[roles, astra, {}, []],
 		[roles, sol, {}, ["--role", "implementer"]],
 		[{ implementer: sol }, astra, {}, []],
-		[roles, "env-model", { SIDECAR_MODEL: "env-model" }, []],
-		[roles, "flag-model", { SIDECAR_MODEL: "env-model" }, ["--model", "flag-model"]],
+		[roles, astra, { SIDECAR_MODEL: "gpt-6.2-astra" }, []],
+		[roles, "provider/env-model", { SIDECAR_MODEL: "provider/env-model" }, []],
+		[roles, "provider/flag-model", { SIDECAR_MODEL: "provider/env-model" }, ["--model", "provider/flag-model"]],
 	] as const) {
 		const f = fixture(t, () => ({ type: "completed", result: "done" }));
 		const config = join(f.root, "config.json");
@@ -99,6 +100,50 @@ test("piModel selects the pi model unless overridden by SIDECAR_MODEL or --model
 	assert.match((await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "ask", "x")).stderr, /unknown piModel role typo/);
 	writeFileSync(config, JSON.stringify({ piModel: { reviewer: sol } }));
 	assert.match((await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "ask", "x")).stderr, /runs Claude Code; use adversarial-reviewer/);
+});
+
+test("Pi model shorthand uses the role or slot provider and refuses unmatched bare IDs before launch", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const config = join(f.root, "config.json");
+	const env = { SIDECAR_CONFIG_FILE: config };
+	const sol = "openai-codex/gpt-6.2-sol";
+	writeFileSync(config, JSON.stringify({ piModel: { researcher: sol } }));
+	const run = await f.runWith({ env }, "--slot", "2", "--role", "researcher", "--model", "gpt-6.2-sol", "--thinking", "high", "ask", "x");
+	assert.equal(run.code, EXIT.report, run.stderr);
+	assert.deepEqual(f.starts[0].slice(2), ["--model", sol, "--thinking", "high"]);
+	// A changed default must not change the provider on an already bound slot.
+	writeFileSync(config, JSON.stringify({ piModel: { researcher: "openai/gpt-6.2-sol" } }));
+	const followUp = await f.runWith({ env }, "--slot", "2", "--model", "gpt-6.2-sol", "ask", "again");
+	assert.equal(followUp.code, EXIT.report, followUp.stderr);
+	assert.ok(f.starts.every((args) => args[3] === sol));
+	const starts = f.starts.length;
+	const refused = await f.runWith({ env }, "--slot", "3", "--role", "researcher", "--model", "gpt-6.2-astra", "ask", "x");
+	assert.equal(refused.code, EXIT.failed);
+	assert.match(refused.stderr, /use provider\/model or omit the override/);
+	assert.equal(f.prompts.length, 2);
+	assert.equal(f.starts.length, starts);
+	assert.equal(new SlotState(join(f.root, "state"), "sc-w1-p1-3").read(), undefined);
+	writeFileSync(config, JSON.stringify({ piModel: { researcher: "gpt-6.2-sol" } }));
+	const unqualifiedConfig = await f.runWith({ env }, "--slot", "3", "--role", "researcher", "ask", "x");
+	assert.equal(unqualifiedConfig.code, EXIT.failed);
+	assert.match(unqualifiedConfig.stderr, /Set piModel and SIDECAR_MODEL to provider\/model/);
+	assert.equal(f.starts.length, starts);
+});
+
+test("an explicit Pi provider wins even when it appears inside a configured model ID", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const config = join(f.root, "config.json");
+	const env = { SIDECAR_CONFIG_FILE: config };
+	writeFileSync(config, JSON.stringify({ piModel: "openrouter/openai/gpt-4.1" }));
+	assert.equal((await f.runWith({ env }, "--slot", "2", "--model", "openai/gpt-4.1", "ask", "x")).code, EXIT.report);
+	assert.equal(f.starts[0][3], "openai/gpt-4.1");
+	const bound = fixture(t, () => ({ type: "completed", result: "done" }));
+	const configured = await bound.runWith({ env }, "--slot", "3", "ask", "use the configured model");
+	assert.equal(configured.code, EXIT.report, configured.stderr);
+	assert.equal(bound.starts[0][3], "openrouter/openai/gpt-4.1");
+	const refused = await bound.runWith({ env }, "--slot", "3", "--model", "openai/gpt-4.1", "ask", "x");
+	assert.equal(refused.code, EXIT.failed);
+	assert.match(refused.stderr, /runs openrouter\/openai\/gpt-4\.1/);
 });
 
 test("claudeModels in the sidecar config replaces the allowlist", async (t) => {
@@ -142,6 +187,15 @@ test("sidecar Claude aliases follow claudeModels, and follow-ups refuse a model 
 	assert.equal(f.prompts.length, 1);
 });
 
+test("Pi resolves a matching Claude alias against the allowlist after choosing the provider", async (t) => {
+	const f = fixture(t, () => ({ type: "completed", result: "done" }));
+	const config = join(f.root, "config.json");
+	writeFileSync(config, JSON.stringify({ piModel: "anthropic/sonnet", claudeModels: ["claude-sonnet-6"] }));
+	const run = await f.runWith({ env: { SIDECAR_CONFIG_FILE: config } }, "--model", "sonnet", "ask", "x");
+	assert.equal(run.code, EXIT.report, run.stderr);
+	assert.equal(f.starts[0][3], "anthropic/claude-sonnet-6");
+});
+
 test("a slot recorded as a pi reviewer is the adversarial reviewer", async (t) => {
 	const { SlotState } = await import("../../src/state.ts");
 	const root = mkdtempSync(join(tmpdir(), "sidecar-legacy-"));
@@ -158,6 +212,15 @@ test("a failed run reports no report and exits 2", async (t) => {
 	const result = await f.run("ask", "x");
 	assert.equal(result.code, EXIT.noReport);
 	assert.match(result.stderr, /no report .* failed: model unavailable/);
+});
+
+test("a Pi pane that exits before accepting the prompt tells Claude not to retry blindly", async (t) => {
+	const f = fixture(t, () => { throw new Error("the prompt must not run"); });
+	f.client.startPi = async ({ paneId }) => { f.panes.delete(paneId); };
+	const result = await f.run("ask", "x");
+	assert.equal(result.code, EXIT.noReport);
+	assert.match(result.stderr, /before accepting the task \(Herdr pane w1:p2\)/);
+	assert.match(result.stderr, /Do not retry on the same slot/);
 });
 
 test("a provider safety block is reported to Claude as a failed request, without a report or retry", async (t) => {

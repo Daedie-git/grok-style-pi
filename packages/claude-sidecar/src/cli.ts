@@ -174,6 +174,14 @@ function allowedClaudeModel(model: string, allowed: string[], claudeCode = false
 	return prefix + found;
 }
 
+/** Resolve only shorthand whose provider is already known; Pi can have the same model ID under several providers. */
+function qualifyPiModel(model: string, reference?: string): string {
+	if (/^[^/]+\/.+$/.test(model)) return model;
+	const slash = reference?.indexOf("/") ?? -1;
+	if (reference && slash > 0 && reference.slice(slash + 1) === model) return reference;
+	throw new UsageError(`Pi model ${JSON.stringify(model)} needs a provider; use provider/model or omit the override to use the slot or role default. Set piModel and SIDECAR_MODEL to provider/model.`);
+}
+
 export class SidecarCli {
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly cwd: string;
@@ -343,7 +351,11 @@ export class SidecarCli {
 				const routed = await this.parent.routeLive(record.agentId);
 				runner = routed.runner;
 				const agent = await runner.resolve(routed.id);
-				if (globals.model && globals.model !== agent.model) throw new UsageError(`slot ${globals.slot} runs ${agent.model}; use stop --fresh or a new slot for ${globals.model}`);
+				// An existing slot may have saved a bare model before fresh launches required a provider.
+				if (globals.model && globals.model !== agent.model) {
+					const requested = record.agent === "pi" ? qualifyPiModel(globals.model, agent.model) : globals.model;
+					if (requested !== agent.model) throw new UsageError(`slot ${globals.slot} runs ${agent.model}; use stop --fresh or a new slot for ${requested}`);
+				}
 				// A model removed from claudeModels ends its slot's conversation. The recorded name must be listed as is: an alias
 				// such as `opus` may have meant another model when the slot started.
 				const { claudeModels: allowed } = modelConfig(this.env, record.role);
@@ -418,7 +430,8 @@ export class SidecarCli {
 			? globals.model || this.env.SIDECAR_CLAUDE_MODEL || allowed[0]
 			: globals.model || this.env.SIDECAR_MODEL || piModel;
 		if (!model) throw new Error("claudeModels is empty; no Claude model is allowed");
-		const checked = allowedClaudeModel(model, allowed, agent === "claude");
+		const selected = agent === "pi" ? qualifyPiModel(model, piModel) : model;
+		const checked = allowedClaudeModel(selected, allowed, agent === "claude");
 		return {
 			runtime: agent === "claude" ? "claude-code" : "pi",
 			prompt,
@@ -522,6 +535,9 @@ export class SidecarCli {
 		else if (snapshot.phase === "completed" && record.agent === "claude") ({ report, question } = claudeQuestion(report));
 		if (snapshot.phase !== "completed" && snapshot.phase !== "needs-answer") {
 			this.io.stderr(`sidecar: no report for ${id}: the run ${snapshot.phase}${snapshot.error ? `: ${snapshot.error}` : ""}\n`);
+			if (snapshot.phase === "failed" && !snapshot.accepted && !snapshot.cancelRequested && !snapshot.paneConflict) {
+				this.io.stderr("sidecar: Do not retry on the same slot without checking the startup failure. Inspect the Herdr pane if available; fix the cause before retrying, and use a fresh slot if the failed slot never started a conversation.\n");
+			}
 			await runner.store.acknowledgeNotice(ref.runId).catch(() => undefined);
 			return snapshot.phase === "stopped" ? EXIT.failed : EXIT.noReport;
 		}

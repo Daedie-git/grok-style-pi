@@ -91,7 +91,7 @@ test('a job held at turn end is submitted then', async ($, on) => {
   await s.clock.advance(3000)
   await $.turn.complete({ turnId: 't1', answer: 'done', durationMs: 1, isAborted: false, reason: 'completed' })
   expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toMatch(/exited 2: no report submitted/)
+  expect(s.submitted[0]).toMatch(/exited 2: no report submitted; check stderr for the reason before retrying/)
 })
 
 test('a finished job left by an earlier plugin copy is delivered at session start', async ($, on) => {

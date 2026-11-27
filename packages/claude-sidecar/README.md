@@ -4,7 +4,7 @@ A Claude Code plugin that runs persistent [pi](https://github.com/badlogic/pi-mo
 
 Sidecars run on [herdr-runner](../herdr-runner/README.md), the core that Grok's Pi subagents use: one coordination database, pane placement, close-on-completion, owner-gone cleanup, cold resume and saved machines. A sidecar is a runner agent owned by the Claude conversation in its pane.
 
-Roles pick the backend: `reviewer` runs Claude Code and `adversarial-reviewer` (the default) runs pi; other roles default to pi. Pi defaults to `openai-codex/gpt-6.2-astra`. Set `piModel` in the config file to one model for all pi roles or a role map, e.g. `{"default":"openai-codex/gpt-6.2-sol","adversarial-reviewer":"openai-codex/gpt-6.2-astra"}`. Unlisted roles use `default` if present, otherwise Astra; `SIDECAR_MODEL` overrides the config. Claude Code defaults to `claude-opus-5-5` (`SIDECAR_CLAUDE_MODEL`). Claude models are limited to `claudeModels` in `~/.config/claude-sidecar/config.json`, default `["claude-opus-5-5", "claude-sonnet-5-5"]`; the first is Claude Code's default. Reviewers and researchers think at `high`, implementers and explorers at `medium` (`SIDECAR_THINKING`). `--model M` and `--thinking T` before the command override both for a fresh slot; the slot keeps its model, and a follow-up naming another model is refused.
+Roles pick the backend: `reviewer` runs Claude Code and `adversarial-reviewer` (the default) runs pi; other roles default to pi. Pi defaults to `openai-codex/gpt-6.2-astra`. Set `piModel` in the config file to one model for all pi roles or a role map, e.g. `{"default":"openai-codex/gpt-6.2-sol","adversarial-reviewer":"openai-codex/gpt-6.2-astra"}`. Unlisted roles use `default` if present, otherwise Astra; `SIDECAR_MODEL` overrides the config. Claude Code defaults to `claude-opus-5-5` (`SIDECAR_CLAUDE_MODEL`). Claude models are limited to `claudeModels` in `~/.config/claude-sidecar/config.json`, default `["claude-opus-5-5", "claude-sonnet-5-5"]`; the first is Claude Code's default. Reviewers and researchers think at `high`, implementers and explorers at `medium` (`SIDECAR_THINKING`). `--model M` and `--thinking T` before the command override both for a fresh slot; the slot keeps its model, and a follow-up naming another model is refused. For Pi, set `piModel` to `provider/model`. Use that form for `--model` and `SIDECAR_MODEL` to choose a provider explicitly; a bare ID is shorthand only if it matches the configured role model. A follow-up can instead name its slot’s saved model by full name or matching bare ID. Other bare IDs are refused before a pane starts. If an older config used a bare ID, add its provider before starting a new slot.
 
 ## Requirements
 
@@ -50,6 +50,8 @@ A request starts the slot's agent, or resumes its conversation, and waits for th
 | 7 | `stop` refused while a request runs |
 
 A request on another machine survives a dropped SSH control channel: the launcher reconnects every 10 seconds while the run continues there, and fails only after `SIDECAR_RECONNECT_S` (default 3600) without a connection.
+
+If a run fails before accepting its task, the job tells Claude to check the startup failure before retrying. A slot that never started a conversation should not be resumed.
 
 When a Pi sidecar ends with a recognized provider safety block, the job exits 2 and tells Claude the run was blocked by the provider's safety policy. The notice does not include the raw provider error, and the launcher does not retry the request.
 

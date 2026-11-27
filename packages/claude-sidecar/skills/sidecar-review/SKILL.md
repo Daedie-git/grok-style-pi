@@ -1,6 +1,6 @@
 ---
 name: sidecar-review
-description: Second-opinion review by a persistent pi or Claude Code agent in Herdr, and the way to run agents on GPT models (Sol, Astra) such as implementers, since the Agent tool runs only Claude models. Use after your own implementation, before complex plans, at milestones to brief the reviewer, when the user asks for a sidecar review, and when the user asks for agents or implementers on a GPT model (`--model gpt-6.2-sol --thinking medium`). A plain user request to review code is not a sidecar request; do that review yourself. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
+description: Second-opinion review by a persistent pi or Claude Code agent in Herdr, and the way to run agents on GPT models (Sol, Astra) such as implementers, since the Agent tool runs only Claude models. Use after your own implementation, before complex plans, at milestones to brief the reviewer, when the user asks for a sidecar review, and when the user asks for agents or implementers on a GPT model (`--model openai-codex/gpt-6.2-sol --thinking medium`). A plain user request to review code is not a sidecar request; do that review yourself. Requires a herdr pane (HERDR_ENV=1) or a Herdr app terminal (HC_TERMINAL_ID).
 ---
 
 # Sidecar review
@@ -146,7 +146,7 @@ Done when every finding is fixed, withdrawn by the reviewer, or overruled, and t
 
 `plan`, `diff`, `ask`, `answer` and idle `steer` wait without a deadline until the sidecar finishes, so an implementation task that takes hours is one job. If a request's job was lost, run `sidecar --slot N wait`: it waits for the slot's current run and prints its report like a request.
 
-`sidecar status` shows each slot's role, agent, machine, run state and pane. If a run fails without a report (an aborted turn or failed context compaction), the command exits 2 with the reason; send the task again with `ask`.
+`sidecar status` shows each slot's role, agent, machine, run state and pane. If a run fails without a report, the command exits 2 with the reason. Check the failure before deciding whether to retry.
 
 ## Questions from the sidecar
 
@@ -156,6 +156,7 @@ When the sidecar is blocked on a decision only you or the user can make, the com
 
 - Outside Herdr (`HERDR_ENV` is not `1` and `HC_TERMINAL_ID` is unset): explain that the sidecar requires an interactive Claude session inside Herdr, and continue without a sidecar review.
 - `blocked`: the sidecar is waiting on a question in its pane. Ask the user to answer it there; do not send keys to it yourself.
-- `no report`: the command prints why the run ended. Retry once with `sidecar ask`; after that, report the failure to the user and continue with your own review.
+- `no report` before the sidecar accepted the task: inspect the named Herdr pane if available and fix the startup error before retrying. If the slot never started a conversation, use a fresh slot. For a Pi model error, omit `--model` to use the configured default, or use the requested `provider/model`; do not guess a provider or retry the same failed launch.
+- `no report` after the sidecar accepted the task: retry once with `sidecar ask` only for a transient failure, not for a provider safety block. If it still fails, report the failure and continue without the sidecar.
 - A sidecar whose turns keep ending without a report while its context is nearly full (compaction in the pane output, or a context figure near its limit) cannot finish in that conversation. Run `sidecar --slot N stop --fresh`, then resend the task with a complete briefing: the new conversation remembers nothing.
 - `sidecar status` shows its state.

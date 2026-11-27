@@ -17,7 +17,7 @@ export const LOST_MS = 90000
 export const LOST_CODE = -1
 const EXIT_MEANING: Record<number, string> = {
   0: 'report delivered',
-  2: 'no report submitted; the output shows the pane',
+  2: 'no report submitted; check stderr for the reason before retrying',
   3: 'the sidecar asks a question; decide (or ask the user), then answer on the same slot with args [..., "answer", "<decision>"]',
   4: 'an identical request is already in flight; wait for it',
   5: 'the sidecar is blocked on an approval in its pane; ask the user to handle it there',
